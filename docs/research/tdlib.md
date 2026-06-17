@@ -96,14 +96,79 @@ rather than reimplementing the receive loop.
   re-verify on bump. For release binaries prefer **`static`** linking so users
   get one self-contained executable with no `LD_LIBRARY_PATH` dance.
 
-## OpenSSL 3 / zlib on Ubuntu 26.04
+## Native dependencies (OpenSSL / zlib) across targets
 
-Host is **Ubuntu 26.04, OpenSSL 3.5.5, zlib present**. The prebuilt tdjson links
-against OpenSSL 3 / zlib, which the system already provides — so the
-`download-tdlib` path "just works" without dev headers. The dev packages
-(`pkg-config libssl-dev zlib1g-dev`) and a C++ toolchain are only required for
-the documented **from-source** build, which we keep as the power-user escape
-hatch, not the default.
+The prebuilt `tdjson` is not self-contained: it dynamically links **OpenSSL 3**
+and **zlib**, which are *TDLib's own* native deps, not ours. Crucially, the
+`tdlib-rs` **`static` feature statically links `tdjson` only** — it does **not**
+bundle OpenSSL/zlib. So those two remain a runtime requirement on every target,
+even for a "static" build. We therefore treat them as a **per-target contract**
+that each platform must satisfy and that CI **verifies empirically** (a linkage
+audit with `otool -L` / `ldd` / `dumpbin`), rather than assuming a single host.
+
+Build deps split into two layers, handled uniformly everywhere:
+
+| Layer | What | Controlled by | Agnostic? |
+|---|---|---|---|
+| `tdjson` | TDLib C ABI lib | `tdlib-rs` features: `download-tdlib` (+ `static`) | Yes — same on all targets |
+| OpenSSL 3 + zlib | TDLib's transitive native deps | **not** removed by `static`; satisfied at runtime per OS | Needs the contract below |
+
+### Runtime contract per target
+
+| Target | OpenSSL | zlib | Satisfied by |
+|---|---|---|---|
+| linux x86_64 / arm64 | `libssl.so.3`, `libcrypto.so.3` | `libz.so.1` | distro pkgs (`libssl3`, `zlib1g`) — usually preinstalled |
+| macOS arm64 | **`/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib` + `libcrypto.3.dylib`** *(measured)* | `/usr/lib/libz.1.dylib` (system) *(measured)* | dev: `brew install openssl@3` (suggested); release: bundled — see Distribution strategy |
+| macOS x86_64 | Homebrew `openssl@3` at `/usr/local/opt/...` *(Intel prefix; confirm in CI)* | system `/usr/lib/libz` | dev: `brew install openssl@3` (suggested); release: bundled |
+| windows x86_64 / arm64 | bundled in prebuilt *(confirm in CI)* | bundled | nothing |
+
+> **Measured on this M4 (aarch64-apple-darwin), tdlib-rs 1.4.0 / TDLib 1.8.61.**
+> `otool -L libtdjson.1.8.61.dylib` →
+> `/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib`,
+> `/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib`, `/usr/lib/libz.1.dylib`.
+> The OpenSSL paths are **absolute Homebrew paths, not `@rpath`** — so a *plain*
+> `download-tdlib` build loads `openssl@3` from the Homebrew prefix at runtime,
+> and `static` linking `tdjson` does **not** remove it. zlib is satisfied by the
+> system, so no Homebrew zlib is needed. Our distribution strategy (below)
+> removes the Homebrew-at-runtime requirement for shipped builds.
+
+### Distribution strategy: native, one place per OS/arch
+
+Principle: resolve deps **as natively as possible** (stay dynamically linked the
+platform-natural way — no from-source static OpenSSL), and keep each platform's
+resolution in **one place**. Homebrew is **suggested for local dev, never
+required at end-user runtime**.
+
+| OS | Native resolution | Single place |
+|---|---|---|
+| Linux | use the system `libssl.so.3` / `libz.so.1`; declare them as package deps (usually preinstalled) | package manifest + [`check-native-deps.sh`](../../scripts/check-native-deps.sh) |
+| macOS (arm64 + x86_64) | **bundle** `libssl.3.dylib` + `libcrypto.3.dylib` beside the binary and rewrite the Mach-O load commands to `@loader_path` via `install_name_tool` (then re-`codesign`); zlib stays the system `/usr/lib/libz` | [`scripts/bundle-native-deps.sh`](../../scripts/bundle-native-deps.sh) |
+| Windows (x86_64 + arm64) | OpenSSL/zlib are already bundled in the prebuilt | the prebuilt (no step) |
+
+For macOS this is the most native option that doesn't force a package manager on
+users: the same dynamically-linked OpenSSL 3, shipped *with* the app and loaded
+relatively, so the binary is self-contained. The OpenSSL dylibs are copied at
+**release time** from the build host's `openssl@3` (present on GitHub macOS
+runners and dev machines) — so brew is a build-time convenience, not a runtime
+dependency. `bundle-native-deps.sh` is a no-op on Linux/Windows by design, and
+finishes by re-running the linkage audit to assert no absolute Homebrew paths
+remain.
+
+### Provisioning & verification
+
+- **One place per OS, not scattered assumptions:** [`check-native-deps.sh`](../../scripts/check-native-deps.sh)
+  (verify/provision, all OSes) and [`bundle-native-deps.sh`](../../scripts/bundle-native-deps.sh)
+  (relocate deps into release artifacts, macOS-only work). The check script is
+  read-only — it detects a compatible OpenSSL 3 + zlib and prints the exact
+  install command for the current OS if anything is missing; CI and devs run the
+  same script. On macOS it points at the [`Brewfile`](../../Brewfile) but treats
+  `openssl@3` as a *suggested dev convenience*, since release builds bundle it.
+- **From-source escape hatch only:** `pkg-config` + `libssl-dev`/`zlib1g-dev`
+  (Linux) or `pkg-config` + `openssl@3` (macOS) plus a C++ toolchain are needed
+  *only* for the `pkg-config`/`local-tdlib` power-user build, never the default.
+- **Historical note (Phase 1):** the original host was Ubuntu 26.04 with OpenSSL
+  3 / zlib already present, so `download-tdlib` "just worked" there. That was a
+  property of that one host, not a portable guarantee — hence this contract.
 
 ## Resource usage
 
@@ -127,9 +192,11 @@ the parameters are on the radar at `setTdlibParameters` time.
   `oneshot` correlation; core exposes an async API + update `Stream`.
 - **Pin** `tdlib-rs` exactly (→ TDLib 1.8.61); treat version bumps as deliberate,
   tested events. Prefer static linking to dodge runtime lib-path issues.
-- **No system dev headers needed for the default path** on Ubuntu 26.04; OpenSSL
-  3 / zlib are already present. `libssl-dev`/`zlib1g-dev`/`pkg-config` remain
-  pending only for the optional from-source build.
+- **Native deps (OpenSSL 3 / zlib) are a per-target contract, not a host
+  assumption** — see [Native dependencies across targets](#native-dependencies-openssl--zlib-across-targets).
+  `static` covers `tdjson` only; OpenSSL/zlib stay dynamic and are provisioned
+  per OS (`Brewfile` / `scripts/check-native-deps.sh`) and audited in CI.
+  `libssl-dev`/`zlib1g-dev`/`pkg-config` remain only for the from-source path.
 
 ## Links
 

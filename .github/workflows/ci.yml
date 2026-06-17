@@ -1,0 +1,95 @@
+name: CI
+
+# Cross-target build/test matrix. The point of this matrix is to prove the
+# project builds and its native deps resolve on every distribution target we
+# care about — not to assume a single host (see docs/research/tdlib.md,
+# "Native dependencies across targets").
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,  os: ubuntu-latest }
+          - { name: macos-arm64,   os: macos-14 }      # Apple Silicon
+          - { name: macos-x86_64,  os: macos-13 }      # Intel
+          - { name: windows-x86_64, os: windows-latest }
+          # Deferred (no GitHub-hosted runner): linux-arm64 and windows-arm64.
+          # Cover these via cross-compilation / self-hosted runners in Phase 2+.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Honors rust-toolchain.toml (channel + rustfmt/clippy).
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Single per-OS source of truth for OpenSSL 3 + zlib. Read-only check;
+      # on macOS it expects Homebrew openssl@3 (preinstalled on GitHub runners).
+      - name: Check native deps (OpenSSL 3 + zlib)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/check-native-deps.sh
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Test
+        run: cargo test --workspace
+
+      # ---------------------------------------------------------------------
+      # Phase 2 (once tdlib-rs is a dependency): build with the prebuilt tdjson
+      # and AUDIT what OpenSSL/zlib the artifact actually links, per target.
+      # This is the continuous version of the one-off macOS probe and is the
+      # real "works regardless of arch" guarantee. Uncomment when the crate lands.
+      # ---------------------------------------------------------------------
+      # - name: Build (download-tdlib)
+      #   run: cargo build --workspace --features tuigram-core/download-tdlib
+      #
+      # - name: Linkage audit (Linux)
+      #   if: runner.os == 'Linux'
+      #   run: |
+      #     lib=$(find target -name 'libtdjson*.so*' | head -1)
+      #     echo "== ldd $lib =="; ldd "$lib" | grep -Ei 'ssl|crypto|libz' || true
+      #
+      # - name: Linkage audit (macOS)
+      #   if: runner.os == 'macOS'
+      #   run: |
+      #     lib=$(find target -name 'libtdjson*.dylib' | head -1)
+      #     echo "== otool -L $lib =="; otool -L "$lib" | grep -Ei 'ssl|crypto|libz' || true
+      #
+      # Release packaging (separate release workflow, macOS only): make the
+      # shipped binary self-contained so end users need no Homebrew —
+      #   ./scripts/bundle-native-deps.sh target/release/tuigram
+      # (no-op on Linux/Windows). See docs/research/tdlib.md, "Distribution strategy".
+      #
+      # - name: Linkage audit (Windows)
+      #   if: runner.os == 'Windows'
+      #   shell: pwsh
+      #   run: |
+      #     $lib = Get-ChildItem -Recurse -Filter tdjson*.dll target | Select-Object -First 1
+      #     dumpbin /DEPENDENTS $lib.FullName
