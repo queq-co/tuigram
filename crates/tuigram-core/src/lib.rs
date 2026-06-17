@@ -22,4 +22,15 @@ mod tests {
         assert_eq!(version(), env!("CARGO_PKG_VERSION"));
         assert!(!version().is_empty());
     }
+
+    /// Runtime proof that our configured prebuilt `tdjson` actually loads and
+    /// its C ABI is callable on this host — not merely that it links. Creating
+    /// a client dynamically loads `libtdjson` (and its OpenSSL 3 / zlib deps,
+    /// the per-target runtime contract in docs/research/tdlib.md) and calls into
+    /// it. The async request/update bridge over this client lands in #5.
+    #[test]
+    fn prebuilt_tdjson_loads_and_creates_a_client() {
+        let client_id = tdlib_rs::create_client();
+        assert!(client_id >= 0, "tdjson returned an invalid client id");
+    }
 }

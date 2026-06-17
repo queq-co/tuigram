@@ -11,4 +11,22 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# tdjson supply (see docs/research/tdlib.md). Exactly one source mode must be
+# active; `download-tdlib` is the default dev path (pulls a prebuilt tdjson at
+# build time, no C++ toolchain needed). Release builds add `static` to link
+# tdjson into the binary: `cargo build --features static` (download + static).
+# From-source power users opt out of the default and pick another source, e.g.
+# `cargo build -p tuigram-core --no-default-features --features pkg-config`.
+default = ["download-tdlib"]
+download-tdlib = ["tdlib-rs/download-tdlib"]
+local-tdlib = ["tdlib-rs/local-tdlib"]
+pkg-config = ["tdlib-rs/pkg-config"]
+static = ["tdlib-rs/static"]
+
 [dependencies]
+tdlib-rs = { workspace = true }
+# Async runtime for the TDLib bridge (blocking td_receive thread -> channels,
+# @extra -> oneshot correlation; see docs/research/tdlib.md). Feature set widens
+# as the bridge lands in #5.
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }

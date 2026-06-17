@@ -10,6 +10,15 @@ repository = "https://github.com/queq-co/tuigram"
 authors = ["queq & co."]
 rust-version = "1.96"
 
+# Dependencies shared across crates. Pinned exactly: `tdlib-rs` transitively
+# fixes the TDLib version (1.8.61) and the prebuilt tdjson artifact, and TDLib
+# has no stable ABI across versions — see docs/research/tdlib.md. Bumps are
+# deliberate, tested events. We pull no tdjson source feature here; each crate
+# selects one (download-tdlib / local-tdlib / pkg-config) via its own features.
+[workspace.dependencies]
+tdlib-rs = { version = "=1.4.0", default-features = false }
+tokio = { version = "1", default-features = false }
+
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.
 [workspace.lints.rust]
