@@ -59,8 +59,9 @@ Phase 0 decision to use prebuilt binaries:
   - `static` — statically link tdjson into our binary (combine with
     `download-tdlib` or `local-tdlib`) so the shipped binary needs no tdjson at
     runtime. **This is our release/distribution path.**
-- **Prebuilt targets provided:** Linux x86_64, Linux arm64, macOS x86_64, macOS
-  arm64, Windows x86_64, Windows arm64 — covers everything we'd distribute.
+- **Prebuilt targets provided:** Linux x86_64, Linux arm64, macOS arm64, Windows
+  x86_64, Windows arm64 — covers everything we'd distribute. (The crate also ships
+  a macOS x86_64 prebuilt, but we do not support Intel Macs.)
 - **License: MIT OR Apache-2.0** — compatible with our MIT project.
 - Pins a known **TDLib version: 1.8.61** (a specific `tdlib/td` commit).
 
@@ -119,7 +120,6 @@ Build deps split into two layers, handled uniformly everywhere:
 |---|---|---|---|
 | linux x86_64 / arm64 | `libssl.so.3`, `libcrypto.so.3` | `libz.so.1` | distro pkgs (`libssl3`, `zlib1g`) — usually preinstalled |
 | macOS arm64 | **`/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib` + `libcrypto.3.dylib`** *(measured)* | `/usr/lib/libz.1.dylib` (system) *(measured)* | dev: `brew install openssl@3` (suggested); release: bundled — see Distribution strategy |
-| macOS x86_64 | Homebrew `openssl@3` at `/usr/local/opt/...` *(Intel prefix; confirm in CI)* | system `/usr/lib/libz` | dev: `brew install openssl@3` (suggested); release: bundled |
 | windows x86_64 / arm64 | bundled in prebuilt *(confirm in CI)* | bundled | nothing |
 
 > **Measured on this M4 (aarch64-apple-darwin), tdlib-rs 1.4.0 / TDLib 1.8.61.**
@@ -142,7 +142,7 @@ required at end-user runtime**.
 | OS | Native resolution | Single place |
 |---|---|---|
 | Linux | use the system `libssl.so.3` / `libz.so.1`; declare them as package deps (usually preinstalled) | package manifest + [`check-native-deps.sh`](../../scripts/check-native-deps.sh) |
-| macOS (arm64 + x86_64) | **bundle** `libssl.3.dylib` + `libcrypto.3.dylib` beside the binary and rewrite the Mach-O load commands to `@loader_path` via `install_name_tool` (then re-`codesign`); zlib stays the system `/usr/lib/libz` | [`scripts/bundle-native-deps.sh`](../../scripts/bundle-native-deps.sh) |
+| macOS (arm64) | **bundle** `libssl.3.dylib` + `libcrypto.3.dylib` beside the binary and rewrite the Mach-O load commands to `@loader_path` via `install_name_tool` (then re-`codesign`); zlib stays the system `/usr/lib/libz` | [`scripts/bundle-native-deps.sh`](../../scripts/bundle-native-deps.sh) |
 | Windows (x86_64 + arm64) | OpenSSL/zlib are already bundled in the prebuilt | the prebuilt (no step) |
 
 For macOS this is the most native option that doesn't force a package manager on
