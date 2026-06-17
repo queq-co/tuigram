@@ -34,7 +34,7 @@ jobs:
           # macOS Intel (x86_64) is intentionally not supported.
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Honors rust-toolchain.toml (channel + rustfmt/clippy).
       - name: Install Rust toolchain
