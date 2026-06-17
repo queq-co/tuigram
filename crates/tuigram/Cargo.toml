@@ -1,0 +1,19 @@
+[package]
+name = "tuigram"
+description = "A terminal UI (Ratatui) Telegram client written in Rust."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "tuigram"
+path = "src/main.rs"
+
+[dependencies]
+tuigram-core = { path = "../tuigram-core" }
