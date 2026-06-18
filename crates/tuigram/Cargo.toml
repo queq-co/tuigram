@@ -15,5 +15,19 @@ workspace = true
 name = "tuigram"
 path = "src/main.rs"
 
+[features]
+# Manual, interactive login harness (#9; examples/login.rs). Off by default so it
+# is excluded from the product binary and from default CI — it needs a real
+# account and a TTY. Run it with:
+#   cargo run -p tuigram --example login --features login-harness
+login-harness = ["dep:tokio", "dep:tokio-stream"]
+
+[[example]]
+name = "login"
+required-features = ["login-harness"]
+
 [dependencies]
 tuigram-core = { path = "../tuigram-core" }
+# Async runtime + update-stream adapter, used only by the login harness example.
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros"] }
+tokio-stream = { workspace = true, optional = true }

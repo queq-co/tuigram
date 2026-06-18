@@ -107,14 +107,24 @@ which is live account access. So:
 
 ### ToS compliance checklist (carry into Phase 2/4)
 
-- [ ] First-run intro states the app uses the **Telegram API** / is part of the
-      ecosystem (2.2).
-- [ ] App name has no "Telegram" (we're "tuigram" — clear) and no official logo
-      (2.4).
-- [ ] No ghost mode / no tampering with read·typing·online·self-destruct (1.4).
-- [ ] No AI scraping of Telegram data (1.5).
-- [ ] Behave well to stay off the abuse radar (no flooding/automation-as-user
-      without consent).
+Phase 2 closed the items expressible in the login path; the rest are behavioral
+guarantees of the **TUI** and carry into **Phase 4**, where the surfaces they
+constrain (rendering, presence, the app's branding) first exist.
+
+- [x] **(2.2)** First-run intro states the app uses the **Telegram API** / is part
+      of the ecosystem. *Done — `print_intro` in
+      [`examples/login.rs`](../../crates/tuigram/examples/login.rs); the future
+      TUI carries the same disclosure (Phase 4).*
+- [x] **(2.4)** App name has no "Telegram" (we're "tuigram" — clear). *Name done.*
+      → **Phase 4:** no official Telegram logo in any TUI branding/splash.
+- [ ] **(1.4) — Phase 4.** No ghost mode / no tampering with
+      read·typing·online·self-destruct: the TUI must send read receipts, typing,
+      and online status like a standard client and honor self-destruct.
+- [ ] **(1.5) — ongoing policy.** No AI scraping of Telegram data (no using
+      fetched data to train/fine-tune models).
+- [ ] **(abuse radar) — ongoing.** Behave well: no flooding / no
+      automation-as-user without consent. Relevant once the client can send
+      (Phase 3+) and act on the user's behalf (Phase 4+).
 
 ## Why this over the memo's lean ("bundled default + user override")
 

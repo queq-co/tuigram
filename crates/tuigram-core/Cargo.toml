@@ -11,4 +11,34 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+# tdjson supply (see docs/research/tdlib.md). Exactly one source mode must be
+# active; `download-tdlib` is the default dev path (pulls a prebuilt tdjson at
+# build time, no C++ toolchain needed). Release builds add `static` to link
+# tdjson into the binary: `cargo build --features static` (download + static).
+# From-source power users opt out of the default and pick another source, e.g.
+# `cargo build -p tuigram-core --no-default-features --features pkg-config`.
+default = ["download-tdlib"]
+download-tdlib = ["tdlib-rs/download-tdlib"]
+local-tdlib = ["tdlib-rs/local-tdlib"]
+pkg-config = ["tdlib-rs/pkg-config"]
+static = ["tdlib-rs/static"]
+
 [dependencies]
+tdlib-rs = { workspace = true }
+# Async runtime for the TDLib bridge (blocking td_receive thread -> channels,
+# @extra -> oneshot correlation; see docs/research/tdlib.md).
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
+# Wraps the broadcast receiver as a Stream for the bridge's update API.
+tokio-stream = { workspace = true }
+# Credential config file (~/.config/tuigram/config.toml) parsing/serialization.
+serde = { workspace = true }
+toml = { workspace = true }
+# Secure session storage (#8): OS keyring for the DB encryption key, OS CSPRNG
+# to generate it. See src/session.rs.
+keyring = { workspace = true }
+getrandom = { workspace = true }
+
+[dev-dependencies]
+# Isolated temp dirs for credential filesystem tests.
+tempfile = { workspace = true }
