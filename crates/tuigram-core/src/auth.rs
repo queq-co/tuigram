@@ -4,7 +4,13 @@
 //! waits for the matching request, looping until it reaches `Ready`. This module
 //! projects that stream onto a reduced [`AuthState`] the login UI is driven from
 //! ([`AuthState::from_tdlib`]), and a [`Login`] driver that answers each waiting
-//! state through the [`TgClient`] seam.
+//! state through the [`AuthRequests`] seam.
+//!
+//! [`AuthRequests`] is this module's slice of the request surface — the login
+//! requests, and nothing else. It is owned here rather than in `bridge` so that
+//! the bridge stays pure transport and a driver (or its test double) depends on
+//! only the requests it makes. [`Bridge`] implements it via its public id; the
+//! chats/messages modules own their own request traits the same way.
 //!
 //! Phase 2 scope is **phone number + login code + 2FA password**. QR login
 //! (`waitOtherDeviceConfirmation`), new-user registration, email, and premium
@@ -14,9 +20,97 @@
 //! Secrets are never retained: the login code and the 2FA password are taken by
 //! value and moved straight into their TDLib request (see the threat model).
 
-use crate::bridge::{ClientParameters, TgClient};
+use crate::bridge::{Bridge, ClientParameters};
 use tdlib_rs::enums::AuthorizationState;
 use tdlib_rs::types::Error as TdError;
+
+/// The login request seam — tuigram's auth slice of the `tdlib_rs::functions`
+/// surface, segregated from the chats/messages requests so the login driver and
+/// its test double implement only these.
+///
+/// [`Bridge`] implements it over a live `tdjson` client (via [`Bridge::id`]);
+/// tests implement it with a spy. Logic written against `C: AuthRequests` runs
+/// unchanged on either, with no network and no live `tdjson`.
+// Internal seam: every consumer is in-crate and generic over `C: AuthRequests`,
+// so the lack of a caller-controllable `Send` bound (the reason this lint fires)
+// is not a concern here.
+#[allow(async_fn_in_trait)]
+pub trait AuthRequests {
+    /// Fetch the current authorization state.
+    ///
+    /// The canonical proof that request/response correlation works: TDLib
+    /// answers it immediately from local state with no network, so a successful
+    /// round-trip means the receive loop is correctly notifying the observer.
+    async fn authorization_state(&self) -> Result<AuthorizationState, TdError>;
+
+    /// Set TDLib's global log verbosity level (0 = fatal only … 3 = info,
+    /// the default … 5 = verbose).
+    ///
+    /// Security-relevant: at the default level TDLib logs request and response
+    /// payloads to stderr, which during login would include phone numbers,
+    /// codes, and the 2FA password. The flow lowers this before any
+    /// credential-bearing request (see [`Login::set_parameters`]).
+    async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError>;
+
+    /// Answer `WaitTdlibParameters` — initialize the client.
+    async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError>;
+
+    /// Answer `WaitPhoneNumber` — submit the phone number and request a code.
+    async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError>;
+
+    /// Answer `WaitCode` — submit the login code the user received.
+    async fn check_authentication_code(&self, code: String) -> Result<(), TdError>;
+
+    /// Answer `WaitPassword` — submit the 2FA password.
+    ///
+    /// The password is moved straight into the TDLib request and never retained
+    /// (see the threat model).
+    async fn check_authentication_password(&self, password: String) -> Result<(), TdError>;
+}
+
+impl AuthRequests for Bridge {
+    async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
+        tdlib_rs::functions::get_authorization_state(self.id()).await
+    }
+
+    async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError> {
+        tdlib_rs::functions::set_log_verbosity_level(level, self.id()).await
+    }
+
+    async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
+        tdlib_rs::functions::set_tdlib_parameters(
+            params.use_test_dc,
+            params.database_directory,
+            params.files_directory,
+            params.database_encryption_key,
+            true,  // use_file_database: persist downloaded/uploaded file info
+            true,  // use_chat_info_database: cache users/groups across restarts
+            true,  // use_message_database: cache chats/messages across restarts
+            false, // use_secret_chats: out of scope for Phase 2
+            params.api_id,
+            params.api_hash,
+            params.system_language_code,
+            params.device_model,
+            String::new(), // system_version: empty -> TDLib auto-detects
+            params.application_version,
+            self.id(),
+        )
+        .await
+    }
+
+    async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError> {
+        // None settings -> TDLib's defaults for code delivery.
+        tdlib_rs::functions::set_authentication_phone_number(phone_number, None, self.id()).await
+    }
+
+    async fn check_authentication_code(&self, code: String) -> Result<(), TdError> {
+        tdlib_rs::functions::check_authentication_code(code, self.id()).await
+    }
+
+    async fn check_authentication_password(&self, password: String) -> Result<(), TdError> {
+        tdlib_rs::functions::check_authentication_password(password, self.id()).await
+    }
+}
 
 /// TDLib log verbosity the login flow drops to before sending any request:
 /// errors only, so request/response payloads (phone number, code, 2FA password)
@@ -89,12 +183,12 @@ impl AuthState {
 /// and, when the state needs input, calls the matching handler. The driver does
 /// not consume the update stream itself — that stays on the bridge so other
 /// subsystems can observe it too.
-pub struct Login<'a, C: TgClient> {
+pub struct Login<'a, C: AuthRequests> {
     client: &'a C,
     state: AuthState,
 }
 
-impl<'a, C: TgClient> Login<'a, C> {
+impl<'a, C: AuthRequests> Login<'a, C> {
     /// Start a login driver. A fresh `tdjson` client begins in
     /// [`AuthState::WaitTdlibParameters`].
     #[must_use]
@@ -151,7 +245,6 @@ impl<'a, C: TgClient> Login<'a, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bridge::UpdateStream;
     use std::cell::RefCell;
     use tdlib_rs::enums::AuthenticationCodeType;
     use tdlib_rs::types::{
@@ -249,12 +342,7 @@ mod tests {
         }
     }
 
-    impl TgClient for SpyClient {
-        fn updates(&self) -> UpdateStream {
-            // Unused by the auth driver.
-            UpdateStream::empty()
-        }
-
+    impl AuthRequests for SpyClient {
         async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
             Ok(AuthorizationState::WaitTdlibParameters)
         }

@@ -9,7 +9,7 @@ pub mod bridge;
 pub mod credentials;
 pub mod session;
 
-pub use auth::{AuthState, Login};
+pub use auth::{AuthRequests, AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, TgClient, UpdateStream};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
