@@ -1,0 +1,238 @@
+//! The single update router — tuigram's one always-on subscriber of the bridge.
+//!
+//! TDLib pushes a firehose of unsolicited updates. Rather than let each
+//! subsystem subscribe and clone the whole stream, Phase 3 routes everything
+//! through **one** long-lived task ([`Router::run`]): it drains the bridge's
+//! lagged-aware stream once, classifies each update with a single match, and
+//! dispatches it O(1) to the owning domain's reducer behind the [`UpdateSink`]
+//! seam.
+//!
+//! The router holds **no business logic**. [`classify`] only tags an update with
+//! the domain that owns it; the actual fold (which field changes, how state is
+//! ordered) lives in the domain reducer the tag points at. That keeps the
+//! reducers independently unit-testable — a domain test drives its reducer with
+//! synthetic updates directly, never through the router — and keeps this file
+//! from accreting per-domain knowledge as Phase 3 grows.
+
+use tdlib_rs::enums::Update;
+use tokio_stream::{Stream, StreamExt};
+
+use crate::bridge::RouterEvent;
+
+/// Where the router folds account-content updates. The chat-list reducer (#17)
+/// and the per-chat message reducer (#18) compose into the real sink (the
+/// `Client`'s account state); tests use a spy.
+///
+/// The router calls **exactly one** method per event — one of the `reduce_*`
+/// for an update it owns, or [`resync_after_lag`](Self::resync_after_lag) for a
+/// dropped-update gap — so implementors hold only fold logic and never repeat
+/// the router's classification.
+pub trait UpdateSink {
+    /// Fold a chat-list update (new chat, position/order, last message, read
+    /// state) into the chat snapshot.
+    fn reduce_chat(&mut self, update: &Update);
+
+    /// Fold a message update (new message, send-lifecycle, content edit,
+    /// deletion) into the per-chat message store.
+    fn reduce_message(&mut self, update: &Update);
+
+    /// Recover from a broadcast overflow: `skipped` updates were dropped before
+    /// the router caught up, so the folded state may be stale and must be
+    /// re-queried. Handling is mandatory — a lag is never silently ignored.
+    fn resync_after_lag(&mut self, skipped: u64);
+}
+
+/// The domain that owns an update, as decided by [`classify`].
+///
+/// A pure routing tag: it carries no payload and no logic, only "who folds
+/// this". Most updates (auth, connectivity, user/option metadata, …) are
+/// [`Ignored`](Route::Ignored) by this layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Folded by the chat-list reducer (#17).
+    Chat,
+    /// Folded by the per-chat message reducer (#18).
+    Message,
+    /// Not account content this router folds; dropped here.
+    Ignored,
+}
+
+/// Tag an update with the domain that owns it.
+///
+/// This is deliberately a *routing* match, not a model projection, so a
+/// catch-all `Ignored` arm is correct: the vast majority of TDLib's update
+/// variants are connectivity/metadata the router does not fold, and a new
+/// variant defaulting to `Ignored` is safe (it is simply not routed). Contrast
+/// `model::*::from_tdlib`, which is total *on purpose* so a new content variant
+/// must be classified before it compiles.
+fn classify(update: &Update) -> Route {
+    match update {
+        Update::NewChat(_)
+        | Update::ChatPosition(_)
+        | Update::ChatLastMessage(_)
+        | Update::ChatReadInbox(_)
+        | Update::ChatReadOutbox(_) => Route::Chat,
+        Update::NewMessage(_)
+        | Update::MessageSendSucceeded(_)
+        | Update::MessageSendFailed(_)
+        | Update::MessageContent(_)
+        | Update::DeleteMessages(_) => Route::Message,
+        _ => Route::Ignored,
+    }
+}
+
+/// The single update router: drains the bridge's lagged-aware stream and folds
+/// each event into `S`.
+///
+/// Generic over the sink so it is exercised in tests with a spy and in
+/// production with the `Client`'s shared account state — the drain/dispatch
+/// plumbing is identical either way.
+pub struct Router<S: UpdateSink> {
+    sink: S,
+}
+
+impl<S: UpdateSink> Router<S> {
+    /// Wrap a sink in a router.
+    pub fn new(sink: S) -> Self {
+        Self { sink }
+    }
+
+    /// Classify and dispatch one update. Synchronous and side-effect-free beyond
+    /// the sink call, so the routing table is unit-testable without a stream,
+    /// a runtime, or a live `tdjson`.
+    pub fn apply(&mut self, update: &Update) {
+        match classify(update) {
+            Route::Chat => self.sink.reduce_chat(update),
+            Route::Message => self.sink.reduce_message(update),
+            Route::Ignored => {}
+        }
+    }
+
+    /// Drain the event stream to completion, folding each event into the sink.
+    ///
+    /// This is the always-on router task: it returns only when the stream closes
+    /// (the bridge was dropped). A [`RouterEvent::Lagged`] is routed to
+    /// [`UpdateSink::resync_after_lag`], never dropped. Returns the sink so a
+    /// test can inspect the folded result after the stream ends.
+    pub async fn run(mut self, events: impl Stream<Item = RouterEvent>) -> S {
+        let mut events = std::pin::pin!(events);
+        while let Some(event) = events.next().await {
+            match event {
+                RouterEvent::Update(update) => self.apply(&update),
+                RouterEvent::Lagged(skipped) => self.sink.resync_after_lag(skipped),
+            }
+        }
+        self.sink
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tdlib_rs::enums::AuthorizationState;
+    use tdlib_rs::types::{
+        UpdateAuthorizationState, UpdateChatLastMessage, UpdateChatReadInbox, UpdateDeleteMessages,
+    };
+
+    /// Records which reducer the router dispatched each update to, and any lag,
+    /// so a test asserts routing without any real fold logic.
+    #[derive(Default)]
+    struct SpySink {
+        chat: u32,
+        message: u32,
+        lagged: Vec<u64>,
+    }
+
+    impl UpdateSink for SpySink {
+        fn reduce_chat(&mut self, _update: &Update) {
+            self.chat += 1;
+        }
+        fn reduce_message(&mut self, _update: &Update) {
+            self.message += 1;
+        }
+        fn resync_after_lag(&mut self, skipped: u64) {
+            self.lagged.push(skipped);
+        }
+    }
+
+    // Representatives chosen for cheap construction (primitives / `None` only):
+    // a full `Chat`/`Message` payload is irrelevant here since the router only
+    // matches the variant, never its contents.
+    fn chat_read_inbox() -> Update {
+        Update::ChatReadInbox(UpdateChatReadInbox {
+            chat_id: 1,
+            last_read_inbox_message_id: 10,
+            unread_count: 0,
+        })
+    }
+
+    fn chat_last_message() -> Update {
+        Update::ChatLastMessage(UpdateChatLastMessage {
+            chat_id: 1,
+            last_message: None,
+            positions: Vec::new(),
+        })
+    }
+
+    fn delete_messages() -> Update {
+        Update::DeleteMessages(UpdateDeleteMessages {
+            chat_id: 1,
+            message_ids: vec![1],
+            is_permanent: true,
+            from_cache: false,
+        })
+    }
+
+    /// An update the router does not fold, to prove the `Ignored` arm dispatches
+    /// to neither reducer.
+    fn unrelated() -> Update {
+        Update::AuthorizationState(UpdateAuthorizationState {
+            authorization_state: AuthorizationState::Ready,
+        })
+    }
+
+    #[test]
+    fn chat_updates_route_to_the_chat_reducer() {
+        let mut router = Router::new(SpySink::default());
+        router.apply(&chat_read_inbox());
+        router.apply(&chat_last_message());
+        let sink = router.sink;
+        assert_eq!(sink.chat, 2);
+        assert_eq!(sink.message, 0);
+    }
+
+    #[test]
+    fn message_updates_route_to_the_message_reducer() {
+        let mut router = Router::new(SpySink::default());
+        router.apply(&delete_messages());
+        let sink = router.sink;
+        assert_eq!(sink.message, 1);
+        assert_eq!(sink.chat, 0);
+    }
+
+    #[test]
+    fn unrelated_updates_route_to_no_reducer() {
+        let mut router = Router::new(SpySink::default());
+        router.apply(&unrelated());
+        let sink = router.sink;
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+    }
+
+    #[tokio::test]
+    async fn run_drains_a_mixed_stream_and_dispatches_each_event() {
+        let events = tokio_stream::iter([
+            RouterEvent::Update(chat_read_inbox()),
+            RouterEvent::Update(delete_messages()),
+            RouterEvent::Lagged(7),
+            RouterEvent::Update(chat_last_message()),
+        ]);
+
+        let sink = Router::new(SpySink::default()).run(events).await;
+
+        assert_eq!(sink.chat, 2);
+        assert_eq!(sink.message, 1);
+        // Lag is handled, not swallowed: the exact skip count reaches the sink.
+        assert_eq!(sink.lagged, vec![7]);
+    }
+}
