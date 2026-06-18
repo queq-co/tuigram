@@ -6,9 +6,13 @@
 
 pub mod auth;
 pub mod bridge;
+pub mod credentials;
 
 pub use auth::{AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, TgClient, UpdateStream};
+pub use credentials::{
+    ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
+};
 
 /// TDLib's typed request API and data model, re-exported so callers depend on
 /// it through tuigram-core rather than reaching for `tdlib-rs` directly. Drive

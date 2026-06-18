@@ -21,6 +21,11 @@ tokio = { version = "1", default-features = false }
 # Stream adapters over tokio channels (BroadcastStream + StreamExt) for the
 # TDLib update stream exposed by tuigram-core's bridge.
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+# Config (de)serialization for ~/.config/tuigram/config.toml (api_id/api_hash).
+serde = { version = "1", features = ["derive"] }
+toml = { version = "1" }
+# Isolated temp dirs for filesystem unit tests (config perms, resolution order).
+tempfile = { version = "3" }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.

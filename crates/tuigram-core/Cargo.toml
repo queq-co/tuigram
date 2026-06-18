@@ -31,3 +31,10 @@ tdlib-rs = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
 # Wraps the broadcast receiver as a Stream for the bridge's update API.
 tokio-stream = { workspace = true }
+# Credential config file (~/.config/tuigram/config.toml) parsing/serialization.
+serde = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+# Isolated temp dirs for credential filesystem tests.
+tempfile = { workspace = true }
