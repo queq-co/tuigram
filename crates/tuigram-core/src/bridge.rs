@@ -134,6 +134,20 @@ impl Bridge {
     pub fn id(&self) -> i32 {
         self.client_id
     }
+
+    /// Subscribe to a **lagged-aware** view of the update stream, for the single
+    /// update router (#16).
+    ///
+    /// Unlike [`updates`](Self::updates) — which skips lag silently because its
+    /// consumers only want "the next update" — this surfaces a
+    /// [`RouterEvent::Lagged`] when the broadcast buffer overflows, so the
+    /// router can resync instead of folding a stream with holes in it. The
+    /// router is the channel's one always-on subscriber, so it is the layer that
+    /// must notice and recover from falling behind.
+    #[must_use]
+    pub fn router_events(&self) -> RouterStream {
+        RouterStream(BroadcastStream::new(self.updates_tx.subscribe()))
+    }
 }
 
 impl Default for Bridge {
@@ -194,6 +208,51 @@ impl Stream for UpdateStream {
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
             };
+        }
+    }
+}
+
+/// One item from the [`RouterStream`]: either an update to fold, or notice that
+/// the broadcast buffer overflowed and updates were lost.
+///
+/// The router matches on this so that a lag is a first-class event it handles
+/// (by resyncing), never a silent gap in the folded state.
+// `Update` is intrinsically large, but it already moves unboxed through the
+// broadcast channel and `UpdateStream` (whose item is a bare `Update`). This is
+// a transient per-item wrapper, not bulk storage, so boxing it just to even out
+// a two-variant event would add a per-update heap allocation for no real gain.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum RouterEvent {
+    /// An unsolicited update to fold into account state.
+    Update(Update),
+    /// The subscriber fell more than [`UPDATE_BUFFER`] behind; this many updates
+    /// were dropped before it caught up. State may now be stale.
+    Lagged(u64),
+}
+
+/// A lagged-aware [`Stream`] of updates for the single update router.
+///
+/// The counterpart to [`UpdateStream`]: where that one skips lag, this one
+/// surfaces it as [`RouterEvent::Lagged`] so the router can resync. Obtained
+/// from [`Bridge::router_events`].
+pub struct RouterStream(BroadcastStream<Update>);
+
+impl Stream for RouterStream {
+    type Item = RouterEvent;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        match std::pin::Pin::new(&mut self.0).poll_next(cx) {
+            Poll::Ready(Some(Ok(update))) => Poll::Ready(Some(RouterEvent::Update(update))),
+            Poll::Ready(Some(Err(BroadcastStreamRecvError::Lagged(skipped)))) => {
+                Poll::Ready(Some(RouterEvent::Lagged(skipped)))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

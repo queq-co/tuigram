@@ -6,12 +6,15 @@
 
 pub mod auth;
 pub mod bridge;
+pub mod client;
 pub mod credentials;
 pub mod model;
+pub mod router;
 pub mod session;
 
 pub use auth::{AuthRequests, AuthState, Login};
-pub use bridge::{Bridge, ClientParameters, TgClient, UpdateStream};
+pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
+pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };
@@ -19,6 +22,7 @@ pub use model::{
     Chat, ChatKind, ChatListKind, ChatPosition, EntityKind, FormattedText, Message, MessageContent,
     SendState, Sender, TextEntity,
 };
+pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
 
 /// TDLib's typed request API and data model, re-exported so callers depend on
