@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod chats;
 pub mod client;
 pub mod credentials;
+pub mod messages;
 pub mod model;
 pub mod router;
 pub mod session;
@@ -20,6 +21,7 @@ pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };
+pub use messages::{MessageRequests, MessageStore, NEWEST, load_history};
 pub use model::{
     Chat, ChatKind, ChatListKind, ChatPosition, EntityKind, FormattedText, Message, MessageContent,
     SendState, Sender, TextEntity,
