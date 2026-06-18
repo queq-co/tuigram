@@ -27,23 +27,32 @@ use tdlib_rs::enums::Update;
 use tokio::task::JoinHandle;
 
 use crate::bridge::Bridge;
+use crate::chats::ChatStore;
 use crate::router::{Router, UpdateSink};
 
 /// The account content the router folds updates into: the chat list (#17) and
 /// per-chat messages (#18).
 ///
-/// Empty for now — #16 establishes the composition root and the router wiring;
-/// each domain adds its store and the matching reduce arm as it lands, so this
+/// Each domain adds its store and the matching reduce arm as it lands, so this
 /// type grows in one place rather than the router accreting state.
 #[derive(Default)]
 pub struct AccountState {
-    // chats: ChatStore,       // #17
+    chats: ChatStore,
     // messages: MessageStore, // #18
 }
 
 impl AccountState {
-    /// Fold a chat-list update. No-op until the chat store lands (#17).
-    fn reduce_chat(&mut self, _update: &Update) {}
+    /// The folded chat-list store, for the facade's read side (e.g.
+    /// `client.read(|s| s.chats().main_list())`).
+    #[must_use]
+    pub fn chats(&self) -> &ChatStore {
+        &self.chats
+    }
+
+    /// Fold a chat-list update into the chat store.
+    fn reduce_chat(&mut self, update: &Update) {
+        self.chats.reduce(update);
+    }
 
     /// Fold a message update. No-op until the message store lands (#18).
     fn reduce_message(&mut self, _update: &Update) {}

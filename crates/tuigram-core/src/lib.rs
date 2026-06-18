@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod bridge;
+pub mod chats;
 pub mod client;
 pub mod credentials;
 pub mod model;
@@ -14,6 +15,7 @@ pub mod session;
 
 pub use auth::{AuthRequests, AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
+pub use chats::{CHATS_EXHAUSTED, ChatRequests, ChatStore, load_main_list};
 pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
