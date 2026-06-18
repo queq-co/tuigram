@@ -18,7 +18,7 @@
 //! without mutating process-global env.
 
 use std::fs;
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -259,6 +259,7 @@ fn env_var(key: &str) -> Option<String> {
 /// pre-existed with looser perms).
 #[cfg(unix)]
 fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let mut file = fs::OpenOptions::new()
         .write(true)
