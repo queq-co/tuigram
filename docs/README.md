@@ -7,6 +7,8 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
 ## Contents
 
 - [architecture.md](architecture.md) — high-level design and the workspace layout.
+- [login-flow.md](login-flow.md) — Phase 2 secure login: state machine, credential
+  resolution, session storage + key, threat model.
 - [branch-model.md](branch-model.md) — how we use `develop` → PR → `main`.
 - Research (Phase 1):
   - [research/ratatui.md](research/ratatui.md) — how Ratatui works and how we'll use it.
