@@ -18,6 +18,9 @@ rust-version = "1.96"
 [workspace.dependencies]
 tdlib-rs = { version = "=1.4.0", default-features = false }
 tokio = { version = "1", default-features = false }
+# Stream adapters over tokio channels (BroadcastStream + StreamExt) for the
+# TDLib update stream exposed by tuigram-core's bridge.
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.

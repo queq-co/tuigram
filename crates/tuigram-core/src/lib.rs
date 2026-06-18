@@ -4,6 +4,16 @@
 //! unit-tested without a TTY. Phases 2–3 (auth, chats, messages) live here;
 //! the Ratatui front-end (Phases 4–5) depends on this crate.
 
+pub mod bridge;
+
+pub use bridge::{Bridge, TgClient, UpdateStream};
+
+/// TDLib's typed request API and data model, re-exported so callers depend on
+/// it through tuigram-core rather than reaching for `tdlib-rs` directly. Drive
+/// `functions::*` with a [`Bridge::id`]; the bridge's receive loop resolves the
+/// futures they return.
+pub use tdlib_rs::{enums, functions, types};
+
 /// Crate version, sourced from Cargo at build time.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

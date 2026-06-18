@@ -27,6 +27,7 @@ static = ["tdlib-rs/static"]
 [dependencies]
 tdlib-rs = { workspace = true }
 # Async runtime for the TDLib bridge (blocking td_receive thread -> channels,
-# @extra -> oneshot correlation; see docs/research/tdlib.md). Feature set widens
-# as the bridge lands in #5.
+# @extra -> oneshot correlation; see docs/research/tdlib.md).
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "macros", "time"] }
+# Wraps the broadcast receiver as a Stream for the bridge's update API.
+tokio-stream = { workspace = true }
