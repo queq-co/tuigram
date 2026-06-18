@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 
 use crate::bridge::Bridge;
 use crate::chats::ChatStore;
+use crate::messages::MessageStore;
 use crate::router::{Router, UpdateSink};
 
 /// The account content the router folds updates into: the chat list (#17) and
@@ -38,7 +39,7 @@ use crate::router::{Router, UpdateSink};
 #[derive(Default)]
 pub struct AccountState {
     chats: ChatStore,
-    // messages: MessageStore, // #18
+    messages: MessageStore,
 }
 
 impl AccountState {
@@ -49,13 +50,22 @@ impl AccountState {
         &self.chats
     }
 
+    /// The folded per-chat message store, for the facade's read side (e.g.
+    /// `client.read(|s| s.messages().history(chat_id))`).
+    #[must_use]
+    pub fn messages(&self) -> &MessageStore {
+        &self.messages
+    }
+
     /// Fold a chat-list update into the chat store.
     fn reduce_chat(&mut self, update: &Update) {
         self.chats.reduce(update);
     }
 
-    /// Fold a message update. No-op until the message store lands (#18).
-    fn reduce_message(&mut self, _update: &Update) {}
+    /// Fold a message update into the message store.
+    fn reduce_message(&mut self, update: &Update) {
+        self.messages.reduce(update);
+    }
 
     /// Recover from a dropped-update gap by re-querying the affected state.
     /// The re-query requests belong to the chat/message domains (#17/#18); until
