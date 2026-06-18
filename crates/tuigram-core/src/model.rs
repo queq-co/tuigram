@@ -243,6 +243,55 @@ impl EntityKind {
             },
         }
     }
+
+    /// Project back to TDLib's `TextEntityType`, for entities on outgoing text.
+    /// Total, mirroring [`EntityKind::from_tdlib`]: a new variant added here must
+    /// be sendable too, or it fails to compile.
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdTextEntityType {
+        use tdlib_rs::types::{
+            TextEntityTypeCustomEmoji, TextEntityTypeMediaTimestamp, TextEntityTypeMentionName,
+            TextEntityTypePreCode, TextEntityTypeTextUrl,
+        };
+        match self {
+            Self::Mention => TdTextEntityType::Mention,
+            Self::Hashtag => TdTextEntityType::Hashtag,
+            Self::Cashtag => TdTextEntityType::Cashtag,
+            Self::BotCommand => TdTextEntityType::BotCommand,
+            Self::Url => TdTextEntityType::Url,
+            Self::EmailAddress => TdTextEntityType::EmailAddress,
+            Self::PhoneNumber => TdTextEntityType::PhoneNumber,
+            Self::BankCardNumber => TdTextEntityType::BankCardNumber,
+            Self::Bold => TdTextEntityType::Bold,
+            Self::Italic => TdTextEntityType::Italic,
+            Self::Underline => TdTextEntityType::Underline,
+            Self::Strikethrough => TdTextEntityType::Strikethrough,
+            Self::Spoiler => TdTextEntityType::Spoiler,
+            Self::Code => TdTextEntityType::Code,
+            Self::Pre => TdTextEntityType::Pre,
+            Self::PreCode { language } => TdTextEntityType::PreCode(TextEntityTypePreCode {
+                language: language.clone(),
+            }),
+            Self::BlockQuote => TdTextEntityType::BlockQuote,
+            Self::ExpandableBlockQuote => TdTextEntityType::ExpandableBlockQuote,
+            Self::TextUrl { url } => {
+                TdTextEntityType::TextUrl(TextEntityTypeTextUrl { url: url.clone() })
+            }
+            Self::MentionName { user_id } => {
+                TdTextEntityType::MentionName(TextEntityTypeMentionName { user_id: *user_id })
+            }
+            Self::CustomEmoji { custom_emoji_id } => {
+                TdTextEntityType::CustomEmoji(TextEntityTypeCustomEmoji {
+                    custom_emoji_id: *custom_emoji_id,
+                })
+            }
+            Self::MediaTimestamp { media_timestamp } => {
+                TdTextEntityType::MediaTimestamp(TextEntityTypeMediaTimestamp {
+                    media_timestamp: *media_timestamp,
+                })
+            }
+        }
+    }
 }
 
 /// One formatting span within a [`FormattedText`]. Offsets and lengths are in
@@ -267,6 +316,16 @@ impl TextEntity {
             kind: EntityKind::from_tdlib(&entity.r#type),
         }
     }
+
+    /// Project back to TDLib's `TextEntity`, for an outgoing formatted message.
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdTextEntity {
+        TdTextEntity {
+            offset: self.offset,
+            length: self.length,
+            r#type: self.kind.to_tdlib(),
+        }
+    }
 }
 
 /// Text with its formatting entities — tuigram's projection of TDLib's
@@ -286,6 +345,16 @@ impl FormattedText {
         Self {
             text: text.text.clone(),
             entities: text.entities.iter().map(TextEntity::from_tdlib).collect(),
+        }
+    }
+
+    /// Project back to TDLib's `FormattedText`, for sending. A plain string with
+    /// no entities round-trips as bare text.
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdFormattedText {
+        TdFormattedText {
+            text: self.text.clone(),
+            entities: self.entities.iter().map(TextEntity::to_tdlib).collect(),
         }
     }
 }
@@ -796,6 +865,38 @@ mod tests {
             MessageContent::from_tdlib(&contact),
             MessageContent::Unsupported("messageContact")
         );
+    }
+
+    #[test]
+    fn formatted_text_round_trips_through_tdlib_for_sending() {
+        // Representative entities: bare, payload-bearing (data + styling), so the
+        // reverse projection is exercised across the variant shapes.
+        let ft = FormattedText {
+            text: "bold link code".to_owned(),
+            entities: vec![
+                TextEntity {
+                    offset: 0,
+                    length: 4,
+                    kind: EntityKind::Bold,
+                },
+                TextEntity {
+                    offset: 5,
+                    length: 4,
+                    kind: EntityKind::TextUrl {
+                        url: "https://t.me".to_owned(),
+                    },
+                },
+                TextEntity {
+                    offset: 10,
+                    length: 4,
+                    kind: EntityKind::PreCode {
+                        language: "rust".to_owned(),
+                    },
+                },
+            ],
+        };
+        // to_tdlib then back is the identity — the projections mirror each other.
+        assert_eq!(FormattedText::from_tdlib(&ft.to_tdlib()), ft);
     }
 
     #[test]
