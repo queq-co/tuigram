@@ -30,8 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
-use tdlib_rs::enums::{AuthorizationState, Update};
-use tdlib_rs::types::Error as TdError;
+use tdlib_rs::enums::Update;
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
@@ -73,11 +72,19 @@ pub struct ClientParameters {
     pub use_test_dc: bool,
 }
 
-/// The async seam between TDLib and tuigram's logic.
+/// The update-subscription seam between TDLib and tuigram's logic.
 ///
-/// Implemented by [`Bridge`] over a live `tdjson` client, and by mocks in tests.
-/// Methods mirror the `tdlib_rs::functions` we drive through the bridge; the set
-/// grows as higher layers (auth, chats) need more requests.
+/// This is the transport's *read* side: a source of the unsolicited updates
+/// `tdjson` pushes. [`Bridge`] implements it over a live client; tests implement
+/// it to feed synthetic updates. The single update router (#16) is its one
+/// always-on consumer.
+///
+/// Requests (the *write* side) are **not** here. They are segregated into
+/// per-domain capability traits owned by the module that drives them —
+/// [`AuthRequests`](crate::auth::AuthRequests) for login, and `ChatRequests` /
+/// `MessageRequests` for Phase 3 — each implemented for [`Bridge`] in its module
+/// via the public [`Bridge::id`]. That keeps this file pure transport and lets a
+/// driver (and its test double) depend on only the slice it uses.
 // Internal seam: every consumer is in-crate and generic over `C: TgClient`, so
 // the lack of a caller-controllable `Send` bound (the reason this lint fires)
 // is not a concern here.
@@ -88,37 +95,6 @@ pub trait TgClient {
     /// Each call yields an independent subscription; updates emitted before a
     /// subscription is created are not replayed to it.
     fn updates(&self) -> UpdateStream;
-
-    /// Fetch the current authorization state.
-    ///
-    /// The canonical proof that request/response correlation works: TDLib
-    /// answers it immediately from local state with no network, so a successful
-    /// round-trip means the receive loop is correctly notifying the observer.
-    async fn authorization_state(&self) -> Result<AuthorizationState, TdError>;
-
-    /// Set TDLib's global log verbosity level (0 = fatal only … 3 = info,
-    /// the default … 5 = verbose).
-    ///
-    /// Security-relevant: at the default level TDLib logs request and response
-    /// payloads to stderr, which during login would include phone numbers,
-    /// codes, and the 2FA password. The auth flow lowers this before any
-    /// credential-bearing request (see `auth`).
-    async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError>;
-
-    /// Answer `WaitTdlibParameters` — initialize the client (#6 handler).
-    async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError>;
-
-    /// Answer `WaitPhoneNumber` — submit the phone number and request a code.
-    async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError>;
-
-    /// Answer `WaitCode` — submit the login code the user received.
-    async fn check_authentication_code(&self, code: String) -> Result<(), TdError>;
-
-    /// Answer `WaitPassword` — submit the 2FA password.
-    ///
-    /// The password is moved straight into the TDLib request and never retained
-    /// (see the threat model).
-    async fn check_authentication_password(&self, password: String) -> Result<(), TdError>;
 }
 
 /// A live connection to a single `tdjson` client and its update pump.
@@ -169,49 +145,6 @@ impl Default for Bridge {
 impl TgClient for Bridge {
     fn updates(&self) -> UpdateStream {
         UpdateStream(BroadcastStream::new(self.updates_tx.subscribe()))
-    }
-
-    async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
-        tdlib_rs::functions::get_authorization_state(self.client_id).await
-    }
-
-    async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError> {
-        tdlib_rs::functions::set_log_verbosity_level(level, self.client_id).await
-    }
-
-    async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
-        tdlib_rs::functions::set_tdlib_parameters(
-            params.use_test_dc,
-            params.database_directory,
-            params.files_directory,
-            params.database_encryption_key,
-            true,  // use_file_database: persist downloaded/uploaded file info
-            true,  // use_chat_info_database: cache users/groups across restarts
-            true,  // use_message_database: cache chats/messages across restarts
-            false, // use_secret_chats: out of scope for Phase 2
-            params.api_id,
-            params.api_hash,
-            params.system_language_code,
-            params.device_model,
-            String::new(), // system_version: empty -> TDLib auto-detects
-            params.application_version,
-            self.client_id,
-        )
-        .await
-    }
-
-    async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError> {
-        // None settings -> TDLib's defaults for code delivery.
-        tdlib_rs::functions::set_authentication_phone_number(phone_number, None, self.client_id)
-            .await
-    }
-
-    async fn check_authentication_code(&self, code: String) -> Result<(), TdError> {
-        tdlib_rs::functions::check_authentication_code(code, self.client_id).await
-    }
-
-    async fn check_authentication_password(&self, password: String) -> Result<(), TdError> {
-        tdlib_rs::functions::check_authentication_password(password, self.client_id).await
     }
 }
 
@@ -294,7 +227,11 @@ fn spawn_receive_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The live round-trip checks `authorization_state`, which the transport
+    // exposes through the auth capability trait.
+    use crate::auth::AuthRequests;
     use std::time::Duration;
+    use tdlib_rs::enums::AuthorizationState;
     use tdlib_rs::types::UpdateAuthorizationState;
     use tokio::sync::broadcast;
     use tokio_stream::StreamExt;
@@ -303,18 +240,18 @@ mod tests {
     /// offline, so anything slower than this is a hang, not latency.
     const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// A network-free [`TgClient`] for unit-testing logic over the seam: it
-    /// answers `authorization_state` with a scripted value and lets a test push
-    /// arbitrary updates into its stream.
+    /// A network-free [`TgClient`]: it lets a test push arbitrary updates into
+    /// its stream, so the update seam (and, later, the router) can be exercised
+    /// without a live `tdjson`. Requests live on the per-domain traits and are
+    /// tested with their own doubles (e.g. the auth `SpyClient`).
     struct MockClient {
-        state: AuthorizationState,
         updates_tx: broadcast::Sender<Update>,
     }
 
     impl MockClient {
-        fn new(state: AuthorizationState) -> Self {
+        fn new() -> Self {
             let (updates_tx, _) = broadcast::channel(16);
-            Self { state, updates_tx }
+            Self { updates_tx }
         }
 
         /// Push an update to every current subscriber.
@@ -327,51 +264,11 @@ mod tests {
         fn updates(&self) -> UpdateStream {
             UpdateStream(BroadcastStream::new(self.updates_tx.subscribe()))
         }
-
-        async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
-            Ok(self.state.clone())
-        }
-
-        // Request handlers are exercised by the auth-module tests; here they
-        // only need to satisfy the trait.
-        async fn set_log_verbosity_level(&self, _level: i32) -> Result<(), TdError> {
-            Ok(())
-        }
-        async fn set_tdlib_parameters(&self, _params: ClientParameters) -> Result<(), TdError> {
-            Ok(())
-        }
-        async fn set_phone_number(&self, _phone_number: String) -> Result<(), TdError> {
-            Ok(())
-        }
-        async fn check_authentication_code(&self, _code: String) -> Result<(), TdError> {
-            Ok(())
-        }
-        async fn check_authentication_password(&self, _password: String) -> Result<(), TdError> {
-            Ok(())
-        }
-    }
-
-    /// Logic written against the seam, exercised below with the mock and usable
-    /// unchanged against a real [`Bridge`].
-    async fn awaiting_login<C: TgClient>(client: &C) -> bool {
-        !matches!(
-            client.authorization_state().await,
-            Ok(AuthorizationState::Ready)
-        )
-    }
-
-    #[tokio::test]
-    async fn seam_request_is_unit_testable_without_tdjson() {
-        let client = MockClient::new(AuthorizationState::WaitPhoneNumber);
-        assert!(awaiting_login(&client).await);
-
-        let ready = MockClient::new(AuthorizationState::Ready);
-        assert!(!awaiting_login(&ready).await);
     }
 
     #[tokio::test]
     async fn seam_streams_updates_without_tdjson() {
-        let client = MockClient::new(AuthorizationState::WaitTdlibParameters);
+        let client = MockClient::new();
         let mut updates = client.updates();
 
         client.emit(Update::AuthorizationState(UpdateAuthorizationState {

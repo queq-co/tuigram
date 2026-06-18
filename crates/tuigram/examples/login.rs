@@ -29,8 +29,8 @@ use tokio_stream::StreamExt;
 use tuigram_core::enums::Update;
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
-    ApiCredentials, AuthState, Bridge, ClientParameters, CredentialError, CredentialResolver,
-    Login, Onboarding, SessionStorage, TgClient,
+    ApiCredentials, AuthRequests, AuthState, Bridge, ClientParameters, CredentialError,
+    CredentialResolver, Login, Onboarding, SessionStorage, TgClient,
 };
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
