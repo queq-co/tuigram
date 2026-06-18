@@ -34,6 +34,10 @@ tokio-stream = { workspace = true }
 # Credential config file (~/.config/tuigram/config.toml) parsing/serialization.
 serde = { workspace = true }
 toml = { workspace = true }
+# Secure session storage (#8): OS keyring for the DB encryption key, OS CSPRNG
+# to generate it. See src/session.rs.
+keyring = { workspace = true }
+getrandom = { workspace = true }
 
 [dev-dependencies]
 # Isolated temp dirs for credential filesystem tests.

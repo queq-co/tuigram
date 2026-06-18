@@ -24,6 +24,13 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 # Config (de)serialization for ~/.config/tuigram/config.toml (api_id/api_hash).
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1" }
+# OS credential store for the TDLib DB encryption key (#8). Default `v1` feature
+# bundles the native backends per target — macOS Keychain, Windows Credential
+# Manager, Linux Secret Service (pure-Rust zbus, no system dbus lib to build).
+# A 600 key file is the fallback where no keyring is reachable.
+keyring = { version = "4" }
+# OS CSPRNG for generating the 32-byte DB encryption key (#8).
+getrandom = { version = "0.4" }
 # Isolated temp dirs for filesystem unit tests (config perms, resolution order).
 tempfile = { version = "3" }
 
