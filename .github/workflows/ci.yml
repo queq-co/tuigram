@@ -42,9 +42,18 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Single per-OS source of truth for OpenSSL 3 + zlib. Read-only check;
-      # on macOS it expects Homebrew openssl@3 (preinstalled on GitHub runners).
-      - name: Check native deps (OpenSSL 3 + zlib)
+      # The Linux prebuilt tdjson links LLVM's libc++ (not libstdc++), which is
+      # not preinstalled on ubuntu runners. OpenSSL 3 + zlib already are. Install
+      # the libc++ runtime so the read-only check below passes. Matches the apt
+      # hint in scripts/check-native-deps.sh.
+      - name: Install Linux native deps (libc++)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libc++1 libc++abi1
+
+      # Single per-OS source of truth for OpenSSL 3 + zlib + libc++. Read-only
+      # check; on macOS it expects Homebrew openssl@3 (preinstalled on GitHub
+      # runners), and libc++ is the macOS system C++ runtime (always present).
+      - name: Check native deps (OpenSSL 3 + zlib + libc++)
         if: runner.os != 'Windows'
         shell: bash
         run: ./scripts/check-native-deps.sh

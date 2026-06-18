@@ -100,27 +100,30 @@ rather than reimplementing the receive loop.
 ## Native dependencies (OpenSSL / zlib) across targets
 
 The prebuilt `tdjson` is not self-contained: it dynamically links **OpenSSL 3**
-and **zlib**, which are *TDLib's own* native deps, not ours. Crucially, the
+and **zlib**, which are *TDLib's own* native deps, not ours — and on **Linux** it
+is built against **LLVM's `libc++`** (not the system `libstdc++`), adding
+`libc++.so.1` / `libc++abi.so.1` to the runtime set there. Crucially, the
 `tdlib-rs` **`static` feature statically links `tdjson` only** — it does **not**
-bundle OpenSSL/zlib. So those two remain a runtime requirement on every target,
-even for a "static" build. We therefore treat them as a **per-target contract**
-that each platform must satisfy and that CI **verifies empirically** (a linkage
-audit with `otool -L` / `ldd` / `dumpbin`), rather than assuming a single host.
+bundle OpenSSL/zlib/libc++. So these remain a runtime requirement on every
+target, even for a "static" build. We therefore treat them as a **per-target
+contract** that each platform must satisfy and that CI **verifies empirically**
+(a linkage audit with `otool -L` / `ldd` / `dumpbin`), rather than assuming a
+single host.
 
 Build deps split into two layers, handled uniformly everywhere:
 
 | Layer | What | Controlled by | Agnostic? |
 |---|---|---|---|
 | `tdjson` | TDLib C ABI lib | `tdlib-rs` features: `download-tdlib` (+ `static`) | Yes — same on all targets |
-| OpenSSL 3 + zlib | TDLib's transitive native deps | **not** removed by `static`; satisfied at runtime per OS | Needs the contract below |
+| OpenSSL 3 + zlib (+ libc++ on Linux) | TDLib's transitive native deps | **not** removed by `static`; satisfied at runtime per OS | Needs the contract below |
 
 ### Runtime contract per target
 
-| Target | OpenSSL | zlib | Satisfied by |
-|---|---|---|---|
-| linux x86_64 / arm64 | `libssl.so.3`, `libcrypto.so.3` | `libz.so.1` | distro pkgs (`libssl3`, `zlib1g`) — usually preinstalled |
-| macOS arm64 | **`/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib` + `libcrypto.3.dylib`** *(measured)* | `/usr/lib/libz.1.dylib` (system) *(measured)* | dev: `brew install openssl@3` (suggested); release: bundled — see Distribution strategy |
-| windows x86_64 / arm64 | bundled in prebuilt *(confirm in CI)* | bundled | nothing |
+| Target | OpenSSL | zlib | C++ runtime | Satisfied by |
+|---|---|---|---|---|
+| linux x86_64 / arm64 | `libssl.so.3`, `libcrypto.so.3` | `libz.so.1` | **`libc++.so.1`, `libc++abi.so.1`** *(measured in CI)* — LLVM libc++, **not** libstdc++ | distro pkgs: `libssl3`, `zlib1g` (usually preinstalled) + **`libc++1`, `libc++abi1`** (**not** preinstalled — must be provisioned) |
+| macOS arm64 | **`/opt/homebrew/opt/openssl@3/lib/libssl.3.dylib` + `libcrypto.3.dylib`** *(measured)* | `/usr/lib/libz.1.dylib` (system) *(measured)* | system `libc++` (always present on macOS) | dev: `brew install openssl@3` (suggested); release: bundled — see Distribution strategy |
+| windows x86_64 / arm64 | bundled in prebuilt *(confirm in CI)* | bundled | bundled (MSVC runtime) | nothing |
 
 > **Measured on this M4 (aarch64-apple-darwin), tdlib-rs 1.4.0 / TDLib 1.8.61.**
 > `otool -L libtdjson.1.8.61.dylib` →
@@ -132,6 +135,16 @@ Build deps split into two layers, handled uniformly everywhere:
 > system, so no Homebrew zlib is needed. Our distribution strategy (below)
 > removes the Homebrew-at-runtime requirement for shipped builds.
 
+> **Measured in CI (ubuntu x86_64, Phase 2 #4).** A plain `download-tdlib` build
+> linked and compiled, but `cargo test` failed at *runtime* loading the test
+> binary: `libc++.so.1: cannot open shared object file`. The Linux prebuilt
+> `tdjson` is built against LLVM `libc++`, which ubuntu runners don't preinstall
+> (they ship `libstdc++`). Fix: provision `libc++1` + `libc++abi1` on Linux
+> (CI step + [`check-native-deps.sh`](../../scripts/check-native-deps.sh) hint).
+> macOS/Windows were unaffected — `libc++` is macOS's system C++ runtime, and the
+> Windows prebuilt bundles its runtime. This is exactly the kind of host-specific
+> gap the "verify empirically per target" stance is meant to catch.
+
 ### Distribution strategy: native, one place per OS/arch
 
 Principle: resolve deps **as natively as possible** (stay dynamically linked the
@@ -141,7 +154,7 @@ required at end-user runtime**.
 
 | OS | Native resolution | Single place |
 |---|---|---|
-| Linux | use the system `libssl.so.3` / `libz.so.1`; declare them as package deps (usually preinstalled) | package manifest + [`check-native-deps.sh`](../../scripts/check-native-deps.sh) |
+| Linux | use the system `libssl.so.3` / `libz.so.1` (usually preinstalled) **plus `libc++1` / `libc++abi1`** (not preinstalled); declare all as package deps | package manifest + [`check-native-deps.sh`](../../scripts/check-native-deps.sh) |
 | macOS (arm64) | **bundle** `libssl.3.dylib` + `libcrypto.3.dylib` beside the binary and rewrite the Mach-O load commands to `@loader_path` via `install_name_tool` (then re-`codesign`); zlib stays the system `/usr/lib/libz` | [`scripts/bundle-native-deps.sh`](../../scripts/bundle-native-deps.sh) |
 | Windows (x86_64 + arm64) | OpenSSL/zlib are already bundled in the prebuilt | the prebuilt (no step) |
 

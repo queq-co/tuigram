@@ -1,6 +1,7 @@
 #!/bin/sh
-# check-native-deps.sh — verify TDLib's native runtime deps (OpenSSL 3 + zlib)
-# are available for the current OS, and print the exact install command if not.
+# check-native-deps.sh — verify TDLib's native runtime deps (OpenSSL 3, zlib,
+# and on Linux libc++) are available for the current OS, and print the exact
+# install command if not.
 #
 # Read-only: this script never installs anything and never uses sudo. It is the
 # single per-OS source of truth shared by developers and CI. See
@@ -20,7 +21,7 @@ bad()  { printf 'MISS %s\n' "$1"; missing=1; }
 warn() { printf 'WARN %s\n' "$1"; }   # suggested, not required — does not fail
 
 uname_s=$(uname -s)
-printf 'Checking TDLib native deps (OpenSSL 3 + zlib) for: %s\n\n' "$uname_s"
+printf 'Checking TDLib native deps (OpenSSL 3, zlib, libc++) for: %s\n\n' "$uname_s"
 
 case "$uname_s" in
   Darwin)
@@ -64,15 +65,24 @@ case "$uname_s" in
     else
       bad "zlib (libz.so.1)"
     fi
+    # libc++: the Linux prebuilt tdjson is built against LLVM's libc++, so it
+    # needs libc++.so.1 / libc++abi.so.1 at runtime — NOT the usual libstdc++,
+    # which is why this is rarely preinstalled and must be provisioned.
+    if ldconfig -p 2>/dev/null | grep -q 'libc++\.so\.1' \
+       && ldconfig -p 2>/dev/null | grep -q 'libc++abi\.so\.1'; then
+      ok "libc++ (libc++.so.1 / libc++abi.so.1)"
+    else
+      bad "libc++ (libc++.so.1 / libc++abi.so.1)"
+    fi
     if [ "$missing" -ne 0 ]; then
       if command -v apt-get >/dev/null 2>&1; then
-        note "install: sudo apt-get install -y libssl3 zlib1g"
+        note "install: sudo apt-get install -y libssl3 zlib1g libc++1 libc++abi1"
       elif command -v dnf >/dev/null 2>&1; then
-        note "install: sudo dnf install -y openssl-libs zlib"
+        note "install: sudo dnf install -y openssl-libs zlib libcxx libcxxabi"
       elif command -v pacman >/dev/null 2>&1; then
-        note "install: sudo pacman -S --needed openssl zlib"
+        note "install: sudo pacman -S --needed openssl zlib libc++ libc++abi"
       else
-        note "install your distro's OpenSSL 3 + zlib runtime packages"
+        note "install your distro's OpenSSL 3 + zlib + libc++ runtime packages"
       fi
     fi
     ;;
