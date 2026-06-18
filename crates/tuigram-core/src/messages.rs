@@ -27,10 +27,16 @@
 //! sent message appears at once and reconciles in place, never blocking on
 //! delivery.
 //!
+//! Editing and deleting (#20) round out the write side:
+//! [`MessageRequests::edit_text`] replaces a message's text and
+//! [`MessageRequests::delete`] removes messages (for self or, with `revoke`, for
+//! everyone). The reducer reconciles both: `updateMessageContent` swaps a known
+//! message's content in place, and a permanent `updateDeleteMessages` drops the
+//! messages — a cache-eviction delete is ignored so our copy survives.
+//!
 //! Scope: history paging, live `updateNewMessage`, sending text + reply with its
-//! lifecycle (#19), and the snapshot. Edits (`updateMessageContent`, #20) and
-//! deletions (`updateDeleteMessages`, #20) are routed here by #16 but folded by
-//! that issue; until then they fall through this reducer's catch-all as no-ops.
+//! lifecycle (#19), editing and deleting with their updates (#20), and the
+//! snapshot.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -39,7 +45,7 @@ use tdlib_rs::enums::{InputMessageContent, InputMessageReplyTo, Messages, Update
 use tdlib_rs::types::{Error as TdError, InputMessageReplyToMessage, InputMessageText};
 
 use crate::bridge::Bridge;
-use crate::model::{FormattedText, Message, SendState};
+use crate::model::{FormattedText, Message, MessageContent, SendState};
 
 /// The message-history request seam — tuigram's message slice of the
 /// `tdlib_rs::functions` surface, segregated from the auth and chat requests so
@@ -75,6 +81,28 @@ pub trait MessageRequests {
         reply_to: Option<i64>,
         text: FormattedText,
     ) -> Result<Message, TdError>;
+
+    /// Replace the text of a message tuigram's account sent. Returns the edited
+    /// [`Message`] TDLib produces once the edit lands server-side; the matching
+    /// `updateMessageContent` reconciles the stored copy. Errors if the message
+    /// is not editable (not own, too old, not a text message).
+    async fn edit_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: FormattedText,
+    ) -> Result<Message, TdError>;
+
+    /// Delete messages from a chat. With `revoke` true the messages are removed
+    /// for **everyone** (revoke for all members); with it false they are removed
+    /// only for tuigram's account. TDLib rejects a revoke it does not permit. The
+    /// matching `updateDeleteMessages` removes them from the store.
+    async fn delete(
+        &self,
+        chat_id: i64,
+        message_ids: Vec<i64>,
+        revoke: bool,
+    ) -> Result<(), TdError>;
 }
 
 impl MessageRequests for Bridge {
@@ -130,6 +158,32 @@ impl MessageRequests for Bridge {
             tdlib_rs::functions::send_message(chat_id, None, reply_to, None, content, self.id())
                 .await?;
         Ok(Message::from_tdlib(&sent))
+    }
+
+    async fn edit_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: FormattedText,
+    ) -> Result<Message, TdError> {
+        // clear_draft false: an edit must not touch the chat's compose draft.
+        let content = InputMessageContent::InputMessageText(InputMessageText {
+            text: text.to_tdlib(),
+            link_preview_options: None,
+            clear_draft: false,
+        });
+        let tdlib_rs::enums::Message::Message(edited) =
+            tdlib_rs::functions::edit_message_text(chat_id, message_id, content, self.id()).await?;
+        Ok(Message::from_tdlib(&edited))
+    }
+
+    async fn delete(
+        &self,
+        chat_id: i64,
+        message_ids: Vec<i64>,
+        revoke: bool,
+    ) -> Result<(), TdError> {
+        tdlib_rs::functions::delete_messages(chat_id, message_ids, revoke, self.id()).await
     }
 }
 
@@ -192,11 +246,15 @@ impl MessageStore {
     ///   place, so the message keeps its spot but gains its final id.
     /// - `updateMessageSendFailed` — the send was rejected; the same entry (it
     ///   keeps its temporary id) flips to [`SendState::Failed`] with the cause.
+    /// - `updateMessageContent` — an edit; the known message's content is swapped
+    ///   in place (unknown message: ignored).
+    /// - `updateDeleteMessages` — a deletion; when permanent, the messages are
+    ///   removed. A cache-eviction delete (`is_permanent` false) is ignored.
     ///
-    /// Edit and delete updates the router also classifies as `Message` are folded
-    /// by #20 and fall through the catch-all as no-ops until then. Every arm is
-    /// idempotent: re-applying converges (a reconcile whose temp entry is already
-    /// gone just re-inserts the real message; a failure re-marks in place).
+    /// Every arm is idempotent: re-applying converges (a reconcile whose temp
+    /// entry is already gone just re-inserts the real message; a failure re-marks
+    /// in place; a re-edit re-sets the same content; a re-delete of an absent id
+    /// is a no-op).
     pub fn reduce(&mut self, update: &Update) {
         match update {
             Update::NewMessage(u) => self.insert(Message::from_tdlib(&u.message)),
@@ -215,6 +273,22 @@ impl MessageStore {
                     message: u.error.message.clone(),
                 };
                 self.insert(message);
+            }
+            Update::MessageContent(u) => {
+                // An edit: swap the known message's content in place.
+                self.edit_content(
+                    u.chat_id,
+                    u.message_id,
+                    MessageContent::from_tdlib(&u.new_content),
+                );
+            }
+            // A real deletion removes the messages; a cache-eviction delete
+            // (`is_permanent` false — TDLib unloading its own cache) leaves our
+            // copy intact, so only the permanent case folds here.
+            Update::DeleteMessages(u) if u.is_permanent => {
+                for &message_id in &u.message_ids {
+                    self.remove(u.chat_id, message_id);
+                }
             }
             _ => {}
         }
@@ -266,10 +340,25 @@ impl MessageStore {
     }
 
     /// Drop a message from a chat by id. A no-op if the chat or id is unknown, so
-    /// reconciling an already-reconciled send is idempotent.
+    /// reconciling an already-reconciled send — or replaying a delete — is
+    /// idempotent.
     fn remove(&mut self, chat_id: i64, message_id: i64) {
         if let Some(chat) = self.by_chat.get_mut(&chat_id) {
             chat.remove(&message_id);
+        }
+    }
+
+    /// Replace a known message's content in place (the `updateMessageContent`
+    /// fold). A no-op if the message is unknown: TDLib only edits the content of
+    /// a message it already delivered, and a content-only update carries no
+    /// sender/date, so we never synthesize a partial entry from one.
+    fn edit_content(&mut self, chat_id: i64, message_id: i64, content: MessageContent) {
+        if let Some(message) = self
+            .by_chat
+            .get_mut(&chat_id)
+            .and_then(|chat| chat.get_mut(&message_id))
+        {
+            message.content = content;
         }
     }
 }
@@ -404,6 +493,38 @@ mod tests {
         })
     }
 
+    /// An edit: the message's content becomes `body`.
+    fn message_content(chat_id: i64, id: i64, body: &str) -> Update {
+        Update::MessageContent(tdlib_rs::types::UpdateMessageContent {
+            chat_id,
+            message_id: id,
+            new_content: tdlib_rs::enums::MessageContent::MessageText(MessageText {
+                text: TdFormattedText {
+                    text: body.to_owned(),
+                    entities: vec![],
+                },
+                link_preview: None,
+                link_preview_options: None,
+            }),
+        })
+    }
+
+    /// A deletion of `ids` from a chat. `is_permanent` distinguishes a real
+    /// delete from a cache eviction; `from_cache` is set on the latter.
+    fn delete_messages(
+        chat_id: i64,
+        ids: Vec<i64>,
+        is_permanent: bool,
+        from_cache: bool,
+    ) -> Update {
+        Update::DeleteMessages(tdlib_rs::types::UpdateDeleteMessages {
+            chat_id,
+            message_ids: ids,
+            is_permanent,
+            from_cache,
+        })
+    }
+
     fn ids(messages: &[&Message]) -> Vec<i64> {
         messages.iter().map(|m| m.id).collect()
     }
@@ -454,19 +575,50 @@ mod tests {
     }
 
     #[test]
-    fn non_new_message_updates_are_ignored_by_the_reducer() {
+    fn edit_swaps_message_content_in_place_and_is_idempotent() {
         let mut store = MessageStore::new();
-        store.merge([msg(10, 1)]);
-        // A delete update (folded in #20) reaching this reducer is inert for now.
-        store.reduce(&Update::DeleteMessages(
-            tdlib_rs::types::UpdateDeleteMessages {
-                chat_id: 10,
-                message_ids: vec![1],
-                is_permanent: true,
-                from_cache: false,
-            },
-        ));
-        assert_eq!(store.count(10), 1);
+        store.merge([msg(10, 1), msg(10, 2)]);
+        store.reduce(&message_content(10, 2, "edited"));
+
+        // The content changed; the entry kept its id and position, none added.
+        assert_eq!(store.get(10, 2).unwrap().text(), Some("edited"));
+        assert_eq!(ids(&store.history(10)), vec![1, 2]);
+        assert_eq!(store.get(10, 1).unwrap().text(), Some("m1"));
+
+        // Replaying the same edit converges.
+        store.reduce(&message_content(10, 2, "edited"));
+        assert_eq!(store.get(10, 2).unwrap().text(), Some("edited"));
+        assert_eq!(store.count(10), 2);
+    }
+
+    #[test]
+    fn edit_of_an_unknown_message_is_ignored() {
+        let mut store = MessageStore::new();
+        // No header/sender to synthesize from a content-only update — stays empty.
+        store.reduce(&message_content(10, 99, "ghost"));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn permanent_delete_removes_only_the_named_messages_and_is_idempotent() {
+        let mut store = MessageStore::new();
+        store.merge([msg(10, 1), msg(10, 2), msg(10, 3)]);
+        store.reduce(&delete_messages(10, vec![1, 3], true, false));
+
+        assert_eq!(ids(&store.history(10)), vec![2]);
+
+        // Replaying the delete (TDLib can repeat) is a no-op on the absent ids.
+        store.reduce(&delete_messages(10, vec![1, 3], true, false));
+        assert_eq!(ids(&store.history(10)), vec![2]);
+    }
+
+    #[test]
+    fn cache_eviction_delete_keeps_our_copy() {
+        let mut store = MessageStore::new();
+        store.merge([msg(10, 1), msg(10, 2)]);
+        // is_permanent false: TDLib is only unloading its cache, not deleting.
+        store.reduce(&delete_messages(10, vec![1, 2], false, true));
+        assert_eq!(ids(&store.history(10)), vec![1, 2]);
     }
 
     #[test]
@@ -548,6 +700,24 @@ mod tests {
                 )),
             )))
         }
+
+        async fn edit_text(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
+
+        async fn delete(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+            _revoke: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
     }
 
     #[tokio::test]
@@ -603,6 +773,24 @@ mod tests {
         ) -> Result<Message, TdError> {
             unimplemented!("HistorySpy exercises history paging only")
         }
+
+        async fn edit_text(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
+
+        async fn delete(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+            _revoke: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
     }
 
     #[tokio::test]
@@ -646,6 +834,24 @@ mod tests {
         ) -> Result<Message, TdError> {
             unimplemented!("FailingSpy exercises the history error path only")
         }
+
+        async fn edit_text(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+
+        async fn delete(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+            _revoke: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
     }
 
     #[tokio::test]
@@ -656,5 +862,86 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, 400);
         assert!(store.is_empty());
+    }
+
+    /// Captures the arguments of the most recent `edit_text` / `delete` so the
+    /// request seam's wiring (which message, which revoke mode) is asserted.
+    #[derive(Default)]
+    struct EditDeleteSpy {
+        edited: RefCell<Option<(i64, i64, FormattedText)>>,
+        deleted: RefCell<Option<(i64, Vec<i64>, bool)>>,
+    }
+
+    impl MessageRequests for EditDeleteSpy {
+        async fn get_chat_history(
+            &self,
+            _chat_id: i64,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+
+        async fn send_text(
+            &self,
+            _chat_id: i64,
+            _reply_to: Option<i64>,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+
+        async fn edit_text(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            text: FormattedText,
+        ) -> Result<Message, TdError> {
+            self.edited
+                .borrow_mut()
+                .replace((chat_id, message_id, text.clone()));
+            // TDLib echoes the edited message; mirror that with the new content.
+            let mut edited = msg(chat_id, message_id);
+            edited.content = MessageContent::Text(text);
+            Ok(edited)
+        }
+
+        async fn delete(
+            &self,
+            chat_id: i64,
+            message_ids: Vec<i64>,
+            revoke: bool,
+        ) -> Result<(), TdError> {
+            self.deleted
+                .borrow_mut()
+                .replace((chat_id, message_ids, revoke));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_text_threads_the_target_and_returns_the_edited_message() {
+        let spy = EditDeleteSpy::default();
+        let body = FormattedText {
+            text: "fixed".to_owned(),
+            entities: vec![],
+        };
+        let edited = spy.edit_text(10, 2, body.clone()).await.unwrap();
+
+        assert_eq!(*spy.edited.borrow(), Some((10, 2, body)));
+        assert_eq!(edited.id, 2);
+        assert_eq!(edited.text(), Some("fixed"));
+    }
+
+    #[tokio::test]
+    async fn delete_threads_the_revoke_choice() {
+        let spy = EditDeleteSpy::default();
+        // Revoke for everyone.
+        spy.delete(10, vec![1, 2], true).await.unwrap();
+        assert_eq!(*spy.deleted.borrow(), Some((10, vec![1, 2], true)));
+
+        // Delete only for self.
+        spy.delete(10, vec![3], false).await.unwrap();
+        assert_eq!(*spy.deleted.borrow(), Some((10, vec![3], false)));
     }
 }
