@@ -43,6 +43,36 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 /// updates on startup and resync.
 const UPDATE_BUFFER: usize = 1024;
 
+/// Parameters for `setTdlibParameters`, the answer to `WaitTdlibParameters`.
+///
+/// A plain data bundle: the `api_id`/`api_hash` come from the user's own
+/// Telegram app registration (#7), and `database_directory` / `files_directory`
+/// / `database_encryption_key` from secure session storage (#8). This struct is
+/// the seam where those land; the bridge supplies the remaining, non-secret
+/// initialization flags.
+#[derive(Clone, Debug)]
+pub struct ClientParameters {
+    /// Telegram API id from <https://my.telegram.org>.
+    pub api_id: i32,
+    /// Telegram API hash from <https://my.telegram.org>.
+    pub api_hash: String,
+    /// Directory for the persistent database.
+    pub database_directory: String,
+    /// Directory for downloaded files (often the same as the database dir).
+    pub files_directory: String,
+    /// Key the on-disk database is encrypted with (#8). Moved straight into the
+    /// request; never logged.
+    pub database_encryption_key: String,
+    /// IETF language tag of the user's OS language, e.g. `en`.
+    pub system_language_code: String,
+    /// Human-readable device model shown in the user's active-sessions list.
+    pub device_model: String,
+    /// tuigram's version string, shown alongside the device model.
+    pub application_version: String,
+    /// Use Telegram's test data center instead of production.
+    pub use_test_dc: bool,
+}
+
 /// The async seam between TDLib and tuigram's logic.
 ///
 /// Implemented by [`Bridge`] over a live `tdjson` client, and by mocks in tests.
@@ -65,6 +95,30 @@ pub trait TgClient {
     /// answers it immediately from local state with no network, so a successful
     /// round-trip means the receive loop is correctly notifying the observer.
     async fn authorization_state(&self) -> Result<AuthorizationState, TdError>;
+
+    /// Set TDLib's global log verbosity level (0 = fatal only … 3 = info,
+    /// the default … 5 = verbose).
+    ///
+    /// Security-relevant: at the default level TDLib logs request and response
+    /// payloads to stderr, which during login would include phone numbers,
+    /// codes, and the 2FA password. The auth flow lowers this before any
+    /// credential-bearing request (see `auth`).
+    async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError>;
+
+    /// Answer `WaitTdlibParameters` — initialize the client (#6 handler).
+    async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError>;
+
+    /// Answer `WaitPhoneNumber` — submit the phone number and request a code.
+    async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError>;
+
+    /// Answer `WaitCode` — submit the login code the user received.
+    async fn check_authentication_code(&self, code: String) -> Result<(), TdError>;
+
+    /// Answer `WaitPassword` — submit the 2FA password.
+    ///
+    /// The password is moved straight into the TDLib request and never retained
+    /// (see the threat model).
+    async fn check_authentication_password(&self, password: String) -> Result<(), TdError>;
 }
 
 /// A live connection to a single `tdjson` client and its update pump.
@@ -120,6 +174,45 @@ impl TgClient for Bridge {
     async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
         tdlib_rs::functions::get_authorization_state(self.client_id).await
     }
+
+    async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError> {
+        tdlib_rs::functions::set_log_verbosity_level(level, self.client_id).await
+    }
+
+    async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
+        tdlib_rs::functions::set_tdlib_parameters(
+            params.use_test_dc,
+            params.database_directory,
+            params.files_directory,
+            params.database_encryption_key,
+            true,  // use_file_database: persist downloaded/uploaded file info
+            true,  // use_chat_info_database: cache users/groups across restarts
+            true,  // use_message_database: cache chats/messages across restarts
+            false, // use_secret_chats: out of scope for Phase 2
+            params.api_id,
+            params.api_hash,
+            params.system_language_code,
+            params.device_model,
+            String::new(), // system_version: empty -> TDLib auto-detects
+            params.application_version,
+            self.client_id,
+        )
+        .await
+    }
+
+    async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError> {
+        // None settings -> TDLib's defaults for code delivery.
+        tdlib_rs::functions::set_authentication_phone_number(phone_number, None, self.client_id)
+            .await
+    }
+
+    async fn check_authentication_code(&self, code: String) -> Result<(), TdError> {
+        tdlib_rs::functions::check_authentication_code(code, self.client_id).await
+    }
+
+    async fn check_authentication_password(&self, password: String) -> Result<(), TdError> {
+        tdlib_rs::functions::check_authentication_password(password, self.client_id).await
+    }
 }
 
 impl Drop for Bridge {
@@ -139,6 +232,17 @@ impl Drop for Bridge {
 /// skipped rather than surfaced as errors: the stream's contract is "the next
 /// update", and a stalled consumer is a higher-layer concern.
 pub struct UpdateStream(BroadcastStream<Update>);
+
+impl UpdateStream {
+    /// An already-closed update stream that yields nothing. For tests and mocks
+    /// whose logic does not consume updates.
+    #[must_use]
+    pub fn empty() -> Self {
+        let (sender, receiver) = broadcast::channel(1);
+        drop(sender);
+        Self(BroadcastStream::new(receiver))
+    }
+}
 
 impl Stream for UpdateStream {
     type Item = Update;
@@ -226,6 +330,24 @@ mod tests {
 
         async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
             Ok(self.state.clone())
+        }
+
+        // Request handlers are exercised by the auth-module tests; here they
+        // only need to satisfy the trait.
+        async fn set_log_verbosity_level(&self, _level: i32) -> Result<(), TdError> {
+            Ok(())
+        }
+        async fn set_tdlib_parameters(&self, _params: ClientParameters) -> Result<(), TdError> {
+            Ok(())
+        }
+        async fn set_phone_number(&self, _phone_number: String) -> Result<(), TdError> {
+            Ok(())
+        }
+        async fn check_authentication_code(&self, _code: String) -> Result<(), TdError> {
+            Ok(())
+        }
+        async fn check_authentication_password(&self, _password: String) -> Result<(), TdError> {
+            Ok(())
         }
     }
 

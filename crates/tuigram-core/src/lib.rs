@@ -4,9 +4,11 @@
 //! unit-tested without a TTY. Phases 2–3 (auth, chats, messages) live here;
 //! the Ratatui front-end (Phases 4–5) depends on this crate.
 
+pub mod auth;
 pub mod bridge;
 
-pub use bridge::{Bridge, TgClient, UpdateStream};
+pub use auth::{AuthState, Login};
+pub use bridge::{Bridge, ClientParameters, TgClient, UpdateStream};
 
 /// TDLib's typed request API and data model, re-exported so callers depend on
 /// it through tuigram-core rather than reaching for `tdlib-rs` directly. Drive
