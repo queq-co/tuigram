@@ -64,41 +64,86 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Build
-        run: cargo build --workspace --all-targets
+      # download-tdlib is tuigram-core's default tdjson source, so this is the
+      # prebuilt-tdjson build across the matrix (#10). The feature is named
+      # explicitly so the intent survives any change to the default, and so the
+      # artifact the linkage audit below inspects is unambiguously produced here.
+      - name: Build (download-tdlib)
+        run: cargo build --workspace --all-targets --features tuigram-core/download-tdlib
 
       - name: Test
         run: cargo test --workspace
 
       # ---------------------------------------------------------------------
-      # Phase 2 (once tdlib-rs is a dependency): build with the prebuilt tdjson
-      # and AUDIT what OpenSSL/zlib the artifact actually links, per target.
-      # This is the continuous version of the one-off macOS probe and is the
-      # real "works regardless of arch" guarantee. Uncomment when the crate lands.
+      # Linkage audit (#10): introspect what the prebuilt tdjson actually links
+      # against, per target, and assert it matches what scripts/check-native-deps.sh
+      # provisions on the host. check-native-deps.sh stays the source of truth for
+      # *host* deps (run before the build); these steps verify the *artifact*. This
+      # is the continuous version of the one-off macOS probe — the real "works
+      # regardless of arch" guarantee. The audit prints the full dependency list
+      # for the record, then fails loudly if an expected dep is missing.
+      #
+      # Expected per target (see docs/research/tdlib.md):
+      #   Linux  — dynamic OpenSSL 3 (libssl/libcrypto.so.3) + zlib (libz.so.1);
+      #            libc++ provisioned above so ldd resolves cleanly.
+      #   macOS  — dynamic Homebrew openssl@3 (libssl/libcrypto.3.dylib) + system
+      #            libz.1 (release builds bundle OpenSSL via bundle-native-deps.sh).
+      #   Windows — OpenSSL/zlib are statically bundled in the prebuilt, so the DLL
+      #            must NOT carry an external crypto/zlib import; assert it is
+      #            self-contained.
       # ---------------------------------------------------------------------
-      # - name: Build (download-tdlib)
-      #   run: cargo build --workspace --features tuigram-core/download-tdlib
-      #
-      # - name: Linkage audit (Linux)
-      #   if: runner.os == 'Linux'
-      #   run: |
-      #     lib=$(find target -name 'libtdjson*.so*' | head -1)
-      #     echo "== ldd $lib =="; ldd "$lib" | grep -Ei 'ssl|crypto|libz' || true
-      #
-      # - name: Linkage audit (macOS)
-      #   if: runner.os == 'macOS'
-      #   run: |
-      #     lib=$(find target -name 'libtdjson*.dylib' | head -1)
-      #     echo "== otool -L $lib =="; otool -L "$lib" | grep -Ei 'ssl|crypto|libz' || true
-      #
+      - name: Linkage audit (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=$(find target -name 'libtdjson.so*' -print -quit)
+          test -n "$lib" || { echo "FAIL: no libtdjson.so found under target/"; exit 1; }
+          echo "== ldd $lib =="
+          deps=$(ldd "$lib"); echo "$deps"
+          grep -q 'libssl\.so\.3'    <<<"$deps" || { echo "FAIL: missing libssl.so.3";    exit 1; }
+          grep -q 'libcrypto\.so\.3' <<<"$deps" || { echo "FAIL: missing libcrypto.so.3"; exit 1; }
+          grep -q 'libz\.so\.1'      <<<"$deps" || { echo "FAIL: missing libz.so.1";      exit 1; }
+          echo "OK: Linux tdjson links OpenSSL 3 (libssl/libcrypto.so.3) + zlib (libz.so.1)"
+
+      - name: Linkage audit (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          lib=$(find target -name 'libtdjson*.dylib' -print -quit)
+          test -n "$lib" || { echo "FAIL: no libtdjson.dylib found under target/"; exit 1; }
+          echo "== otool -L $lib =="
+          deps=$(otool -L "$lib"); echo "$deps"
+          grep -q 'libssl\.3\.dylib'    <<<"$deps" || { echo "FAIL: missing libssl.3.dylib";    exit 1; }
+          grep -q 'libcrypto\.3\.dylib' <<<"$deps" || { echo "FAIL: missing libcrypto.3.dylib"; exit 1; }
+          grep -q '/libz\.1\.dylib'     <<<"$deps" || { echo "FAIL: missing libz.1.dylib";      exit 1; }
+          echo "OK: macOS tdjson links Homebrew OpenSSL 3 + system zlib"
+
+      - name: Linkage audit (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lib = Get-ChildItem -Recurse -Filter 'tdjson*.dll' target | Select-Object -First 1
+          if (-not $lib) { Write-Error 'FAIL: no tdjson.dll found under target/'; exit 1 }
+          # dumpbin ships with MSVC but is not on PATH; locate it via vswhere
+          # (preinstalled on GitHub-hosted Windows runners).
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -find '**\dumpbin.exe' | Select-Object -First 1
+          if (-not $dumpbin) { Write-Error 'FAIL: dumpbin.exe not found via vswhere'; exit 1 }
+          Write-Host "== $dumpbin /DEPENDENTS $($lib.FullName) =="
+          $deps = & $dumpbin /DEPENDENTS $lib.FullName
+          $deps | Write-Host
+          # OpenSSL/zlib are statically bundled in the Windows prebuilt — assert the
+          # DLL does NOT dynamically import an external crypto/zlib library.
+          if ($deps -match '(?i)libssl|libcrypto|ssleay|libeay|zlib1?\.dll') {
+            Write-Error 'FAIL: Windows tdjson unexpectedly imports an external OpenSSL/zlib DLL'
+            exit 1
+          }
+          Write-Host 'OK: Windows tdjson is self-contained (OpenSSL/zlib bundled, no external import)'
+
       # Release packaging (separate release workflow, macOS only): make the
       # shipped binary self-contained so end users need no Homebrew —
       #   ./scripts/bundle-native-deps.sh target/release/tuigram
       # (no-op on Linux/Windows). See docs/research/tdlib.md, "Distribution strategy".
-      #
-      # - name: Linkage audit (Windows)
-      #   if: runner.os == 'Windows'
-      #   shell: pwsh
-      #   run: |
-      #     $lib = Get-ChildItem -Recurse -Filter tdjson*.dll target | Select-Object -First 1
-      #     dumpbin /DEPENDENTS $lib.FullName
