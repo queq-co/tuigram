@@ -34,14 +34,19 @@
 //! message's content in place, and a permanent `updateDeleteMessages` drops the
 //! messages — a cache-eviction delete is ignored so our copy survives.
 //!
+//! Read state (#21): [`MessageRequests::view_messages`] marks a chat's messages
+//! read. It is advisory — the call acknowledges the messages to the server and
+//! never blocks the read path; the resulting unread-count change arrives as
+//! `updateChatReadInbox`, which the [chat store](crate::chats::ChatStore) folds.
+//!
 //! Scope: history paging, live `updateNewMessage`, sending text + reply with its
-//! lifecycle (#19), editing and deleting with their updates (#20), and the
-//! snapshot.
+//! lifecycle (#19), editing and deleting with their updates (#20), marking
+//! messages read (#21), and the snapshot.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 
-use tdlib_rs::enums::{InputMessageContent, InputMessageReplyTo, Messages, Update};
+use tdlib_rs::enums::{InputMessageContent, InputMessageReplyTo, MessageSource, Messages, Update};
 use tdlib_rs::types::{Error as TdError, InputMessageReplyToMessage, InputMessageText};
 
 use crate::bridge::Bridge;
@@ -103,6 +108,13 @@ pub trait MessageRequests {
         message_ids: Vec<i64>,
         revoke: bool,
     ) -> Result<(), TdError>;
+
+    /// Mark `message_ids` in a chat as read (TDLib's `viewMessages`). **Advisory**
+    /// — it acknowledges the messages to the server and lets the unread count
+    /// settle, but the read path never waits on the result: the new count returns
+    /// asynchronously as `updateChatReadInbox`, folded by the chat store. An empty
+    /// `message_ids` is a no-op at the seam.
+    async fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) -> Result<(), TdError>;
 }
 
 impl MessageRequests for Bridge {
@@ -184,6 +196,20 @@ impl MessageRequests for Bridge {
         revoke: bool,
     ) -> Result<(), TdError> {
         tdlib_rs::functions::delete_messages(chat_id, message_ids, revoke, self.id()).await
+    }
+
+    async fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) -> Result<(), TdError> {
+        // `ChatHistory` source + `force_read`: a headless client is explicitly
+        // marking a chat's history read, not reacting to messages drawn on screen,
+        // so it must take effect without a visible message view.
+        tdlib_rs::functions::view_messages(
+            chat_id,
+            message_ids,
+            Some(MessageSource::ChatHistory),
+            true,
+            self.id(),
+        )
+        .await
     }
 }
 
@@ -718,6 +744,14 @@ mod tests {
         ) -> Result<(), TdError> {
             unimplemented!("SendSpy exercises the send path only")
         }
+
+        async fn view_messages(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+        ) -> Result<(), TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
     }
 
     #[tokio::test]
@@ -791,6 +825,14 @@ mod tests {
         ) -> Result<(), TdError> {
             unimplemented!("HistorySpy exercises history paging only")
         }
+
+        async fn view_messages(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+        ) -> Result<(), TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
     }
 
     #[tokio::test]
@@ -849,6 +891,14 @@ mod tests {
             _chat_id: i64,
             _message_ids: Vec<i64>,
             _revoke: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+
+        async fn view_messages(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
         ) -> Result<(), TdError> {
             unimplemented!("FailingSpy exercises the history error path only")
         }
@@ -917,6 +967,14 @@ mod tests {
                 .replace((chat_id, message_ids, revoke));
             Ok(())
         }
+
+        async fn view_messages(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+        ) -> Result<(), TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
     }
 
     #[tokio::test]
@@ -943,5 +1001,62 @@ mod tests {
         // Delete only for self.
         spy.delete(10, vec![3], false).await.unwrap();
         assert_eq!(*spy.deleted.borrow(), Some((10, vec![3], false)));
+    }
+
+    /// Captures the arguments of the most recent `view_messages`, so the read
+    /// request's wiring (which chat, which message ids) is asserted.
+    #[derive(Default)]
+    struct ViewSpy {
+        viewed: RefCell<Option<(i64, Vec<i64>)>>,
+    }
+
+    impl MessageRequests for ViewSpy {
+        async fn get_chat_history(
+            &self,
+            _chat_id: i64,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn send_text(
+            &self,
+            _chat_id: i64,
+            _reply_to: Option<i64>,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn edit_text(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn delete(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+            _revoke: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) -> Result<(), TdError> {
+            self.viewed.borrow_mut().replace((chat_id, message_ids));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn view_messages_threads_the_chat_and_message_ids() {
+        let spy = ViewSpy::default();
+        spy.view_messages(10, vec![1, 2, 3]).await.unwrap();
+        assert_eq!(*spy.viewed.borrow(), Some((10, vec![1, 2, 3])));
     }
 }
