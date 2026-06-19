@@ -98,10 +98,10 @@ impl ChatStore {
     /// Fold one chat-route update into the store.
     ///
     /// Projects the update into tuigram's [model](crate::model) types and applies
-    /// it. Updates the router classifies as `Chat` but this issue does not fold
-    /// yet (e.g. `updateChatReadOutbox`, handled in #21) fall through the
-    /// catch-all as harmless no-ops — the router owns classification, this owns
-    /// only the fold.
+    /// it: `updateNewChat`, `updateChatPosition`, `updateChatLastMessage`, and the
+    /// read-state pair `updateChatReadInbox` / `updateChatReadOutbox` (#21). The
+    /// catch-all stays inert — the router owns classification, this owns only the
+    /// fold — so any other variant reaching here is a harmless no-op.
     pub fn reduce(&mut self, update: &Update) {
         match update {
             Update::NewChat(u) => self.upsert(Chat::from_tdlib(&u.chat)),
@@ -115,6 +115,9 @@ impl ChatStore {
             ),
             Update::ChatReadInbox(u) => {
                 self.mark_inbox_read(u.chat_id, u.last_read_inbox_message_id, u.unread_count);
+            }
+            Update::ChatReadOutbox(u) => {
+                self.mark_outbox_read(u.chat_id, u.last_read_outbox_message_id);
             }
             _ => {}
         }
@@ -210,6 +213,16 @@ impl ChatStore {
             chat.unread_count = unread_count;
         }
     }
+
+    /// Fold `updateChatReadOutbox`: the peer has read up to this outgoing message,
+    /// so the chat's last-read-outbox marker advances. Unlike the inbox side this
+    /// carries no unread counter — it only moves the read horizon for our own
+    /// sent messages. Idempotent: re-applying sets the same id.
+    fn mark_outbox_read(&mut self, chat_id: i64, last_read_outbox_message_id: i64) {
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.last_read_outbox_message_id = last_read_outbox_message_id;
+        }
+    }
 }
 
 /// Merge one position into a chat's position list: replace any existing position
@@ -230,7 +243,7 @@ mod tests {
     use tdlib_rs::enums::{ChatList as TdChatList, ChatType as TdChatType};
     use tdlib_rs::types::{
         ChatPosition as TdChatPosition, ChatTypePrivate, UpdateChatLastMessage, UpdateChatPosition,
-        UpdateChatReadInbox, UpdateNewChat,
+        UpdateChatReadInbox, UpdateChatReadOutbox, UpdateNewChat,
     };
 
     /// A TDLib `Chat` with every field zeroed but id/title and an empty position
@@ -309,6 +322,13 @@ mod tests {
         })
     }
 
+    fn read_outbox(chat_id: i64, last_read: i64) -> Update {
+        Update::ChatReadOutbox(UpdateChatReadOutbox {
+            chat_id,
+            last_read_outbox_message_id: last_read,
+        })
+    }
+
     /// A store seeded with two known chats, neither positioned yet.
     fn seeded() -> ChatStore {
         let mut store = ChatStore::new();
@@ -381,6 +401,30 @@ mod tests {
         let chat = store.get(10).unwrap();
         assert_eq!(chat.unread_count, 3);
         assert_eq!(chat.last_read_inbox_message_id, 42);
+    }
+
+    #[test]
+    fn read_outbox_advances_last_read_outbox_idempotently() {
+        let mut store = seeded();
+        store.reduce(&read_outbox(10, 77));
+        assert_eq!(store.get(10).unwrap().last_read_outbox_message_id, 77);
+
+        // The inbox side is untouched — outbox carries no unread counter.
+        assert_eq!(store.get(10).unwrap().unread_count, 0);
+        assert_eq!(store.get(10).unwrap().last_read_inbox_message_id, 0);
+
+        // Re-applying the same horizon converges; a later one advances it.
+        store.reduce(&read_outbox(10, 77));
+        assert_eq!(store.get(10).unwrap().last_read_outbox_message_id, 77);
+        store.reduce(&read_outbox(10, 120));
+        assert_eq!(store.get(10).unwrap().last_read_outbox_message_id, 120);
+    }
+
+    #[test]
+    fn read_outbox_for_unknown_chat_is_ignored() {
+        let mut store = ChatStore::new();
+        store.reduce(&read_outbox(999, 5));
+        assert!(store.is_empty());
     }
 
     #[test]
