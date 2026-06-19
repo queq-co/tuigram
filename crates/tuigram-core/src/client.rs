@@ -18,8 +18,10 @@
 //! read seam, but both are empty until those domains add their stores and the
 //! router's [`reduce_chat`](crate::router::UpdateSink::reduce_chat) /
 //! [`reduce_message`](crate::router::UpdateSink::reduce_message) arms land with
-//! them. Write actions (send/edit/delete/mark-read) arrive with their request
-//! traits in #19–#21.
+//! them. Write actions (send/edit/delete/mark-read, #19–#21) are driven over the
+//! bridge's per-domain request traits ([`Client::bridge`]) and reconcile through
+//! the router; the one fetch that returns directly rather than as updates —
+//! history paging — folds in via [`Client::merge_history`].
 
 use std::sync::{Arc, Mutex};
 
@@ -29,6 +31,7 @@ use tokio::task::JoinHandle;
 use crate::bridge::Bridge;
 use crate::chats::ChatStore;
 use crate::messages::MessageStore;
+use crate::model::Message;
 use crate::router::{Router, UpdateSink};
 
 /// The account content the router folds updates into: the chat list (#17) and
@@ -65,6 +68,14 @@ impl AccountState {
     /// Fold a message update into the message store.
     fn reduce_message(&mut self, update: &Update) {
         self.messages.reduce(update);
+    }
+
+    /// Merge a fetched history page into the message store. Unlike live messages,
+    /// `getChatHistory` returns its page in the response rather than as updates,
+    /// so the fetcher folds it in here — alongside the live messages the router
+    /// folds — through the same deduping [`MessageStore::merge`].
+    fn merge_history(&mut self, page: Vec<Message>) {
+        self.messages.merge(page);
     }
 
     /// Recover from a dropped-update gap by re-querying the affected state.
@@ -147,6 +158,23 @@ impl Client {
     pub fn read<R>(&self, reader: impl FnOnce(&AccountState) -> R) -> R {
         reader(&self.state.lock().expect("account state mutex poisoned"))
     }
+
+    /// Fold a fetched history page into the account's message store, under the
+    /// same lock the router folds through and [`read`](Self::read) reads from.
+    ///
+    /// `getChatHistory` (driven via
+    /// [`load_history`](crate::messages::load_history) or a single
+    /// [`get_chat_history`](crate::messages::MessageRequests::get_chat_history)
+    /// call) returns each page in the response, not as updates — so a caller
+    /// paging a chat's history hands each page here to merge it into the store the
+    /// facade reads back. This is the "production fold" `load_history` leaves to
+    /// its caller; merging is deduped, so an overlapping re-page is idempotent.
+    pub fn merge_history(&self, page: Vec<Message>) {
+        self.state
+            .lock()
+            .expect("account state mutex poisoned")
+            .merge_history(page);
+    }
 }
 
 impl Drop for Client {
@@ -182,5 +210,32 @@ mod tests {
 
         // Readable through the same lock the facade's `read` uses.
         let _guard = state.lock().expect("mutex usable after the router ran");
+    }
+
+    /// A fetched history page folds into the message store and is readable back,
+    /// deduping an overlapping re-page (the property the facade's `merge_history`
+    /// passes through to the store).
+    #[test]
+    fn merge_history_folds_a_page_into_the_readable_store() {
+        use crate::model::{FormattedText, MessageContent, SendState, Sender};
+
+        let msg = |id: i64| Message {
+            id,
+            chat_id: 10,
+            sender: Sender::User(1),
+            date: 0,
+            edit_date: 0,
+            is_outgoing: false,
+            content: MessageContent::Text(FormattedText::default()),
+            send_state: SendState::Sent,
+        };
+
+        let mut state = AccountState::default();
+        state.merge_history(vec![msg(2), msg(1)]);
+        // An overlapping page collapses onto the same ids, ordered chronologically.
+        state.merge_history(vec![msg(2), msg(3)]);
+
+        let ids: Vec<i64> = state.messages().history(10).iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
     }
 }
