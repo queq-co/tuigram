@@ -394,7 +394,8 @@ impl MessageRequests for Bridge {
 /// A search page is a **transient view**: its messages are normalized
 /// [`Message`]s but they are never folded into the [`MessageStore`]; collect them
 /// into a [`SearchResults`] instead, so a search never disturbs loaded history.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Eq`: a hit's [`Message`] may carry `f64` location coordinates.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SearchPage<C> {
     /// The normalized hits on this page, in the order TDLib ranked them.
     pub messages: Vec<Message>,

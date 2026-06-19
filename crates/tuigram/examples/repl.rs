@@ -491,6 +491,19 @@ fn format_message(m: &Message) -> String {
             a.duration,
             caption(&a.caption)
         ),
+        MessageContent::Location(l) => {
+            format!("<location {:.5},{:.5}>", l.latitude, l.longitude)
+        }
+        MessageContent::Venue(v) => format!("<venue {} — {}>", v.title, v.address),
+        MessageContent::Contact(c) => {
+            format!(
+                "<contact {} {} {}>",
+                c.first_name, c.last_name, c.phone_number
+            )
+        }
+        MessageContent::Poll(p) => {
+            format!("<poll {} ({} options)>", p.question.text, p.options.len())
+        }
         MessageContent::Unsupported(name) => format!("<{name}>"),
     };
     format!("  [{}] {who}{state}: {body}", m.id)
