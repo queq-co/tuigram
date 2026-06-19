@@ -22,7 +22,7 @@ use tdlib_rs::enums::{
     TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
-    Chat as TdChat, ChatPosition as TdChatPosition, DraftMessage as TdDraftMessage,
+    Chat as TdChat, ChatPosition as TdChatPosition, DraftMessage as TdDraftMessage, File as TdFile,
     FormattedText as TdFormattedText, InputMessageReplyToMessage, InputMessageText,
     Message as TdMessage, MessageSenderChat as TdMessageSenderChat,
     MessageSenderUser as TdMessageSenderUser, TextEntity as TdTextEntity, User as TdUser,
@@ -507,6 +507,106 @@ impl FormattedText {
         TdFormattedText {
             text: self.text.clone(),
             entities: self.entities.iter().map(TextEntity::to_tdlib).collect(),
+        }
+    }
+}
+
+/// A reference to a TDLib file, as held by media message content.
+///
+/// Media (a photo, video, document, …) carries only this id; the bytes and the
+/// download/upload state live in the [`FileStore`](crate::files::FileStore),
+/// which the single update router keeps current from `updateFile`. This is the
+/// same indirection [`Sender::User`] uses for people: content stays a cheap,
+/// `Copy` reference and the mutable file state is resolved out of one store —
+/// `store.get(file_ref)` — rather than duplicated into every message snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FileRef {
+    /// TDLib's per-session file id (the key into the [`FileStore`]).
+    pub id: i32,
+}
+
+impl FileRef {
+    /// Wrap a TDLib file id.
+    #[must_use]
+    pub fn new(id: i32) -> Self {
+        Self { id }
+    }
+}
+
+/// A file tuigram knows about — its size and its local/remote transfer state,
+/// flattened from TDLib's `File`/`LocalFile`/`RemoteFile` trio into the subset a
+/// caller needs to show a thumbnail, a download/upload bar, or open the bytes.
+///
+/// The projection is **total** (it reads every nested field it surfaces), and
+/// folding the same `updateFile` twice converges, so the [`FileStore`] can
+/// re-apply TDLib's repeated emissions idempotently.
+///
+/// [`FileStore`]: crate::files::FileStore
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct File {
+    /// TDLib's per-session file id.
+    pub id: i32,
+    /// File size in bytes; `0` if unknown (then [`expected_size`](Self::expected_size)
+    /// approximates it).
+    pub size: i64,
+    /// Approximate size in bytes when the exact `size` is unknown; for progress.
+    pub expected_size: i64,
+    /// Path to the local copy; empty until a download starts writing one.
+    pub local_path: String,
+    /// Bytes of the file available locally so far (download progress numerator).
+    pub downloaded_size: i64,
+    /// Whether a download is currently in progress.
+    pub is_downloading_active: bool,
+    /// Whether the local copy is fully downloaded.
+    pub is_downloading_completed: bool,
+    /// Bytes of the file uploaded so far (upload progress numerator, for #47).
+    pub uploaded_size: i64,
+    /// Whether an upload is currently in progress.
+    pub is_uploading_active: bool,
+    /// Whether the remote copy is fully uploaded.
+    pub is_uploading_completed: bool,
+}
+
+impl File {
+    /// Project TDLib's `File`, flattening its local and remote sub-records.
+    #[must_use]
+    pub fn from_tdlib(file: &TdFile) -> Self {
+        Self {
+            id: file.id,
+            size: file.size,
+            expected_size: file.expected_size,
+            local_path: file.local.path.clone(),
+            downloaded_size: file.local.downloaded_size,
+            is_downloading_active: file.local.is_downloading_active,
+            is_downloading_completed: file.local.is_downloading_completed,
+            uploaded_size: file.remote.uploaded_size,
+            is_uploading_active: file.remote.is_uploading_active,
+            is_uploading_completed: file.remote.is_uploading_completed,
+        }
+    }
+
+    /// A reference to this file, for embedding in media content.
+    #[must_use]
+    pub fn as_ref(&self) -> FileRef {
+        FileRef::new(self.id)
+    }
+
+    /// Whether the full file is readable from [`local_path`](Self::local_path)
+    /// now — downloaded to completion with a path set. The single bool a caller
+    /// checks before opening the bytes, rather than re-deriving it each time.
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        self.is_downloading_completed && !self.local_path.is_empty()
+    }
+
+    /// The best known total size in bytes: the exact `size` when TDLib has it,
+    /// else the `expected_size` estimate. The denominator for a progress bar.
+    #[must_use]
+    pub fn total_size(&self) -> i64 {
+        if self.size > 0 {
+            self.size
+        } else {
+            self.expected_size
         }
     }
 }
