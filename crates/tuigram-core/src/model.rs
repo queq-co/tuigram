@@ -16,12 +16,14 @@
 //! forwards, replies, and service messages are out of scope for this model.
 
 use tdlib_rs::enums::{
-    ChatList as TdChatList, ChatType as TdChatType, MessageContent as TdMessageContent,
+    ChatList as TdChatList, ChatType as TdChatType, InputMessageContent as TdInputMessageContent,
+    InputMessageReplyTo as TdInputMessageReplyTo, MessageContent as TdMessageContent,
     MessageSender as TdMessageSender, MessageSendingState as TdMessageSendingState,
     TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
-    Chat as TdChat, ChatPosition as TdChatPosition, FormattedText as TdFormattedText,
+    Chat as TdChat, ChatPosition as TdChatPosition, DraftMessage as TdDraftMessage,
+    FormattedText as TdFormattedText, InputMessageReplyToMessage, InputMessageText,
     Message as TdMessage, MessageSenderChat as TdMessageSenderChat,
     MessageSenderUser as TdMessageSenderUser, TextEntity as TdTextEntity, User as TdUser,
 };
@@ -771,6 +773,74 @@ impl Message {
     }
 }
 
+/// A chat's unsent compose draft — tuigram's projection of TDLib's
+/// `DraftMessage`. Telegram syncs this half-typed message across the account's
+/// devices, so it is **chat state, not history**: it lives on the [`Chat`]
+/// snapshot and never enters the message store.
+///
+/// Phase 3 models a **text** draft — the realistic case for a keyboard-driven
+/// client. TDLib also allows voice/video-note drafts, which carry no text and
+/// project with an empty [`text`](Self::text); modeling those is a follow-up,
+/// the same scope line as [`MessageContent`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Draft {
+    /// The draft text with its formatting entities (empty for a non-text draft).
+    pub text: FormattedText,
+    /// The message this draft replies to, if any (by id, in the same chat).
+    pub reply_to_message_id: Option<i64>,
+    /// Unix timestamp when the draft was created.
+    pub date: i32,
+}
+
+impl Draft {
+    /// Project TDLib's `DraftMessage`. A non-text draft (voice/video note, which
+    /// Phase 3 does not model) keeps an empty `text`; a reply target other than
+    /// an in-chat message (an external message or a story) is dropped, as those
+    /// reply kinds are out of scope.
+    #[must_use]
+    pub fn from_tdlib(draft: &TdDraftMessage) -> Self {
+        let text = match &draft.input_message_text {
+            TdInputMessageContent::InputMessageText(t) => FormattedText::from_tdlib(&t.text),
+            _ => FormattedText::default(),
+        };
+        let reply_to_message_id = match &draft.reply_to {
+            Some(TdInputMessageReplyTo::Message(m)) => Some(m.message_id),
+            _ => None,
+        };
+        Self {
+            text,
+            reply_to_message_id,
+            date: draft.date,
+        }
+    }
+
+    /// Lower back to TDLib's `DraftMessage`, for pushing a draft over the seam.
+    /// The inverse of [`from_tdlib`](Self::from_tdlib): the text becomes an
+    /// `inputMessageText` (never clearing the draft itself — clearing is a
+    /// `None` draft at the request, not a flag here), and a reply target becomes
+    /// an in-chat `inputMessageReplyToMessage`.
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdDraftMessage {
+        TdDraftMessage {
+            reply_to: self.reply_to_message_id.map(|message_id| {
+                TdInputMessageReplyTo::Message(InputMessageReplyToMessage {
+                    message_id,
+                    quote: None,
+                    checklist_task_id: 0,
+                })
+            }),
+            date: self.date,
+            input_message_text: TdInputMessageContent::InputMessageText(InputMessageText {
+                text: self.text.to_tdlib(),
+                link_preview_options: None,
+                clear_draft: false,
+            }),
+            effect_id: 0,
+            suggested_post_info: None,
+        }
+    }
+}
+
 /// A chat — tuigram's projection of TDLib's `Chat`, carrying what the chat list
 /// and a conversation header need.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -793,6 +863,8 @@ pub struct Chat {
     pub last_read_outbox_message_id: i64,
     /// The chat's positions across the lists it appears in.
     pub positions: Vec<ChatPosition>,
+    /// The unsent compose draft synced for this chat, if any.
+    pub draft: Option<Draft>,
 }
 
 impl Chat {
@@ -813,6 +885,7 @@ impl Chat {
                 .iter()
                 .map(ChatPosition::from_tdlib)
                 .collect(),
+            draft: chat.draft_message.as_ref().map(Draft::from_tdlib),
         }
     }
 
@@ -1178,6 +1251,53 @@ mod tests {
             chat.last_message.and_then(|m| m.text().map(str::to_owned)),
             Some("last".to_owned())
         );
+    }
+
+    #[test]
+    fn draft_projects_text_and_reply_target_and_round_trips() {
+        let td = TdDraftMessage {
+            reply_to: Some(TdInputMessageReplyTo::Message(InputMessageReplyToMessage {
+                message_id: 99,
+                quote: None,
+                checklist_task_id: 0,
+            })),
+            date: 1_700_000_500,
+            input_message_text: TdInputMessageContent::InputMessageText(InputMessageText {
+                text: TdFormattedTextT {
+                    text: "half-typed".to_owned(),
+                    entities: vec![],
+                },
+                link_preview_options: None,
+                clear_draft: false,
+            }),
+            effect_id: 0,
+            suggested_post_info: None,
+        };
+        let draft = Draft::from_tdlib(&td);
+        assert_eq!(draft.text.text, "half-typed");
+        assert_eq!(draft.reply_to_message_id, Some(99));
+        assert_eq!(draft.date, 1_700_000_500);
+
+        // to_tdlib then back is the identity over the fields the model carries.
+        assert_eq!(Draft::from_tdlib(&draft.to_tdlib()), draft);
+    }
+
+    #[test]
+    fn draft_without_a_reply_and_non_text_content_projects_empty() {
+        // No reply target → None; a non-text draft (unmodeled) → empty text.
+        let td = TdDraftMessage {
+            reply_to: None,
+            date: 0,
+            input_message_text: TdInputMessageContent::InputMessageLocation(
+                tdlib_rs::types::InputMessageLocation::default(),
+            ),
+            effect_id: 0,
+            suggested_post_info: None,
+        };
+        let draft = Draft::from_tdlib(&td);
+        assert_eq!(draft, Draft::default());
+        assert!(draft.text.text.is_empty());
+        assert_eq!(draft.reply_to_message_id, None);
     }
 
     /// A TDLib `User` with every field zeroed but the ones a test cares about.

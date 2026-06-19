@@ -77,7 +77,8 @@ fn classify(update: &Update) -> Route {
         | Update::ChatPosition(_)
         | Update::ChatLastMessage(_)
         | Update::ChatReadInbox(_)
-        | Update::ChatReadOutbox(_) => Route::Chat,
+        | Update::ChatReadOutbox(_)
+        | Update::ChatDraftMessage(_) => Route::Chat,
         Update::NewMessage(_)
         | Update::MessageSendSucceeded(_)
         | Update::MessageSendFailed(_)
@@ -186,6 +187,14 @@ mod tests {
         })
     }
 
+    fn chat_draft_message() -> Update {
+        Update::ChatDraftMessage(tdlib_rs::types::UpdateChatDraftMessage {
+            chat_id: 1,
+            draft_message: None,
+            positions: Vec::new(),
+        })
+    }
+
     fn delete_messages() -> Update {
         Update::DeleteMessages(UpdateDeleteMessages {
             chat_id: 1,
@@ -217,6 +226,18 @@ mod tests {
         router.apply(&chat_last_message());
         let sink = router.sink;
         assert_eq!(sink.chat, 2);
+        assert_eq!(sink.message, 0);
+    }
+
+    #[test]
+    fn draft_updates_route_to_the_chat_reducer_not_the_message_store() {
+        // A synced compose draft is chat state: it must reach the chat reducer
+        // and never the message store, so it is never confused with a sent
+        // message (#38).
+        let mut router = Router::new(SpySink::default());
+        router.apply(&chat_draft_message());
+        let sink = router.sink;
+        assert_eq!(sink.chat, 1);
         assert_eq!(sink.message, 0);
     }
 
