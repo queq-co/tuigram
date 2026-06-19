@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod chats;
 pub mod client;
 pub mod credentials;
+pub mod files;
 pub mod messages;
 pub mod model;
 pub mod router;
@@ -22,12 +23,13 @@ pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };
+pub use files::{DOWNLOAD_PRIORITY, FileRequests, FileStore};
 pub use messages::{
     MessageRequests, MessageStore, NEWEST, SearchPage, SearchResults, load_history,
 };
 pub use model::{
-    Chat, ChatKind, ChatListKind, ChatPosition, Draft, EntityKind, FormattedText, Message,
-    MessageContent, Presence, SendState, Sender, TextEntity, User, UserKind,
+    Chat, ChatKind, ChatListKind, ChatPosition, Draft, EntityKind, File, FileRef, FormattedText,
+    Message, MessageContent, Presence, SendState, Sender, TextEntity, User, UserKind,
 };
 pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};

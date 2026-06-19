@@ -30,6 +30,7 @@ use tokio::task::JoinHandle;
 
 use crate::bridge::Bridge;
 use crate::chats::ChatStore;
+use crate::files::FileStore;
 use crate::messages::MessageStore;
 use crate::model::Message;
 use crate::router::{Router, UpdateSink};
@@ -45,6 +46,7 @@ pub struct AccountState {
     chats: ChatStore,
     messages: MessageStore,
     users: UserStore,
+    files: FileStore,
 }
 
 impl AccountState {
@@ -70,6 +72,14 @@ impl AccountState {
         &self.users
     }
 
+    /// The folded files store, for the facade's read side — the transfer state
+    /// behind a media `FileRef` (e.g.
+    /// `client.read(|s| s.files().get(file_ref.id).is_some_and(File::is_present))`).
+    #[must_use]
+    pub fn files(&self) -> &FileStore {
+        &self.files
+    }
+
     /// Fold a chat-list update into the chat store.
     fn reduce_chat(&mut self, update: &Update) {
         self.chats.reduce(update);
@@ -83,6 +93,11 @@ impl AccountState {
     /// Fold a user update into the users store.
     fn reduce_user(&mut self, update: &Update) {
         self.users.reduce(update);
+    }
+
+    /// Fold a file update into the files store.
+    fn reduce_file(&mut self, update: &Update) {
+        self.files.reduce(update);
     }
 
     /// Merge a fetched history page into the message store. Unlike live messages,
@@ -125,6 +140,12 @@ impl UpdateSink for SharedState {
         self.lock()
             .expect("account state mutex poisoned")
             .reduce_user(update);
+    }
+
+    fn reduce_file(&mut self, update: &Update) {
+        self.lock()
+            .expect("account state mutex poisoned")
+            .reduce_file(update);
     }
 
     fn resync_after_lag(&mut self, skipped: u64) {

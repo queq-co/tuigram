@@ -40,6 +40,10 @@ pub trait UpdateSink {
     /// users store, so senders and private chats resolve to names.
     fn reduce_user(&mut self, update: &Update);
 
+    /// Fold a file update (`updateFile`: download/upload progress, local path)
+    /// into the files store, so media content resolves to transferable bytes.
+    fn reduce_file(&mut self, update: &Update);
+
     /// Recover from a broadcast overflow: `skipped` updates were dropped before
     /// the router caught up, so the folded state may be stale and must be
     /// re-queried. Handling is mandatory — a lag is never silently ignored.
@@ -59,6 +63,8 @@ enum Route {
     Message,
     /// Folded by the users reducer (#35).
     User,
+    /// Folded by the files reducer (#44).
+    File,
     /// Not account content this router folds; dropped here.
     Ignored,
 }
@@ -85,6 +91,7 @@ fn classify(update: &Update) -> Route {
         | Update::MessageContent(_)
         | Update::DeleteMessages(_) => Route::Message,
         Update::User(_) | Update::UserStatus(_) => Route::User,
+        Update::File(_) => Route::File,
         _ => Route::Ignored,
     }
 }
@@ -113,6 +120,7 @@ impl<S: UpdateSink> Router<S> {
             Route::Chat => self.sink.reduce_chat(update),
             Route::Message => self.sink.reduce_message(update),
             Route::User => self.sink.reduce_user(update),
+            Route::File => self.sink.reduce_file(update),
             Route::Ignored => {}
         }
     }
@@ -150,6 +158,7 @@ mod tests {
         chat: u32,
         message: u32,
         user: u32,
+        file: u32,
         lagged: Vec<u64>,
     }
 
@@ -162,6 +171,9 @@ mod tests {
         }
         fn reduce_user(&mut self, _update: &Update) {
             self.user += 1;
+        }
+        fn reduce_file(&mut self, _update: &Update) {
+            self.file += 1;
         }
         fn resync_after_lag(&mut self, skipped: u64) {
             self.lagged.push(skipped);
@@ -208,6 +220,15 @@ mod tests {
         Update::UserStatus(tdlib_rs::types::UpdateUserStatus {
             user_id: 7,
             status: tdlib_rs::enums::UserStatus::Recently(Default::default()),
+        })
+    }
+
+    fn file_update() -> Update {
+        Update::File(tdlib_rs::types::UpdateFile {
+            file: tdlib_rs::types::File {
+                id: 7,
+                ..Default::default()
+            },
         })
     }
 
@@ -261,6 +282,17 @@ mod tests {
     }
 
     #[test]
+    fn file_updates_route_to_the_file_reducer() {
+        let mut router = Router::new(SpySink::default());
+        router.apply(&file_update());
+        let sink = router.sink;
+        assert_eq!(sink.file, 1);
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+        assert_eq!(sink.user, 0);
+    }
+
+    #[test]
     fn unrelated_updates_route_to_no_reducer() {
         let mut router = Router::new(SpySink::default());
         router.apply(&unrelated());
@@ -268,6 +300,7 @@ mod tests {
         assert_eq!(sink.chat, 0);
         assert_eq!(sink.message, 0);
         assert_eq!(sink.user, 0);
+        assert_eq!(sink.file, 0);
     }
 
     #[tokio::test]
