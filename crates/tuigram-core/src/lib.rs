@@ -26,8 +26,8 @@ pub use messages::{
     MessageRequests, MessageStore, NEWEST, SearchPage, SearchResults, load_history,
 };
 pub use model::{
-    Chat, ChatKind, ChatListKind, ChatPosition, EntityKind, FormattedText, Message, MessageContent,
-    Presence, SendState, Sender, TextEntity, User, UserKind,
+    Chat, ChatKind, ChatListKind, ChatPosition, Draft, EntityKind, FormattedText, Message,
+    MessageContent, Presence, SendState, Sender, TextEntity, User, UserKind,
 };
 pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};

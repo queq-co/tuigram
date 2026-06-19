@@ -2,10 +2,12 @@
 //!
 //! TDLib never hands over "the chat list" as a value; it streams a sequence of
 //! updates (`updateNewChat`, `updateChatPosition`, `updateChatLastMessage`,
-//! `updateChatReadInbox`, …) and expects the client to maintain the list itself.
-//! [`ChatStore`] is that maintained state: the single update router folds each
-//! chat-route update into it via [`ChatStore::reduce`], and [`ChatStore::main_list`]
-//! reads back an ordered snapshot for the chat list view.
+//! `updateChatReadInbox`, `updateChatDraftMessage`, …) and expects the client to
+//! maintain the list itself. [`ChatStore`] is that maintained state: the single
+//! update router folds each chat-route update into it via [`ChatStore::reduce`],
+//! and [`ChatStore::main_list`] reads back an ordered snapshot for the chat list
+//! view. A chat's synced compose draft (#38) rides this same family — it is chat
+//! state, surfaced on the [`Chat`] snapshot, never in the message store.
 //!
 //! Folding is **idempotent** — TDLib repeats and reorders updates freely (on
 //! reconnect, on resync, or just because order changed), so re-applying any
@@ -28,7 +30,7 @@ use tdlib_rs::enums::{ChatList, Update};
 use tdlib_rs::types::Error as TdError;
 
 use crate::bridge::Bridge;
-use crate::model::{Chat, ChatPosition, Message};
+use crate::model::{Chat, ChatPosition, Draft, Message};
 
 /// The chat-list request seam — tuigram's chat slice of the
 /// `tdlib_rs::functions` surface, segregated from the auth and message requests
@@ -50,6 +52,19 @@ pub trait ChatRequests {
     /// TDLib answers with error [`CHATS_EXHAUSTED`] (404) — the normal end of
     /// paging, which [`load_main_list`] treats as success.
     async fn load_chats(&self, limit: i32) -> Result<(), TdError>;
+
+    /// Push a compose draft to a chat, or clear it with `None`.
+    ///
+    /// TDLib persists the draft and syncs it across the account's devices, then
+    /// echoes `updateChatDraftMessage`, which [`ChatStore`] folds — so this only
+    /// *writes*; the snapshot updates through the router, the same one-way shape
+    /// as the read-state and send requests. Idempotent: setting the same draft,
+    /// or clearing an absent one, converges.
+    async fn set_chat_draft_message(
+        &self,
+        chat_id: i64,
+        draft: Option<Draft>,
+    ) -> Result<(), TdError>;
 }
 
 impl ChatRequests for Bridge {
@@ -58,6 +73,21 @@ impl ChatRequests for Bridge {
         // than `None` (which TDLib also reads as Main) to keep the intent
         // explicit at the seam.
         tdlib_rs::functions::load_chats(Some(ChatList::Main), limit, self.id()).await
+    }
+
+    async fn set_chat_draft_message(
+        &self,
+        chat_id: i64,
+        draft: Option<Draft>,
+    ) -> Result<(), TdError> {
+        // `topic_id` None: the chat's main draft, not a forum-topic draft.
+        tdlib_rs::functions::set_chat_draft_message(
+            chat_id,
+            None,
+            draft.map(|d| d.to_tdlib()),
+            self.id(),
+        )
+        .await
     }
 }
 
@@ -119,6 +149,11 @@ impl ChatStore {
             Update::ChatReadOutbox(u) => {
                 self.mark_outbox_read(u.chat_id, u.last_read_outbox_message_id);
             }
+            Update::ChatDraftMessage(u) => self.set_draft(
+                u.chat_id,
+                u.draft_message.as_ref().map(Draft::from_tdlib),
+                u.positions.iter().map(ChatPosition::from_tdlib).collect(),
+            ),
             _ => {}
         }
     }
@@ -214,6 +249,22 @@ impl ChatStore {
         }
     }
 
+    /// Fold `updateChatDraftMessage`: set or clear the chat's compose draft, and
+    /// merge any positions it carries (setting a draft floats the chat up the
+    /// list, so TDLib delivers the new positions on the same update). A `None`
+    /// draft clears it. Idempotent — re-applying sets the same draft. Drafts are
+    /// chat state: they land here on the [`Chat`] snapshot and never in the
+    /// message store, so a draft is never confused with a sent message. Unknown
+    /// chats are ignored (TDLib announces a chat before drafting into it).
+    fn set_draft(&mut self, chat_id: i64, draft: Option<Draft>, positions: Vec<ChatPosition>) {
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            chat.draft = draft;
+            for position in positions {
+                merge_position(&mut chat.positions, position);
+            }
+        }
+    }
+
     /// Fold `updateChatReadOutbox`: the peer has read up to this outgoing message,
     /// so the chat's last-read-outbox marker advances. Unlike the inbox side this
     /// carries no unread counter — it only moves the read horizon for our own
@@ -239,11 +290,13 @@ fn merge_position(positions: &mut Vec<ChatPosition>, position: ChatPosition) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use crate::model::FormattedText;
+    use std::cell::{Cell, RefCell};
     use tdlib_rs::enums::{ChatList as TdChatList, ChatType as TdChatType};
     use tdlib_rs::types::{
-        ChatPosition as TdChatPosition, ChatTypePrivate, UpdateChatLastMessage, UpdateChatPosition,
-        UpdateChatReadInbox, UpdateChatReadOutbox, UpdateNewChat,
+        ChatPosition as TdChatPosition, ChatTypePrivate, UpdateChatDraftMessage,
+        UpdateChatLastMessage, UpdateChatPosition, UpdateChatReadInbox, UpdateChatReadOutbox,
+        UpdateNewChat,
     };
 
     /// A TDLib `Chat` with every field zeroed but id/title and an empty position
@@ -326,6 +379,48 @@ mod tests {
         Update::ChatReadOutbox(UpdateChatReadOutbox {
             chat_id,
             last_read_outbox_message_id: last_read,
+        })
+    }
+
+    /// A text-draft update for `chat_id` (replying to `reply_to`, if any), with
+    /// no carried positions.
+    fn draft_message(chat_id: i64, text: &str, reply_to: Option<i64>) -> Update {
+        Update::ChatDraftMessage(UpdateChatDraftMessage {
+            chat_id,
+            draft_message: Some(tdlib_rs::types::DraftMessage {
+                reply_to: reply_to.map(|message_id| {
+                    tdlib_rs::enums::InputMessageReplyTo::Message(
+                        tdlib_rs::types::InputMessageReplyToMessage {
+                            message_id,
+                            quote: None,
+                            checklist_task_id: 0,
+                        },
+                    )
+                }),
+                date: 1_700_000_000,
+                input_message_text: tdlib_rs::enums::InputMessageContent::InputMessageText(
+                    tdlib_rs::types::InputMessageText {
+                        text: tdlib_rs::types::FormattedText {
+                            text: text.to_owned(),
+                            entities: vec![],
+                        },
+                        link_preview_options: None,
+                        clear_draft: false,
+                    },
+                ),
+                effect_id: 0,
+                suggested_post_info: None,
+            }),
+            positions: vec![],
+        })
+    }
+
+    /// A draft-cleared update (`draft_message: None`) for `chat_id`.
+    fn clear_draft(chat_id: i64) -> Update {
+        Update::ChatDraftMessage(UpdateChatDraftMessage {
+            chat_id,
+            draft_message: None,
+            positions: vec![],
         })
     }
 
@@ -428,6 +523,67 @@ mod tests {
     }
 
     #[test]
+    fn draft_set_update_and_clear_fold_onto_the_chat_snapshot() {
+        let mut store = seeded();
+        assert!(store.get(10).unwrap().draft.is_none());
+
+        // Set a draft replying to a message.
+        store.reduce(&draft_message(10, "half-typed", Some(99)));
+        let draft = store.get(10).unwrap().draft.clone().unwrap();
+        assert_eq!(draft.text.text, "half-typed");
+        assert_eq!(draft.reply_to_message_id, Some(99));
+
+        // Update it (more typed, reply target dropped) — the draft is replaced.
+        store.reduce(&draft_message(10, "half-typed more", None));
+        let draft = store.get(10).unwrap().draft.clone().unwrap();
+        assert_eq!(draft.text.text, "half-typed more");
+        assert_eq!(draft.reply_to_message_id, None);
+
+        // Clearing (draft_message: None) removes it.
+        store.reduce(&clear_draft(10));
+        assert!(store.get(10).unwrap().draft.is_none());
+    }
+
+    #[test]
+    fn reapplying_a_draft_is_idempotent() {
+        let mut store = seeded();
+        store.reduce(&draft_message(10, "hi", None));
+        let first = store.get(10).unwrap().draft.clone();
+
+        // The identical update converges rather than mutating the draft.
+        store.reduce(&draft_message(10, "hi", None));
+        assert_eq!(store.get(10).unwrap().draft, first);
+
+        // A redundant clear on an already-absent draft is a no-op, not a panic.
+        store.reduce(&clear_draft(20));
+        assert!(store.get(20).unwrap().draft.is_none());
+    }
+
+    #[test]
+    fn draft_for_unknown_chat_is_ignored() {
+        let mut store = ChatStore::new();
+        store.reduce(&draft_message(999, "ghost", None));
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn draft_update_merges_its_positions() {
+        let mut store = seeded();
+        // A draft that also carries a Main position floats the chat into the list.
+        store.reduce(&Update::ChatDraftMessage(UpdateChatDraftMessage {
+            chat_id: 10,
+            draft_message: None,
+            positions: vec![TdChatPosition {
+                list: TdChatList::Main,
+                order: 50,
+                is_pinned: false,
+                source: None,
+            }],
+        }));
+        assert_eq!(ids(&store.main_list()), vec![10]);
+    }
+
+    #[test]
     fn last_message_update_merges_its_positions() {
         let mut store = seeded();
         store.reduce(&Update::ChatLastMessage(UpdateChatLastMessage {
@@ -512,6 +668,14 @@ mod tests {
                 })
             }
         }
+
+        async fn set_chat_draft_message(
+            &self,
+            _chat_id: i64,
+            _draft: Option<Draft>,
+        ) -> Result<(), TdError> {
+            unimplemented!("PagingSpy exercises load paging, not drafts")
+        }
     }
 
     #[tokio::test]
@@ -532,11 +696,83 @@ mod tests {
                 message: "FLOOD_WAIT".to_owned(),
             })
         }
+
+        async fn set_chat_draft_message(
+            &self,
+            _chat_id: i64,
+            _draft: Option<Draft>,
+        ) -> Result<(), TdError> {
+            unimplemented!("FailingSpy exercises load paging, not drafts")
+        }
     }
 
     #[tokio::test]
     async fn paging_propagates_a_real_error() {
         let err = load_main_list(&FailingSpy, 20).await.unwrap_err();
         assert_eq!(err.code, 420);
+    }
+
+    /// One recorded `set_chat_draft_message` call: the chat and the draft pushed
+    /// (`None` for a clear).
+    #[derive(Debug, PartialEq, Eq)]
+    struct DraftCall {
+        chat_id: i64,
+        draft: Option<Draft>,
+    }
+
+    /// A spy `ChatRequests` that records every draft push/clear it is asked to
+    /// make, so a test asserts what threaded through the seam.
+    struct DraftSpy {
+        calls: RefCell<Vec<DraftCall>>,
+    }
+
+    impl ChatRequests for DraftSpy {
+        async fn load_chats(&self, _limit: i32) -> Result<(), TdError> {
+            unimplemented!("DraftSpy exercises drafts, not load paging")
+        }
+
+        async fn set_chat_draft_message(
+            &self,
+            chat_id: i64,
+            draft: Option<Draft>,
+        ) -> Result<(), TdError> {
+            self.calls.borrow_mut().push(DraftCall { chat_id, draft });
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn setting_and_clearing_a_draft_threads_through_the_seam() {
+        let spy = DraftSpy {
+            calls: RefCell::new(Vec::new()),
+        };
+
+        let draft = Draft {
+            text: FormattedText {
+                text: "wip".to_owned(),
+                entities: vec![],
+            },
+            reply_to_message_id: Some(42),
+            date: 0,
+        };
+        spy.set_chat_draft_message(10, Some(draft.clone()))
+            .await
+            .unwrap();
+        // Clearing is the same request with `None`.
+        spy.set_chat_draft_message(10, None).await.unwrap();
+
+        assert_eq!(
+            *spy.calls.borrow(),
+            vec![
+                DraftCall {
+                    chat_id: 10,
+                    draft: Some(draft),
+                },
+                DraftCall {
+                    chat_id: 10,
+                    draft: None,
+                },
+            ]
+        );
     }
 }
