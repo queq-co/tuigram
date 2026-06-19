@@ -115,6 +115,28 @@ pub trait MessageRequests {
     /// asynchronously as `updateChatReadInbox`, folded by the chat store. An empty
     /// `message_ids` is a no-op at the seam.
     async fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) -> Result<(), TdError>;
+
+    /// Forward `message_ids` from `from_chat_id` into `to_chat_id`.
+    ///
+    /// `send_copy` forwards the messages as a fresh copy — no "forwarded from"
+    /// attribution, the messages appear as if newly sent; with it false they carry
+    /// the usual forward header naming the original sender. `remove_caption` drops
+    /// any caption when copying (only meaningful with `send_copy`).
+    ///
+    /// Returns the messages TDLib creates **optimistically** in the target chat —
+    /// temporary ids, [`SendState::Pending`] — exactly like
+    /// [`send_text`](Self::send_text). TDLib also streams each as
+    /// `updateNewMessage`, so the store gains them through the router on the same
+    /// lifecycle path as a normal send; these returned copies are for the caller's
+    /// reference, not a second insert.
+    async fn forward_messages(
+        &self,
+        from_chat_id: i64,
+        message_ids: Vec<i64>,
+        to_chat_id: i64,
+        send_copy: bool,
+        remove_caption: bool,
+    ) -> Result<Vec<Message>, TdError>;
 }
 
 impl MessageRequests for Bridge {
@@ -210,6 +232,37 @@ impl MessageRequests for Bridge {
             self.id(),
         )
         .await
+    }
+
+    async fn forward_messages(
+        &self,
+        from_chat_id: i64,
+        message_ids: Vec<i64>,
+        to_chat_id: i64,
+        send_copy: bool,
+        remove_caption: bool,
+    ) -> Result<Vec<Message>, TdError> {
+        // topic_id/options default; TDLib returns the optimistic forwarded
+        // messages and also streams each as updateNewMessage, so the store gains
+        // them via the router — these returned copies carry the temp ids for the
+        // caller, not a second insert. `remove_caption` only bites with `send_copy`.
+        let Messages::Messages(forwarded) = tdlib_rs::functions::forward_messages(
+            to_chat_id,
+            None,
+            from_chat_id,
+            message_ids,
+            None,
+            send_copy,
+            remove_caption,
+            self.id(),
+        )
+        .await?;
+        Ok(forwarded
+            .messages
+            .into_iter()
+            .flatten()
+            .map(|m| Message::from_tdlib(&m))
+            .collect())
     }
 }
 
@@ -752,6 +805,17 @@ mod tests {
         ) -> Result<(), TdError> {
             unimplemented!("SendSpy exercises the send path only")
         }
+
+        async fn forward_messages(
+            &self,
+            _from_chat_id: i64,
+            _message_ids: Vec<i64>,
+            _to_chat_id: i64,
+            _send_copy: bool,
+            _remove_caption: bool,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
     }
 
     #[tokio::test]
@@ -833,6 +897,17 @@ mod tests {
         ) -> Result<(), TdError> {
             unimplemented!("HistorySpy exercises history paging only")
         }
+
+        async fn forward_messages(
+            &self,
+            _from_chat_id: i64,
+            _message_ids: Vec<i64>,
+            _to_chat_id: i64,
+            _send_copy: bool,
+            _remove_caption: bool,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
     }
 
     #[tokio::test]
@@ -900,6 +975,17 @@ mod tests {
             _chat_id: i64,
             _message_ids: Vec<i64>,
         ) -> Result<(), TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+
+        async fn forward_messages(
+            &self,
+            _from_chat_id: i64,
+            _message_ids: Vec<i64>,
+            _to_chat_id: i64,
+            _send_copy: bool,
+            _remove_caption: bool,
+        ) -> Result<Vec<Message>, TdError> {
             unimplemented!("FailingSpy exercises the history error path only")
         }
     }
@@ -973,6 +1059,17 @@ mod tests {
             _chat_id: i64,
             _message_ids: Vec<i64>,
         ) -> Result<(), TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+
+        async fn forward_messages(
+            &self,
+            _from_chat_id: i64,
+            _message_ids: Vec<i64>,
+            _to_chat_id: i64,
+            _send_copy: bool,
+            _remove_caption: bool,
+        ) -> Result<Vec<Message>, TdError> {
             unimplemented!("EditDeleteSpy exercises edit/delete only")
         }
     }
@@ -1051,6 +1148,17 @@ mod tests {
             self.viewed.borrow_mut().replace((chat_id, message_ids));
             Ok(())
         }
+
+        async fn forward_messages(
+            &self,
+            _from_chat_id: i64,
+            _message_ids: Vec<i64>,
+            _to_chat_id: i64,
+            _send_copy: bool,
+            _remove_caption: bool,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
     }
 
     #[tokio::test]
@@ -1058,5 +1166,151 @@ mod tests {
         let spy = ViewSpy::default();
         spy.view_messages(10, vec![1, 2, 3]).await.unwrap();
         assert_eq!(*spy.viewed.borrow(), Some((10, vec![1, 2, 3])));
+    }
+
+    /// A forward as TDLib emits it: the same messages re-appear in the target chat
+    /// under fresh temp ids and Pending state.
+    fn forwarded_pending(target_chat: i64, temp_id: i64) -> Update {
+        pending_message(target_chat, temp_id)
+    }
+
+    /// The arguments of a `forward_messages` call, captured for assertion.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ForwardCall {
+        from_chat_id: i64,
+        message_ids: Vec<i64>,
+        to_chat_id: i64,
+        send_copy: bool,
+        remove_caption: bool,
+    }
+
+    /// Captures the most recent `forward_messages` arguments and echoes back the
+    /// optimistic Pending messages TDLib would create in the target chat.
+    #[derive(Default)]
+    struct ForwardSpy {
+        last: RefCell<Option<ForwardCall>>,
+    }
+
+    impl MessageRequests for ForwardSpy {
+        async fn get_chat_history(
+            &self,
+            _chat_id: i64,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn send_text(
+            &self,
+            _chat_id: i64,
+            _reply_to: Option<i64>,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn edit_text(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn delete(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+            _revoke: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn view_messages(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+        ) -> Result<(), TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn forward_messages(
+            &self,
+            from_chat_id: i64,
+            message_ids: Vec<i64>,
+            to_chat_id: i64,
+            send_copy: bool,
+            remove_caption: bool,
+        ) -> Result<Vec<Message>, TdError> {
+            self.last.borrow_mut().replace(ForwardCall {
+                from_chat_id,
+                message_ids: message_ids.clone(),
+                to_chat_id,
+                send_copy,
+                remove_caption,
+            });
+            // One optimistic forwarded message per source id, under a fresh temp id
+            // in the target chat — the contract send_text also honours.
+            Ok(message_ids
+                .iter()
+                .enumerate()
+                .map(|(i, _)| {
+                    Message::from_tdlib(&td_message_state(
+                        to_chat_id,
+                        2001 + i as i64,
+                        Some(MessageSendingState::Pending(
+                            MessageSendingStatePending::default(),
+                        )),
+                    ))
+                })
+                .collect())
+        }
+    }
+
+    #[tokio::test]
+    async fn forward_threads_source_target_and_copy_options() {
+        let spy = ForwardSpy::default();
+        // Forward two messages from chat 10 into chat 20, as a copy without caption.
+        let optimistic = spy
+            .forward_messages(10, vec![1, 2], 20, true, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *spy.last.borrow(),
+            Some(ForwardCall {
+                from_chat_id: 10,
+                message_ids: vec![1, 2],
+                to_chat_id: 20,
+                send_copy: true,
+                remove_caption: true,
+            })
+        );
+        // The caller gets one optimistic Pending message per forwarded id.
+        assert_eq!(optimistic.len(), 2);
+        assert!(
+            optimistic
+                .iter()
+                .all(|m| m.send_state == SendState::Pending && m.chat_id == 20)
+        );
+    }
+
+    #[test]
+    fn forwarded_messages_land_in_the_target_store_via_new_message() {
+        let mut store = MessageStore::new();
+        // The source chat already holds the originals.
+        store.merge([msg(10, 1), msg(10, 2)]);
+
+        // The router folds each forwarded message as a normal updateNewMessage into
+        // the target chat — the same lifecycle path as a fresh send.
+        store.reduce(&forwarded_pending(20, 2001));
+        store.reduce(&forwarded_pending(20, 2002));
+
+        assert_eq!(ids(&store.history(20)), vec![2001, 2002]);
+        assert_eq!(store.get(20, 2001).unwrap().send_state, SendState::Pending);
+        // The source chat is untouched by the forward.
+        assert_eq!(ids(&store.history(10)), vec![1, 2]);
     }
 }
