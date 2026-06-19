@@ -1,7 +1,8 @@
 # Architecture
 
 > Living document. The Phase 1 open decisions are now resolved (see below) and
-> implemented across Phase 2; later phases extend rather than revisit them.
+> implemented across Phase 2; Phase 3 builds the headless core client on top of
+> them. Later phases extend rather than revisit these decisions.
 
 ## Goals
 
@@ -64,3 +65,29 @@ The Phase 1 research closed every open decision below; each is now implemented i
 
 The Phase 2 login that ties these together is documented in
 [login-flow.md](login-flow.md), including the session-protection threat model.
+
+## Resolved decisions (Phase 3 — headless core client)
+
+Phase 3 builds the headless client surface (list chats/messages, send, reply,
+edit, delete, read state, drafts) on the Phase 2 bridge. Two decisions shape it;
+[headless-client.md](headless-client.md) holds the full reasoning.
+
+- **One `Client` facade + a single update router.** TDLib pushes account content
+  as a `broadcast` firehose of updates. Rather than have each subsystem subscribe
+  and clone the whole stream, a single long-lived router task — the **only**
+  always-on subscriber — drains it once, classifies each update, and dispatches it
+  O(1) to the owning domain's reducer behind an `UpdateSink` seam. One update
+  clone, one auditable data path for account content, and O(1) growth as domains
+  are added. The router holds no business logic (classification only), so each
+  reducer stays independently unit-testable with synthetic updates, and a
+  broadcast `Lagged` is resynced rather than silently dropped. The
+  [`Client`](../crates/tuigram-core/src/client.rs) facade owns that router and the
+  folded state so the app holds one handle.
+- **A headless model + per-domain request seams.** The crate depends on its own
+  [`model`](../crates/tuigram-core/src/model.rs) types (`Chat`, `Message`,
+  `Draft`, …), projected from `tdlib_rs` shapes — the same insulation `AuthState`
+  gave Phase 2, with content mapping kept **total** (`Unsupported(name)` for
+  anything unmodeled). Each domain owns its slice of the request surface as its
+  own trait (`ChatRequests`/`MessageRequests`/`UserRequests`), segregated exactly
+  as `AuthRequests` was, so the [bridge](../crates/tuigram-core/src/bridge.rs)
+  stays pure transport.

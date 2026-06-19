@@ -9,6 +9,9 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
 - [architecture.md](architecture.md) — high-level design and the workspace layout.
 - [login-flow.md](login-flow.md) — Phase 2 secure login: state machine, credential
   resolution, session storage + key, threat model.
+- [headless-client.md](headless-client.md) — Phase 3 core client: the `Client`
+  facade + single update router, the headless model, per-domain folding (chats,
+  messages, users), the send lifecycle, read state, and drafts.
 - [branch-model.md](branch-model.md) — how we use `develop` → PR → `main`.
 - Research (Phase 1):
   - [research/ratatui.md](research/ratatui.md) — how Ratatui works and how we'll use it.
@@ -23,6 +26,6 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
 | 0 | Bootstrap & GitHub integration | Repo access, toolchain, branch model — **done** |
 | 1 | State of the art & security research | Ratatui, TDLib, app registration |
 | 2 | Secure login | Authenticate as a user via TDLib |
-| 3 | Core client features (headless) | List chats/messages, send, reply |
+| 3 | Core client features (headless) | List chats/messages, send, reply — **done** |
 | 4 | TUI | Ratatui interface |
 | 5 | Wire Telegram ↔ TUI (MVP) | Render & interact over real data |
