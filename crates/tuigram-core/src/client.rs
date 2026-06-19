@@ -33,6 +33,7 @@ use crate::chats::ChatStore;
 use crate::messages::MessageStore;
 use crate::model::Message;
 use crate::router::{Router, UpdateSink};
+use crate::users::UserStore;
 
 /// The account content the router folds updates into: the chat list (#17) and
 /// per-chat messages (#18).
@@ -43,6 +44,7 @@ use crate::router::{Router, UpdateSink};
 pub struct AccountState {
     chats: ChatStore,
     messages: MessageStore,
+    users: UserStore,
 }
 
 impl AccountState {
@@ -60,6 +62,14 @@ impl AccountState {
         &self.messages
     }
 
+    /// The folded users store, for the facade's read side — the join that turns
+    /// the bare ids on senders and private chats into names (e.g.
+    /// `client.read(|s| s.users().display_name(user_id))`).
+    #[must_use]
+    pub fn users(&self) -> &UserStore {
+        &self.users
+    }
+
     /// Fold a chat-list update into the chat store.
     fn reduce_chat(&mut self, update: &Update) {
         self.chats.reduce(update);
@@ -68,6 +78,11 @@ impl AccountState {
     /// Fold a message update into the message store.
     fn reduce_message(&mut self, update: &Update) {
         self.messages.reduce(update);
+    }
+
+    /// Fold a user update into the users store.
+    fn reduce_user(&mut self, update: &Update) {
+        self.users.reduce(update);
     }
 
     /// Merge a fetched history page into the message store. Unlike live messages,
@@ -104,6 +119,12 @@ impl UpdateSink for SharedState {
         self.lock()
             .expect("account state mutex poisoned")
             .reduce_message(update);
+    }
+
+    fn reduce_user(&mut self, update: &Update) {
+        self.lock()
+            .expect("account state mutex poisoned")
+            .reduce_user(update);
     }
 
     fn resync_after_lag(&mut self, skipped: u64) {

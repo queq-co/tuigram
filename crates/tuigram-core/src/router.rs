@@ -36,6 +36,10 @@ pub trait UpdateSink {
     /// deletion) into the per-chat message store.
     fn reduce_message(&mut self, update: &Update);
 
+    /// Fold a user update (new/changed user record, presence change) into the
+    /// users store, so senders and private chats resolve to names.
+    fn reduce_user(&mut self, update: &Update);
+
     /// Recover from a broadcast overflow: `skipped` updates were dropped before
     /// the router caught up, so the folded state may be stale and must be
     /// re-queried. Handling is mandatory — a lag is never silently ignored.
@@ -53,6 +57,8 @@ enum Route {
     Chat,
     /// Folded by the per-chat message reducer (#18).
     Message,
+    /// Folded by the users reducer (#35).
+    User,
     /// Not account content this router folds; dropped here.
     Ignored,
 }
@@ -77,6 +83,7 @@ fn classify(update: &Update) -> Route {
         | Update::MessageSendFailed(_)
         | Update::MessageContent(_)
         | Update::DeleteMessages(_) => Route::Message,
+        Update::User(_) | Update::UserStatus(_) => Route::User,
         _ => Route::Ignored,
     }
 }
@@ -104,6 +111,7 @@ impl<S: UpdateSink> Router<S> {
         match classify(update) {
             Route::Chat => self.sink.reduce_chat(update),
             Route::Message => self.sink.reduce_message(update),
+            Route::User => self.sink.reduce_user(update),
             Route::Ignored => {}
         }
     }
@@ -140,6 +148,7 @@ mod tests {
     struct SpySink {
         chat: u32,
         message: u32,
+        user: u32,
         lagged: Vec<u64>,
     }
 
@@ -149,6 +158,9 @@ mod tests {
         }
         fn reduce_message(&mut self, _update: &Update) {
             self.message += 1;
+        }
+        fn reduce_user(&mut self, _update: &Update) {
+            self.user += 1;
         }
         fn resync_after_lag(&mut self, skipped: u64) {
             self.lagged.push(skipped);
@@ -183,6 +195,13 @@ mod tests {
         })
     }
 
+    fn user_status() -> Update {
+        Update::UserStatus(tdlib_rs::types::UpdateUserStatus {
+            user_id: 7,
+            status: tdlib_rs::enums::UserStatus::Recently(Default::default()),
+        })
+    }
+
     /// An update the router does not fold, to prove the `Ignored` arm dispatches
     /// to neither reducer.
     fn unrelated() -> Update {
@@ -211,12 +230,23 @@ mod tests {
     }
 
     #[test]
+    fn user_updates_route_to_the_user_reducer() {
+        let mut router = Router::new(SpySink::default());
+        router.apply(&user_status());
+        let sink = router.sink;
+        assert_eq!(sink.user, 1);
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+    }
+
+    #[test]
     fn unrelated_updates_route_to_no_reducer() {
         let mut router = Router::new(SpySink::default());
         router.apply(&unrelated());
         let sink = router.sink;
         assert_eq!(sink.chat, 0);
         assert_eq!(sink.message, 0);
+        assert_eq!(sink.user, 0);
     }
 
     #[tokio::test]
