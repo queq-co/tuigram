@@ -6,15 +6,32 @@
 
 pub mod auth;
 pub mod bridge;
+pub mod chats;
+pub mod client;
 pub mod credentials;
+pub mod messages;
+pub mod model;
+pub mod router;
 pub mod session;
+pub mod users;
 
-pub use auth::{AuthState, Login};
-pub use bridge::{Bridge, ClientParameters, TgClient, UpdateStream};
+pub use auth::{AuthRequests, AuthState, Login};
+pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
+pub use chats::{CHATS_EXHAUSTED, ChatRequests, ChatStore, load_main_list};
+pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };
+pub use messages::{
+    MessageRequests, MessageStore, NEWEST, SearchPage, SearchResults, load_history,
+};
+pub use model::{
+    Chat, ChatKind, ChatListKind, ChatPosition, Draft, EntityKind, FormattedText, Message,
+    MessageContent, Presence, SendState, Sender, TextEntity, User, UserKind,
+};
+pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
+pub use users::{UserRequests, UserStore};
 
 /// TDLib's typed request API and data model, re-exported so callers depend on
 /// it through tuigram-core rather than reaching for `tdlib-rs` directly. Drive
