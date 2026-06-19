@@ -450,8 +450,47 @@ fn format_message(m: &Message) -> String {
         SendState::Pending => " [sending…]",
         SendState::Failed { .. } => " [failed]",
     };
+    // Append a media caption inline when there is one, so a photo/video with a
+    // caption reads as `<photo 1280x720> nice view` rather than dropping the text.
+    let caption = |c: &FormattedText| {
+        if c.text.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", c.text)
+        }
+    };
     let body = match &m.content {
         MessageContent::Text(t) => t.text.clone(),
+        MessageContent::Photo(p) => {
+            format!("<photo {}x{}>{}", p.width, p.height, caption(&p.caption))
+        }
+        MessageContent::Video(v) => format!(
+            "<video {}x{} {}s>{}",
+            v.width,
+            v.height,
+            v.duration,
+            caption(&v.caption)
+        ),
+        MessageContent::Document(d) => {
+            format!("<document {}>{}", d.file_name, caption(&d.caption))
+        }
+        MessageContent::Audio(a) => {
+            format!(
+                "<audio {} — {}>{}",
+                a.performer,
+                a.title,
+                caption(&a.caption)
+            )
+        }
+        MessageContent::Voice(v) => format!("<voice {}s>{}", v.duration, caption(&v.caption)),
+        MessageContent::Sticker(s) => format!("<sticker {} {}x{}>", s.emoji, s.width, s.height),
+        MessageContent::Animation(a) => format!(
+            "<animation {}x{} {}s>{}",
+            a.width,
+            a.height,
+            a.duration,
+            caption(&a.caption)
+        ),
         MessageContent::Unsupported(name) => format!("<{name}>"),
     };
     format!("  [{}] {who}{state}: {body}", m.id)

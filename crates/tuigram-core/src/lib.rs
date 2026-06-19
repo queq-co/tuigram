@@ -28,8 +28,9 @@ pub use messages::{
     MessageRequests, MessageStore, NEWEST, SearchPage, SearchResults, load_history,
 };
 pub use model::{
-    Chat, ChatKind, ChatListKind, ChatPosition, Draft, EntityKind, File, FileRef, FormattedText,
-    Message, MessageContent, Presence, SendState, Sender, TextEntity, User, UserKind,
+    Animation, Audio, Chat, ChatKind, ChatListKind, ChatPosition, Document, Draft, EntityKind,
+    File, FileRef, FormattedText, Message, MessageContent, Photo, Presence, SendState, Sender,
+    Sticker, TextEntity, User, UserKind, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
