@@ -16,18 +16,22 @@ name = "tuigram"
 path = "src/main.rs"
 
 [features]
-# Manual, interactive login harness (#9; examples/login.rs). Off by default so it
-# is excluded from the product binary and from default CI — it needs a real
-# account and a TTY. Run it with:
-#   cargo run -p tuigram --example login --features login-harness
+# Manual, interactive headless harness (#9, #22; examples/repl.rs). Off by default
+# so it is excluded from the product binary and from default CI — it needs a real
+# account and a TTY. It logs in and then drops into a stdin REPL that drives the
+# Phase 3 client surface (list chats, open a chat, send/reply/edit/delete/read).
+# Run it with:
+#   cargo run -p tuigram --example repl --features login-harness
 login-harness = ["dep:tokio", "dep:tokio-stream"]
 
 [[example]]
-name = "login"
+name = "repl"
 required-features = ["login-harness"]
 
 [dependencies]
 tuigram-core = { path = "../tuigram-core" }
-# Async runtime + update-stream adapter, used only by the login harness example.
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros"] }
+# Async runtime + update-stream adapter, used only by the headless harness
+# example. `time` paces a brief settle after async loads so the router's folded
+# snapshot is current before the REPL reads it back.
+tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "time"] }
 tokio-stream = { workspace = true, optional = true }
