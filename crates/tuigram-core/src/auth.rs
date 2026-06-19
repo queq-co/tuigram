@@ -66,6 +66,15 @@ pub trait AuthRequests {
     /// The password is moved straight into the TDLib request and never retained
     /// (see the threat model).
     async fn check_authentication_password(&self, password: String) -> Result<(), TdError>;
+
+    /// Log out of the current account.
+    ///
+    /// TDLib invalidates the session server-side and wipes its local database,
+    /// then drives authorization back through `Closed` to `WaitPhoneNumber`, so a
+    /// fresh login can follow. Carries no credential payload, and leaves the app's
+    /// `api_id`/`api_hash` and the storage encryption key untouched — those are
+    /// reused for the next login, not part of the account session.
+    async fn log_out(&self) -> Result<(), TdError>;
 }
 
 impl AuthRequests for Bridge {
@@ -109,6 +118,10 @@ impl AuthRequests for Bridge {
 
     async fn check_authentication_password(&self, password: String) -> Result<(), TdError> {
         tdlib_rs::functions::check_authentication_password(password, self.id()).await
+    }
+
+    async fn log_out(&self) -> Result<(), TdError> {
+        tdlib_rs::functions::log_out(self.id()).await
     }
 }
 
@@ -379,6 +392,10 @@ mod tests {
                 .push("check_authentication_password(<redacted>)".to_owned());
             Ok(())
         }
+        async fn log_out(&self) -> Result<(), TdError> {
+            self.calls.borrow_mut().push("log_out()".to_owned());
+            Ok(())
+        }
     }
 
     fn params() -> ClientParameters {
@@ -447,6 +464,16 @@ mod tests {
                 "check_authentication_password(<redacted>)".to_owned(),
             ]
         );
+    }
+
+    /// Logout threads through the auth request seam — the one call, no
+    /// credential payload — so a driver can end a session over `C: AuthRequests`
+    /// with no network and no live `tdjson`.
+    #[tokio::test]
+    async fn log_out_threads_through_the_seam() {
+        let client = SpyClient::default();
+        client.log_out().await.unwrap();
+        assert_eq!(client.calls(), vec!["log_out()".to_owned()]);
     }
 
     /// A login without 2FA skips `WaitPassword` entirely.

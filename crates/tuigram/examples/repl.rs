@@ -16,9 +16,13 @@
 //! ([`tuigram_core::Login`]) — to log in, then hands the authenticated bridge to
 //! the [`tuigram_core::Client`] facade and drops into a stdin REPL. The REPL
 //! exercises the Phase 3 surface: list chats, open a chat (load + view history),
-//! send, reply, edit, delete, and mark read. Reads come from the facade's folded
-//! snapshot (kept current by its single update router); writes go over the
-//! bridge's per-domain request traits.
+//! send, reply, edit, delete, mark read, and log out. Reads come from the
+//! facade's folded snapshot (kept current by its single update router); writes go
+//! over the bridge's per-domain request traits.
+//!
+//! `logout` invalidates the account session and wipes TDLib's local database, so
+//! the next run starts at a fresh login rather than resuming the persisted
+//! session — the inverse of the login the harness opens with.
 //!
 //! Secrets are handled the same way the library does: the login code and the 2FA
 //! password are read, moved straight into their TDLib request, and never logged
@@ -266,6 +270,11 @@ async fn run_repl(client: &Client) -> Fallible {
                 Ok(chat_id) => mark_read(client, chat_id).await,
                 Err(e) => println!("{e}"),
             },
+            "logout" => {
+                if logout(client).await == Flow::Done {
+                    return Ok(());
+                }
+            }
             other => println!("Unknown command: {other:?}. Type `help`."),
         }
     }
@@ -395,6 +404,35 @@ async fn mark_read(client: &Client, chat_id: i64) {
     }
 }
 
+/// Log out: invalidate the session, wait for TDLib to clear it, then end the
+/// REPL so the next run starts at a fresh login. A failed request stays in the
+/// REPL ([`Flow::Continue`]); a successful one exits ([`Flow::Done`]).
+async fn logout(client: &Client) -> Flow {
+    println!("Logging out…");
+    if let Err(e) = client.bridge().log_out().await {
+        println!("Logout failed: {} {}", e.code, e.message);
+        return Flow::Continue;
+    }
+    wait_until_logged_out(client.bridge()).await;
+    println!("Logged out. The local session has been cleared — re-run to sign in again.");
+    Flow::Done
+}
+
+/// After `log_out`, wait for TDLib to leave `Ready`. `logOut` clears the session
+/// asynchronously (`Ready` -> `LoggingOut` -> `WaitPhoneNumber`), and we want
+/// that to have taken effect before the process exits. Bounded (~5s) so a stuck
+/// logout cannot hang the harness.
+async fn wait_until_logged_out(bridge: &Bridge) {
+    for _ in 0..50 {
+        match bridge.authorization_state().await {
+            Ok(state) if AuthState::from_tdlib(&state) == AuthState::Ready => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            _ => return,
+        }
+    }
+}
+
 /// Render one message for display: id, sender, send state, and its body. A
 /// non-text message shows its TDLib content type in angle brackets rather than
 /// any payload.
@@ -496,6 +534,7 @@ fn print_help() {
          \x20 edit <chat> <msg> <text>           edit one of your messages\n\
          \x20 delete <chat> <msg> [all]          delete a message (all = for everyone)\n\
          \x20 read <chat>                        mark a chat's known messages read\n\
+         \x20 logout                             end the session and exit (next run logs in fresh)\n\
          \x20 help                               show this help\n\
          \x20 quit                               exit (Ctrl-D also works)"
     );
