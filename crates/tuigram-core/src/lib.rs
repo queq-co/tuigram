@@ -22,7 +22,9 @@ pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };
-pub use messages::{MessageRequests, MessageStore, NEWEST, load_history};
+pub use messages::{
+    MessageRequests, MessageStore, NEWEST, SearchPage, SearchResults, load_history,
+};
 pub use model::{
     Chat, ChatKind, ChatListKind, ChatPosition, EntityKind, FormattedText, Message, MessageContent,
     Presence, SendState, Sender, TextEntity, User, UserKind,

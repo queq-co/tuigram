@@ -22,7 +22,8 @@ use tdlib_rs::enums::{
 };
 use tdlib_rs::types::{
     Chat as TdChat, ChatPosition as TdChatPosition, FormattedText as TdFormattedText,
-    Message as TdMessage, TextEntity as TdTextEntity, User as TdUser,
+    Message as TdMessage, MessageSenderChat as TdMessageSenderChat,
+    MessageSenderUser as TdMessageSenderUser, TextEntity as TdTextEntity, User as TdUser,
 };
 
 /// Who sent a message.
@@ -41,6 +42,17 @@ impl Sender {
         match sender {
             TdMessageSender::User(u) => Self::User(u.user_id),
             TdMessageSender::Chat(c) => Self::Chat(c.chat_id),
+        }
+    }
+
+    /// Lower back to TDLib's `MessageSender`, for requests that filter by sender
+    /// (e.g. searching a chat for one person's messages). The inverse of
+    /// [`from_tdlib`](Self::from_tdlib).
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdMessageSender {
+        match self {
+            Self::User(id) => TdMessageSender::User(TdMessageSenderUser { user_id: *id }),
+            Self::Chat(id) => TdMessageSender::Chat(TdMessageSenderChat { chat_id: *id }),
         }
     }
 }

@@ -39,18 +39,30 @@
 //! never blocks the read path; the resulting unread-count change arrives as
 //! `updateChatReadInbox`, which the [chat store](crate::chats::ChatStore) folds.
 //!
+//! Search (#37): [`MessageRequests::search_chat_messages`] looks within one chat
+//! and [`MessageRequests::search_messages`] across the whole account. Both return
+//! normalized hits with a paging cursor as a [`SearchPage`], and the caller
+//! collects them into a [`SearchResults`] — a transient, id-deduplicated view
+//! that never folds into [`MessageStore`], so a search leaves loaded history
+//! untouched.
+//!
 //! Scope: history paging, live `updateNewMessage`, sending text + reply with its
 //! lifecycle (#19), editing and deleting with their updates (#20), marking
-//! messages read (#21), and the snapshot.
+//! messages read (#21), forwarding (#36), in-chat and global search (#37), and
+//! the snapshot.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 
-use tdlib_rs::enums::{InputMessageContent, InputMessageReplyTo, MessageSource, Messages, Update};
+use tdlib_rs::enums::{
+    FoundChatMessages, FoundMessages, InputMessageContent, InputMessageReplyTo, MessageSource,
+    Messages, Update,
+};
 use tdlib_rs::types::{Error as TdError, InputMessageReplyToMessage, InputMessageText};
 
 use crate::bridge::Bridge;
-use crate::model::{FormattedText, Message, MessageContent, SendState};
+use crate::model::{FormattedText, Message, MessageContent, SendState, Sender};
 
 /// The message-history request seam — tuigram's message slice of the
 /// `tdlib_rs::functions` surface, segregated from the auth and chat requests so
@@ -137,6 +149,43 @@ pub trait MessageRequests {
         send_copy: bool,
         remove_caption: bool,
     ) -> Result<Vec<Message>, TdError>;
+
+    /// Search one chat's messages for `query`, optionally restricted to messages
+    /// from `sender`. Pages backward from `from_message_id` ([`NEWEST`] for the
+    /// first page); each call returns up to `limit` hits.
+    ///
+    /// The returned [`SearchPage`] carries the normalized hits, an approximate
+    /// total, and the cursor for the next page ([`SearchPage::next`] is `None` at
+    /// the end). Results are a **transient view** — the caller folds them into a
+    /// [`SearchResults`], never the live [`MessageStore`], so a search leaves the
+    /// loaded history untouched.
+    ///
+    /// Media-type filtering (TDLib's `SearchMessagesFilter`) is out of scope here
+    /// — this searches all message types; filtering by content kind is a
+    /// follow-up alongside the non-text content model.
+    async fn search_chat_messages(
+        &self,
+        chat_id: i64,
+        query: String,
+        sender: Option<Sender>,
+        from_message_id: i64,
+        limit: i32,
+    ) -> Result<SearchPage<i64>, TdError>;
+
+    /// Search the whole account for `query` across all chats. Pages from
+    /// `from_offset` (the empty string for the first page), returning up to
+    /// `limit` hits.
+    ///
+    /// The returned [`SearchPage`] carries the normalized hits and the opaque
+    /// string cursor for the next page ([`SearchPage::next`] is `None` when the
+    /// offset comes back empty). As with the in-chat search, results are a
+    /// transient view and never folded into the live store.
+    async fn search_messages(
+        &self,
+        query: String,
+        from_offset: String,
+        limit: i32,
+    ) -> Result<SearchPage<String>, TdError>;
 }
 
 impl MessageRequests for Bridge {
@@ -263,6 +312,153 @@ impl MessageRequests for Bridge {
             .flatten()
             .map(|m| Message::from_tdlib(&m))
             .collect())
+    }
+
+    async fn search_chat_messages(
+        &self,
+        chat_id: i64,
+        query: String,
+        sender: Option<Sender>,
+        from_message_id: i64,
+        limit: i32,
+    ) -> Result<SearchPage<i64>, TdError> {
+        // topic_id None: search the whole chat, not one forum topic. offset 0: no
+        // look-ahead past the anchor. filter None (Empty): all message types.
+        let FoundChatMessages::FoundChatMessages(found) =
+            tdlib_rs::functions::search_chat_messages(
+                chat_id,
+                None,
+                query,
+                sender.map(|s| s.to_tdlib()),
+                from_message_id,
+                0,
+                limit,
+                None,
+                self.id(),
+            )
+            .await?;
+        // next_from_message_id is 0 when the chat's matches are exhausted.
+        let next = (found.next_from_message_id != 0).then_some(found.next_from_message_id);
+        Ok(SearchPage {
+            messages: found
+                .messages
+                .into_iter()
+                .map(|m| Message::from_tdlib(&m))
+                .collect(),
+            total_count: found.total_count,
+            next,
+        })
+    }
+
+    async fn search_messages(
+        &self,
+        query: String,
+        from_offset: String,
+        limit: i32,
+    ) -> Result<SearchPage<String>, TdError> {
+        // chat_list None: the Main list. filter/chat_type_filter None, date bounds
+        // 0: search every chat and message type with no time window.
+        let FoundMessages::FoundMessages(found) = tdlib_rs::functions::search_messages(
+            None,
+            query,
+            from_offset,
+            limit,
+            None,
+            None,
+            0,
+            0,
+            self.id(),
+        )
+        .await?;
+        // next_offset is empty when there are no more results.
+        let next = (!found.next_offset.is_empty()).then_some(found.next_offset);
+        Ok(SearchPage {
+            messages: found
+                .messages
+                .into_iter()
+                .map(|m| Message::from_tdlib(&m))
+                .collect(),
+            total_count: found.total_count,
+            next,
+        })
+    }
+}
+
+/// A page of message-search hits plus the cursor for the next page.
+///
+/// Generic over the cursor `C` because TDLib pages the two searches differently:
+/// an in-chat search resumes from a message id (`C = i64`), a global search from
+/// an opaque string offset (`C = String`). [`next`](Self::next) is `None` at the
+/// end of results — the loop stop condition either way.
+///
+/// A search page is a **transient view**: its messages are normalized
+/// [`Message`]s but they are never folded into the [`MessageStore`]; collect them
+/// into a [`SearchResults`] instead, so a search never disturbs loaded history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPage<C> {
+    /// The normalized hits on this page, in the order TDLib ranked them.
+    pub messages: Vec<Message>,
+    /// Approximate total number of matches; `-1` when TDLib does not know.
+    pub total_count: i32,
+    /// Cursor for the next page, or `None` when results are exhausted.
+    pub next: Option<C>,
+}
+
+/// A transient, deduplicated accumulation of search hits across pages.
+///
+/// Search results are a view onto messages that mostly already live (or could
+/// live) in the [`MessageStore`]; this keeps them **separate** so a search never
+/// mutates loaded history. Hits are deduplicated by `(chat_id, message_id)` — so
+/// overlapping pages, or a hit that also appears in the history already on
+/// screen, collapse onto one entry — while preserving TDLib's result ordering.
+#[derive(Debug, Default)]
+pub struct SearchResults {
+    messages: Vec<Message>,
+    seen: HashSet<(i64, i64)>,
+}
+
+impl SearchResults {
+    /// An empty result set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append a page of hits, dropping any whose `(chat_id, message_id)` was
+    /// already collected. Order is preserved (the first occurrence wins), so
+    /// re-appending an overlapping page — or [`extend`](Self::extend)ing with a
+    /// hit already on screen — is idempotent.
+    pub fn extend(&mut self, page: impl IntoIterator<Item = Message>) {
+        for message in page {
+            if self.seen.insert((message.chat_id, message.id)) {
+                self.messages.push(message);
+            }
+        }
+    }
+
+    /// The collected hits, in result order.
+    #[must_use]
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    /// Whether a given message has already been collected — the dedupe a caller
+    /// uses to avoid showing a hit twice when it also sits in loaded history.
+    #[must_use]
+    pub fn contains(&self, chat_id: i64, message_id: i64) -> bool {
+        self.seen.contains(&(chat_id, message_id))
+    }
+
+    /// Number of distinct hits collected.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.messages.len()
+    }
+
+    /// Whether no hits have been collected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
     }
 }
 
@@ -816,6 +1012,26 @@ mod tests {
         ) -> Result<Vec<Message>, TdError> {
             unimplemented!("SendSpy exercises the send path only")
         }
+
+        async fn search_chat_messages(
+            &self,
+            _chat_id: i64,
+            _query: String,
+            _sender: Option<Sender>,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<SearchPage<i64>, TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
+
+        async fn search_messages(
+            &self,
+            _query: String,
+            _from_offset: String,
+            _limit: i32,
+        ) -> Result<SearchPage<String>, TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
     }
 
     #[tokio::test]
@@ -908,6 +1124,26 @@ mod tests {
         ) -> Result<Vec<Message>, TdError> {
             unimplemented!("HistorySpy exercises history paging only")
         }
+
+        async fn search_chat_messages(
+            &self,
+            _chat_id: i64,
+            _query: String,
+            _sender: Option<Sender>,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<SearchPage<i64>, TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
+
+        async fn search_messages(
+            &self,
+            _query: String,
+            _from_offset: String,
+            _limit: i32,
+        ) -> Result<SearchPage<String>, TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
     }
 
     #[tokio::test]
@@ -986,6 +1222,26 @@ mod tests {
             _send_copy: bool,
             _remove_caption: bool,
         ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+
+        async fn search_chat_messages(
+            &self,
+            _chat_id: i64,
+            _query: String,
+            _sender: Option<Sender>,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<SearchPage<i64>, TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+
+        async fn search_messages(
+            &self,
+            _query: String,
+            _from_offset: String,
+            _limit: i32,
+        ) -> Result<SearchPage<String>, TdError> {
             unimplemented!("FailingSpy exercises the history error path only")
         }
     }
@@ -1070,6 +1326,26 @@ mod tests {
             _send_copy: bool,
             _remove_caption: bool,
         ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+
+        async fn search_chat_messages(
+            &self,
+            _chat_id: i64,
+            _query: String,
+            _sender: Option<Sender>,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<SearchPage<i64>, TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+
+        async fn search_messages(
+            &self,
+            _query: String,
+            _from_offset: String,
+            _limit: i32,
+        ) -> Result<SearchPage<String>, TdError> {
             unimplemented!("EditDeleteSpy exercises edit/delete only")
         }
     }
@@ -1157,6 +1433,26 @@ mod tests {
             _send_copy: bool,
             _remove_caption: bool,
         ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn search_chat_messages(
+            &self,
+            _chat_id: i64,
+            _query: String,
+            _sender: Option<Sender>,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<SearchPage<i64>, TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn search_messages(
+            &self,
+            _query: String,
+            _from_offset: String,
+            _limit: i32,
+        ) -> Result<SearchPage<String>, TdError> {
             unimplemented!("ViewSpy exercises the read path only")
         }
     }
@@ -1267,6 +1563,26 @@ mod tests {
                 })
                 .collect())
         }
+
+        async fn search_chat_messages(
+            &self,
+            _chat_id: i64,
+            _query: String,
+            _sender: Option<Sender>,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<SearchPage<i64>, TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn search_messages(
+            &self,
+            _query: String,
+            _from_offset: String,
+            _limit: i32,
+        ) -> Result<SearchPage<String>, TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
     }
 
     #[tokio::test]
@@ -1312,5 +1628,279 @@ mod tests {
         assert_eq!(store.get(20, 2001).unwrap().send_state, SendState::Pending);
         // The source chat is untouched by the forward.
         assert_eq!(ids(&store.history(10)), vec![1, 2]);
+    }
+
+    /// The arguments of a `search_chat_messages` call, captured for assertion.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ChatSearchCall {
+        chat_id: i64,
+        query: String,
+        sender: Option<Sender>,
+        from_message_id: i64,
+        limit: i32,
+    }
+
+    /// The arguments of a `search_messages` (global) call, captured for assertion.
+    #[derive(Debug, PartialEq, Eq)]
+    struct GlobalSearchCall {
+        query: String,
+        from_offset: String,
+        limit: i32,
+    }
+
+    /// Records every search call and serves scripted result pages in order, so a
+    /// test asserts both the threaded query/paging arguments and the normalized
+    /// results — following each page's cursor exactly as a real driver would.
+    #[derive(Default)]
+    struct SearchSpy {
+        chat_calls: RefCell<Vec<ChatSearchCall>>,
+        global_calls: RefCell<Vec<GlobalSearchCall>>,
+        chat_pages: RefCell<VecDeque<SearchPage<i64>>>,
+        global_pages: RefCell<VecDeque<SearchPage<String>>>,
+    }
+
+    impl MessageRequests for SearchSpy {
+        async fn get_chat_history(
+            &self,
+            _chat_id: i64,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn send_text(
+            &self,
+            _chat_id: i64,
+            _reply_to: Option<i64>,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn edit_text(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn delete(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+            _revoke: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn view_messages(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+        ) -> Result<(), TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn forward_messages(
+            &self,
+            _from_chat_id: i64,
+            _message_ids: Vec<i64>,
+            _to_chat_id: i64,
+            _send_copy: bool,
+            _remove_caption: bool,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn search_chat_messages(
+            &self,
+            chat_id: i64,
+            query: String,
+            sender: Option<Sender>,
+            from_message_id: i64,
+            limit: i32,
+        ) -> Result<SearchPage<i64>, TdError> {
+            self.chat_calls.borrow_mut().push(ChatSearchCall {
+                chat_id,
+                query,
+                sender,
+                from_message_id,
+                limit,
+            });
+            Ok(self
+                .chat_pages
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(SearchPage {
+                    messages: vec![],
+                    total_count: 0,
+                    next: None,
+                }))
+        }
+
+        async fn search_messages(
+            &self,
+            query: String,
+            from_offset: String,
+            limit: i32,
+        ) -> Result<SearchPage<String>, TdError> {
+            self.global_calls.borrow_mut().push(GlobalSearchCall {
+                query,
+                from_offset,
+                limit,
+            });
+            Ok(self
+                .global_pages
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(SearchPage {
+                    messages: vec![],
+                    total_count: 0,
+                    next: None,
+                }))
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_search_threads_query_sender_and_returns_a_normalized_page() {
+        let spy = SearchSpy::default();
+        spy.chat_pages.borrow_mut().push_back(SearchPage {
+            messages: vec![msg(10, 30), msg(10, 20)],
+            total_count: 5,
+            next: Some(20),
+        });
+
+        // Search chat 10 for "hi", restricted to one sender, from the newest.
+        let page = spy
+            .search_chat_messages(10, "hi".to_owned(), Some(Sender::User(7)), NEWEST, 2)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *spy.chat_calls.borrow(),
+            vec![ChatSearchCall {
+                chat_id: 10,
+                query: "hi".to_owned(),
+                sender: Some(Sender::User(7)),
+                from_message_id: NEWEST,
+                limit: 2,
+            }]
+        );
+        // Hits come back normalized, in the server's result order (not re-sorted),
+        // with the next-page cursor and the approximate total carried through.
+        let hit_ids: Vec<i64> = page.messages.iter().map(|m| m.id).collect();
+        assert_eq!(hit_ids, vec![30, 20]);
+        assert_eq!(page.total_count, 5);
+        assert_eq!(page.next, Some(20));
+    }
+
+    #[tokio::test]
+    async fn chat_search_pages_until_exhausted_deduping_into_a_transient_view() {
+        let spy = SearchSpy::default();
+        spy.chat_pages.borrow_mut().extend([
+            SearchPage {
+                messages: vec![msg(10, 30), msg(10, 20)],
+                total_count: 3,
+                next: Some(20),
+            },
+            // The older page overlaps on id 20 and ends the results.
+            SearchPage {
+                messages: vec![msg(10, 20), msg(10, 15)],
+                total_count: 3,
+                next: None,
+            },
+        ]);
+
+        // The chat already has some loaded history — the search must not touch it.
+        let mut store = MessageStore::new();
+        store.merge([msg(10, 30)]);
+
+        let mut results = SearchResults::new();
+        let mut anchor = NEWEST;
+        loop {
+            let page = spy
+                .search_chat_messages(10, "x".to_owned(), None, anchor, 2)
+                .await
+                .unwrap();
+            results.extend(page.messages);
+            match page.next {
+                Some(cursor) => anchor = cursor,
+                None => break,
+            }
+        }
+
+        // Overlapping id 20 collapsed to one entry; result order preserved.
+        let collected: Vec<i64> = results.messages().iter().map(|m| m.id).collect();
+        assert_eq!(collected, vec![30, 20, 15]);
+        assert_eq!(results.len(), 3);
+        assert!(results.contains(10, 20));
+        // Each page asked from the previous page's cursor, starting at NEWEST.
+        let anchors: Vec<i64> = spy
+            .chat_calls
+            .borrow()
+            .iter()
+            .map(|c| c.from_message_id)
+            .collect();
+        assert_eq!(anchors, vec![NEWEST, 20]);
+        // The transient view left the live history store untouched.
+        assert_eq!(ids(&store.history(10)), vec![30]);
+    }
+
+    #[tokio::test]
+    async fn global_search_threads_query_offset_and_keeps_cross_chat_hits_distinct() {
+        let spy = SearchSpy::default();
+        spy.global_pages.borrow_mut().extend([
+            SearchPage {
+                messages: vec![msg(10, 5), msg(20, 5)],
+                total_count: 3,
+                next: Some("pg2".to_owned()),
+            },
+            SearchPage {
+                messages: vec![msg(30, 1)],
+                total_count: 3,
+                next: None,
+            },
+        ]);
+
+        let mut results = SearchResults::new();
+        let mut offset = String::new();
+        loop {
+            let page = spy
+                .search_messages("term".to_owned(), offset.clone(), 2)
+                .await
+                .unwrap();
+            results.extend(page.messages);
+            match page.next {
+                Some(cursor) => offset = cursor,
+                None => break,
+            }
+        }
+
+        // Same id 5 in two chats stays distinct — dedupe keys on (chat, id).
+        let keys: Vec<(i64, i64)> = results
+            .messages()
+            .iter()
+            .map(|m| (m.chat_id, m.id))
+            .collect();
+        assert_eq!(keys, vec![(10, 5), (20, 5), (30, 1)]);
+        // Query threaded, paging resumed from the opaque offset (empty first).
+        assert_eq!(
+            *spy.global_calls.borrow(),
+            vec![
+                GlobalSearchCall {
+                    query: "term".to_owned(),
+                    from_offset: String::new(),
+                    limit: 2,
+                },
+                GlobalSearchCall {
+                    query: "term".to_owned(),
+                    from_offset: "pg2".to_owned(),
+                    limit: 2,
+                },
+            ]
+        );
     }
 }
