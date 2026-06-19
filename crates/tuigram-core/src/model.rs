@@ -18,11 +18,11 @@
 use tdlib_rs::enums::{
     ChatList as TdChatList, ChatType as TdChatType, MessageContent as TdMessageContent,
     MessageSender as TdMessageSender, MessageSendingState as TdMessageSendingState,
-    TextEntityType as TdTextEntityType,
+    TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
     Chat as TdChat, ChatPosition as TdChatPosition, FormattedText as TdFormattedText,
-    Message as TdMessage, TextEntity as TdTextEntity,
+    Message as TdMessage, TextEntity as TdTextEntity, User as TdUser,
 };
 
 /// Who sent a message.
@@ -42,6 +42,144 @@ impl Sender {
             TdMessageSender::User(u) => Self::User(u.user_id),
             TdMessageSender::Chat(c) => Self::Chat(c.chat_id),
         }
+    }
+}
+
+/// A user's online presence — tuigram's projection of TDLib's `UserStatus`.
+///
+/// Total over the enum with no catch-all, the same discipline as the message
+/// content projection: a new `UserStatus` variant fails to compile here until it
+/// is classified. The "recently / last week / last month" buckets carry no
+/// timestamp on purpose — TDLib hides the exact time for those and surfaces only
+/// the bucket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Presence {
+    /// Status never set, or hidden from us entirely.
+    Never,
+    /// Online until `expires` (Unix timestamp).
+    Online { expires: i32 },
+    /// Offline; last seen at `was_online` (Unix timestamp).
+    Offline { was_online: i32 },
+    /// Online recently — within a few days — with the exact time hidden.
+    Recently,
+    /// Online within the last week, with the exact time hidden.
+    LastWeek,
+    /// Online within the last month, with the exact time hidden.
+    LastMonth,
+}
+
+impl Presence {
+    /// Project TDLib's `UserStatus`.
+    #[must_use]
+    pub fn from_tdlib(status: &TdUserStatus) -> Self {
+        match status {
+            TdUserStatus::Empty => Self::Never,
+            TdUserStatus::Online(s) => Self::Online { expires: s.expires },
+            TdUserStatus::Offline(s) => Self::Offline {
+                was_online: s.was_online,
+            },
+            TdUserStatus::Recently(_) => Self::Recently,
+            TdUserStatus::LastWeek(_) => Self::LastWeek,
+            TdUserStatus::LastMonth(_) => Self::LastMonth,
+        }
+    }
+}
+
+/// What kind of account a [`User`] is — tuigram's projection of TDLib's
+/// `UserType`. Total over the enum, no catch-all. The bot payload is dropped:
+/// the model only needs to know *that* an account is a bot, not its bot details.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UserKind {
+    /// A regular user account.
+    Regular,
+    /// A deleted account — only the id survives; renders as "Deleted Account".
+    Deleted,
+    /// A bot.
+    Bot,
+    /// An inaccessible account: not deleted, but with no information available.
+    /// TDLib says to treat it exactly like a deleted user.
+    Unknown,
+}
+
+impl UserKind {
+    /// Project TDLib's `UserType`.
+    #[must_use]
+    pub fn from_tdlib(kind: &TdUserType) -> Self {
+        match kind {
+            TdUserType::Regular => Self::Regular,
+            TdUserType::Deleted => Self::Deleted,
+            TdUserType::Bot(_) => Self::Bot,
+            TdUserType::Unknown => Self::Unknown,
+        }
+    }
+}
+
+/// A user — tuigram's projection of TDLib's `User`, carrying what a sender line
+/// and a private-chat header need to read as a name instead of a bare id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct User {
+    /// User id.
+    pub id: i64,
+    /// First name (may be empty for a deleted account).
+    pub first_name: String,
+    /// Last name (often empty).
+    pub last_name: String,
+    /// Active usernames, primary first; empty if the user has none.
+    pub usernames: Vec<String>,
+    /// Phone number, if the user shares one with this account.
+    pub phone_number: Option<String>,
+    /// Whether the user is in this account's contacts.
+    pub is_contact: bool,
+    /// What kind of account this is.
+    pub kind: UserKind,
+    /// Current online presence.
+    pub status: Presence,
+}
+
+impl User {
+    /// Project TDLib's `User`. An empty phone number becomes `None`, and the
+    /// usernames flatten to the active list (primary first).
+    #[must_use]
+    pub fn from_tdlib(user: &TdUser) -> Self {
+        Self {
+            id: user.id,
+            first_name: user.first_name.clone(),
+            last_name: user.last_name.clone(),
+            usernames: user
+                .usernames
+                .as_ref()
+                .map(|u| u.active_usernames.clone())
+                .unwrap_or_default(),
+            phone_number: Some(user.phone_number.clone()).filter(|p| !p.is_empty()),
+            is_contact: user.is_contact,
+            kind: UserKind::from_tdlib(&user.r#type),
+            status: Presence::from_tdlib(&user.status),
+        }
+    }
+
+    /// The user's primary username (without the leading `@`), if any.
+    #[must_use]
+    pub fn username(&self) -> Option<&str> {
+        self.usernames.first().map(String::as_str)
+    }
+
+    /// A human-readable name to render in place of the user's id: the full name
+    /// if set, else the primary `@username`, else `"Deleted Account"` for a
+    /// deleted or inaccessible account, else a bare `User {id}` as a last resort.
+    #[must_use]
+    pub fn display_name(&self) -> String {
+        let full = format!("{} {}", self.first_name, self.last_name);
+        let full = full.trim();
+        if !full.is_empty() {
+            return full.to_owned();
+        }
+        if let Some(username) = self.username() {
+            return format!("@{username}");
+        }
+        if matches!(self.kind, UserKind::Deleted | UserKind::Unknown) {
+            return "Deleted Account".to_owned();
+        }
+        format!("User {}", self.id)
     }
 }
 
@@ -1028,5 +1166,181 @@ mod tests {
             chat.last_message.and_then(|m| m.text().map(str::to_owned)),
             Some("last".to_owned())
         );
+    }
+
+    /// A TDLib `User` with every field zeroed but the ones a test cares about.
+    fn td_user(
+        id: i64,
+        first: &str,
+        last: &str,
+        usernames: Vec<&str>,
+        phone: &str,
+        kind: TdUserType,
+        status: TdUserStatus,
+    ) -> TdUser {
+        TdUser {
+            id,
+            first_name: first.to_owned(),
+            last_name: last.to_owned(),
+            usernames: (!usernames.is_empty()).then(|| tdlib_rs::types::Usernames {
+                active_usernames: usernames.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            }),
+            phone_number: phone.to_owned(),
+            status,
+            profile_photo: None,
+            accent_color_id: 0,
+            background_custom_emoji_id: 0,
+            upgraded_gift_colors: None,
+            profile_accent_color_id: 0,
+            profile_background_custom_emoji_id: 0,
+            emoji_status: None,
+            is_contact: false,
+            is_mutual_contact: false,
+            is_close_friend: false,
+            verification_status: None,
+            is_premium: false,
+            is_support: false,
+            restriction_info: None,
+            active_story_state: None,
+            restricts_new_chats: false,
+            paid_message_star_count: 0,
+            have_access: true,
+            r#type: kind,
+            language_code: String::new(),
+            added_to_attachment_menu: false,
+        }
+    }
+
+    #[test]
+    fn user_status_projects_every_bucket() {
+        use tdlib_rs::types::{
+            UserStatusLastMonth, UserStatusLastWeek, UserStatusOffline, UserStatusOnline,
+            UserStatusRecently,
+        };
+        assert_eq!(Presence::from_tdlib(&TdUserStatus::Empty), Presence::Never);
+        assert_eq!(
+            Presence::from_tdlib(&TdUserStatus::Online(UserStatusOnline { expires: 99 })),
+            Presence::Online { expires: 99 }
+        );
+        assert_eq!(
+            Presence::from_tdlib(&TdUserStatus::Offline(UserStatusOffline { was_online: 42 })),
+            Presence::Offline { was_online: 42 }
+        );
+        assert_eq!(
+            Presence::from_tdlib(&TdUserStatus::Recently(UserStatusRecently::default())),
+            Presence::Recently
+        );
+        assert_eq!(
+            Presence::from_tdlib(&TdUserStatus::LastWeek(UserStatusLastWeek::default())),
+            Presence::LastWeek
+        );
+        assert_eq!(
+            Presence::from_tdlib(&TdUserStatus::LastMonth(UserStatusLastMonth::default())),
+            Presence::LastMonth
+        );
+    }
+
+    #[test]
+    fn user_kind_projects_every_variant() {
+        assert_eq!(
+            UserKind::from_tdlib(&TdUserType::Regular),
+            UserKind::Regular
+        );
+        assert_eq!(
+            UserKind::from_tdlib(&TdUserType::Deleted),
+            UserKind::Deleted
+        );
+        assert_eq!(
+            UserKind::from_tdlib(&TdUserType::Bot(tdlib_rs::types::UserTypeBot::default())),
+            UserKind::Bot
+        );
+        assert_eq!(
+            UserKind::from_tdlib(&TdUserType::Unknown),
+            UserKind::Unknown
+        );
+    }
+
+    #[test]
+    fn user_projects_fields_with_optional_username_and_phone() {
+        let user = User::from_tdlib(&td_user(
+            7,
+            "Ada",
+            "Lovelace",
+            vec!["ada", "countess"],
+            "+15551234",
+            TdUserType::Regular,
+            TdUserStatus::Online(tdlib_rs::types::UserStatusOnline { expires: 5 }),
+        ));
+        assert_eq!(user.id, 7);
+        assert_eq!(user.username(), Some("ada"));
+        assert_eq!(user.usernames, vec!["ada", "countess"]);
+        assert_eq!(user.phone_number.as_deref(), Some("+15551234"));
+        assert_eq!(user.kind, UserKind::Regular);
+        assert_eq!(user.status, Presence::Online { expires: 5 });
+
+        // No usernames and an empty phone collapse to None/empty, not "".
+        let bare = User::from_tdlib(&td_user(
+            8,
+            "Grace",
+            "",
+            vec![],
+            "",
+            TdUserType::Regular,
+            TdUserStatus::Empty,
+        ));
+        assert_eq!(bare.username(), None);
+        assert!(bare.usernames.is_empty());
+        assert_eq!(bare.phone_number, None);
+    }
+
+    #[test]
+    fn display_name_falls_back_name_then_username_then_deleted_then_id() {
+        let named = User::from_tdlib(&td_user(
+            7,
+            "Ada",
+            "Lovelace",
+            vec!["ada"],
+            "",
+            TdUserType::Regular,
+            TdUserStatus::Empty,
+        ));
+        assert_eq!(named.display_name(), "Ada Lovelace");
+
+        // No name → primary username.
+        let handle = User::from_tdlib(&td_user(
+            8,
+            "",
+            "",
+            vec!["grace"],
+            "",
+            TdUserType::Regular,
+            TdUserStatus::Empty,
+        ));
+        assert_eq!(handle.display_name(), "@grace");
+
+        // No name, no username, deleted → the conventional label.
+        let gone = User::from_tdlib(&td_user(
+            9,
+            "",
+            "",
+            vec![],
+            "",
+            TdUserType::Deleted,
+            TdUserStatus::Empty,
+        ));
+        assert_eq!(gone.display_name(), "Deleted Account");
+
+        // No name, no username, still a regular account → the bare id.
+        let anon = User::from_tdlib(&td_user(
+            10,
+            "",
+            "",
+            vec![],
+            "",
+            TdUserType::Regular,
+            TdUserStatus::Empty,
+        ));
+        assert_eq!(anon.display_name(), "User 10");
     }
 }
