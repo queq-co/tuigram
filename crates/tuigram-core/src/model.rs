@@ -24,8 +24,11 @@ use tdlib_rs::enums::{
 use tdlib_rs::types::{
     Chat as TdChat, ChatPosition as TdChatPosition, DraftMessage as TdDraftMessage, File as TdFile,
     FormattedText as TdFormattedText, InputMessageReplyToMessage, InputMessageText,
-    Message as TdMessage, MessageSenderChat as TdMessageSenderChat,
-    MessageSenderUser as TdMessageSenderUser, TextEntity as TdTextEntity, User as TdUser,
+    Message as TdMessage, MessageAnimation as TdMessageAnimation, MessageAudio as TdMessageAudio,
+    MessageDocument as TdMessageDocument, MessagePhoto as TdMessagePhoto,
+    MessageSenderChat as TdMessageSenderChat, MessageSenderUser as TdMessageSenderUser,
+    MessageSticker as TdMessageSticker, MessageVideo as TdMessageVideo,
+    MessageVoiceNote as TdMessageVoiceNote, TextEntity as TdTextEntity, User as TdUser,
 };
 
 /// Who sent a message.
@@ -611,14 +614,256 @@ impl File {
     }
 }
 
-/// The content of a message. Phase 3 models text; everything else is
+/// A photo message: its caption and the single best (largest) size to show.
+///
+/// TDLib sends a photo as several pre-scaled [`sizes`](TdMessagePhoto); a
+/// keyboard-driven client renders one, so this keeps the largest and drops the
+/// thumbnails. The bytes live in the [`FileStore`](crate::files::FileStore) under
+/// [`file`](Self::file) — content stays a cheap reference, same as elsewhere.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Photo {
+    /// Caption shown with the photo (empty when there is none).
+    pub caption: FormattedText,
+    /// The largest available size's file (id `0` if the photo has no sizes).
+    pub file: FileRef,
+    /// Width of [`file`](Self::file), in pixels.
+    pub width: i32,
+    /// Height of [`file`](Self::file), in pixels.
+    pub height: i32,
+}
+
+impl Photo {
+    /// Project TDLib's `messagePhoto`, keeping its largest size.
+    #[must_use]
+    pub fn from_tdlib(m: &TdMessagePhoto) -> Self {
+        // TDLib doesn't guarantee `sizes` order, so pick by pixel area rather
+        // than trusting the last element; absent sizes degrade to a 0 ref.
+        let largest = m
+            .photo
+            .sizes
+            .iter()
+            .max_by_key(|s| i64::from(s.width) * i64::from(s.height));
+        let (file, width, height) = match largest {
+            Some(s) => (FileRef::new(s.photo.id), s.width, s.height),
+            None => (FileRef::new(0), 0, 0),
+        };
+        Self {
+            caption: FormattedText::from_tdlib(&m.caption),
+            file,
+            width,
+            height,
+        }
+    }
+}
+
+/// A video message: caption, dimensions, duration, and the file to play.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Video {
+    /// Caption shown with the video (empty when there is none).
+    pub caption: FormattedText,
+    /// The video file.
+    pub file: FileRef,
+    /// Video width, in pixels.
+    pub width: i32,
+    /// Video height, in pixels.
+    pub height: i32,
+    /// Duration, in seconds.
+    pub duration: i32,
+    /// Original file name, as given by the sender (may be empty).
+    pub file_name: String,
+    /// MIME type, as given by the sender (may be empty).
+    pub mime_type: String,
+}
+
+impl Video {
+    /// Project TDLib's `messageVideo`.
+    #[must_use]
+    pub fn from_tdlib(m: &TdMessageVideo) -> Self {
+        Self {
+            caption: FormattedText::from_tdlib(&m.caption),
+            file: FileRef::new(m.video.video.id),
+            width: m.video.width,
+            height: m.video.height,
+            duration: m.video.duration,
+            file_name: m.video.file_name.clone(),
+            mime_type: m.video.mime_type.clone(),
+        }
+    }
+}
+
+/// A document (arbitrary file) message: caption, name, MIME type, and file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Document {
+    /// Caption shown with the document (empty when there is none).
+    pub caption: FormattedText,
+    /// The document file.
+    pub file: FileRef,
+    /// Original file name, as given by the sender (may be empty).
+    pub file_name: String,
+    /// MIME type, as given by the sender (may be empty).
+    pub mime_type: String,
+}
+
+impl Document {
+    /// Project TDLib's `messageDocument`.
+    #[must_use]
+    pub fn from_tdlib(m: &TdMessageDocument) -> Self {
+        Self {
+            caption: FormattedText::from_tdlib(&m.caption),
+            file: FileRef::new(m.document.document.id),
+            file_name: m.document.file_name.clone(),
+            mime_type: m.document.mime_type.clone(),
+        }
+    }
+}
+
+/// A music/audio message: caption, track metadata, and the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Audio {
+    /// Caption shown with the audio (empty when there is none).
+    pub caption: FormattedText,
+    /// The audio file.
+    pub file: FileRef,
+    /// Duration, in seconds.
+    pub duration: i32,
+    /// Track title, as given by the sender (may be empty).
+    pub title: String,
+    /// Performer, as given by the sender (may be empty).
+    pub performer: String,
+    /// Original file name, as given by the sender (may be empty).
+    pub file_name: String,
+    /// MIME type, as given by the sender (may be empty).
+    pub mime_type: String,
+}
+
+impl Audio {
+    /// Project TDLib's `messageAudio`.
+    #[must_use]
+    pub fn from_tdlib(m: &TdMessageAudio) -> Self {
+        Self {
+            caption: FormattedText::from_tdlib(&m.caption),
+            file: FileRef::new(m.audio.audio.id),
+            duration: m.audio.duration,
+            title: m.audio.title.clone(),
+            performer: m.audio.performer.clone(),
+            file_name: m.audio.file_name.clone(),
+            mime_type: m.audio.mime_type.clone(),
+        }
+    }
+}
+
+/// A voice-note message: caption, duration, MIME type, and the file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Voice {
+    /// Caption shown with the voice note (empty when there is none).
+    pub caption: FormattedText,
+    /// The voice-note file.
+    pub file: FileRef,
+    /// Duration, in seconds.
+    pub duration: i32,
+    /// MIME type, as given by the sender (e.g. `audio/ogg`; may be empty).
+    pub mime_type: String,
+}
+
+impl Voice {
+    /// Project TDLib's `messageVoiceNote`.
+    #[must_use]
+    pub fn from_tdlib(m: &TdMessageVoiceNote) -> Self {
+        Self {
+            caption: FormattedText::from_tdlib(&m.caption),
+            file: FileRef::new(m.voice_note.voice.id),
+            duration: m.voice_note.duration,
+            mime_type: m.voice_note.mime_type.clone(),
+        }
+    }
+}
+
+/// A sticker message: its emoji, dimensions, and the file. Stickers carry no
+/// caption in TDLib, so there is none here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sticker {
+    /// The sticker file.
+    pub file: FileRef,
+    /// Sticker width, in pixels.
+    pub width: i32,
+    /// Sticker height, in pixels.
+    pub height: i32,
+    /// The emoji the sticker corresponds to (may be empty if unknown).
+    pub emoji: String,
+}
+
+impl Sticker {
+    /// Project TDLib's `messageSticker`.
+    #[must_use]
+    pub fn from_tdlib(m: &TdMessageSticker) -> Self {
+        Self {
+            file: FileRef::new(m.sticker.sticker.id),
+            width: m.sticker.width,
+            height: m.sticker.height,
+            emoji: m.sticker.emoji.clone(),
+        }
+    }
+}
+
+/// An animation (GIF/silent video) message: caption, dimensions, duration, file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Animation {
+    /// Caption shown with the animation (empty when there is none).
+    pub caption: FormattedText,
+    /// The animation file.
+    pub file: FileRef,
+    /// Animation width, in pixels.
+    pub width: i32,
+    /// Animation height, in pixels.
+    pub height: i32,
+    /// Duration, in seconds.
+    pub duration: i32,
+    /// Original file name, as given by the sender (may be empty).
+    pub file_name: String,
+    /// MIME type, as given by the sender (e.g. `video/mp4`; may be empty).
+    pub mime_type: String,
+}
+
+impl Animation {
+    /// Project TDLib's `messageAnimation`.
+    #[must_use]
+    pub fn from_tdlib(m: &TdMessageAnimation) -> Self {
+        Self {
+            caption: FormattedText::from_tdlib(&m.caption),
+            file: FileRef::new(m.animation.animation.id),
+            width: m.animation.width,
+            height: m.animation.height,
+            duration: m.animation.duration,
+            file_name: m.animation.file_name.clone(),
+            mime_type: m.animation.mime_type.clone(),
+        }
+    }
+}
+
+/// The content of a message. tuigram models text and the common file-backed
+/// media types ([`Photo`], [`Video`], [`Document`], [`Audio`], [`Voice`],
+/// [`Sticker`], [`Animation`]); everything else is
 /// [`MessageContent::Unsupported`] carrying TDLib's content type name.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MessageContent {
     /// A text message, with its formatting entities.
     Text(FormattedText),
+    /// A photo message.
+    Photo(Photo),
+    /// A video message.
+    Video(Video),
+    /// A document (arbitrary file) message.
+    Document(Document),
+    /// A music/audio message.
+    Audio(Audio),
+    /// A voice-note message.
+    Voice(Voice),
+    /// A sticker message.
+    Sticker(Sticker),
+    /// An animation (GIF/silent video) message.
+    Animation(Animation),
     /// A content type tuigram does not model yet. Carries TDLib's type name
-    /// (e.g. `"messagePhoto"`) so callers can report it precisely.
+    /// (e.g. `"messageVideoNote"`) so callers can report it precisely.
     Unsupported(&'static str),
 }
 
@@ -629,15 +874,15 @@ impl MessageContent {
     pub fn from_tdlib(content: &TdMessageContent) -> Self {
         match content {
             TdMessageContent::MessageText(t) => Self::Text(FormattedText::from_tdlib(&t.text)),
-            TdMessageContent::MessageAnimation(_) => Self::Unsupported("messageAnimation"),
-            TdMessageContent::MessageAudio(_) => Self::Unsupported("messageAudio"),
-            TdMessageContent::MessageDocument(_) => Self::Unsupported("messageDocument"),
+            TdMessageContent::MessageAnimation(m) => Self::Animation(Animation::from_tdlib(m)),
+            TdMessageContent::MessageAudio(m) => Self::Audio(Audio::from_tdlib(m)),
+            TdMessageContent::MessageDocument(m) => Self::Document(Document::from_tdlib(m)),
             TdMessageContent::MessagePaidMedia(_) => Self::Unsupported("messagePaidMedia"),
-            TdMessageContent::MessagePhoto(_) => Self::Unsupported("messagePhoto"),
-            TdMessageContent::MessageSticker(_) => Self::Unsupported("messageSticker"),
-            TdMessageContent::MessageVideo(_) => Self::Unsupported("messageVideo"),
+            TdMessageContent::MessagePhoto(m) => Self::Photo(Photo::from_tdlib(m)),
+            TdMessageContent::MessageSticker(m) => Self::Sticker(Sticker::from_tdlib(m)),
+            TdMessageContent::MessageVideo(m) => Self::Video(Video::from_tdlib(m)),
             TdMessageContent::MessageVideoNote(_) => Self::Unsupported("messageVideoNote"),
-            TdMessageContent::MessageVoiceNote(_) => Self::Unsupported("messageVoiceNote"),
+            TdMessageContent::MessageVoiceNote(m) => Self::Voice(Voice::from_tdlib(m)),
             TdMessageContent::MessageExpiredPhoto => Self::Unsupported("messageExpiredPhoto"),
             TdMessageContent::MessageExpiredVideo => Self::Unsupported("messageExpiredVideo"),
             TdMessageContent::MessageExpiredVideoNote => {
@@ -868,7 +1113,9 @@ impl Message {
     pub fn text(&self) -> Option<&str> {
         match &self.content {
             MessageContent::Text(t) => Some(&t.text),
-            MessageContent::Unsupported(_) => None,
+            // A media caption is not the message's text body; this accessor is
+            // about text messages, so anything else has no text to return.
+            _ => None,
         }
     }
 }
@@ -1187,6 +1434,277 @@ mod tests {
         assert_eq!(
             MessageContent::from_tdlib(&contact),
             MessageContent::Unsupported("messageContact")
+        );
+    }
+
+    /// A TDLib `File` is a deep record; tests only care about its id (what a
+    /// [`FileRef`] keeps), so build one with the rest zeroed.
+    fn td_file(id: i32) -> TdFile {
+        TdFile {
+            id,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn photo_content_keeps_the_largest_size_and_caption() {
+        // Two sizes out of natural order; the projection must pick by area, not
+        // position, so the 1280x720 size wins over the 90x90 thumbnail.
+        let content = TdMessageContent::MessagePhoto(TdMessagePhoto {
+            photo: tdlib_rs::types::Photo {
+                sizes: vec![
+                    tdlib_rs::types::PhotoSize {
+                        photo: td_file(11),
+                        width: 1280,
+                        height: 720,
+                        ..Default::default()
+                    },
+                    tdlib_rs::types::PhotoSize {
+                        photo: td_file(10),
+                        width: 90,
+                        height: 90,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            },
+            caption: TdFormattedTextT {
+                text: "sunset".to_owned(),
+                entities: vec![],
+            },
+            ..Default::default()
+        });
+        assert_eq!(
+            MessageContent::from_tdlib(&content),
+            MessageContent::Photo(Photo {
+                caption: FormattedText {
+                    text: "sunset".to_owned(),
+                    entities: vec![],
+                },
+                file: FileRef::new(11),
+                width: 1280,
+                height: 720,
+            })
+        );
+    }
+
+    #[test]
+    fn photo_with_no_sizes_degrades_to_a_zero_ref() {
+        let content = TdMessageContent::MessagePhoto(TdMessagePhoto::default());
+        assert_eq!(
+            MessageContent::from_tdlib(&content),
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(0),
+                width: 0,
+                height: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn video_content_projects_metadata_and_file() {
+        let content = TdMessageContent::MessageVideo(TdMessageVideo {
+            video: tdlib_rs::types::Video {
+                duration: 12,
+                width: 640,
+                height: 480,
+                file_name: "clip.mp4".to_owned(),
+                mime_type: "video/mp4".to_owned(),
+                has_stickers: false,
+                supports_streaming: true,
+                minithumbnail: None,
+                thumbnail: None,
+                video: td_file(7),
+            },
+            alternative_videos: vec![],
+            storyboards: vec![],
+            cover: None,
+            start_timestamp: 0,
+            caption: TdFormattedTextT {
+                text: "watch".to_owned(),
+                entities: vec![],
+            },
+            show_caption_above_media: false,
+            has_spoiler: false,
+            is_secret: false,
+        });
+        assert_eq!(
+            MessageContent::from_tdlib(&content),
+            MessageContent::Video(Video {
+                caption: FormattedText {
+                    text: "watch".to_owned(),
+                    entities: vec![],
+                },
+                file: FileRef::new(7),
+                width: 640,
+                height: 480,
+                duration: 12,
+                file_name: "clip.mp4".to_owned(),
+                mime_type: "video/mp4".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn document_content_projects_name_mime_and_file() {
+        let content = TdMessageContent::MessageDocument(TdMessageDocument {
+            document: tdlib_rs::types::Document {
+                file_name: "report.pdf".to_owned(),
+                mime_type: "application/pdf".to_owned(),
+                minithumbnail: None,
+                thumbnail: None,
+                document: td_file(3),
+            },
+            caption: TdFormattedTextT::default(),
+        });
+        assert_eq!(
+            MessageContent::from_tdlib(&content),
+            MessageContent::Document(Document {
+                caption: FormattedText::default(),
+                file: FileRef::new(3),
+                file_name: "report.pdf".to_owned(),
+                mime_type: "application/pdf".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn audio_content_projects_track_metadata_and_file() {
+        let content = TdMessageContent::MessageAudio(TdMessageAudio {
+            audio: tdlib_rs::types::Audio {
+                duration: 200,
+                title: "Song".to_owned(),
+                performer: "Artist".to_owned(),
+                file_name: "song.mp3".to_owned(),
+                mime_type: "audio/mpeg".to_owned(),
+                album_cover_minithumbnail: None,
+                album_cover_thumbnail: None,
+                external_album_covers: vec![],
+                audio: td_file(5),
+            },
+            caption: TdFormattedTextT::default(),
+        });
+        assert_eq!(
+            MessageContent::from_tdlib(&content),
+            MessageContent::Audio(Audio {
+                caption: FormattedText::default(),
+                file: FileRef::new(5),
+                duration: 200,
+                title: "Song".to_owned(),
+                performer: "Artist".to_owned(),
+                file_name: "song.mp3".to_owned(),
+                mime_type: "audio/mpeg".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn voice_content_projects_duration_mime_and_file() {
+        let content = TdMessageContent::MessageVoiceNote(TdMessageVoiceNote {
+            voice_note: tdlib_rs::types::VoiceNote {
+                duration: 8,
+                mime_type: "audio/ogg".to_owned(),
+                voice: td_file(9),
+                ..Default::default()
+            },
+            caption: TdFormattedTextT::default(),
+            ..Default::default()
+        });
+        assert_eq!(
+            MessageContent::from_tdlib(&content),
+            MessageContent::Voice(Voice {
+                caption: FormattedText::default(),
+                file: FileRef::new(9),
+                duration: 8,
+                mime_type: "audio/ogg".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn sticker_content_projects_emoji_dimensions_and_file() {
+        let content = TdMessageContent::MessageSticker(TdMessageSticker {
+            sticker: tdlib_rs::types::Sticker {
+                id: 0,
+                set_id: 0,
+                width: 512,
+                height: 512,
+                emoji: "😀".to_owned(),
+                format: tdlib_rs::enums::StickerFormat::Webp,
+                full_type: tdlib_rs::enums::StickerFullType::Regular(
+                    tdlib_rs::types::StickerFullTypeRegular::default(),
+                ),
+                thumbnail: None,
+                sticker: td_file(4),
+            },
+            is_premium: false,
+        });
+        assert_eq!(
+            MessageContent::from_tdlib(&content),
+            MessageContent::Sticker(Sticker {
+                file: FileRef::new(4),
+                width: 512,
+                height: 512,
+                emoji: "😀".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn animation_content_projects_metadata_and_file() {
+        let content = TdMessageContent::MessageAnimation(TdMessageAnimation {
+            animation: tdlib_rs::types::Animation {
+                duration: 3,
+                width: 320,
+                height: 240,
+                file_name: "loop.gif".to_owned(),
+                mime_type: "video/mp4".to_owned(),
+                has_stickers: false,
+                minithumbnail: None,
+                thumbnail: None,
+                animation: td_file(6),
+            },
+            caption: TdFormattedTextT::default(),
+            show_caption_above_media: false,
+            has_spoiler: false,
+            is_secret: false,
+        });
+        assert_eq!(
+            MessageContent::from_tdlib(&content),
+            MessageContent::Animation(Animation {
+                caption: FormattedText::default(),
+                file: FileRef::new(6),
+                width: 320,
+                height: 240,
+                duration: 3,
+                file_name: "loop.gif".to_owned(),
+                mime_type: "video/mp4".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn unmodeled_media_still_falls_through_to_unsupported() {
+        // Video notes and paid media are deliberately not modeled by #45; the
+        // total mapping must keep surfacing them by name, never mis-map them as
+        // one of the seven types above.
+        let video_note = TdMessageContent::MessageVideoNote(tdlib_rs::types::MessageVideoNote {
+            video_note: tdlib_rs::types::VideoNote {
+                duration: 5,
+                waveform: String::new(),
+                length: 240,
+                minithumbnail: None,
+                thumbnail: None,
+                speech_recognition_result: None,
+                video: td_file(8),
+            },
+            is_viewed: false,
+            is_secret: false,
+        });
+        assert_eq!(
+            MessageContent::from_tdlib(&video_note),
+            MessageContent::Unsupported("messageVideoNote")
         );
     }
 
