@@ -12,14 +12,17 @@
 //! id-ascending is chronological (oldest first). A `BTreeMap` per chat gives that
 //! ordering and the dedupe for free: re-inserting an id replaces in place.
 //!
-//! [`MessageRequests`] is this module's slice of the request surface — only the
-//! history fetch — owned here rather than in `bridge`, the same per-domain
-//! segregation as [`ChatRequests`](crate::chats::ChatRequests) and
-//! [`AuthRequests`](crate::auth::AuthRequests). [`load_history`] drives the
-//! backward paging; folding each page stays the caller's choice (so production
-//! can fold under its lock per page, never across an await).
+//! This module owns the message slice of the request surface — the same
+//! per-domain segregation as [`ChatRequests`](crate::chats::ChatRequests) and
+//! [`AuthRequests`](crate::auth::AuthRequests), but segmented one level further:
+//! the seam is split into per-capability traits ([`HistoryRequests`],
+//! [`SendRequests`], [`EditRequests`], …) so a consumer binds only what it uses
+//! and a test double implements only what it exercises. [`MessageRequests`]
+//! bundles them all for a caller that wants the whole surface. [`load_history`]
+//! drives the backward paging; folding each page stays the caller's choice (so
+//! production can fold under its lock per page, never across an await).
 //!
-//! Sending (#19) lives here too: [`MessageRequests::send_text`] posts a text
+//! Sending (#19) lives here too: [`SendRequests::send_text`] posts a text
 //! message (optionally a reply) and TDLib creates it optimistically with a
 //! temporary id in [`SendState::Pending`]; the reducer then folds the lifecycle —
 //! `updateMessageSendSucceeded` swaps the temp id for the server's real one,
@@ -28,28 +31,28 @@
 //! delivery.
 //!
 //! Editing and deleting (#20) round out the write side:
-//! [`MessageRequests::edit_text`] replaces a message's text and
-//! [`MessageRequests::delete`] removes messages (for self or, with `revoke`, for
+//! [`EditRequests::edit_text`] replaces a message's text and
+//! [`DeleteRequests::delete`] removes messages (for self or, with `revoke`, for
 //! everyone). The reducer reconciles both: `updateMessageContent` swaps a known
 //! message's content in place, and a permanent `updateDeleteMessages` drops the
 //! messages — a cache-eviction delete is ignored so our copy survives.
 //!
-//! Read state (#21): [`MessageRequests::view_messages`] marks a chat's messages
+//! Read state (#21): [`ReadRequests::view_messages`] marks a chat's messages
 //! read. It is advisory — the call acknowledges the messages to the server and
 //! never blocks the read path; the resulting unread-count change arrives as
 //! `updateChatReadInbox`, which the [chat store](crate::chats::ChatStore) folds.
 //!
-//! Search (#37): [`MessageRequests::search_chat_messages`] looks within one chat
-//! and [`MessageRequests::search_messages`] across the whole account. Both return
+//! Search (#37): [`SearchRequests::search_chat_messages`] looks within one chat
+//! and [`SearchRequests::search_messages`] across the whole account. Both return
 //! normalized hits with a paging cursor as a [`SearchPage`], and the caller
 //! collects them into a [`SearchResults`] — a transient, id-deduplicated view
 //! that never folds into [`MessageStore`], so a search leaves loaded history
 //! untouched. [`search_chat`] and [`search_global`] drive either search to
 //! exhaustion into that view, the search counterpart to [`load_history`].
 //!
-//! Reactions and pins (#51): [`MessageRequests::add_message_reaction`] /
-//! [`MessageRequests::remove_message_reaction`] react to a message, and
-//! [`MessageRequests::pin_chat_message`] / [`MessageRequests::unpin_chat_message`]
+//! Reactions and pins (#51): [`ReactionRequests::add_message_reaction`] /
+//! [`ReactionRequests::remove_message_reaction`] react to a message, and
+//! [`PinRequests::pin_chat_message`] / [`PinRequests::unpin_chat_message`]
 //! pin it. Both are advisory, like the read path: a reaction's new counts arrive
 //! as `updateMessageInteractionInfo`, which this store folds onto the message
 //! (replacing its reaction buckets in place); a pin's `updateMessageIsPinned`
@@ -78,18 +81,27 @@ use crate::model::{
     FormattedText, Message, MessageContent, OutgoingMedia, Reaction, SendState, Sender,
 };
 
-/// The message-history request seam — tuigram's message slice of the
-/// `tdlib_rs::functions` surface, segregated from the auth and chat requests so
-/// a driver (and its test double) implements only this.
-///
-/// [`Bridge`] implements it over a live `tdjson` client (via [`Bridge::id`]);
-/// tests implement it with a spy. Logic written against `C: MessageRequests`
-/// runs unchanged on either, with no network and no live `tdjson`.
-// Internal seam: every consumer is in-crate and generic over `C: MessageRequests`,
-// so the lack of a caller-controllable `Send` bound (the reason this lint fires)
-// is not a concern here.
+// The message request seam — tuigram's message slice of the
+// `tdlib_rs::functions` surface, segregated from the auth and chat requests.
+//
+// Rather than one monolithic trait, the seam is split into per-capability
+// request traits (history, send, edit, …). A consumer binds only the capability
+// it uses (`load_history` needs [`HistoryRequests`], not the rest), and a test
+// double implements only the capability it exercises — so a new method lands in
+// one focused trait and touches one spy, not all of them. [`Bridge`] implements
+// every capability over a live `tdjson` client (via [`Bridge::id`]); the
+// [`MessageRequests`] aggregate bundles them for a caller that wants the whole
+// surface and keeps `Bridge` provably complete.
+//
+// Logic written against these traits runs unchanged on the live bridge or a
+// spy, with no network and no live `tdjson`. Every consumer is in-crate and
+// generic over the capability it needs, so the lack of a caller-controllable
+// `Send` bound (the reason `async_fn_in_trait` fires) is not a concern on any
+// of them.
+
+/// Read a chat's message history, page by page.
 #[allow(async_fn_in_trait)]
-pub trait MessageRequests {
+pub trait HistoryRequests {
     /// Fetch up to `limit` messages of a chat's history, older than the anchor
     /// `from_message_id` ([`NEWEST`] for the most recent). Returns the page
     /// projected to [`Message`]s (TDLib's null entries dropped); an **empty**
@@ -100,7 +112,11 @@ pub trait MessageRequests {
         from_message_id: i64,
         limit: i32,
     ) -> Result<Vec<Message>, TdError>;
+}
 
+/// Send new messages — plain text and file-backed media.
+#[allow(async_fn_in_trait)]
+pub trait SendRequests {
     /// Send `text` to a chat, optionally replying to `reply_to` (a message id in
     /// the same chat; `None` for a plain message). Returns the message TDLib
     /// creates **optimistically** — a temporary id, [`SendState::Pending`] —
@@ -110,17 +126,6 @@ pub trait MessageRequests {
         &self,
         chat_id: i64,
         reply_to: Option<i64>,
-        text: FormattedText,
-    ) -> Result<Message, TdError>;
-
-    /// Replace the text of a message tuigram's account sent. Returns the edited
-    /// [`Message`] TDLib produces once the edit lands server-side; the matching
-    /// `updateMessageContent` reconciles the stored copy. Errors if the message
-    /// is not editable (not own, too old, not a text message).
-    async fn edit_text(
-        &self,
-        chat_id: i64,
-        message_id: i64,
         text: FormattedText,
     ) -> Result<Message, TdError>;
 
@@ -142,6 +147,21 @@ pub trait MessageRequests {
         reply_to: Option<i64>,
         media: OutgoingMedia,
     ) -> Result<Message, TdError>;
+}
+
+/// Edit messages tuigram's account already sent.
+#[allow(async_fn_in_trait)]
+pub trait EditRequests {
+    /// Replace the text of a message tuigram's account sent. Returns the edited
+    /// [`Message`] TDLib produces once the edit lands server-side; the matching
+    /// `updateMessageContent` reconciles the stored copy. Errors if the message
+    /// is not editable (not own, too old, not a text message).
+    async fn edit_text(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        text: FormattedText,
+    ) -> Result<Message, TdError>;
 
     /// Replace the caption of a media message tuigram's account sent (an empty
     /// `caption` clears it). Returns the edited [`Message`] TDLib produces once the
@@ -154,7 +174,11 @@ pub trait MessageRequests {
         message_id: i64,
         caption: FormattedText,
     ) -> Result<Message, TdError>;
+}
 
+/// Delete messages from a chat.
+#[allow(async_fn_in_trait)]
+pub trait DeleteRequests {
     /// Delete messages from a chat. With `revoke` true the messages are removed
     /// for **everyone** (revoke for all members); with it false they are removed
     /// only for tuigram's account. TDLib rejects a revoke it does not permit. The
@@ -165,14 +189,22 @@ pub trait MessageRequests {
         message_ids: Vec<i64>,
         revoke: bool,
     ) -> Result<(), TdError>;
+}
 
+/// Acknowledge messages as read.
+#[allow(async_fn_in_trait)]
+pub trait ReadRequests {
     /// Mark `message_ids` in a chat as read (TDLib's `viewMessages`). **Advisory**
     /// — it acknowledges the messages to the server and lets the unread count
     /// settle, but the read path never waits on the result: the new count returns
     /// asynchronously as `updateChatReadInbox`, folded by the chat store. An empty
     /// `message_ids` is a no-op at the seam.
     async fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) -> Result<(), TdError>;
+}
 
+/// Forward messages into another chat.
+#[allow(async_fn_in_trait)]
+pub trait ForwardRequests {
     /// Forward `message_ids` from `from_chat_id` into `to_chat_id`.
     ///
     /// `send_copy` forwards the messages as a fresh copy — no "forwarded from"
@@ -182,7 +214,7 @@ pub trait MessageRequests {
     ///
     /// Returns the messages TDLib creates **optimistically** in the target chat —
     /// temporary ids, [`SendState::Pending`] — exactly like
-    /// [`send_text`](Self::send_text). TDLib also streams each as
+    /// [`send_text`](SendRequests::send_text). TDLib also streams each as
     /// `updateNewMessage`, so the store gains them through the router on the same
     /// lifecycle path as a normal send; these returned copies are for the caller's
     /// reference, not a second insert.
@@ -194,7 +226,11 @@ pub trait MessageRequests {
         send_copy: bool,
         remove_caption: bool,
     ) -> Result<Vec<Message>, TdError>;
+}
 
+/// Search messages — within one chat or across the whole account.
+#[allow(async_fn_in_trait)]
+pub trait SearchRequests {
     /// Search one chat's messages for `query`, optionally restricted to messages
     /// from `sender`. Pages backward from `from_message_id` ([`NEWEST`] for the
     /// first page); each call returns up to `limit` hits.
@@ -231,10 +267,14 @@ pub trait MessageRequests {
         from_offset: String,
         limit: i32,
     ) -> Result<SearchPage<String>, TdError>;
+}
 
+/// Add or remove tuigram's account's emoji reaction on a message.
+#[allow(async_fn_in_trait)]
+pub trait ReactionRequests {
     /// Add tuigram's account's reaction to a message — a standard `emoji`
     /// (e.g. `"👍"`), TDLib's `addMessageReaction`. **Advisory**, like
-    /// [`view_messages`](Self::view_messages): it acknowledges the reaction to the
+    /// [`view_messages`](ReadRequests::view_messages): it acknowledges the reaction to the
     /// server and never blocks; the resulting reaction counts arrive as
     /// `updateMessageInteractionInfo`, which the [`MessageStore`] folds onto the
     /// message. Only emoji reactions are sent here — custom-emoji and paid
@@ -257,7 +297,11 @@ pub trait MessageRequests {
         message_id: i64,
         emoji: String,
     ) -> Result<(), TdError>;
+}
 
+/// Pin and unpin a chat's messages.
+#[allow(async_fn_in_trait)]
+pub trait PinRequests {
     /// Pin a message in a chat, TDLib's `pinChatMessage`. `disable_notification`
     /// pins silently; `only_for_self` pins only for tuigram's account (a private
     /// pin). The resulting `updateMessageIsPinned` folds the chat's pinned-message
@@ -275,6 +319,39 @@ pub trait MessageRequests {
     /// `updateMessageIsPinned` (with `is_pinned` false) folds the message out of
     /// the chat's pinned set.
     async fn unpin_chat_message(&self, chat_id: i64, message_id: i64) -> Result<(), TdError>;
+}
+
+/// The full message request seam — every per-capability request trait in one
+/// bound. A caller that genuinely needs the whole surface (or wants to assert a
+/// driver is complete) binds this; everything else binds the narrow trait it
+/// uses. The blanket impl makes any type that satisfies every capability a
+/// `MessageRequests` automatically, so [`Bridge`] earns it by implementing the
+/// parts — and the day a capability is added to this bundle, `Bridge` fails to
+/// compile until it implements that part too.
+pub trait MessageRequests:
+    HistoryRequests
+    + SendRequests
+    + EditRequests
+    + DeleteRequests
+    + ReadRequests
+    + ForwardRequests
+    + SearchRequests
+    + ReactionRequests
+    + PinRequests
+{
+}
+
+impl<T> MessageRequests for T where
+    T: HistoryRequests
+        + SendRequests
+        + EditRequests
+        + DeleteRequests
+        + ReadRequests
+        + ForwardRequests
+        + SearchRequests
+        + ReactionRequests
+        + PinRequests
+{
 }
 
 impl Bridge {
@@ -306,7 +383,7 @@ impl Bridge {
     }
 }
 
-impl MessageRequests for Bridge {
+impl HistoryRequests for Bridge {
     async fn get_chat_history(
         &self,
         chat_id: i64,
@@ -332,7 +409,9 @@ impl MessageRequests for Bridge {
             .map(|m| Message::from_tdlib(&m))
             .collect())
     }
+}
 
+impl SendRequests for Bridge {
     async fn send_text(
         &self,
         chat_id: i64,
@@ -347,6 +426,20 @@ impl MessageRequests for Bridge {
         self.send_content(chat_id, reply_to, content).await
     }
 
+    async fn send_media(
+        &self,
+        chat_id: i64,
+        reply_to: Option<i64>,
+        media: OutgoingMedia,
+    ) -> Result<Message, TdError> {
+        // The media variant builds the inputMessage* content (local file + caption,
+        // metadata left for TDLib to measure); the send lifecycle is then identical
+        // to text, so it shares send_content.
+        self.send_content(chat_id, reply_to, media.to_tdlib()).await
+    }
+}
+
+impl EditRequests for Bridge {
     async fn edit_text(
         &self,
         chat_id: i64,
@@ -362,18 +455,6 @@ impl MessageRequests for Bridge {
         let tdlib_rs::enums::Message::Message(edited) =
             tdlib_rs::functions::edit_message_text(chat_id, message_id, content, self.id()).await?;
         Ok(Message::from_tdlib(&edited))
-    }
-
-    async fn send_media(
-        &self,
-        chat_id: i64,
-        reply_to: Option<i64>,
-        media: OutgoingMedia,
-    ) -> Result<Message, TdError> {
-        // The media variant builds the inputMessage* content (local file + caption,
-        // metadata left for TDLib to measure); the send lifecycle is then identical
-        // to text, so it shares send_content.
-        self.send_content(chat_id, reply_to, media.to_tdlib()).await
     }
 
     async fn edit_caption(
@@ -395,7 +476,9 @@ impl MessageRequests for Bridge {
         .await?;
         Ok(Message::from_tdlib(&edited))
     }
+}
 
+impl DeleteRequests for Bridge {
     async fn delete(
         &self,
         chat_id: i64,
@@ -404,7 +487,9 @@ impl MessageRequests for Bridge {
     ) -> Result<(), TdError> {
         tdlib_rs::functions::delete_messages(chat_id, message_ids, revoke, self.id()).await
     }
+}
 
+impl ReadRequests for Bridge {
     async fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) -> Result<(), TdError> {
         // `ChatHistory` source + `force_read`: a headless client is explicitly
         // marking a chat's history read, not reacting to messages drawn on screen,
@@ -418,7 +503,9 @@ impl MessageRequests for Bridge {
         )
         .await
     }
+}
 
+impl ForwardRequests for Bridge {
     async fn forward_messages(
         &self,
         from_chat_id: i64,
@@ -449,7 +536,9 @@ impl MessageRequests for Bridge {
             .map(|m| Message::from_tdlib(&m))
             .collect())
     }
+}
 
+impl SearchRequests for Bridge {
     async fn search_chat_messages(
         &self,
         chat_id: i64,
@@ -518,7 +607,9 @@ impl MessageRequests for Bridge {
             next,
         })
     }
+}
 
+impl ReactionRequests for Bridge {
     async fn add_message_reaction(
         &self,
         chat_id: i64,
@@ -553,7 +644,9 @@ impl MessageRequests for Bridge {
         )
         .await
     }
+}
 
+impl PinRequests for Bridge {
     async fn pin_chat_message(
         &self,
         chat_id: i64,
@@ -655,7 +748,7 @@ impl SearchResults {
     }
 }
 
-/// Anchor passed to [`MessageRequests::get_chat_history`] to start from a chat's
+/// Anchor passed to [`HistoryRequests::get_chat_history`] to start from a chat's
 /// most recent message. TDLib reads message id `0` as "the newest".
 pub const NEWEST: i64 = 0;
 
@@ -674,7 +767,7 @@ pub async fn load_history<C, F>(
     mut fold: F,
 ) -> Result<(), TdError>
 where
-    C: MessageRequests,
+    C: HistoryRequests,
     F: FnMut(Vec<Message>),
 {
     let mut anchor = NEWEST;
@@ -710,7 +803,7 @@ pub async fn search_chat<C>(
     page: i32,
 ) -> Result<SearchResults, TdError>
 where
-    C: MessageRequests,
+    C: SearchRequests,
 {
     let mut results = SearchResults::new();
     let mut anchor = NEWEST;
@@ -742,7 +835,7 @@ pub async fn search_global<C>(
     page: i32,
 ) -> Result<SearchResults, TdError>
 where
-    C: MessageRequests,
+    C: SearchRequests,
 {
     let mut results = SearchResults::new();
     let mut offset = String::new();
@@ -1236,34 +1329,7 @@ mod tests {
         last: RefCell<Option<(i64, Option<i64>, FormattedText)>>,
     }
 
-    impl MessageRequests for SendSpy {
-        async fn send_media(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _media: OutgoingMedia,
-        ) -> Result<Message, TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn edit_caption(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _caption: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn get_chat_history(
-            &self,
-            _chat_id: i64,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
+    impl SendRequests for SendSpy {
         async fn send_text(
             &self,
             chat_id: i64,
@@ -1282,91 +1348,12 @@ mod tests {
             )))
         }
 
-        async fn edit_text(
+        async fn send_media(
             &self,
             _chat_id: i64,
-            _message_id: i64,
-            _text: FormattedText,
+            _reply_to: Option<i64>,
+            _media: OutgoingMedia,
         ) -> Result<Message, TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn delete(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-            _revoke: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn view_messages(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-        ) -> Result<(), TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn forward_messages(
-            &self,
-            _from_chat_id: i64,
-            _message_ids: Vec<i64>,
-            _to_chat_id: i64,
-            _send_copy: bool,
-            _remove_caption: bool,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn search_chat_messages(
-            &self,
-            _chat_id: i64,
-            _query: String,
-            _sender: Option<Sender>,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<SearchPage<i64>, TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn search_messages(
-            &self,
-            _query: String,
-            _from_offset: String,
-            _limit: i32,
-        ) -> Result<SearchPage<String>, TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-        async fn add_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn remove_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn pin_chat_message(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _disable_notification: bool,
-            _only_for_self: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("SendSpy exercises the send path only")
-        }
-
-        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
             unimplemented!("SendSpy exercises the send path only")
         }
     }
@@ -1405,25 +1392,7 @@ mod tests {
         }
     }
 
-    impl MessageRequests for HistorySpy {
-        async fn send_media(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _media: OutgoingMedia,
-        ) -> Result<Message, TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn edit_caption(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _caption: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
+    impl HistoryRequests for HistorySpy {
         async fn get_chat_history(
             &self,
             _chat_id: i64,
@@ -1432,103 +1401,6 @@ mod tests {
         ) -> Result<Vec<Message>, TdError> {
             *self.calls.borrow_mut() += 1;
             Ok(self.pages.borrow_mut().pop_front().unwrap_or_default())
-        }
-
-        async fn send_text(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn edit_text(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn delete(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-            _revoke: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn view_messages(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-        ) -> Result<(), TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn forward_messages(
-            &self,
-            _from_chat_id: i64,
-            _message_ids: Vec<i64>,
-            _to_chat_id: i64,
-            _send_copy: bool,
-            _remove_caption: bool,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn search_chat_messages(
-            &self,
-            _chat_id: i64,
-            _query: String,
-            _sender: Option<Sender>,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<SearchPage<i64>, TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn search_messages(
-            &self,
-            _query: String,
-            _from_offset: String,
-            _limit: i32,
-        ) -> Result<SearchPage<String>, TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-        async fn add_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn remove_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn pin_chat_message(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _disable_notification: bool,
-            _only_for_self: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
-        }
-
-        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
-            unimplemented!("HistorySpy exercises history paging only")
         }
     }
 
@@ -1552,25 +1424,7 @@ mod tests {
     /// A history fetch that fails stops paging and propagates the error.
     struct FailingSpy;
 
-    impl MessageRequests for FailingSpy {
-        async fn send_media(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _media: OutgoingMedia,
-        ) -> Result<Message, TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn edit_caption(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _caption: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
+    impl HistoryRequests for FailingSpy {
         async fn get_chat_history(
             &self,
             _chat_id: i64,
@@ -1581,103 +1435,6 @@ mod tests {
                 code: 400,
                 message: "CHANNEL_PRIVATE".to_owned(),
             })
-        }
-
-        async fn send_text(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn edit_text(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn delete(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-            _revoke: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn view_messages(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-        ) -> Result<(), TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn forward_messages(
-            &self,
-            _from_chat_id: i64,
-            _message_ids: Vec<i64>,
-            _to_chat_id: i64,
-            _send_copy: bool,
-            _remove_caption: bool,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn search_chat_messages(
-            &self,
-            _chat_id: i64,
-            _query: String,
-            _sender: Option<Sender>,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<SearchPage<i64>, TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn search_messages(
-            &self,
-            _query: String,
-            _from_offset: String,
-            _limit: i32,
-        ) -> Result<SearchPage<String>, TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-        async fn add_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn remove_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn pin_chat_message(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _disable_notification: bool,
-            _only_for_self: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
-        }
-
-        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
-            unimplemented!("FailingSpy exercises the history error path only")
         }
     }
 
@@ -1699,43 +1456,7 @@ mod tests {
         deleted: RefCell<Option<(i64, Vec<i64>, bool)>>,
     }
 
-    impl MessageRequests for EditDeleteSpy {
-        async fn send_media(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _media: OutgoingMedia,
-        ) -> Result<Message, TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn edit_caption(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _caption: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn get_chat_history(
-            &self,
-            _chat_id: i64,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn send_text(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
+    impl EditRequests for EditDeleteSpy {
         async fn edit_text(
             &self,
             chat_id: i64,
@@ -1751,6 +1472,17 @@ mod tests {
             Ok(edited)
         }
 
+        async fn edit_caption(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _caption: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+    }
+
+    impl DeleteRequests for EditDeleteSpy {
         async fn delete(
             &self,
             chat_id: i64,
@@ -1761,76 +1493,6 @@ mod tests {
                 .borrow_mut()
                 .replace((chat_id, message_ids, revoke));
             Ok(())
-        }
-
-        async fn view_messages(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-        ) -> Result<(), TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn forward_messages(
-            &self,
-            _from_chat_id: i64,
-            _message_ids: Vec<i64>,
-            _to_chat_id: i64,
-            _send_copy: bool,
-            _remove_caption: bool,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn search_chat_messages(
-            &self,
-            _chat_id: i64,
-            _query: String,
-            _sender: Option<Sender>,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<SearchPage<i64>, TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn search_messages(
-            &self,
-            _query: String,
-            _from_offset: String,
-            _limit: i32,
-        ) -> Result<SearchPage<String>, TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-        async fn add_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn remove_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn pin_chat_message(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _disable_notification: bool,
-            _only_for_self: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
-        }
-
-        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
-            unimplemented!("EditDeleteSpy exercises edit/delete only")
         }
     }
 
@@ -1867,126 +1529,10 @@ mod tests {
         viewed: RefCell<Option<(i64, Vec<i64>)>>,
     }
 
-    impl MessageRequests for ViewSpy {
-        async fn send_media(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _media: OutgoingMedia,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn edit_caption(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _caption: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn get_chat_history(
-            &self,
-            _chat_id: i64,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn send_text(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn edit_text(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn delete(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-            _revoke: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
+    impl ReadRequests for ViewSpy {
         async fn view_messages(&self, chat_id: i64, message_ids: Vec<i64>) -> Result<(), TdError> {
             self.viewed.borrow_mut().replace((chat_id, message_ids));
             Ok(())
-        }
-
-        async fn forward_messages(
-            &self,
-            _from_chat_id: i64,
-            _message_ids: Vec<i64>,
-            _to_chat_id: i64,
-            _send_copy: bool,
-            _remove_caption: bool,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn search_chat_messages(
-            &self,
-            _chat_id: i64,
-            _query: String,
-            _sender: Option<Sender>,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<SearchPage<i64>, TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn search_messages(
-            &self,
-            _query: String,
-            _from_offset: String,
-            _limit: i32,
-        ) -> Result<SearchPage<String>, TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-        async fn add_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn remove_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn pin_chat_message(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _disable_notification: bool,
-            _only_for_self: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
-        }
-
-        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
-            unimplemented!("ViewSpy exercises the read path only")
         }
     }
 
@@ -2020,69 +1566,7 @@ mod tests {
         last: RefCell<Option<ForwardCall>>,
     }
 
-    impl MessageRequests for ForwardSpy {
-        async fn send_media(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _media: OutgoingMedia,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn edit_caption(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _caption: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn get_chat_history(
-            &self,
-            _chat_id: i64,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn send_text(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn edit_text(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn delete(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-            _revoke: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn view_messages(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-        ) -> Result<(), TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
+    impl ForwardRequests for ForwardSpy {
         async fn forward_messages(
             &self,
             from_chat_id: i64,
@@ -2113,57 +1597,6 @@ mod tests {
                     ))
                 })
                 .collect())
-        }
-
-        async fn search_chat_messages(
-            &self,
-            _chat_id: i64,
-            _query: String,
-            _sender: Option<Sender>,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<SearchPage<i64>, TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn search_messages(
-            &self,
-            _query: String,
-            _from_offset: String,
-            _limit: i32,
-        ) -> Result<SearchPage<String>, TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-        async fn add_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn remove_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn pin_chat_message(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _disable_notification: bool,
-            _only_for_self: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
-        }
-
-        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
-            unimplemented!("ForwardSpy exercises the forward path only")
         }
     }
 
@@ -2241,80 +1674,7 @@ mod tests {
         global_pages: RefCell<VecDeque<SearchPage<String>>>,
     }
 
-    impl MessageRequests for SearchSpy {
-        async fn send_media(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _media: OutgoingMedia,
-        ) -> Result<Message, TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn edit_caption(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _caption: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn get_chat_history(
-            &self,
-            _chat_id: i64,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn send_text(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn edit_text(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn delete(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-            _revoke: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn view_messages(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-        ) -> Result<(), TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn forward_messages(
-            &self,
-            _from_chat_id: i64,
-            _message_ids: Vec<i64>,
-            _to_chat_id: i64,
-            _send_copy: bool,
-            _remove_caption: bool,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
+    impl SearchRequests for SearchSpy {
         async fn search_chat_messages(
             &self,
             chat_id: i64,
@@ -2361,37 +1721,6 @@ mod tests {
                     total_count: 0,
                     next: None,
                 }))
-        }
-        async fn add_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn remove_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn pin_chat_message(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _disable_notification: bool,
-            _only_for_self: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
-        }
-
-        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
-            unimplemented!("SearchSpy exercises the search path only")
         }
     }
 
@@ -2544,7 +1873,16 @@ mod tests {
         captioned: RefCell<Option<(i64, i64, FormattedText)>>,
     }
 
-    impl MessageRequests for MediaSpy {
+    impl SendRequests for MediaSpy {
+        async fn send_text(
+            &self,
+            _chat_id: i64,
+            _reply_to: Option<i64>,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("MediaSpy exercises the media send path only")
+        }
+
         async fn send_media(
             &self,
             chat_id: i64,
@@ -2563,6 +1901,17 @@ mod tests {
                 )),
             )))
         }
+    }
+
+    impl EditRequests for MediaSpy {
+        async fn edit_text(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("MediaSpy exercises the media send path only")
+        }
 
         async fn edit_caption(
             &self,
@@ -2576,112 +1925,6 @@ mod tests {
             Ok(Message::from_tdlib(&td_photo_message(
                 chat_id, message_id, "edited", None,
             )))
-        }
-
-        async fn get_chat_history(
-            &self,
-            _chat_id: i64,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn send_text(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn edit_text(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn delete(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-            _revoke: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn view_messages(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-        ) -> Result<(), TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn forward_messages(
-            &self,
-            _from_chat_id: i64,
-            _message_ids: Vec<i64>,
-            _to_chat_id: i64,
-            _send_copy: bool,
-            _remove_caption: bool,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn search_chat_messages(
-            &self,
-            _chat_id: i64,
-            _query: String,
-            _sender: Option<Sender>,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<SearchPage<i64>, TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn search_messages(
-            &self,
-            _query: String,
-            _from_offset: String,
-            _limit: i32,
-        ) -> Result<SearchPage<String>, TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-        async fn add_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn remove_message_reaction(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _emoji: String,
-        ) -> Result<(), TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn pin_chat_message(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _disable_notification: bool,
-            _only_for_self: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
-        }
-
-        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
-            unimplemented!("MediaSpy exercises the media send path only")
         }
     }
 
@@ -2934,100 +2177,7 @@ mod tests {
         calls: RefCell<ReactionPinCalls>,
     }
 
-    impl MessageRequests for ReactionPinSpy {
-        async fn send_media(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _media: OutgoingMedia,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn edit_caption(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _caption: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn get_chat_history(
-            &self,
-            _chat_id: i64,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn send_text(
-            &self,
-            _chat_id: i64,
-            _reply_to: Option<i64>,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn edit_text(
-            &self,
-            _chat_id: i64,
-            _message_id: i64,
-            _text: FormattedText,
-        ) -> Result<Message, TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn delete(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-            _revoke: bool,
-        ) -> Result<(), TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn view_messages(
-            &self,
-            _chat_id: i64,
-            _message_ids: Vec<i64>,
-        ) -> Result<(), TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn forward_messages(
-            &self,
-            _from_chat_id: i64,
-            _message_ids: Vec<i64>,
-            _to_chat_id: i64,
-            _send_copy: bool,
-            _remove_caption: bool,
-        ) -> Result<Vec<Message>, TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn search_chat_messages(
-            &self,
-            _chat_id: i64,
-            _query: String,
-            _sender: Option<Sender>,
-            _from_message_id: i64,
-            _limit: i32,
-        ) -> Result<SearchPage<i64>, TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
-        async fn search_messages(
-            &self,
-            _query: String,
-            _from_offset: String,
-            _limit: i32,
-        ) -> Result<SearchPage<String>, TdError> {
-            unimplemented!("ReactionPinSpy exercises reactions and pins only")
-        }
-
+    impl ReactionRequests for ReactionPinSpy {
         async fn add_message_reaction(
             &self,
             chat_id: i64,
@@ -3047,7 +2197,9 @@ mod tests {
             self.calls.borrow_mut().removed = Some((chat_id, message_id, emoji));
             Ok(())
         }
+    }
 
+    impl PinRequests for ReactionPinSpy {
         async fn pin_chat_message(
             &self,
             chat_id: i64,

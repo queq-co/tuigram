@@ -42,7 +42,7 @@ use tokio::task::JoinHandle;
 use crate::bridge::Bridge;
 use crate::chats::ChatStore;
 use crate::files::FileStore;
-use crate::messages::{MessageRequests, MessageStore, SearchResults};
+use crate::messages::{ForwardRequests, MessageStore, SearchResults};
 use crate::model::{Message, Sender};
 use crate::router::{Router, UpdateSink};
 use crate::users::UserStore;
@@ -217,7 +217,7 @@ impl Client {
     ///
     /// `getChatHistory` (driven via
     /// [`load_history`](crate::messages::load_history) or a single
-    /// [`get_chat_history`](crate::messages::MessageRequests::get_chat_history)
+    /// [`get_chat_history`](crate::messages::HistoryRequests::get_chat_history)
     /// call) returns each page in the response, not as updates — so a caller
     /// paging a chat's history hands each page here to merge it into the store the
     /// facade reads back. This is the "production fold" `load_history` leaves to
@@ -271,7 +271,8 @@ impl Client {
     /// **write that reconciles through the router**: TDLib streams each forwarded
     /// message into the target chat as `updateNewMessage`, which the router folds
     /// into the [`MessageStore`] on the same optimistic-send lifecycle as
-    /// [`MessageRequests::send_text`]. The returned [`Message`]s are the caller's
+    /// [`SendRequests::send_text`](crate::messages::SendRequests::send_text). The
+    /// returned [`Message`]s are the caller's
     /// reference copies of those optimistic entries (temporary ids,
     /// [`SendState::Pending`](crate::model::SendState::Pending)), not a second
     /// insert. It returns as soon as TDLib accepts the request.

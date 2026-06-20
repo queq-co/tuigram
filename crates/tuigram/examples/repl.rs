@@ -45,8 +45,9 @@ use tuigram_core::enums::Update;
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
     ApiCredentials, AuthRequests, AuthState, Bridge, Client, ClientParameters, CredentialError,
-    CredentialResolver, FormattedText, Login, Message, MessageContent, MessageRequests, NEWEST,
-    Onboarding, SendState, Sender, SessionStorage, TgClient, UpdateStream, load_main_list,
+    CredentialResolver, DeleteRequests, EditRequests, FormattedText, HistoryRequests, Login,
+    Message, MessageContent, NEWEST, Onboarding, ReadRequests, SendRequests, SendState, Sender,
+    SessionStorage, TgClient, UpdateStream, load_main_list,
 };
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;

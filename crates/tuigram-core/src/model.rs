@@ -1468,7 +1468,7 @@ fn optional_caption(caption: &FormattedText) -> Option<TdFormattedText> {
 /// Total over the TDLib enum: a standard [`Emoji`](Self::Emoji), a
 /// [`CustomEmoji`](Self::CustomEmoji) by its sticker id, or the channel
 /// [`Paid`](Self::Paid) star reaction. Only the emoji case is sent over the
-/// request seam ([`add_message_reaction`](crate::MessageRequests::add_message_reaction));
+/// request seam ([`add_message_reaction`](crate::ReactionRequests::add_message_reaction));
 /// the other two are read-only projections of reactions already on a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReactionKind {
