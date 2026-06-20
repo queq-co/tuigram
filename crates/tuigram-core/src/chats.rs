@@ -18,19 +18,21 @@
 //! pure transport and a driver depends on just the requests it makes, exactly as
 //! [`AuthRequests`](crate::auth::AuthRequests) does for login. The chats arrive
 //! asynchronously as updates; the request side only *asks* for more of them
-//! ([`load_main_list`]).
+//! ([`load_main_list`], [`load_archive_list`]).
 //!
-//! Scope (#17): the **Main** list only. Archived chats, folders, and secret
-//! chats are out of scope (follow-up issues); chats with no Main-list position
-//! are simply not part of [`ChatStore::main_list`].
+//! Scope: the **Main** (#17) and **Archive** (#48) lists. Both fold the same
+//! per-list `updateChatPosition` family; [`ChatStore::main_list`] and
+//! [`ChatStore::archive_list`] read each back ordered. Folders and secret chats
+//! remain out of scope (follow-up issues); a chat is in a list's snapshot only
+//! when it has a position there.
 
 use std::collections::HashMap;
 
-use tdlib_rs::enums::{ChatList, Update};
+use tdlib_rs::enums::Update;
 use tdlib_rs::types::Error as TdError;
 
 use crate::bridge::Bridge;
-use crate::model::{Chat, ChatPosition, Draft, Message};
+use crate::model::{Chat, ChatListKind, ChatPosition, Draft, Message};
 
 /// The chat-list request seam — tuigram's chat slice of the
 /// `tdlib_rs::functions` surface, segregated from the auth and message requests
@@ -44,14 +46,14 @@ use crate::model::{Chat, ChatPosition, Draft, Message};
 // is not a concern here.
 #[allow(async_fn_in_trait)]
 pub trait ChatRequests {
-    /// Ask TDLib to load up to `limit` more chats from the **Main** list.
+    /// Ask TDLib to load up to `limit` more chats from `list` (Main or Archive).
     ///
     /// This does not return the chats: TDLib loads them into its own state and
     /// emits `updateNewChat` / `updateChatPosition` for any the client did not
     /// already know, which [`ChatStore`] folds. Once the list is fully loaded,
     /// TDLib answers with error [`CHATS_EXHAUSTED`] (404) — the normal end of
-    /// paging, which [`load_main_list`] treats as success.
-    async fn load_chats(&self, limit: i32) -> Result<(), TdError>;
+    /// paging, which the paging drivers treat as success.
+    async fn load_chats(&self, list: ChatListKind, limit: i32) -> Result<(), TdError>;
 
     /// Push a compose draft to a chat, or clear it with `None`.
     ///
@@ -68,11 +70,10 @@ pub trait ChatRequests {
 }
 
 impl ChatRequests for Bridge {
-    async fn load_chats(&self, limit: i32) -> Result<(), TdError> {
-        // Always the Main list — tuigram's primary view. `Some(Main)` rather
-        // than `None` (which TDLib also reads as Main) to keep the intent
-        // explicit at the seam.
-        tdlib_rs::functions::load_chats(Some(ChatList::Main), limit, self.id()).await
+    async fn load_chats(&self, list: ChatListKind, limit: i32) -> Result<(), TdError> {
+        // `Some(list)` rather than `None` (which TDLib reads as Main) to keep the
+        // selected list explicit at the seam.
+        tdlib_rs::functions::load_chats(Some(list.to_tdlib()), limit, self.id()).await
     }
 
     async fn set_chat_draft_message(
@@ -95,20 +96,35 @@ impl ChatRequests for Bridge {
 /// been loaded. Not a failure — the natural terminal condition of paging.
 pub const CHATS_EXHAUSTED: i32 = 404;
 
-/// Page the entire Main chat list, asking for `page` chats at a time until TDLib
+/// Page an entire chat list, asking for `page` chats at a time until TDLib
 /// reports there are no more ([`CHATS_EXHAUSTED`]).
 ///
 /// Only the *requests* are driven here; the chats themselves arrive on the
 /// update stream and are folded by [`ChatStore`] on the router task. Any error
-/// other than the exhausted sentinel is propagated.
-pub async fn load_main_list<C: ChatRequests>(client: &C, page: i32) -> Result<(), TdError> {
+/// other than the exhausted sentinel is propagated. [`load_main_list`] and
+/// [`load_archive_list`] are the per-list entry points.
+async fn load_list<C: ChatRequests>(
+    client: &C,
+    list: ChatListKind,
+    page: i32,
+) -> Result<(), TdError> {
     loop {
-        match client.load_chats(page).await {
+        match client.load_chats(list.clone(), page).await {
             Ok(()) => {}
             Err(e) if e.code == CHATS_EXHAUSTED => return Ok(()),
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Page the entire **Main** chat list to exhaustion. See [`load_list`].
+pub async fn load_main_list<C: ChatRequests>(client: &C, page: i32) -> Result<(), TdError> {
+    load_list(client, ChatListKind::Main, page).await
+}
+
+/// Page the entire **Archive** chat list to exhaustion (#48). See [`load_list`].
+pub async fn load_archive_list<C: ChatRequests>(client: &C, page: i32) -> Result<(), TdError> {
+    load_list(client, ChatListKind::Archive, page).await
 }
 
 /// The folded chat-list state: every known chat, keyed by id, with an ordered
@@ -158,21 +174,39 @@ impl ChatStore {
         }
     }
 
-    /// The Main list, ordered the way TDLib intends it shown: by descending
+    /// One chat list, ordered the way TDLib intends it shown: by descending
     /// position order (pinned chats carry higher orders, so they float to the
-    /// top), with chat id as a stable tiebreaker. Chats with no Main position
-    /// (archived, or not yet positioned) are excluded.
-    #[must_use]
-    pub fn main_list(&self) -> Vec<&Chat> {
+    /// top), with chat id as a stable tiebreaker. Chats with no position in
+    /// `list` are excluded. The per-list views ([`main_list`](Self::main_list),
+    /// [`archive_list`](Self::archive_list)) are this, fixed to one list.
+    fn ordered_by(&self, list: &ChatListKind) -> Vec<&Chat> {
         let mut ordered: Vec<&Chat> = self
             .chats
             .values()
-            .filter(|c| c.main_order().is_some())
+            .filter(|c| c.order_in(list).is_some())
             .collect();
         // Both keys are `Some` here (filtered above); compare descending, then
         // break ties by id descending so the order is total and stable.
-        ordered.sort_by(|a, b| b.main_order().cmp(&a.main_order()).then(b.id.cmp(&a.id)));
+        ordered.sort_by(|a, b| {
+            b.order_in(list)
+                .cmp(&a.order_in(list))
+                .then(b.id.cmp(&a.id))
+        });
         ordered
+    }
+
+    /// The Main list, ordered highest-first (#17). Chats with no Main position
+    /// (archived, or not yet positioned) are excluded.
+    #[must_use]
+    pub fn main_list(&self) -> Vec<&Chat> {
+        self.ordered_by(&ChatListKind::Main)
+    }
+
+    /// The Archive list, ordered highest-first (#48). Chats with no Archive
+    /// position are excluded; the Main snapshot is independent of this one.
+    #[must_use]
+    pub fn archive_list(&self) -> Vec<&Chat> {
+        self.ordered_by(&ChatListKind::Archive)
     }
 
     /// Look up a chat by id, whatever list it is in.
@@ -367,6 +401,19 @@ mod tests {
         })
     }
 
+    /// An Archive-list position update for `chat_id` with the given order.
+    fn archive_position(chat_id: i64, order: i64) -> Update {
+        Update::ChatPosition(UpdateChatPosition {
+            chat_id,
+            position: TdChatPosition {
+                list: TdChatList::Archive,
+                order,
+                is_pinned: false,
+                source: None,
+            },
+        })
+    }
+
     fn read_inbox(chat_id: i64, last_read: i64, unread: i32) -> Update {
         Update::ChatReadInbox(UpdateChatReadInbox {
             chat_id,
@@ -455,6 +502,50 @@ mod tests {
         assert_eq!(ids(&store.main_list()), vec![10]);
         assert!(store.get(20).is_some());
         assert_eq!(store.len(), 2);
+    }
+
+    #[test]
+    fn positions_order_the_archive_list_highest_first() {
+        let mut store = seeded();
+        store.reduce(&archive_position(10, 5));
+        store.reduce(&archive_position(20, 99));
+
+        // Same highest-first ordering as Main, read off the Archive positions.
+        assert_eq!(ids(&store.archive_list()), vec![20, 10]);
+    }
+
+    #[test]
+    fn the_two_lists_are_independent() {
+        let mut store = seeded();
+        store.reduce(&new_chat(30, "Thirty"));
+        // 10 in Main only, 30 in Archive only, 20 in both (its Archive order
+        // differs from its Main order — TDLib positions each list separately).
+        store.reduce(&main_position(10, 5));
+        store.reduce(&main_position(20, 99));
+        store.reduce(&archive_position(20, 3));
+        store.reduce(&archive_position(30, 50));
+
+        // Each snapshot contains only chats positioned in that list, ordered by
+        // that list's order — neither leaks into the other.
+        assert_eq!(ids(&store.main_list()), vec![20, 10]);
+        assert_eq!(ids(&store.archive_list()), vec![30, 20]);
+    }
+
+    #[test]
+    fn archiving_a_chat_moves_it_between_the_lists() {
+        let mut store = seeded();
+        store.reduce(&main_position(10, 5));
+        store.reduce(&main_position(20, 99));
+        assert_eq!(ids(&store.main_list()), vec![20, 10]);
+
+        // 10 leaves Main (order 0 removes the position) and gains an Archive one —
+        // the move TDLib delivers as two per-list position updates.
+        store.reduce(&main_position(10, 0));
+        store.reduce(&archive_position(10, 7));
+        assert_eq!(ids(&store.main_list()), vec![20]);
+        assert_eq!(ids(&store.archive_list()), vec![10]);
+        // The chat itself is still known, just relisted.
+        assert!(store.get(10).is_some());
     }
 
     #[test]
@@ -640,10 +731,12 @@ mod tests {
     }
 
     /// A spy `ChatRequests` that answers `ok_pages` successful loads and then the
-    /// exhausted sentinel, counting every call.
+    /// exhausted sentinel, counting every call and recording the list it was asked
+    /// to page (so a test can assert which list a driver targets).
     struct PagingSpy {
         ok_pages: Cell<u32>,
         calls: Cell<u32>,
+        last_list: RefCell<Option<ChatListKind>>,
     }
 
     impl PagingSpy {
@@ -651,13 +744,15 @@ mod tests {
             Self {
                 ok_pages: Cell::new(ok_pages),
                 calls: Cell::new(0),
+                last_list: RefCell::new(None),
             }
         }
     }
 
     impl ChatRequests for PagingSpy {
-        async fn load_chats(&self, _limit: i32) -> Result<(), TdError> {
+        async fn load_chats(&self, list: ChatListKind, _limit: i32) -> Result<(), TdError> {
             self.calls.set(self.calls.get() + 1);
+            self.last_list.borrow_mut().replace(list);
             if self.ok_pages.get() > 0 {
                 self.ok_pages.set(self.ok_pages.get() - 1);
                 Ok(())
@@ -684,13 +779,23 @@ mod tests {
         load_main_list(&spy, 20).await.unwrap();
         // Two successful pages, then the 404 that ends paging: three calls total.
         assert_eq!(spy.calls.get(), 3);
+        assert_eq!(*spy.last_list.borrow(), Some(ChatListKind::Main));
+    }
+
+    #[tokio::test]
+    async fn archive_paging_loads_the_archive_list_until_exhausted() {
+        let spy = PagingSpy::new(1);
+        load_archive_list(&spy, 20).await.unwrap();
+        // One page, then the 404: two calls, and the Archive list was the target.
+        assert_eq!(spy.calls.get(), 2);
+        assert_eq!(*spy.last_list.borrow(), Some(ChatListKind::Archive));
     }
 
     /// A non-404 error stops paging and propagates, rather than looping forever.
     struct FailingSpy;
 
     impl ChatRequests for FailingSpy {
-        async fn load_chats(&self, _limit: i32) -> Result<(), TdError> {
+        async fn load_chats(&self, _list: ChatListKind, _limit: i32) -> Result<(), TdError> {
             Err(TdError {
                 code: 420,
                 message: "FLOOD_WAIT".to_owned(),
@@ -727,7 +832,7 @@ mod tests {
     }
 
     impl ChatRequests for DraftSpy {
-        async fn load_chats(&self, _limit: i32) -> Result<(), TdError> {
+        async fn load_chats(&self, _list: ChatListKind, _limit: i32) -> Result<(), TdError> {
             unimplemented!("DraftSpy exercises drafts, not load paging")
         }
 

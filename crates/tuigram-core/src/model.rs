@@ -26,7 +26,7 @@ use tdlib_rs::enums::{
     TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
-    Chat as TdChat, ChatPosition as TdChatPosition, Contact as TdContact,
+    Chat as TdChat, ChatListFolder, ChatPosition as TdChatPosition, Contact as TdContact,
     DraftMessage as TdDraftMessage, File as TdFile, FormattedText as TdFormattedText,
     InputFileLocal, InputMessageAnimation, InputMessageAudio, InputMessageDocument,
     InputMessagePhoto, InputMessageReplyToMessage, InputMessageText, InputMessageVideo,
@@ -266,6 +266,20 @@ impl ChatListKind {
             TdChatList::Main => Self::Main,
             TdChatList::Archive => Self::Archive,
             TdChatList::Folder(f) => Self::Folder(f.chat_folder_id),
+        }
+    }
+
+    /// Build TDLib's `ChatList`, for the request side (e.g. selecting which list
+    /// to page with `loadChats`). Total, mirroring [`from_tdlib`](Self::from_tdlib):
+    /// a new variant added here must be handled rather than defaulting.
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdChatList {
+        match self {
+            Self::Main => TdChatList::Main,
+            Self::Archive => TdChatList::Archive,
+            Self::Folder(id) => TdChatList::Folder(ChatListFolder {
+                chat_folder_id: *id,
+            }),
         }
     }
 }
@@ -1587,14 +1601,26 @@ impl Chat {
         }
     }
 
-    /// This chat's ordering key in the Main list, if it has a position there.
-    /// The chat list module (#17) sorts the Main view by this.
+    /// This chat's ordering key in `list`, if it has a position there. The chat
+    /// list module sorts each list's view by this.
     #[must_use]
-    pub fn main_order(&self) -> Option<i64> {
+    pub fn order_in(&self, list: &ChatListKind) -> Option<i64> {
         self.positions
             .iter()
-            .find(|p| p.list == ChatListKind::Main)
+            .find(|p| &p.list == list)
             .map(|p| p.order)
+    }
+
+    /// This chat's ordering key in the Main list, if any (#17).
+    #[must_use]
+    pub fn main_order(&self) -> Option<i64> {
+        self.order_in(&ChatListKind::Main)
+    }
+
+    /// This chat's ordering key in the Archive list, if any (#48).
+    #[must_use]
+    pub fn archive_order(&self) -> Option<i64> {
+        self.order_in(&ChatListKind::Archive)
     }
 }
 
@@ -2407,10 +2433,25 @@ mod tests {
         assert_eq!(chat.kind, ChatKind::Private { user_id: 7 });
         assert_eq!(chat.unread_count, 3);
         assert_eq!(chat.main_order(), Some(99));
+        // The same chat carries a separate Archive position, read independently.
+        assert_eq!(chat.archive_order(), Some(5));
         assert_eq!(
             chat.last_message.and_then(|m| m.text().map(str::to_owned)),
             Some("last".to_owned())
         );
+    }
+
+    #[test]
+    fn chat_list_kind_round_trips_through_tdlib() {
+        // to_tdlib then from_tdlib is the identity over every variant — the
+        // request side and the fold side agree on each list.
+        for kind in [
+            ChatListKind::Main,
+            ChatListKind::Archive,
+            ChatListKind::Folder(7),
+        ] {
+            assert_eq!(ChatListKind::from_tdlib(&kind.to_tdlib()), kind);
+        }
     }
 
     #[test]
