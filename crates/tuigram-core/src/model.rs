@@ -19,16 +19,18 @@
 //! service messages are out of scope for this model.
 
 use tdlib_rs::enums::{
-    ChatList as TdChatList, ChatType as TdChatType, InputMessageContent as TdInputMessageContent,
-    InputMessageReplyTo as TdInputMessageReplyTo, MessageContent as TdMessageContent,
-    MessageSender as TdMessageSender, MessageSendingState as TdMessageSendingState,
-    PollType as TdPollType, TextEntityType as TdTextEntityType, UserStatus as TdUserStatus,
-    UserType as TdUserType,
+    ChatList as TdChatList, ChatType as TdChatType, InputFile as TdInputFile,
+    InputMessageContent as TdInputMessageContent, InputMessageReplyTo as TdInputMessageReplyTo,
+    MessageContent as TdMessageContent, MessageSender as TdMessageSender,
+    MessageSendingState as TdMessageSendingState, PollType as TdPollType,
+    TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
     Chat as TdChat, ChatPosition as TdChatPosition, Contact as TdContact,
     DraftMessage as TdDraftMessage, File as TdFile, FormattedText as TdFormattedText,
-    InputMessageReplyToMessage, InputMessageText, Location as TdLocation, Message as TdMessage,
+    InputFileLocal, InputMessageAnimation, InputMessageAudio, InputMessageDocument,
+    InputMessagePhoto, InputMessageReplyToMessage, InputMessageText, InputMessageVideo,
+    InputMessageVoiceNote, Location as TdLocation, Message as TdMessage,
     MessageAnimation as TdMessageAnimation, MessageAudio as TdMessageAudio,
     MessageDocument as TdMessageDocument, MessagePhoto as TdMessagePhoto,
     MessageSenderChat as TdMessageSenderChat, MessageSenderUser as TdMessageSenderUser,
@@ -1262,6 +1264,159 @@ impl MessageContent {
     }
 }
 
+/// A file-backed message to send, from a local path — the write-side counterpart
+/// to the read-side media [`MessageContent`] variants ([`Photo`], [`Video`], …).
+///
+/// Each variant carries the **local path** to upload and a caption (an empty
+/// [`FormattedText`] when there is none). The remaining TDLib metadata a
+/// `inputMessage*` accepts — dimensions, duration, thumbnails — is left for TDLib
+/// to detect from the file itself: a headless client sends what it has on disk, so
+/// it does not pre-measure media. [`to_tdlib`](Self::to_tdlib) projects each
+/// variant into the matching `inputMessage*` content with that metadata defaulted.
+///
+/// Sticker is intentionally absent: a sticker is sent by file id from an installed
+/// set, not by a local path, so it does not belong on this local-file seam.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OutgoingMedia {
+    /// A photo, from a local image file.
+    Photo {
+        /// Local path to the image to upload.
+        path: String,
+        /// Caption to send with it (empty for none).
+        caption: FormattedText,
+    },
+    /// A video, from a local video file.
+    Video {
+        /// Local path to the video to upload.
+        path: String,
+        /// Caption to send with it (empty for none).
+        caption: FormattedText,
+    },
+    /// A document (arbitrary file), from a local path.
+    Document {
+        /// Local path to the file to upload.
+        path: String,
+        /// Caption to send with it (empty for none).
+        caption: FormattedText,
+    },
+    /// A music/audio track, from a local audio file.
+    Audio {
+        /// Local path to the audio to upload.
+        path: String,
+        /// Caption to send with it (empty for none).
+        caption: FormattedText,
+    },
+    /// A voice note, from a local audio file.
+    Voice {
+        /// Local path to the audio to upload.
+        path: String,
+        /// Caption to send with it (empty for none).
+        caption: FormattedText,
+    },
+    /// An animation (GIF/silent video), from a local file.
+    Animation {
+        /// Local path to the file to upload.
+        path: String,
+        /// Caption to send with it (empty for none).
+        caption: FormattedText,
+    },
+}
+
+impl OutgoingMedia {
+    /// Project into the matching TDLib `inputMessage*` content, wrapping the local
+    /// path as an [`InputFile::Local`](TdInputFile::Local) and carrying the caption
+    /// (omitted when empty). All other metadata is defaulted so TDLib measures the
+    /// file on upload; this never blocks on probing the media locally.
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdInputMessageContent {
+        match self {
+            Self::Photo { path, caption } => {
+                TdInputMessageContent::InputMessagePhoto(InputMessagePhoto {
+                    photo: local_file(path),
+                    thumbnail: None,
+                    added_sticker_file_ids: vec![],
+                    width: 0,
+                    height: 0,
+                    caption: optional_caption(caption),
+                    show_caption_above_media: false,
+                    self_destruct_type: None,
+                    has_spoiler: false,
+                })
+            }
+            Self::Video { path, caption } => {
+                TdInputMessageContent::InputMessageVideo(InputMessageVideo {
+                    video: local_file(path),
+                    thumbnail: None,
+                    cover: None,
+                    start_timestamp: 0,
+                    added_sticker_file_ids: vec![],
+                    duration: 0,
+                    width: 0,
+                    height: 0,
+                    supports_streaming: false,
+                    caption: optional_caption(caption),
+                    show_caption_above_media: false,
+                    self_destruct_type: None,
+                    has_spoiler: false,
+                })
+            }
+            Self::Document { path, caption } => {
+                TdInputMessageContent::InputMessageDocument(InputMessageDocument {
+                    document: local_file(path),
+                    thumbnail: None,
+                    disable_content_type_detection: false,
+                    caption: optional_caption(caption),
+                })
+            }
+            Self::Audio { path, caption } => {
+                TdInputMessageContent::InputMessageAudio(InputMessageAudio {
+                    audio: local_file(path),
+                    album_cover_thumbnail: None,
+                    duration: 0,
+                    title: String::new(),
+                    performer: String::new(),
+                    caption: optional_caption(caption),
+                })
+            }
+            Self::Voice { path, caption } => {
+                TdInputMessageContent::InputMessageVoiceNote(InputMessageVoiceNote {
+                    voice_note: local_file(path),
+                    duration: 0,
+                    waveform: String::new(),
+                    caption: optional_caption(caption),
+                    self_destruct_type: None,
+                })
+            }
+            Self::Animation { path, caption } => {
+                TdInputMessageContent::InputMessageAnimation(InputMessageAnimation {
+                    animation: local_file(path),
+                    thumbnail: None,
+                    added_sticker_file_ids: vec![],
+                    duration: 0,
+                    width: 0,
+                    height: 0,
+                    caption: optional_caption(caption),
+                    show_caption_above_media: false,
+                    has_spoiler: false,
+                })
+            }
+        }
+    }
+}
+
+/// Wrap a local path as a TDLib [`InputFile::Local`](TdInputFile::Local).
+fn local_file(path: &str) -> TdInputFile {
+    TdInputFile::Local(InputFileLocal {
+        path: path.to_owned(),
+    })
+}
+
+/// Project a caption, omitting it when empty: TDLib reads a `None` caption as no
+/// caption, so an empty [`FormattedText`] must not be sent as an empty body.
+fn optional_caption(caption: &FormattedText) -> Option<TdFormattedText> {
+    (!caption.text.is_empty()).then(|| caption.to_tdlib())
+}
+
 /// A single message — tuigram's projection of TDLib's `Message`.
 ///
 /// Not `Eq`: a [`MessageContent::Location`] carries `f64` coordinates, so the
@@ -2479,5 +2634,121 @@ mod tests {
             TdUserStatus::Empty,
         ));
         assert_eq!(anon.display_name(), "User 10");
+    }
+
+    /// The local path an `inputMessage*`'s file carries, for asserting it threads
+    /// through unchanged. Panics on a non-local input file — the projection only
+    /// ever builds [`TdInputFile::Local`].
+    fn local_path(file: &TdInputFile) -> &str {
+        match file {
+            TdInputFile::Local(local) => &local.path,
+            other => panic!("expected a local input file, got {other:?}"),
+        }
+    }
+
+    fn caption_text(caption: &str) -> FormattedText {
+        FormattedText {
+            text: caption.to_owned(),
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn outgoing_photo_carries_its_local_path_and_caption() {
+        let content = OutgoingMedia::Photo {
+            path: "/tmp/cat.jpg".to_owned(),
+            caption: caption_text("a cat"),
+        }
+        .to_tdlib();
+
+        let TdInputMessageContent::InputMessagePhoto(photo) = content else {
+            panic!("expected an input photo");
+        };
+        assert_eq!(local_path(&photo.photo), "/tmp/cat.jpg");
+        assert_eq!(photo.caption.unwrap().text, "a cat");
+    }
+
+    #[test]
+    fn outgoing_document_carries_its_local_path_and_caption() {
+        // The document struct names its file field differently, so it is worth its
+        // own check that the path lands in the right place.
+        let content = OutgoingMedia::Document {
+            path: "/tmp/report.pdf".to_owned(),
+            caption: caption_text("q3"),
+        }
+        .to_tdlib();
+
+        let TdInputMessageContent::InputMessageDocument(doc) = content else {
+            panic!("expected an input document");
+        };
+        assert_eq!(local_path(&doc.document), "/tmp/report.pdf");
+        assert_eq!(doc.caption.unwrap().text, "q3");
+    }
+
+    #[test]
+    fn outgoing_media_omits_an_empty_caption() {
+        // An empty caption must project to None, not an empty body — TDLib reads
+        // None as "no caption".
+        let content = OutgoingMedia::Voice {
+            path: "/tmp/note.ogg".to_owned(),
+            caption: caption_text(""),
+        }
+        .to_tdlib();
+
+        let TdInputMessageContent::InputMessageVoiceNote(voice) = content else {
+            panic!("expected an input voice note");
+        };
+        assert_eq!(local_path(&voice.voice_note), "/tmp/note.ogg");
+        assert!(voice.caption.is_none());
+    }
+
+    #[test]
+    fn each_outgoing_media_variant_maps_to_its_input_content() {
+        let cap = caption_text("c");
+        let path = "/tmp/x".to_owned();
+        assert!(matches!(
+            OutgoingMedia::Photo {
+                path: path.clone(),
+                caption: cap.clone(),
+            }
+            .to_tdlib(),
+            TdInputMessageContent::InputMessagePhoto(_)
+        ));
+        assert!(matches!(
+            OutgoingMedia::Video {
+                path: path.clone(),
+                caption: cap.clone(),
+            }
+            .to_tdlib(),
+            TdInputMessageContent::InputMessageVideo(_)
+        ));
+        assert!(matches!(
+            OutgoingMedia::Document {
+                path: path.clone(),
+                caption: cap.clone(),
+            }
+            .to_tdlib(),
+            TdInputMessageContent::InputMessageDocument(_)
+        ));
+        assert!(matches!(
+            OutgoingMedia::Audio {
+                path: path.clone(),
+                caption: cap.clone(),
+            }
+            .to_tdlib(),
+            TdInputMessageContent::InputMessageAudio(_)
+        ));
+        assert!(matches!(
+            OutgoingMedia::Voice {
+                path: path.clone(),
+                caption: cap.clone(),
+            }
+            .to_tdlib(),
+            TdInputMessageContent::InputMessageVoiceNote(_)
+        ));
+        assert!(matches!(
+            OutgoingMedia::Animation { path, caption: cap }.to_tdlib(),
+            TdInputMessageContent::InputMessageAnimation(_)
+        ));
     }
 }
