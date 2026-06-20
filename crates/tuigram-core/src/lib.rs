@@ -29,9 +29,9 @@ pub use messages::{
 };
 pub use model::{
     Animation, Audio, Chat, ChatKind, ChatListKind, ChatPosition, Contact, Document, Draft,
-    EntityKind, File, FileRef, FormattedText, Location, Message, MessageContent, Photo, Poll,
-    PollKind, PollOption, Presence, SendState, Sender, Sticker, TextEntity, User, UserKind, Venue,
-    Video, Voice,
+    EntityKind, File, FileRef, FormattedText, Location, Message, MessageContent, OutgoingMedia,
+    Photo, Poll, PollKind, PollOption, Presence, SendState, Sender, Sticker, TextEntity, User,
+    UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};

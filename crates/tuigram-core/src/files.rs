@@ -213,6 +213,46 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
+    /// A TDLib `File` mid-upload: bytes on the remote side, no local download
+    /// state. Mirrors what `updateFile` carries while an outgoing media message's
+    /// file is being sent.
+    fn td_uploading_file(id: i32, size: i64, uploaded: i64, completed: bool) -> TdFile {
+        TdFile {
+            id,
+            size,
+            expected_size: size,
+            local: LocalFile::default(),
+            remote: RemoteFile {
+                uploaded_size: uploaded,
+                is_uploading_active: !completed && uploaded > 0,
+                is_uploading_completed: completed,
+                ..RemoteFile::default()
+            },
+        }
+    }
+
+    #[test]
+    fn upload_progress_folds_in_place_until_complete() {
+        // The upload side of `updateFile`, the path an outgoing media send takes:
+        // announced, partway, then fully uploaded — each emission replaces the last.
+        let mut store = FileStore::new();
+        store.reduce(&update_file(td_uploading_file(7, 1000, 0, false)));
+        store.reduce(&update_file(td_uploading_file(7, 1000, 400, false)));
+        assert_eq!(store.len(), 1);
+        let mid = store.get(7).unwrap();
+        assert!(mid.is_uploading_active);
+        assert!(!mid.is_uploading_completed);
+        assert_eq!(mid.uploaded_size, 400);
+
+        store.reduce(&update_file(td_uploading_file(7, 1000, 1000, true)));
+        let done = store.get(7).unwrap();
+        assert!(done.is_uploading_completed);
+        assert!(!done.is_uploading_active);
+        // Re-applying the completed record is idempotent, never a duplicate.
+        store.reduce(&update_file(td_uploading_file(7, 1000, 1000, true)));
+        assert_eq!(store.len(), 1);
+    }
+
     #[test]
     fn is_present_requires_a_path_not_just_completion() {
         // A completed flag with no local path is not yet openable.
