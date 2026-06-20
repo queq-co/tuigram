@@ -85,11 +85,16 @@ fn classify(update: &Update) -> Route {
         | Update::ChatReadInbox(_)
         | Update::ChatReadOutbox(_)
         | Update::ChatDraftMessage(_)
-        | Update::ChatFolders(_) => Route::Chat,
+        | Update::ChatFolders(_)
+        // A message's pinned state is chat state (#51): the chat store folds it
+        // onto the chat's pinned-message set, not the per-message store.
+        | Update::MessageIsPinned(_) => Route::Chat,
         Update::NewMessage(_)
         | Update::MessageSendSucceeded(_)
         | Update::MessageSendFailed(_)
         | Update::MessageContent(_)
+        // A reaction change (#51) folds onto the message itself.
+        | Update::MessageInteractionInfo(_)
         | Update::DeleteMessages(_) => Route::Message,
         Update::User(_) | Update::UserStatus(_) => Route::User,
         Update::File(_) => Route::File,
@@ -225,6 +230,22 @@ mod tests {
         })
     }
 
+    fn message_interaction_info() -> Update {
+        Update::MessageInteractionInfo(tdlib_rs::types::UpdateMessageInteractionInfo {
+            chat_id: 1,
+            message_id: 2,
+            interaction_info: None,
+        })
+    }
+
+    fn message_is_pinned() -> Update {
+        Update::MessageIsPinned(tdlib_rs::types::UpdateMessageIsPinned {
+            chat_id: 1,
+            message_id: 2,
+            is_pinned: true,
+        })
+    }
+
     fn user_status() -> Update {
         Update::UserStatus(tdlib_rs::types::UpdateUserStatus {
             user_id: 7,
@@ -279,6 +300,27 @@ mod tests {
         let sink = router.sink;
         assert_eq!(sink.message, 1);
         assert_eq!(sink.chat, 0);
+    }
+
+    #[test]
+    fn reaction_updates_route_to_the_message_reducer() {
+        // updateMessageInteractionInfo folds onto the message (its reactions).
+        let mut router = Router::new(SpySink::default());
+        router.apply(&message_interaction_info());
+        let sink = router.sink;
+        assert_eq!(sink.message, 1);
+        assert_eq!(sink.chat, 0);
+    }
+
+    #[test]
+    fn message_pin_updates_route_to_the_chat_reducer() {
+        // updateMessageIsPinned is chat state (the chat's pinned-message set), so
+        // it routes to the chat reducer, not the message store.
+        let mut router = Router::new(SpySink::default());
+        router.apply(&message_is_pinned());
+        let sink = router.sink;
+        assert_eq!(sink.chat, 1);
+        assert_eq!(sink.message, 0);
     }
 
     #[test]

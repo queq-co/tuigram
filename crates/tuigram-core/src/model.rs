@@ -15,15 +15,17 @@
 //! file-backed **media** types ([`Photo`], [`Video`], [`Document`], [`Audio`],
 //! [`Voice`], [`Sticker`], [`Animation`]), and the **structured** types
 //! ([`Location`], [`Venue`], [`Contact`], [`Poll`]); rarer content is
-//! `Unsupported`, for follow-up issues. Reactions, forwards, replies, and
-//! service messages are out of scope for this model.
+//! `Unsupported`, for follow-up issues. Message **reactions** are modeled (#51,
+//! see [`Reaction`]); forwards, replies, and service messages are out of scope
+//! for this model.
 
 use tdlib_rs::enums::{
     ChatList as TdChatList, ChatType as TdChatType, InputFile as TdInputFile,
     InputMessageContent as TdInputMessageContent, InputMessageReplyTo as TdInputMessageReplyTo,
     MessageContent as TdMessageContent, MessageSender as TdMessageSender,
     MessageSendingState as TdMessageSendingState, PollType as TdPollType,
-    TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
+    ReactionType as TdReactionType, TextEntityType as TdTextEntityType, UserStatus as TdUserStatus,
+    UserType as TdUserType,
 };
 use tdlib_rs::types::{
     Chat as TdChat, ChatFolderInfo as TdChatFolderInfo, ChatListFolder,
@@ -32,11 +34,13 @@ use tdlib_rs::types::{
     InputMessageAudio, InputMessageDocument, InputMessagePhoto, InputMessageReplyToMessage,
     InputMessageText, InputMessageVideo, InputMessageVoiceNote, Location as TdLocation,
     Message as TdMessage, MessageAnimation as TdMessageAnimation, MessageAudio as TdMessageAudio,
-    MessageDocument as TdMessageDocument, MessagePhoto as TdMessagePhoto,
+    MessageDocument as TdMessageDocument, MessageInteractionInfo as TdMessageInteractionInfo,
+    MessagePhoto as TdMessagePhoto, MessageReaction as TdMessageReaction,
     MessageSenderChat as TdMessageSenderChat, MessageSenderUser as TdMessageSenderUser,
     MessageSticker as TdMessageSticker, MessageVideo as TdMessageVideo,
     MessageVoiceNote as TdMessageVoiceNote, Poll as TdPoll, PollOption as TdPollOption,
-    TextEntity as TdTextEntity, User as TdUser, Venue as TdVenue,
+    ReactionTypeCustomEmoji, ReactionTypeEmoji, TextEntity as TdTextEntity, User as TdUser,
+    Venue as TdVenue,
 };
 
 /// Who sent a message.
@@ -1459,6 +1463,88 @@ fn optional_caption(caption: &FormattedText) -> Option<TdFormattedText> {
     (!caption.text.is_empty()).then(|| caption.to_tdlib())
 }
 
+/// A reaction's identity — tuigram's projection of TDLib's `ReactionType`.
+///
+/// Total over the TDLib enum: a standard [`Emoji`](Self::Emoji), a
+/// [`CustomEmoji`](Self::CustomEmoji) by its sticker id, or the channel
+/// [`Paid`](Self::Paid) star reaction. Only the emoji case is sent over the
+/// request seam ([`add_message_reaction`](crate::MessageRequests::add_message_reaction));
+/// the other two are read-only projections of reactions already on a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReactionKind {
+    /// A standard emoji reaction, e.g. `"👍"`.
+    Emoji(String),
+    /// A custom emoji reaction, by its custom-emoji (sticker) id.
+    CustomEmoji(i64),
+    /// The channel paid ("star") reaction.
+    Paid,
+}
+
+impl ReactionKind {
+    /// Project TDLib's `ReactionType`.
+    #[must_use]
+    pub fn from_tdlib(kind: &TdReactionType) -> Self {
+        match kind {
+            TdReactionType::Emoji(e) => Self::Emoji(e.emoji.clone()),
+            TdReactionType::CustomEmoji(c) => Self::CustomEmoji(c.custom_emoji_id),
+            TdReactionType::Paid => Self::Paid,
+        }
+    }
+
+    /// Lower back to TDLib's `ReactionType`, for adding or removing a reaction
+    /// over the request seam — the inverse of [`from_tdlib`](Self::from_tdlib).
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdReactionType {
+        match self {
+            Self::Emoji(emoji) => TdReactionType::Emoji(ReactionTypeEmoji {
+                emoji: emoji.clone(),
+            }),
+            Self::CustomEmoji(id) => TdReactionType::CustomEmoji(ReactionTypeCustomEmoji {
+                custom_emoji_id: *id,
+            }),
+            Self::Paid => TdReactionType::Paid,
+        }
+    }
+}
+
+/// One reaction bucket on a message — tuigram's projection of TDLib's
+/// `MessageReaction`: which reaction it is, how many added it, and whether
+/// tuigram's own account is one of them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    /// Which reaction this bucket counts.
+    pub kind: ReactionKind,
+    /// How many times the reaction was added.
+    pub count: i32,
+    /// Whether tuigram's account chose this reaction.
+    pub is_chosen: bool,
+}
+
+impl Reaction {
+    /// Project TDLib's `MessageReaction`. The recent-sender list and paid-reactor
+    /// details are dropped — a headless client needs the kind, the count, and
+    /// whether it is our own choice, not who else reacted.
+    #[must_use]
+    pub fn from_tdlib(reaction: &TdMessageReaction) -> Self {
+        Self {
+            kind: ReactionKind::from_tdlib(&reaction.r#type),
+            count: reaction.total_count,
+            is_chosen: reaction.is_chosen,
+        }
+    }
+}
+
+/// Project a message's reactions out of its optional interaction info: the
+/// buckets in `interaction_info.reactions`, in TDLib's order, or empty when
+/// either the interaction info or its reaction list is absent. Shared by
+/// [`Message::from_tdlib`] and the `updateMessageInteractionInfo` fold in
+/// [`MessageStore`](crate::messages::MessageStore).
+pub(crate) fn reactions_from(info: Option<&TdMessageInteractionInfo>) -> Vec<Reaction> {
+    info.and_then(|i| i.reactions.as_ref())
+        .map(|r| r.reactions.iter().map(Reaction::from_tdlib).collect())
+        .unwrap_or_default()
+}
+
 /// A single message — tuigram's projection of TDLib's `Message`.
 ///
 /// Not `Eq`: a [`MessageContent::Location`] carries `f64` coordinates, so the
@@ -1481,6 +1567,9 @@ pub struct Message {
     pub content: MessageContent,
     /// Delivery state for outgoing messages.
     pub send_state: SendState,
+    /// Reactions added to the message, one bucket per reaction, in TDLib's
+    /// order. Empty when the message has no reactions.
+    pub reactions: Vec<Reaction>,
 }
 
 impl Message {
@@ -1496,6 +1585,7 @@ impl Message {
             is_outgoing: message.is_outgoing,
             content: MessageContent::from_tdlib(&message.content),
             send_state: SendState::from_tdlib(message.sending_state.as_ref()),
+            reactions: reactions_from(message.interaction_info.as_ref()),
         }
     }
 
@@ -1605,6 +1695,10 @@ pub struct Chat {
     pub positions: Vec<ChatPosition>,
     /// The unsent compose draft synced for this chat, if any.
     pub draft: Option<Draft>,
+    /// Ids of the chat's pinned messages, ascending. Folded from
+    /// `updateMessageIsPinned` (#51); TDLib's `Chat` does not carry them inline,
+    /// so this starts empty on projection and the pin/unpin updates maintain it.
+    pub pinned_message_ids: Vec<i64>,
 }
 
 impl Chat {
@@ -1626,6 +1720,9 @@ impl Chat {
                 .map(ChatPosition::from_tdlib)
                 .collect(),
             draft: chat.draft_message.as_ref().map(Draft::from_tdlib),
+            // TDLib delivers pinned-message ids via updateMessageIsPinned, not on
+            // the Chat object; the chat store folds them in.
+            pinned_message_ids: Vec::new(),
         }
     }
 
@@ -2845,5 +2942,90 @@ mod tests {
             OutgoingMedia::Animation { path, caption: cap }.to_tdlib(),
             TdInputMessageContent::InputMessageAnimation(_)
         ));
+    }
+
+    #[test]
+    fn reaction_kind_round_trips_through_every_variant() {
+        use tdlib_rs::types::{ReactionTypeCustomEmoji, ReactionTypeEmoji};
+        for kind in [
+            ReactionKind::Emoji("👍".to_owned()),
+            ReactionKind::CustomEmoji(987),
+            ReactionKind::Paid,
+        ] {
+            // Projection is total and lossless for the kinds we model.
+            assert_eq!(ReactionKind::from_tdlib(&kind.to_tdlib()), kind);
+        }
+        // And the projection reads each TDLib variant.
+        assert_eq!(
+            ReactionKind::from_tdlib(&TdReactionType::Emoji(ReactionTypeEmoji {
+                emoji: "🔥".to_owned(),
+            })),
+            ReactionKind::Emoji("🔥".to_owned())
+        );
+        assert_eq!(
+            ReactionKind::from_tdlib(&TdReactionType::CustomEmoji(ReactionTypeCustomEmoji {
+                custom_emoji_id: 5,
+            })),
+            ReactionKind::CustomEmoji(5)
+        );
+        assert_eq!(
+            ReactionKind::from_tdlib(&TdReactionType::Paid),
+            ReactionKind::Paid
+        );
+    }
+
+    #[test]
+    fn message_projects_its_reactions_and_defaults_to_none() {
+        use tdlib_rs::types::{
+            MessageInteractionInfo, MessageReaction, MessageReactions, MessageText,
+        };
+        let text = TdMessageContent::MessageText(MessageText {
+            text: TdFormattedTextT::default(),
+            link_preview: None,
+            link_preview_options: None,
+        });
+        // No interaction info → no reactions.
+        let bare = td_message(
+            1,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            text.clone(),
+            None,
+            false,
+        );
+        assert!(Message::from_tdlib(&bare).reactions.is_empty());
+
+        // Interaction info with reaction buckets → projected in order.
+        let mut with_reactions = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            text,
+            None,
+            false,
+        );
+        with_reactions.interaction_info = Some(MessageInteractionInfo {
+            reactions: Some(MessageReactions {
+                reactions: vec![MessageReaction {
+                    r#type: TdReactionType::Emoji(tdlib_rs::types::ReactionTypeEmoji {
+                        emoji: "👍".to_owned(),
+                    }),
+                    total_count: 4,
+                    is_chosen: true,
+                    used_sender_id: None,
+                    recent_sender_ids: vec![],
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            Message::from_tdlib(&with_reactions).reactions,
+            vec![Reaction {
+                kind: ReactionKind::Emoji("👍".to_owned()),
+                count: 4,
+                is_chosen: true,
+            }]
+        );
     }
 }

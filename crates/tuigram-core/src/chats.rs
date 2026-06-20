@@ -163,8 +163,10 @@ impl ChatStore {
     /// Projects the update into tuigram's [model](crate::model) types and applies
     /// it: `updateNewChat`, `updateChatPosition`, `updateChatLastMessage`, the
     /// read-state pair `updateChatReadInbox` / `updateChatReadOutbox` (#21), the
-    /// compose `updateChatDraftMessage` (#38), and the folder set
-    /// `updateChatFolders` (#49). The catch-all stays inert — the router owns
+    /// compose `updateChatDraftMessage` (#38), the folder set
+    /// `updateChatFolders` (#49), and a message's pin state
+    /// `updateMessageIsPinned` (#51), which is chat state — it maintains the
+    /// chat's pinned-message set. The catch-all stays inert — the router owns
     /// classification, this owns only the fold — so any other variant reaching
     /// here is a harmless no-op.
     pub fn reduce(&mut self, update: &Update) {
@@ -195,6 +197,9 @@ impl ChatStore {
                     .map(ChatFolderInfo::from_tdlib)
                     .collect(),
             ),
+            Update::MessageIsPinned(u) => {
+                self.set_message_pinned(u.chat_id, u.message_id, u.is_pinned);
+            }
             _ => {}
         }
     }
@@ -358,6 +363,26 @@ impl ChatStore {
     fn mark_outbox_read(&mut self, chat_id: i64, last_read_outbox_message_id: i64) {
         if let Some(chat) = self.chats.get_mut(&chat_id) {
             chat.last_read_outbox_message_id = last_read_outbox_message_id;
+        }
+    }
+
+    /// Fold `updateMessageIsPinned` (#51): add `message_id` to the chat's pinned
+    /// set when `is_pinned`, or remove it when not. The set is kept sorted and
+    /// deduplicated, so the order is deterministic and re-applying either
+    /// transition converges — pinning an already-pinned message, or unpinning one
+    /// not in the set, is a no-op. Unknown chats are ignored (TDLib announces a
+    /// chat before pinning within it).
+    fn set_message_pinned(&mut self, chat_id: i64, message_id: i64, is_pinned: bool) {
+        if let Some(chat) = self.chats.get_mut(&chat_id) {
+            match chat.pinned_message_ids.binary_search(&message_id) {
+                Ok(idx) if !is_pinned => {
+                    chat.pinned_message_ids.remove(idx);
+                }
+                Err(idx) if is_pinned => chat.pinned_message_ids.insert(idx, message_id),
+                // Already in the wanted state: pin of a pinned id / unpin of an
+                // absent id — nothing to do.
+                _ => {}
+            }
         }
     }
 }
@@ -1046,5 +1071,46 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// An `updateMessageIsPinned` toggling `message_id`'s pin state in a chat.
+    fn message_is_pinned(chat_id: i64, message_id: i64, is_pinned: bool) -> Update {
+        Update::MessageIsPinned(tdlib_rs::types::UpdateMessageIsPinned {
+            chat_id,
+            message_id,
+            is_pinned,
+        })
+    }
+
+    #[test]
+    fn pin_updates_maintain_a_sorted_deduplicated_pinned_set_on_the_chat() {
+        let mut store = ChatStore::new();
+        store.reduce(&new_chat(10, "Group"));
+
+        // Pins arrive out of order; the set is kept ascending.
+        store.reduce(&message_is_pinned(10, 30, true));
+        store.reduce(&message_is_pinned(10, 10, true));
+        store.reduce(&message_is_pinned(10, 20, true));
+        assert_eq!(store.get(10).unwrap().pinned_message_ids, vec![10, 20, 30]);
+
+        // Re-pinning an already-pinned id is a no-op (no duplicate).
+        store.reduce(&message_is_pinned(10, 20, true));
+        assert_eq!(store.get(10).unwrap().pinned_message_ids, vec![10, 20, 30]);
+
+        // Unpinning removes just that id; the rest keep their order.
+        store.reduce(&message_is_pinned(10, 20, false));
+        assert_eq!(store.get(10).unwrap().pinned_message_ids, vec![10, 30]);
+
+        // Unpinning an absent id is a no-op.
+        store.reduce(&message_is_pinned(10, 999, false));
+        assert_eq!(store.get(10).unwrap().pinned_message_ids, vec![10, 30]);
+    }
+
+    #[test]
+    fn pin_update_for_an_unknown_chat_is_ignored() {
+        let mut store = ChatStore::new();
+        // TDLib announces a chat before pinning within it; a stray pin is dropped.
+        store.reduce(&message_is_pinned(404, 1, true));
+        assert!(store.get(404).is_none());
     }
 }

@@ -33,8 +33,8 @@ pub use messages::{
 pub use model::{
     Animation, Audio, Chat, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition, Contact,
     Document, Draft, EntityKind, File, FileRef, FormattedText, Location, Message, MessageContent,
-    OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, SendState, Sender, Sticker,
-    TextEntity, User, UserKind, Venue, Video, Voice,
+    OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, Reaction, ReactionKind, SendState,
+    Sender, Sticker, TextEntity, User, UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
