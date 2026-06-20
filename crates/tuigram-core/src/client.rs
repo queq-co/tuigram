@@ -22,17 +22,28 @@
 //! bridge's per-domain request traits ([`Client::bridge`]) and reconcile through
 //! the router; the one fetch that returns directly rather than as updates —
 //! history paging — folds in via [`Client::merge_history`].
+//!
+//! **Search & forward (#50).** Two of the message domain's request paths get a
+//! facade helper rather than going through `bridge()` directly. Search
+//! ([`Client::search_chat`], [`Client::search_messages`]) returns its hits — like
+//! history — directly rather than as updates, but must **never** fold into the
+//! account state, so the facade pages them into a transient
+//! [`SearchResults`](crate::messages::SearchResults) it returns instead of through
+//! `merge_history`. Forwarding ([`Client::forward_messages`]) is a write whose
+//! results *do* reconcile through the router (as `updateNewMessage`), exposed here
+//! for symmetry; its returned copies are the optimistic entries, not a fold.
 
 use std::sync::{Arc, Mutex};
 
 use tdlib_rs::enums::Update;
+use tdlib_rs::types::Error as TdError;
 use tokio::task::JoinHandle;
 
 use crate::bridge::Bridge;
 use crate::chats::ChatStore;
 use crate::files::FileStore;
-use crate::messages::MessageStore;
-use crate::model::Message;
+use crate::messages::{MessageRequests, MessageStore, SearchResults};
+use crate::model::{Message, Sender};
 use crate::router::{Router, UpdateSink};
 use crate::users::UserStore;
 
@@ -216,6 +227,71 @@ impl Client {
             .lock()
             .expect("account state mutex poisoned")
             .merge_history(page);
+    }
+
+    /// Search one chat for `query`, paging to exhaustion into a transient
+    /// [`SearchResults`] (`page` hits per request).
+    ///
+    /// Unlike history, search results are a **read-only view that never folds
+    /// into the account state**: this returns them in a [`SearchResults`] of its
+    /// own rather than through [`merge_history`](Self::merge_history), so a search
+    /// leaves the live [`MessageStore`] — and what [`read`](Self::read) sees —
+    /// untouched. `sender` optionally restricts hits to one sender. The paging
+    /// itself lives in [`search_chat`](crate::messages::search_chat); the facade
+    /// only binds it to this session's bridge.
+    pub async fn search_chat(
+        &self,
+        chat_id: i64,
+        query: String,
+        sender: Option<Sender>,
+        page: i32,
+    ) -> Result<SearchResults, TdError> {
+        crate::messages::search_chat(&self.bridge, chat_id, query, sender, page).await
+    }
+
+    /// Search the whole account for `query`, paging to exhaustion into a transient
+    /// [`SearchResults`] (`page` hits per request).
+    ///
+    /// The account-wide counterpart to [`search_chat`](Self::search_chat), with
+    /// the same discipline: the hits are a transient view and never fold into the
+    /// live [`MessageStore`]. Paging lives in
+    /// [`search_global`](crate::messages::search_global).
+    pub async fn search_messages(
+        &self,
+        query: String,
+        page: i32,
+    ) -> Result<SearchResults, TdError> {
+        crate::messages::search_global(&self.bridge, query, page).await
+    }
+
+    /// Forward `message_ids` from `from_chat_id` into `to_chat_id`.
+    ///
+    /// `send_copy` forwards a fresh copy (no "forwarded from" attribution);
+    /// `remove_caption` drops captions when copying. Unlike search, a forward is a
+    /// **write that reconciles through the router**: TDLib streams each forwarded
+    /// message into the target chat as `updateNewMessage`, which the router folds
+    /// into the [`MessageStore`] on the same optimistic-send lifecycle as
+    /// [`MessageRequests::send_text`]. The returned [`Message`]s are the caller's
+    /// reference copies of those optimistic entries (temporary ids,
+    /// [`SendState::Pending`](crate::model::SendState::Pending)), not a second
+    /// insert. It returns as soon as TDLib accepts the request.
+    pub async fn forward_messages(
+        &self,
+        from_chat_id: i64,
+        message_ids: Vec<i64>,
+        to_chat_id: i64,
+        send_copy: bool,
+        remove_caption: bool,
+    ) -> Result<Vec<Message>, TdError> {
+        self.bridge
+            .forward_messages(
+                from_chat_id,
+                message_ids,
+                to_chat_id,
+                send_copy,
+                remove_caption,
+            )
+            .await
     }
 }
 

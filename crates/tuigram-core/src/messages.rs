@@ -44,7 +44,8 @@
 //! normalized hits with a paging cursor as a [`SearchPage`], and the caller
 //! collects them into a [`SearchResults`] — a transient, id-deduplicated view
 //! that never folds into [`MessageStore`], so a search leaves loaded history
-//! untouched.
+//! untouched. [`search_chat`] and [`search_global`] drive either search to
+//! exhaustion into that view, the search counterpart to [`load_history`].
 //!
 //! Scope: history paging, live `updateNewMessage`, sending text + reply with its
 //! lifecycle (#19), editing and deleting with their updates (#20), marking
@@ -576,6 +577,70 @@ where
             .min()
             .expect("batch is non-empty");
         fold(batch);
+    }
+}
+
+/// Page an in-chat search to exhaustion, collecting every hit into a transient
+/// [`SearchResults`].
+///
+/// Mirrors [`load_history`]'s paging, but for search and with one deliberate
+/// difference: the hits are **never** folded into a [`MessageStore`]. Each call
+/// resumes from the previous page's [`SearchPage::next`] cursor (the first from
+/// [`NEWEST`]) and stops when the cursor comes back `None`; the hits accumulate —
+/// deduplicated by `(chat_id, message_id)` — in the returned [`SearchResults`], so
+/// a search leaves loaded history untouched. Any request error is propagated.
+pub async fn search_chat<C>(
+    client: &C,
+    chat_id: i64,
+    query: String,
+    sender: Option<Sender>,
+    page: i32,
+) -> Result<SearchResults, TdError>
+where
+    C: MessageRequests,
+{
+    let mut results = SearchResults::new();
+    let mut anchor = NEWEST;
+    loop {
+        let hits = client
+            .search_chat_messages(chat_id, query.clone(), sender.clone(), anchor, page)
+            .await?;
+        let next = hits.next;
+        results.extend(hits.messages);
+        match next {
+            // Page strictly older than the last hit of this page.
+            Some(cursor) => anchor = cursor,
+            None => return Ok(results),
+        }
+    }
+}
+
+/// Page a global (whole-account) search to exhaustion, collecting every hit into
+/// a transient [`SearchResults`].
+///
+/// The account-wide counterpart to [`search_chat`]: it resumes from the opaque
+/// string offset TDLib returns (the first page from the empty string) and stops
+/// when [`SearchPage::next`] comes back `None`. Hits across different chats stay
+/// distinct — the dedupe keys on `(chat_id, message_id)` — and, as with the
+/// in-chat search, never fold into the live [`MessageStore`]. Errors propagate.
+pub async fn search_global<C>(
+    client: &C,
+    query: String,
+    page: i32,
+) -> Result<SearchResults, TdError>
+where
+    C: MessageRequests,
+{
+    let mut results = SearchResults::new();
+    let mut offset = String::new();
+    loop {
+        let hits = client.search_messages(query.clone(), offset, page).await?;
+        let next = hits.next;
+        results.extend(hits.messages);
+        match next {
+            Some(cursor) => offset = cursor,
+            None => return Ok(results),
+        }
     }
 }
 
@@ -2025,19 +2090,11 @@ mod tests {
         let mut store = MessageStore::new();
         store.merge([msg(10, 30)]);
 
-        let mut results = SearchResults::new();
-        let mut anchor = NEWEST;
-        loop {
-            let page = spy
-                .search_chat_messages(10, "x".to_owned(), None, anchor, 2)
-                .await
-                .unwrap();
-            results.extend(page.messages);
-            match page.next {
-                Some(cursor) => anchor = cursor,
-                None => break,
-            }
-        }
+        // The paging driver follows each page's cursor to exhaustion, collecting
+        // into the transient view — it never sees the store.
+        let results = search_chat(&spy, 10, "x".to_owned(), None, 2)
+            .await
+            .unwrap();
 
         // Overlapping id 20 collapsed to one entry; result order preserved.
         let collected: Vec<i64> = results.messages().iter().map(|m| m.id).collect();
@@ -2072,19 +2129,7 @@ mod tests {
             },
         ]);
 
-        let mut results = SearchResults::new();
-        let mut offset = String::new();
-        loop {
-            let page = spy
-                .search_messages("term".to_owned(), offset.clone(), 2)
-                .await
-                .unwrap();
-            results.extend(page.messages);
-            match page.next {
-                Some(cursor) => offset = cursor,
-                None => break,
-            }
-        }
+        let results = search_global(&spy, "term".to_owned(), 2).await.unwrap();
 
         // Same id 5 in two chats stays distinct — dedupe keys on (chat, id).
         let keys: Vec<(i64, i64)> = results
