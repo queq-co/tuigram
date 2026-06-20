@@ -18,13 +18,15 @@
 //! pure transport and a driver depends on just the requests it makes, exactly as
 //! [`AuthRequests`](crate::auth::AuthRequests) does for login. The chats arrive
 //! asynchronously as updates; the request side only *asks* for more of them
-//! ([`load_main_list`], [`load_archive_list`]).
+//! ([`load_main_list`], [`load_archive_list`], [`load_folder_list`]).
 //!
-//! Scope: the **Main** (#17) and **Archive** (#48) lists. Both fold the same
-//! per-list `updateChatPosition` family; [`ChatStore::main_list`] and
-//! [`ChatStore::archive_list`] read each back ordered. Folders and secret chats
-//! remain out of scope (follow-up issues); a chat is in a list's snapshot only
-//! when it has a position there.
+//! Scope: the **Main** (#17), **Archive** (#48), and user-defined **folder**
+//! (#49) lists. All three fold the same per-list `updateChatPosition` family;
+//! [`ChatStore::main_list`], [`ChatStore::archive_list`], and
+//! [`ChatStore::folder_list`] read each back ordered. The set of folders itself
+//! arrives as `updateChatFolders`, folded into [`ChatStore::folders`]. Secret
+//! chats remain out of scope (follow-up issues); a chat is in a list's snapshot
+//! only when it has a position there.
 
 use std::collections::HashMap;
 
@@ -32,7 +34,7 @@ use tdlib_rs::enums::Update;
 use tdlib_rs::types::Error as TdError;
 
 use crate::bridge::Bridge;
-use crate::model::{Chat, ChatListKind, ChatPosition, Draft, Message};
+use crate::model::{Chat, ChatFolderInfo, ChatListKind, ChatPosition, Draft, Message};
 
 /// The chat-list request seam — tuigram's chat slice of the
 /// `tdlib_rs::functions` surface, segregated from the auth and message requests
@@ -46,7 +48,8 @@ use crate::model::{Chat, ChatListKind, ChatPosition, Draft, Message};
 // is not a concern here.
 #[allow(async_fn_in_trait)]
 pub trait ChatRequests {
-    /// Ask TDLib to load up to `limit` more chats from `list` (Main or Archive).
+    /// Ask TDLib to load up to `limit` more chats from `list` (Main, Archive, or
+    /// a folder).
     ///
     /// This does not return the chats: TDLib loads them into its own state and
     /// emits `updateNewChat` / `updateChatPosition` for any the client did not
@@ -101,8 +104,8 @@ pub const CHATS_EXHAUSTED: i32 = 404;
 ///
 /// Only the *requests* are driven here; the chats themselves arrive on the
 /// update stream and are folded by [`ChatStore`] on the router task. Any error
-/// other than the exhausted sentinel is propagated. [`load_main_list`] and
-/// [`load_archive_list`] are the per-list entry points.
+/// other than the exhausted sentinel is propagated. [`load_main_list`],
+/// [`load_archive_list`], and [`load_folder_list`] are the per-list entry points.
 async fn load_list<C: ChatRequests>(
     client: &C,
     list: ChatListKind,
@@ -127,11 +130,25 @@ pub async fn load_archive_list<C: ChatRequests>(client: &C, page: i32) -> Result
     load_list(client, ChatListKind::Archive, page).await
 }
 
+/// Page the user-defined **folder** `folder_id` to exhaustion (#49). The folder
+/// metadata arrives separately as `updateChatFolders` (see
+/// [`ChatStore::folders`]); this pages the chats positioned in it, which fold
+/// into [`ChatStore::folder_list`]. See [`load_list`].
+pub async fn load_folder_list<C: ChatRequests>(
+    client: &C,
+    folder_id: i32,
+    page: i32,
+) -> Result<(), TdError> {
+    load_list(client, ChatListKind::Folder(folder_id), page).await
+}
+
 /// The folded chat-list state: every known chat, keyed by id, with an ordered
-/// [`main_list`](Self::main_list) view derived from each chat's Main position.
+/// [`main_list`](Self::main_list) view derived from each chat's Main position,
+/// plus the set of user-defined [`folders`](Self::folders) (#49).
 #[derive(Debug, Default)]
 pub struct ChatStore {
     chats: HashMap<i64, Chat>,
+    folders: Vec<ChatFolderInfo>,
 }
 
 impl ChatStore {
@@ -144,10 +161,12 @@ impl ChatStore {
     /// Fold one chat-route update into the store.
     ///
     /// Projects the update into tuigram's [model](crate::model) types and applies
-    /// it: `updateNewChat`, `updateChatPosition`, `updateChatLastMessage`, and the
-    /// read-state pair `updateChatReadInbox` / `updateChatReadOutbox` (#21). The
-    /// catch-all stays inert — the router owns classification, this owns only the
-    /// fold — so any other variant reaching here is a harmless no-op.
+    /// it: `updateNewChat`, `updateChatPosition`, `updateChatLastMessage`, the
+    /// read-state pair `updateChatReadInbox` / `updateChatReadOutbox` (#21), the
+    /// compose `updateChatDraftMessage` (#38), and the folder set
+    /// `updateChatFolders` (#49). The catch-all stays inert — the router owns
+    /// classification, this owns only the fold — so any other variant reaching
+    /// here is a harmless no-op.
     pub fn reduce(&mut self, update: &Update) {
         match update {
             Update::NewChat(u) => self.upsert(Chat::from_tdlib(&u.chat)),
@@ -169,6 +188,12 @@ impl ChatStore {
                 u.chat_id,
                 u.draft_message.as_ref().map(Draft::from_tdlib),
                 u.positions.iter().map(ChatPosition::from_tdlib).collect(),
+            ),
+            Update::ChatFolders(u) => self.set_folders(
+                u.chat_folders
+                    .iter()
+                    .map(ChatFolderInfo::from_tdlib)
+                    .collect(),
             ),
             _ => {}
         }
@@ -207,6 +232,23 @@ impl ChatStore {
     #[must_use]
     pub fn archive_list(&self) -> Vec<&Chat> {
         self.ordered_by(&ChatListKind::Archive)
+    }
+
+    /// One user-defined folder's list, ordered highest-first (#49). Chats with
+    /// no position in folder `folder_id` are excluded; each folder's snapshot is
+    /// independent of Main, Archive, and the other folders. The folder need not
+    /// be a known [`folder`](Self::folders) — a position alone lists a chat here.
+    #[must_use]
+    pub fn folder_list(&self, folder_id: i32) -> Vec<&Chat> {
+        self.ordered_by(&ChatListKind::Folder(folder_id))
+    }
+
+    /// The user-defined chat folders, in the order TDLib lists them (#49). The
+    /// folder *contents* read back via [`folder_list`](Self::folder_list); this
+    /// is the set of folders themselves, from the last `updateChatFolders`.
+    #[must_use]
+    pub fn folders(&self) -> &[ChatFolderInfo] {
+        &self.folders
     }
 
     /// Look up a chat by id, whatever list it is in.
@@ -297,6 +339,16 @@ impl ChatStore {
                 merge_position(&mut chat.positions, position);
             }
         }
+    }
+
+    /// Fold `updateChatFolders`: TDLib delivers the **entire** new folder list on
+    /// every change, so this is a wholesale replace — adding, removing, renaming,
+    /// or reordering a folder all arrive the same way. Idempotent: re-applying the
+    /// same list converges. The chats inside each folder are unaffected; they ride
+    /// their own `updateChatPosition`s and read back via
+    /// [`folder_list`](Self::folder_list).
+    fn set_folders(&mut self, folders: Vec<ChatFolderInfo>) {
+        self.folders = folders;
     }
 
     /// Fold `updateChatReadOutbox`: the peer has read up to this outgoing message,
@@ -411,6 +463,48 @@ mod tests {
                 is_pinned: false,
                 source: None,
             },
+        })
+    }
+
+    /// A folder-list position update for `chat_id` in folder `folder_id`.
+    fn folder_position(chat_id: i64, folder_id: i32, order: i64) -> Update {
+        Update::ChatPosition(UpdateChatPosition {
+            chat_id,
+            position: TdChatPosition {
+                list: TdChatList::Folder(tdlib_rs::types::ChatListFolder {
+                    chat_folder_id: folder_id,
+                }),
+                order,
+                is_pinned: false,
+                source: None,
+            },
+        })
+    }
+
+    /// An `updateChatFolders` carrying folders with the given `(id, title)`s.
+    fn chat_folders(folders: &[(i32, &str)]) -> Update {
+        Update::ChatFolders(tdlib_rs::types::UpdateChatFolders {
+            chat_folders: folders
+                .iter()
+                .map(|&(id, title)| tdlib_rs::types::ChatFolderInfo {
+                    id,
+                    name: tdlib_rs::types::ChatFolderName {
+                        text: tdlib_rs::types::FormattedText {
+                            text: title.to_owned(),
+                            entities: vec![],
+                        },
+                        animate_custom_emoji: false,
+                    },
+                    icon: tdlib_rs::types::ChatFolderIcon {
+                        name: "Custom".to_owned(),
+                    },
+                    color_id: -1,
+                    is_shareable: false,
+                    has_my_invite_links: false,
+                })
+                .collect(),
+            main_chat_list_position: 0,
+            are_tags_enabled: false,
         })
     }
 
@@ -546,6 +640,70 @@ mod tests {
         assert_eq!(ids(&store.archive_list()), vec![10]);
         // The chat itself is still known, just relisted.
         assert!(store.get(10).is_some());
+    }
+
+    #[test]
+    fn chat_folders_update_folds_the_folder_set() {
+        let mut store = ChatStore::new();
+        assert!(store.folders().is_empty());
+
+        store.reduce(&chat_folders(&[(2, "Work"), (5, "Family")]));
+
+        // The folder set is folded in TDLib's order, id and title projected.
+        let folders: Vec<(i32, &str)> = store
+            .folders()
+            .iter()
+            .map(|f| (f.id, f.title.as_str()))
+            .collect();
+        assert_eq!(folders, vec![(2, "Work"), (5, "Family")]);
+    }
+
+    #[test]
+    fn chat_folders_update_replaces_the_whole_set() {
+        let mut store = ChatStore::new();
+        store.reduce(&chat_folders(&[(2, "Work"), (5, "Family")]));
+
+        // TDLib re-sends the entire list on any change: a rename + removal here
+        // is a wholesale replace, not a merge — the dropped folder is gone.
+        store.reduce(&chat_folders(&[(2, "Job")]));
+        let folders: Vec<(i32, &str)> = store
+            .folders()
+            .iter()
+            .map(|f| (f.id, f.title.as_str()))
+            .collect();
+        assert_eq!(folders, vec![(2, "Job")]);
+
+        // Re-applying the same list converges rather than duplicating.
+        store.reduce(&chat_folders(&[(2, "Job")]));
+        assert_eq!(store.folders().len(), 1);
+    }
+
+    #[test]
+    fn positions_order_a_folder_list_highest_first() {
+        let mut store = seeded();
+        store.reduce(&folder_position(10, 3, 5));
+        store.reduce(&folder_position(20, 3, 99));
+
+        // Same highest-first ordering as the other lists, read off folder 3.
+        assert_eq!(ids(&store.folder_list(3)), vec![20, 10]);
+    }
+
+    #[test]
+    fn folder_lists_are_independent_of_each_other_and_the_main_list() {
+        let mut store = seeded();
+        store.reduce(&new_chat(30, "Thirty"));
+        // 10 in Main, 20 in folder 3, 30 in folder 7 — and 20 also in folder 7
+        // with a different order. No list leaks into another.
+        store.reduce(&main_position(10, 5));
+        store.reduce(&folder_position(20, 3, 99));
+        store.reduce(&folder_position(20, 7, 1));
+        store.reduce(&folder_position(30, 7, 50));
+
+        assert_eq!(ids(&store.main_list()), vec![10]);
+        assert_eq!(ids(&store.folder_list(3)), vec![20]);
+        assert_eq!(ids(&store.folder_list(7)), vec![30, 20]);
+        // A folder with no positioned chats is simply empty.
+        assert!(store.folder_list(99).is_empty());
     }
 
     #[test]
@@ -789,6 +947,15 @@ mod tests {
         // One page, then the 404: two calls, and the Archive list was the target.
         assert_eq!(spy.calls.get(), 2);
         assert_eq!(*spy.last_list.borrow(), Some(ChatListKind::Archive));
+    }
+
+    #[tokio::test]
+    async fn folder_paging_loads_that_folder_until_exhausted() {
+        let spy = PagingSpy::new(1);
+        load_folder_list(&spy, 7, 20).await.unwrap();
+        // One page, then the 404: two calls, targeting folder 7 specifically.
+        assert_eq!(spy.calls.get(), 2);
+        assert_eq!(*spy.last_list.borrow(), Some(ChatListKind::Folder(7)));
     }
 
     /// A non-404 error stops paging and propagates, rather than looping forever.

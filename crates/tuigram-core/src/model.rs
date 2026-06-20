@@ -26,12 +26,12 @@ use tdlib_rs::enums::{
     TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
-    Chat as TdChat, ChatListFolder, ChatPosition as TdChatPosition, Contact as TdContact,
-    DraftMessage as TdDraftMessage, File as TdFile, FormattedText as TdFormattedText,
-    InputFileLocal, InputMessageAnimation, InputMessageAudio, InputMessageDocument,
-    InputMessagePhoto, InputMessageReplyToMessage, InputMessageText, InputMessageVideo,
-    InputMessageVoiceNote, Location as TdLocation, Message as TdMessage,
-    MessageAnimation as TdMessageAnimation, MessageAudio as TdMessageAudio,
+    Chat as TdChat, ChatFolderInfo as TdChatFolderInfo, ChatListFolder,
+    ChatPosition as TdChatPosition, Contact as TdContact, DraftMessage as TdDraftMessage,
+    File as TdFile, FormattedText as TdFormattedText, InputFileLocal, InputMessageAnimation,
+    InputMessageAudio, InputMessageDocument, InputMessagePhoto, InputMessageReplyToMessage,
+    InputMessageText, InputMessageVideo, InputMessageVoiceNote, Location as TdLocation,
+    Message as TdMessage, MessageAnimation as TdMessageAnimation, MessageAudio as TdMessageAudio,
     MessageDocument as TdMessageDocument, MessagePhoto as TdMessagePhoto,
     MessageSenderChat as TdMessageSenderChat, MessageSenderUser as TdMessageSenderUser,
     MessageSticker as TdMessageSticker, MessageVideo as TdMessageVideo,
@@ -280,6 +280,34 @@ impl ChatListKind {
             Self::Folder(id) => TdChatList::Folder(ChatListFolder {
                 chat_folder_id: *id,
             }),
+        }
+    }
+}
+
+/// Metadata for one user-defined chat folder, as listed by `updateChatFolders`
+/// (#49). The folder's chats are not carried here — they arrive as per-list
+/// `updateChatPosition`s for [`ChatListKind::Folder`] and read back ordered via
+/// [`ChatStore::folder_list`](crate::ChatStore::folder_list); this is only the
+/// folder's identity, for presenting the set of folders.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatFolderInfo {
+    /// Unique folder id — the `id` carried by [`ChatListKind::Folder`].
+    pub id: i32,
+    /// The folder's display title: its name's plain text. A folder name may
+    /// carry only custom-emoji entities, which tuigram drops — the bare text is
+    /// the title shown.
+    pub title: String,
+}
+
+impl ChatFolderInfo {
+    /// Project TDLib's `chatFolderInfo` down to the id and display title tuigram
+    /// lists. A partial projection by design — the icon, color, and share state
+    /// are not modelled (follow-up issues); the title is the name's plain text.
+    #[must_use]
+    pub fn from_tdlib(info: &TdChatFolderInfo) -> Self {
+        Self {
+            id: info.id,
+            title: info.name.text.text.clone(),
         }
     }
 }
@@ -2452,6 +2480,32 @@ mod tests {
         ] {
             assert_eq!(ChatListKind::from_tdlib(&kind.to_tdlib()), kind);
         }
+    }
+
+    #[test]
+    fn chat_folder_info_projects_id_and_title() {
+        // The projection keeps the folder's id and its name's plain text, and
+        // drops the icon/color/share metadata tuigram does not model.
+        let info = TdChatFolderInfo {
+            id: 7,
+            name: tdlib_rs::types::ChatFolderName {
+                text: TdFormattedTextT {
+                    text: "Work".to_owned(),
+                    entities: vec![],
+                },
+                animate_custom_emoji: true,
+            },
+            icon: tdlib_rs::types::ChatFolderIcon {
+                name: "Work".to_owned(),
+            },
+            color_id: 3,
+            is_shareable: true,
+            has_my_invite_links: false,
+        };
+
+        let folder = ChatFolderInfo::from_tdlib(&info);
+        assert_eq!(folder.id, 7);
+        assert_eq!(folder.title, "Work");
     }
 
     #[test]

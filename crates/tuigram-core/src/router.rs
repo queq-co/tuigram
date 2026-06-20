@@ -29,7 +29,7 @@ use crate::bridge::RouterEvent;
 /// the router's classification.
 pub trait UpdateSink {
     /// Fold a chat-list update (new chat, position/order, last message, read
-    /// state) into the chat snapshot.
+    /// state, draft, folder list) into the chat snapshot.
     fn reduce_chat(&mut self, update: &Update);
 
     /// Fold a message update (new message, send-lifecycle, content edit,
@@ -84,7 +84,8 @@ fn classify(update: &Update) -> Route {
         | Update::ChatLastMessage(_)
         | Update::ChatReadInbox(_)
         | Update::ChatReadOutbox(_)
-        | Update::ChatDraftMessage(_) => Route::Chat,
+        | Update::ChatDraftMessage(_)
+        | Update::ChatFolders(_) => Route::Chat,
         Update::NewMessage(_)
         | Update::MessageSendSucceeded(_)
         | Update::MessageSendFailed(_)
@@ -207,6 +208,14 @@ mod tests {
         })
     }
 
+    fn chat_folders() -> Update {
+        Update::ChatFolders(tdlib_rs::types::UpdateChatFolders {
+            chat_folders: Vec::new(),
+            main_chat_list_position: 0,
+            are_tags_enabled: false,
+        })
+    }
+
     fn delete_messages() -> Update {
         Update::DeleteMessages(UpdateDeleteMessages {
             chat_id: 1,
@@ -245,8 +254,9 @@ mod tests {
         let mut router = Router::new(SpySink::default());
         router.apply(&chat_read_inbox());
         router.apply(&chat_last_message());
+        router.apply(&chat_folders());
         let sink = router.sink;
-        assert_eq!(sink.chat, 2);
+        assert_eq!(sink.chat, 3);
         assert_eq!(sink.message, 0);
     }
 
