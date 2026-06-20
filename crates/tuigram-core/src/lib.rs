@@ -18,7 +18,7 @@ pub mod users;
 
 pub use auth::{AuthRequests, AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
-pub use chats::{CHATS_EXHAUSTED, ChatRequests, ChatStore, load_main_list};
+pub use chats::{CHATS_EXHAUSTED, ChatRequests, ChatStore, load_archive_list, load_main_list};
 pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
