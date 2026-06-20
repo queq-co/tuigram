@@ -18,7 +18,9 @@ pub mod users;
 
 pub use auth::{AuthRequests, AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
-pub use chats::{CHATS_EXHAUSTED, ChatRequests, ChatStore, load_archive_list, load_main_list};
+pub use chats::{
+    CHATS_EXHAUSTED, ChatRequests, ChatStore, load_archive_list, load_folder_list, load_main_list,
+};
 pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
@@ -28,10 +30,10 @@ pub use messages::{
     MessageRequests, MessageStore, NEWEST, SearchPage, SearchResults, load_history,
 };
 pub use model::{
-    Animation, Audio, Chat, ChatKind, ChatListKind, ChatPosition, Contact, Document, Draft,
-    EntityKind, File, FileRef, FormattedText, Location, Message, MessageContent, OutgoingMedia,
-    Photo, Poll, PollKind, PollOption, Presence, SendState, Sender, Sticker, TextEntity, User,
-    UserKind, Venue, Video, Voice,
+    Animation, Audio, Chat, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition, Contact,
+    Document, Draft, EntityKind, File, FileRef, FormattedText, Location, Message, MessageContent,
+    OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, SendState, Sender, Sticker,
+    TextEntity, User, UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
