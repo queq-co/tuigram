@@ -27,8 +27,9 @@ pub use credentials::{
 };
 pub use files::{DOWNLOAD_PRIORITY, FileRequests, FileStore};
 pub use messages::{
-    MessageRequests, MessageStore, NEWEST, SearchPage, SearchResults, load_history, search_chat,
-    search_global,
+    DeleteRequests, EditRequests, ForwardRequests, HistoryRequests, MessageRequests, MessageStore,
+    NEWEST, PinRequests, ReactionRequests, ReadRequests, SearchPage, SearchRequests, SearchResults,
+    SendRequests, load_history, search_chat, search_global,
 };
 pub use model::{
     Animation, Audio, Chat, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition, Contact,
