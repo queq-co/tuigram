@@ -346,6 +346,7 @@ mod tests {
             is_outgoing: false,
             content: MessageContent::Text(FormattedText::default()),
             send_state: SendState::Sent,
+            reactions: vec![],
         };
 
         let mut state = AccountState::default();

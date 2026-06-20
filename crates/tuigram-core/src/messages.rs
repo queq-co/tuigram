@@ -47,10 +47,19 @@
 //! untouched. [`search_chat`] and [`search_global`] drive either search to
 //! exhaustion into that view, the search counterpart to [`load_history`].
 //!
+//! Reactions and pins (#51): [`MessageRequests::add_message_reaction`] /
+//! [`MessageRequests::remove_message_reaction`] react to a message, and
+//! [`MessageRequests::pin_chat_message`] / [`MessageRequests::unpin_chat_message`]
+//! pin it. Both are advisory, like the read path: a reaction's new counts arrive
+//! as `updateMessageInteractionInfo`, which this store folds onto the message
+//! (replacing its reaction buckets in place); a pin's `updateMessageIsPinned`
+//! is chat state, folded by the [chat store](crate::chats::ChatStore) onto
+//! [`Chat::pinned_message_ids`](crate::model::Chat::pinned_message_ids), not here.
+//!
 //! Scope: history paging, live `updateNewMessage`, sending text + reply with its
 //! lifecycle (#19), editing and deleting with their updates (#20), marking
-//! messages read (#21), forwarding (#36), in-chat and global search (#37), and
-//! the snapshot.
+//! messages read (#21), forwarding (#36), in-chat and global search (#37),
+//! reactions and pins (#51), and the snapshot.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -58,12 +67,16 @@ use std::collections::HashSet;
 
 use tdlib_rs::enums::{
     FoundChatMessages, FoundMessages, InputMessageContent, InputMessageReplyTo, MessageSource,
-    Messages, Update,
+    Messages, ReactionType, Update,
 };
-use tdlib_rs::types::{Error as TdError, InputMessageReplyToMessage, InputMessageText};
+use tdlib_rs::types::{
+    Error as TdError, InputMessageReplyToMessage, InputMessageText, ReactionTypeEmoji,
+};
 
 use crate::bridge::Bridge;
-use crate::model::{FormattedText, Message, MessageContent, OutgoingMedia, SendState, Sender};
+use crate::model::{
+    FormattedText, Message, MessageContent, OutgoingMedia, Reaction, SendState, Sender,
+};
 
 /// The message-history request seam — tuigram's message slice of the
 /// `tdlib_rs::functions` surface, segregated from the auth and chat requests so
@@ -218,6 +231,50 @@ pub trait MessageRequests {
         from_offset: String,
         limit: i32,
     ) -> Result<SearchPage<String>, TdError>;
+
+    /// Add tuigram's account's reaction to a message — a standard `emoji`
+    /// (e.g. `"👍"`), TDLib's `addMessageReaction`. **Advisory**, like
+    /// [`view_messages`](Self::view_messages): it acknowledges the reaction to the
+    /// server and never blocks; the resulting reaction counts arrive as
+    /// `updateMessageInteractionInfo`, which the [`MessageStore`] folds onto the
+    /// message. Only emoji reactions are sent here — custom-emoji and paid
+    /// reactions ([`ReactionKind`](crate::model::ReactionKind)) are read-only in
+    /// this model.
+    async fn add_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: String,
+    ) -> Result<(), TdError>;
+
+    /// Remove tuigram's account's emoji reaction from a message, TDLib's
+    /// `removeMessageReaction`. The counterpart to
+    /// [`add_message_reaction`](Self::add_message_reaction); the matching
+    /// `updateMessageInteractionInfo` folds the new counts.
+    async fn remove_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: String,
+    ) -> Result<(), TdError>;
+
+    /// Pin a message in a chat, TDLib's `pinChatMessage`. `disable_notification`
+    /// pins silently; `only_for_self` pins only for tuigram's account (a private
+    /// pin). The resulting `updateMessageIsPinned` folds the chat's pinned-message
+    /// set ([`Chat::pinned_message_ids`](crate::model::Chat::pinned_message_ids)).
+    async fn pin_chat_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        disable_notification: bool,
+        only_for_self: bool,
+    ) -> Result<(), TdError>;
+
+    /// Unpin a message in a chat, TDLib's `unpinChatMessage`. The counterpart to
+    /// [`pin_chat_message`](Self::pin_chat_message); the matching
+    /// `updateMessageIsPinned` (with `is_pinned` false) folds the message out of
+    /// the chat's pinned set.
+    async fn unpin_chat_message(&self, chat_id: i64, message_id: i64) -> Result<(), TdError>;
 }
 
 impl Bridge {
@@ -461,6 +518,62 @@ impl MessageRequests for Bridge {
             next,
         })
     }
+
+    async fn add_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: String,
+    ) -> Result<(), TdError> {
+        // is_big false: a normal (non-animated) reaction. update_recent_reactions
+        // true: reacting promotes the emoji in the account's recent set, the usual
+        // client behaviour.
+        tdlib_rs::functions::add_message_reaction(
+            chat_id,
+            message_id,
+            ReactionType::Emoji(ReactionTypeEmoji { emoji }),
+            false,
+            true,
+            self.id(),
+        )
+        .await
+    }
+
+    async fn remove_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: String,
+    ) -> Result<(), TdError> {
+        tdlib_rs::functions::remove_message_reaction(
+            chat_id,
+            message_id,
+            ReactionType::Emoji(ReactionTypeEmoji { emoji }),
+            self.id(),
+        )
+        .await
+    }
+
+    async fn pin_chat_message(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        disable_notification: bool,
+        only_for_self: bool,
+    ) -> Result<(), TdError> {
+        tdlib_rs::functions::pin_chat_message(
+            chat_id,
+            message_id,
+            disable_notification,
+            only_for_self,
+            self.id(),
+        )
+        .await
+    }
+
+    async fn unpin_chat_message(&self, chat_id: i64, message_id: i64) -> Result<(), TdError> {
+        tdlib_rs::functions::unpin_chat_message(chat_id, message_id, self.id()).await
+    }
 }
 
 /// A page of message-search hits plus the cursor for the next page.
@@ -667,6 +780,9 @@ impl MessageStore {
     ///   keeps its temporary id) flips to [`SendState::Failed`] with the cause.
     /// - `updateMessageContent` — an edit; the known message's content is swapped
     ///   in place (unknown message: ignored).
+    /// - `updateMessageInteractionInfo` — a reaction change (#51); the known
+    ///   message's reactions are replaced in place with the update's buckets, or
+    ///   cleared when it carries none (unknown message: ignored).
     /// - `updateDeleteMessages` — a deletion; when permanent, the messages are
     ///   removed. A cache-eviction delete (`is_permanent` false) is ignored.
     ///
@@ -699,6 +815,16 @@ impl MessageStore {
                     u.chat_id,
                     u.message_id,
                     MessageContent::from_tdlib(&u.new_content),
+                );
+            }
+            Update::MessageInteractionInfo(u) => {
+                // A reaction change: replace the known message's reactions with
+                // this update's buckets (empty when the info or its reactions are
+                // absent — i.e. the last reaction was removed).
+                self.set_reactions(
+                    u.chat_id,
+                    u.message_id,
+                    crate::model::reactions_from(u.interaction_info.as_ref()),
                 );
             }
             // A real deletion removes the messages; a cache-eviction delete
@@ -780,6 +906,21 @@ impl MessageStore {
             message.content = content;
         }
     }
+
+    /// Replace a known message's reactions in place (the
+    /// `updateMessageInteractionInfo` fold). A no-op if the message is unknown —
+    /// the update carries no sender/date/content, so we never synthesize a partial
+    /// entry from one, the same rule as [`edit_content`](Self::edit_content).
+    /// Idempotent: re-applying sets the same buckets; the empty list clears them.
+    fn set_reactions(&mut self, chat_id: i64, message_id: i64, reactions: Vec<Reaction>) {
+        if let Some(message) = self
+            .by_chat
+            .get_mut(&chat_id)
+            .and_then(|chat| chat.get_mut(&message_id))
+        {
+            message.reactions = reactions;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -810,6 +951,7 @@ mod tests {
                 entities: vec![],
             }),
             send_state: SendState::Sent,
+            reactions: vec![],
         }
     }
 
@@ -1196,6 +1338,37 @@ mod tests {
         ) -> Result<SearchPage<String>, TdError> {
             unimplemented!("SendSpy exercises the send path only")
         }
+        async fn add_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
+
+        async fn pin_chat_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _disable_notification: bool,
+            _only_for_self: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
+
+        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
+            unimplemented!("SendSpy exercises the send path only")
+        }
     }
 
     #[tokio::test]
@@ -1326,6 +1499,37 @@ mod tests {
         ) -> Result<SearchPage<String>, TdError> {
             unimplemented!("HistorySpy exercises history paging only")
         }
+        async fn add_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
+
+        async fn pin_chat_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _disable_notification: bool,
+            _only_for_self: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
+
+        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
+            unimplemented!("HistorySpy exercises history paging only")
+        }
     }
 
     #[tokio::test]
@@ -1442,6 +1646,37 @@ mod tests {
             _from_offset: String,
             _limit: i32,
         ) -> Result<SearchPage<String>, TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+        async fn add_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+
+        async fn pin_chat_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _disable_notification: bool,
+            _only_for_self: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("FailingSpy exercises the history error path only")
+        }
+
+        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
             unimplemented!("FailingSpy exercises the history error path only")
         }
     }
@@ -1564,6 +1799,37 @@ mod tests {
             _from_offset: String,
             _limit: i32,
         ) -> Result<SearchPage<String>, TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+        async fn add_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+
+        async fn pin_chat_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _disable_notification: bool,
+            _only_for_self: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("EditDeleteSpy exercises edit/delete only")
+        }
+
+        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
             unimplemented!("EditDeleteSpy exercises edit/delete only")
         }
     }
@@ -1689,6 +1955,37 @@ mod tests {
             _from_offset: String,
             _limit: i32,
         ) -> Result<SearchPage<String>, TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+        async fn add_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn pin_chat_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _disable_notification: bool,
+            _only_for_self: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("ViewSpy exercises the read path only")
+        }
+
+        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
             unimplemented!("ViewSpy exercises the read path only")
         }
     }
@@ -1835,6 +2132,37 @@ mod tests {
             _from_offset: String,
             _limit: i32,
         ) -> Result<SearchPage<String>, TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+        async fn add_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn pin_chat_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _disable_notification: bool,
+            _only_for_self: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("ForwardSpy exercises the forward path only")
+        }
+
+        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
             unimplemented!("ForwardSpy exercises the forward path only")
         }
     }
@@ -2033,6 +2361,37 @@ mod tests {
                     total_count: 0,
                     next: None,
                 }))
+        }
+        async fn add_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn pin_chat_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _disable_notification: bool,
+            _only_for_self: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
+        }
+
+        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
+            unimplemented!("SearchSpy exercises the search path only")
         }
     }
 
@@ -2293,6 +2652,37 @@ mod tests {
         ) -> Result<SearchPage<String>, TdError> {
             unimplemented!("MediaSpy exercises the media send path only")
         }
+        async fn add_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("MediaSpy exercises the media send path only")
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _emoji: String,
+        ) -> Result<(), TdError> {
+            unimplemented!("MediaSpy exercises the media send path only")
+        }
+
+        async fn pin_chat_message(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _disable_notification: bool,
+            _only_for_self: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("MediaSpy exercises the media send path only")
+        }
+
+        async fn unpin_chat_message(&self, _chat_id: i64, _message_id: i64) -> Result<(), TdError> {
+            unimplemented!("MediaSpy exercises the media send path only")
+        }
     }
 
     #[tokio::test]
@@ -2414,5 +2804,290 @@ mod tests {
             panic!("expected a photo message");
         };
         assert_eq!(photo.caption.text, "new");
+    }
+
+    /// An `updateMessageInteractionInfo` carrying `reactions` as
+    /// `(emoji, count, is_chosen)` triples — the reaction-count change TDLib
+    /// streams after a reaction is added or removed.
+    fn reaction_update(chat_id: i64, message_id: i64, reactions: &[(&str, i32, bool)]) -> Update {
+        use tdlib_rs::types::{
+            MessageInteractionInfo, MessageReaction, MessageReactions, UpdateMessageInteractionInfo,
+        };
+        Update::MessageInteractionInfo(UpdateMessageInteractionInfo {
+            chat_id,
+            message_id,
+            interaction_info: Some(MessageInteractionInfo {
+                reactions: Some(MessageReactions {
+                    reactions: reactions
+                        .iter()
+                        .map(|&(emoji, total_count, is_chosen)| MessageReaction {
+                            r#type: ReactionType::Emoji(ReactionTypeEmoji {
+                                emoji: emoji.to_owned(),
+                            }),
+                            total_count,
+                            is_chosen,
+                            used_sender_id: None,
+                            recent_sender_ids: vec![],
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// An `updateMessageInteractionInfo` with no interaction info at all — TDLib's
+    /// signal that a message's last reaction (and other interactions) is gone.
+    fn reaction_cleared(chat_id: i64, message_id: i64) -> Update {
+        Update::MessageInteractionInfo(tdlib_rs::types::UpdateMessageInteractionInfo {
+            chat_id,
+            message_id,
+            interaction_info: None,
+        })
+    }
+
+    /// The reaction kinds and counts a message carries, for terse assertions.
+    fn reactions(message: &Message) -> Vec<(crate::model::ReactionKind, i32, bool)> {
+        message
+            .reactions
+            .iter()
+            .map(|r| (r.kind.clone(), r.count, r.is_chosen))
+            .collect()
+    }
+
+    #[test]
+    fn interaction_info_folds_reactions_onto_a_known_message_in_place_and_is_idempotent() {
+        use crate::model::ReactionKind::Emoji;
+        let mut store = MessageStore::new();
+        store.merge([msg(10, 1), msg(10, 2)]);
+
+        store.reduce(&reaction_update(
+            10,
+            2,
+            &[("👍", 3, true), ("🔥", 1, false)],
+        ));
+
+        // The reactions land on the message in TDLib's order; no entry added.
+        assert_eq!(
+            reactions(store.get(10, 2).unwrap()),
+            vec![
+                (Emoji("👍".to_owned()), 3, true),
+                (Emoji("🔥".to_owned()), 1, false)
+            ]
+        );
+        assert_eq!(ids(&store.history(10)), vec![1, 2]);
+        // The sibling message is untouched.
+        assert!(store.get(10, 1).unwrap().reactions.is_empty());
+
+        // Replaying the same update converges.
+        store.reduce(&reaction_update(
+            10,
+            2,
+            &[("👍", 3, true), ("🔥", 1, false)],
+        ));
+        assert_eq!(store.get(10, 2).unwrap().reactions.len(), 2);
+    }
+
+    #[test]
+    fn interaction_info_replaces_then_clears_a_messages_reactions() {
+        use crate::model::ReactionKind::Emoji;
+        let mut store = MessageStore::new();
+        store.merge([msg(10, 1)]);
+
+        // A later update wholly replaces the previous buckets (count bumped, a new
+        // reaction chosen) — it is not merged with the prior state.
+        store.reduce(&reaction_update(10, 1, &[("👍", 1, false)]));
+        store.reduce(&reaction_update(10, 1, &[("👍", 2, true)]));
+        assert_eq!(
+            reactions(store.get(10, 1).unwrap()),
+            vec![(Emoji("👍".to_owned()), 2, true)]
+        );
+
+        // The last reaction removed: TDLib drops the interaction info, clearing them.
+        store.reduce(&reaction_cleared(10, 1));
+        assert!(store.get(10, 1).unwrap().reactions.is_empty());
+    }
+
+    #[test]
+    fn interaction_info_for_an_unknown_message_is_ignored() {
+        let mut store = MessageStore::new();
+        // No header/sender to synthesize from an interaction-only update — like an
+        // edit of an unknown message, it leaves the store empty.
+        store.reduce(&reaction_update(10, 99, &[("👍", 1, false)]));
+        assert!(store.is_empty());
+    }
+
+    /// The arguments of a reaction or pin call, captured for assertion.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    struct ReactionPinCalls {
+        added: Option<(i64, i64, String)>,
+        removed: Option<(i64, i64, String)>,
+        pinned: Option<(i64, i64, bool, bool)>,
+        unpinned: Option<(i64, i64)>,
+    }
+
+    /// Captures the most recent reaction/pin request arguments so the seam's
+    /// wiring (which message, which emoji, which pin flags) is asserted.
+    #[derive(Default)]
+    struct ReactionPinSpy {
+        calls: RefCell<ReactionPinCalls>,
+    }
+
+    impl MessageRequests for ReactionPinSpy {
+        async fn send_media(
+            &self,
+            _chat_id: i64,
+            _reply_to: Option<i64>,
+            _media: OutgoingMedia,
+        ) -> Result<Message, TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn edit_caption(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _caption: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn get_chat_history(
+            &self,
+            _chat_id: i64,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn send_text(
+            &self,
+            _chat_id: i64,
+            _reply_to: Option<i64>,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn edit_text(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _text: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn delete(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+            _revoke: bool,
+        ) -> Result<(), TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn view_messages(
+            &self,
+            _chat_id: i64,
+            _message_ids: Vec<i64>,
+        ) -> Result<(), TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn forward_messages(
+            &self,
+            _from_chat_id: i64,
+            _message_ids: Vec<i64>,
+            _to_chat_id: i64,
+            _send_copy: bool,
+            _remove_caption: bool,
+        ) -> Result<Vec<Message>, TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn search_chat_messages(
+            &self,
+            _chat_id: i64,
+            _query: String,
+            _sender: Option<Sender>,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<SearchPage<i64>, TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn search_messages(
+            &self,
+            _query: String,
+            _from_offset: String,
+            _limit: i32,
+        ) -> Result<SearchPage<String>, TdError> {
+            unimplemented!("ReactionPinSpy exercises reactions and pins only")
+        }
+
+        async fn add_message_reaction(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            emoji: String,
+        ) -> Result<(), TdError> {
+            self.calls.borrow_mut().added = Some((chat_id, message_id, emoji));
+            Ok(())
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            emoji: String,
+        ) -> Result<(), TdError> {
+            self.calls.borrow_mut().removed = Some((chat_id, message_id, emoji));
+            Ok(())
+        }
+
+        async fn pin_chat_message(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            disable_notification: bool,
+            only_for_self: bool,
+        ) -> Result<(), TdError> {
+            self.calls.borrow_mut().pinned =
+                Some((chat_id, message_id, disable_notification, only_for_self));
+            Ok(())
+        }
+
+        async fn unpin_chat_message(&self, chat_id: i64, message_id: i64) -> Result<(), TdError> {
+            self.calls.borrow_mut().unpinned = Some((chat_id, message_id));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn reaction_requests_thread_the_target_message_and_emoji() {
+        let spy = ReactionPinSpy::default();
+        spy.add_message_reaction(10, 2, "👍".to_owned())
+            .await
+            .unwrap();
+        spy.remove_message_reaction(10, 2, "👎".to_owned())
+            .await
+            .unwrap();
+
+        assert_eq!(spy.calls.borrow().added, Some((10, 2, "👍".to_owned())));
+        assert_eq!(spy.calls.borrow().removed, Some((10, 2, "👎".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn pin_requests_thread_the_target_and_pin_flags() {
+        let spy = ReactionPinSpy::default();
+        // Pin silently, only for this account.
+        spy.pin_chat_message(10, 5, true, true).await.unwrap();
+        spy.unpin_chat_message(10, 5).await.unwrap();
+
+        assert_eq!(spy.calls.borrow().pinned, Some((10, 5, true, true)));
+        assert_eq!(spy.calls.borrow().unpinned, Some((10, 5)));
     }
 }
