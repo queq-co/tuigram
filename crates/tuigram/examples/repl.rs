@@ -16,9 +16,12 @@
 //! ([`tuigram_core::Login`]) — to log in, then hands the authenticated bridge to
 //! the [`tuigram_core::Client`] facade and drops into a stdin REPL. The REPL
 //! exercises the Phase 3 surface: list chats, open a chat (load + view history),
-//! send, reply, edit, delete, mark read, and log out. Reads come from the
-//! facade's folded snapshot (kept current by its single update router); writes go
-//! over the bridge's per-domain request traits.
+//! send, reply, edit, delete, mark read, search, forward, and log out. Reads come
+//! from the facade's folded snapshot (kept current by its single update router);
+//! writes go over the bridge's per-domain request traits. `search` is the
+//! exception that returns its hits directly: they print from the facade's
+//! transient `SearchResults` and never fold into the snapshot, so a search leaves
+//! loaded history untouched.
 //!
 //! `logout` invalidates the account session and wipes TDLib's local database, so
 //! the next run starts at a fresh login rather than resuming the persisted
@@ -50,6 +53,8 @@ type Fallible = Result<(), Box<dyn std::error::Error>>;
 
 /// How many of a chat's most recent messages a single `open` pulls.
 const HISTORY_PAGE: i32 = 50;
+/// How many search hits to request per page; the facade pages to exhaustion.
+const SEARCH_PAGE: i32 = 50;
 /// How many chats to ask the Main list for on startup.
 const CHATS_PAGE: i32 = 100;
 /// A brief pause after an async load so the router has folded the resulting
@@ -270,6 +275,11 @@ async fn run_repl(client: &Client) -> Fallible {
                 Ok(chat_id) => mark_read(client, chat_id).await,
                 Err(e) => println!("{e}"),
             },
+            "search" => run_search(client, rest).await,
+            "forward" => match parse_forward(rest) {
+                Ok((from, ids, to)) => forward_messages(client, from, ids, to).await,
+                Err(e) => println!("{e}"),
+            },
             "logout" => {
                 if logout(client).await == Flow::Done {
                     return Ok(());
@@ -401,6 +411,60 @@ async fn mark_read(client: &Client, chat_id: i64) {
     }
     if let Err(e) = client.bridge().view_messages(chat_id, ids).await {
         println!("Mark-read failed: {} {}", e.code, e.message);
+    }
+}
+
+/// Run a message search and print the hits straight from the returned transient
+/// view. With a leading chat id the search is scoped to that chat; otherwise it
+/// is account-wide. The results never fold into the folded snapshot, so the live
+/// history store is untouched — this prints from the [`SearchResults`] directly,
+/// not from `client.read`.
+async fn run_search(client: &Client, rest: &str) {
+    let (scope, query) = parse_search(rest);
+    if query.is_empty() {
+        println!("usage: search [chat] <query>");
+        return;
+    }
+    let results = match scope {
+        // No sender filter from the REPL; the facade still threads one through.
+        Some(chat_id) => client.search_chat(chat_id, query, None, SEARCH_PAGE).await,
+        None => client.search_messages(query, SEARCH_PAGE).await,
+    };
+    match results {
+        Ok(hits) if hits.is_empty() => println!("(no matches)"),
+        Ok(hits) => {
+            println!("{} match(es):", hits.len());
+            for m in hits.messages() {
+                // Prefix the chat so global hits across chats are distinguishable.
+                println!(
+                    "  chat {:>14} {}",
+                    m.chat_id,
+                    format_message(m).trim_start()
+                );
+            }
+        }
+        Err(e) => println!("Search failed: {} {}", e.code, e.message),
+    }
+}
+
+/// Forward messages from one chat into another, carrying the usual "forwarded
+/// from" attribution. The forwarded copies fold into the target chat via the
+/// router on the optimistic-send lifecycle, so `history <to>` shows them settle.
+async fn forward_messages(client: &Client, from: i64, ids: Vec<i64>, to: i64) {
+    let count = ids.len();
+    match client.forward_messages(from, ids, to, false, false).await {
+        Ok(msgs) => {
+            let temp_ids = msgs
+                .iter()
+                .map(|m| m.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "Forwarded {count} message(s) to {to} (optimistic ids {temp_ids}). \
+                 `history {to}` to follow them."
+            );
+        }
+        Err(e) => println!("Forward failed: {} {}", e.code, e.message),
     }
 }
 
@@ -574,6 +638,48 @@ fn parse_delete(rest: &str) -> Result<(i64, i64, bool), String> {
     Ok((chat_id, message_id, revoke))
 }
 
+/// Parse `search`'s argument: an optional leading chat id followed by the query.
+/// A first token that parses as an integer (with a non-empty remainder) scopes
+/// the search to that chat; otherwise the whole string is a global query. A
+/// global query that begins with a bare number is therefore read as a chat id —
+/// an accepted ambiguity for this harness.
+fn parse_search(rest: &str) -> (Option<i64>, String) {
+    let rest = rest.trim();
+    let (head, tail) = split_first(rest);
+    match head.parse::<i64>() {
+        Ok(chat_id) if !tail.is_empty() => (Some(chat_id), tail.to_owned()),
+        _ => (None, rest.to_owned()),
+    }
+}
+
+/// Parse `forward <from_chat> <msg_ids> <to_chat>`, where `msg_ids` is one id or
+/// a comma-separated list with no spaces (e.g. `101,102,103`).
+fn parse_forward(rest: &str) -> Result<(i64, Vec<i64>, i64), String> {
+    let usage = "usage: forward <from_chat> <msg_id[,msg_id...]> <to_chat>";
+    let mut parts = rest.split_whitespace();
+    let from = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| usage.to_owned())?;
+    let ids_raw = parts.next().ok_or_else(|| usage.to_owned())?;
+    let to = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| usage.to_owned())?;
+    if parts.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    let message_ids = ids_raw
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<Vec<i64>, _>>()
+        .map_err(|_| usage.to_owned())?;
+    if message_ids.is_empty() {
+        return Err(usage.to_owned());
+    }
+    Ok((from, message_ids, to))
+}
+
 /// The command reference, shown on entry and on `help`.
 fn print_help() {
     println!(
@@ -586,6 +692,8 @@ fn print_help() {
          \x20 edit <chat> <msg> <text>           edit one of your messages\n\
          \x20 delete <chat> <msg> [all]          delete a message (all = for everyone)\n\
          \x20 read <chat>                        mark a chat's known messages read\n\
+         \x20 search [chat] <query>             search one chat (with id) or the whole account\n\
+         \x20 forward <from> <ids> <to>          forward msg ids (comma-separated) between chats\n\
          \x20 logout                             end the session and exit (next run logs in fresh)\n\
          \x20 help                               show this help\n\
          \x20 quit                               exit (Ctrl-D also works)"
