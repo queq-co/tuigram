@@ -23,18 +23,20 @@
 //! `updateNewChat` and folds into the [chat store](crate::chats::ChatStore)); the
 //! secret-chat record itself follows as `updateSecretChat`.
 //!
-//! **Text messaging** needs nothing of its own here. A secret chat is reached by
-//! its ordinary chat id, so text sent and received in one flows through the same
-//! [`MessageStore`](crate::messages::MessageStore) and send lifecycle as any other
-//! chat — `updateNewMessage` folds an incoming message, [`send_text`] posts an
-//! outgoing one optimistically, and `updateMessageSendSucceeded`/`Failed` reconcile
-//! it — with no secret-chat-specific routing. The one rule the lifecycle adds is
-//! readiness: a send only succeeds once the chat is
-//! [`Ready`](crate::model::SecretChatState::Ready), so a driver gates the compose
-//! path on [`SecretChat::is_ready`]. (Sending **media** into a secret chat is a
-//! follow-up; this covers text only.)
+//! **Text and media messaging** need nothing of their own here. A secret chat is
+//! reached by its ordinary chat id, so messages sent and received in one flow
+//! through the same [`MessageStore`](crate::messages::MessageStore) and send
+//! lifecycle as any other chat — `updateNewMessage` folds an incoming message,
+//! [`send_text`] and [`send_media`] post an outgoing one optimistically, and
+//! `updateMessageSendSucceeded`/`Failed` reconcile it — with no secret-chat-specific
+//! routing. Media settles exactly as text does, with the upload streaming as
+//! `updateFile` alongside; the file-backed content rides the chat id like any other.
+//! The one rule the lifecycle adds is readiness: a send only succeeds once the chat
+//! is [`Ready`](crate::model::SecretChatState::Ready), so a driver gates the compose
+//! path on [`SecretChat::is_ready`] — the same gate for text and media alike.
 //!
 //! [`send_text`]: crate::messages::SendRequests::send_text
+//! [`send_media`]: crate::messages::SendRequests::send_media
 
 use std::collections::HashMap;
 
