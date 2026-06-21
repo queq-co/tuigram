@@ -46,6 +46,7 @@ use crate::files::FileStore;
 use crate::messages::{ForwardRequests, MessageStore, SearchResults};
 use crate::model::{Message, Sender};
 use crate::router::{Router, UpdateSink};
+use crate::secret_chats::SecretChatStore;
 use crate::users::UserStore;
 
 /// The account content the router folds updates into: the chat list (#17) and
@@ -60,6 +61,7 @@ pub struct AccountState {
     users: UserStore,
     files: FileStore,
     actions: ChatActionStore,
+    secret_chats: SecretChatStore,
 }
 
 impl AccountState {
@@ -101,6 +103,14 @@ impl AccountState {
         &self.actions
     }
 
+    /// The secret-chat store, for the facade's read side — the encryption state
+    /// behind a [`ChatKind::Secret`](crate::model::ChatKind::Secret) chat (e.g.
+    /// `client.read(|s| s.secret_chats().get(secret_chat_id))`).
+    #[must_use]
+    pub fn secret_chats(&self) -> &SecretChatStore {
+        &self.secret_chats
+    }
+
     /// Fold a chat-list update into the chat store.
     fn reduce_chat(&mut self, update: &Update) {
         self.chats.reduce(update);
@@ -124,6 +134,11 @@ impl AccountState {
     /// Fold a chat-action update into the transient typing view.
     fn reduce_action(&mut self, update: &Update) {
         self.actions.reduce(update);
+    }
+
+    /// Fold a secret-chat update into the secret-chat store.
+    fn reduce_secret_chat(&mut self, update: &Update) {
+        self.secret_chats.reduce(update);
     }
 
     /// Merge a fetched history page into the message store. Unlike live messages,
@@ -178,6 +193,12 @@ impl UpdateSink for SharedState {
         self.lock()
             .expect("account state mutex poisoned")
             .reduce_action(update);
+    }
+
+    fn reduce_secret_chat(&mut self, update: &Update) {
+        self.lock()
+            .expect("account state mutex poisoned")
+            .reduce_secret_chat(update);
     }
 
     fn resync_after_lag(&mut self, skipped: u64) {

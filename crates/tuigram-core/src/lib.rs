@@ -14,6 +14,7 @@ pub mod files;
 pub mod messages;
 pub mod model;
 pub mod router;
+pub mod secret_chats;
 pub mod session;
 pub mod users;
 
@@ -37,9 +38,11 @@ pub use model::{
     Animation, Audio, Chat, ChatAction, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition,
     Contact, Document, Draft, EntityKind, File, FileRef, FormattedText, Location, Message,
     MessageContent, OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, Reaction,
-    ReactionKind, SendState, Sender, Sticker, TextEntity, User, UserKind, Venue, Video, Voice,
+    ReactionKind, SecretChat, SecretChatState, SendState, Sender, Sticker, TextEntity, User,
+    UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
+pub use secret_chats::{SecretChatRequests, SecretChatStore};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
 pub use users::{UserRequests, UserStore};
 
