@@ -24,8 +24,8 @@ use tdlib_rs::enums::{
     InputFile as TdInputFile, InputMessageContent as TdInputMessageContent,
     InputMessageReplyTo as TdInputMessageReplyTo, MessageContent as TdMessageContent,
     MessageSender as TdMessageSender, MessageSendingState as TdMessageSendingState,
-    PollType as TdPollType, ReactionType as TdReactionType, TextEntityType as TdTextEntityType,
-    UserStatus as TdUserStatus, UserType as TdUserType,
+    PollType as TdPollType, ReactionType as TdReactionType, SecretChatState as TdSecretChatState,
+    TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
     Chat as TdChat, ChatFolderInfo as TdChatFolderInfo, ChatListFolder,
@@ -39,8 +39,8 @@ use tdlib_rs::types::{
     MessageSenderChat as TdMessageSenderChat, MessageSenderUser as TdMessageSenderUser,
     MessageSticker as TdMessageSticker, MessageVideo as TdMessageVideo,
     MessageVoiceNote as TdMessageVoiceNote, Poll as TdPoll, PollOption as TdPollOption,
-    ReactionTypeCustomEmoji, ReactionTypeEmoji, TextEntity as TdTextEntity, User as TdUser,
-    Venue as TdVenue,
+    ReactionTypeCustomEmoji, ReactionTypeEmoji, SecretChat as TdSecretChat,
+    TextEntity as TdTextEntity, User as TdUser, Venue as TdVenue,
 };
 
 /// Who sent a message.
@@ -361,6 +361,71 @@ impl ChatKind {
                 secret_chat_id: s.secret_chat_id,
                 user_id: s.user_id,
             },
+        }
+    }
+}
+
+/// The lifecycle state of a [`SecretChat`] — tuigram's projection of TDLib's
+/// `SecretChatState`. Total over the enum, no catch-all, the same discipline as
+/// [`Presence`]: a new state fails to compile here until it is classified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecretChatState {
+    /// Not yet established — waiting for the partner to come online and complete
+    /// the key exchange.
+    Pending,
+    /// Established and usable for end-to-end encrypted messaging.
+    Ready,
+    /// Closed by either party; no longer usable.
+    Closed,
+}
+
+impl SecretChatState {
+    /// Project TDLib's `SecretChatState`.
+    #[must_use]
+    pub fn from_tdlib(state: &TdSecretChatState) -> Self {
+        match state {
+            TdSecretChatState::Pending => Self::Pending,
+            TdSecretChatState::Ready => Self::Ready,
+            TdSecretChatState::Closed => Self::Closed,
+        }
+    }
+}
+
+/// An end-to-end encrypted secret chat — tuigram's projection of TDLib's
+/// `SecretChat`, the encryption state behind a
+/// [`ChatKind::Secret`](ChatKind::Secret) chat in the snapshot.
+///
+/// A secret chat has its own id space (`i32`, distinct from a chat's `i64`); a
+/// `ChatKind::Secret` carries the `secret_chat_id` that keys back to this record.
+/// The protocol `layer` is dropped — the model tracks the chat's *lifecycle and
+/// identity*, not the partner app's feature level — keeping the same minimal
+/// projection discipline as the rest of the model. The `key_hash` is retained raw
+/// for a caller to render the key-verification image or hex fingerprint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretChat {
+    /// Secret chat identifier (the key in [`ChatKind::Secret`]).
+    pub id: i32,
+    /// The chat partner's user id.
+    pub user_id: i64,
+    /// Where the chat is in its lifecycle.
+    pub state: SecretChatState,
+    /// Whether the current user created the chat (`true`) or accepted it (`false`).
+    pub is_outbound: bool,
+    /// Raw key hash, for rendering the key-verification fingerprint. Empty until
+    /// the chat is [`Ready`](SecretChatState::Ready).
+    pub key_hash: String,
+}
+
+impl SecretChat {
+    /// Project TDLib's `SecretChat`.
+    #[must_use]
+    pub fn from_tdlib(chat: &TdSecretChat) -> Self {
+        Self {
+            id: chat.id,
+            user_id: chat.user_id,
+            state: SecretChatState::from_tdlib(&chat.state),
+            is_outbound: chat.is_outbound,
+            key_hash: chat.key_hash.clone(),
         }
     }
 }

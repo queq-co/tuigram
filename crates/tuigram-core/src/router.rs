@@ -49,6 +49,10 @@ pub trait UpdateSink {
     /// never persisted into the message store.
     fn reduce_action(&mut self, update: &Update);
 
+    /// Fold a secret-chat update (`updateSecretChat`: lifecycle/key state of an
+    /// end-to-end encrypted chat) into the secret-chat store.
+    fn reduce_secret_chat(&mut self, update: &Update);
+
     /// Recover from a broadcast overflow: `skipped` updates were dropped before
     /// the router caught up, so the folded state may be stale and must be
     /// re-queried. Handling is mandatory — a lag is never silently ignored.
@@ -72,6 +76,8 @@ enum Route {
     File,
     /// Folded by the chat-action reducer (#52) — the transient typing view.
     Action,
+    /// Folded by the secret-chat reducer (#53) — the E2E chat lifecycle.
+    SecretChat,
     /// Not account content this router folds; dropped here.
     Ignored,
 }
@@ -108,6 +114,9 @@ fn classify(update: &Update) -> Route {
         // updateChatAction is transient typing/recording presence (#52): the
         // chat-action store folds it into a separate view, never into history.
         Update::ChatAction(_) => Route::Action,
+        // updateSecretChat is the E2E chat lifecycle (#53), folded into the
+        // secret-chat store keyed by secret_chat_id.
+        Update::SecretChat(_) => Route::SecretChat,
         _ => Route::Ignored,
     }
 }
@@ -138,6 +147,7 @@ impl<S: UpdateSink> Router<S> {
             Route::User => self.sink.reduce_user(update),
             Route::File => self.sink.reduce_file(update),
             Route::Action => self.sink.reduce_action(update),
+            Route::SecretChat => self.sink.reduce_secret_chat(update),
             Route::Ignored => {}
         }
     }
@@ -177,6 +187,7 @@ mod tests {
         user: u32,
         file: u32,
         action: u32,
+        secret_chat: u32,
         lagged: Vec<u64>,
     }
 
@@ -195,6 +206,9 @@ mod tests {
         }
         fn reduce_action(&mut self, _update: &Update) {
             self.action += 1;
+        }
+        fn reduce_secret_chat(&mut self, _update: &Update) {
+            self.secret_chat += 1;
         }
         fn resync_after_lag(&mut self, skipped: u64) {
             self.lagged.push(skipped);
@@ -285,6 +299,19 @@ mod tests {
                 user_id: 7,
             }),
             action: tdlib_rs::enums::ChatAction::Typing,
+        })
+    }
+
+    fn secret_chat() -> Update {
+        Update::SecretChat(tdlib_rs::types::UpdateSecretChat {
+            secret_chat: tdlib_rs::types::SecretChat {
+                id: 5,
+                user_id: 7,
+                state: tdlib_rs::enums::SecretChatState::Pending,
+                is_outbound: true,
+                key_hash: String::new(),
+                layer: 144,
+            },
         })
     }
 
@@ -383,6 +410,17 @@ mod tests {
     }
 
     #[test]
+    fn secret_chat_updates_route_to_the_secret_chat_reducer() {
+        // updateSecretChat is the E2E chat lifecycle, folded into its own store.
+        let mut router = Router::new(SpySink::default());
+        router.apply(&secret_chat());
+        let sink = router.sink;
+        assert_eq!(sink.secret_chat, 1);
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+    }
+
+    #[test]
     fn unrelated_updates_route_to_no_reducer() {
         let mut router = Router::new(SpySink::default());
         router.apply(&unrelated());
@@ -392,6 +430,7 @@ mod tests {
         assert_eq!(sink.user, 0);
         assert_eq!(sink.file, 0);
         assert_eq!(sink.action, 0);
+        assert_eq!(sink.secret_chat, 0);
     }
 
     #[tokio::test]
