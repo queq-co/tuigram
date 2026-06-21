@@ -7,10 +7,13 @@
 > and [research/app-registration-security.md](research/app-registration-security.md)
 > (`api_id` policy + session protection).
 
-Scope is the **phone path** — phone number + login code + 2FA password, the
-route a normal user hits — plus **QR login** (request a code, scan the link on an
-already signed-in device). New-user registration, email, and premium purchase
-remain out of scope and are surfaced explicitly (see [Out of scope](#out-of-scope)).
+Scope is **every** TDLib authorization state. The **phone path** — phone number +
+login code + 2FA password, the route a normal user hits — plus **QR login**
+(request a code, scan the link on an already signed-in device), **new-user
+registration** (accept the terms, submit a name), and **email login** (email
+address + emailed code) are all driven to completion. **Premium purchase** is
+modeled too, but surfaced as a dead end — completing it needs an in-store
+purchase a headless client can't make (see [Out of scope](#out-of-scope)).
 
 ## The pieces
 
@@ -38,8 +41,12 @@ WaitTdlibParameters         --setTdlibParameters(api_id, api_hash, dirs, key)-->
 WaitPhoneNumber             --setAuthenticationPhoneNumber(phone)-------------->
   └─ or QR:                 --requestQrCodeAuthentication()------------------->
 WaitOtherDeviceConfirmation{link}  scan link on a signed-in device (no input)-->
+WaitEmailAddress            --setAuthenticationEmailAddress(email)------------->
+WaitEmailCode{pattern}      --checkAuthenticationEmailCode(code)-------------->
 WaitCode                    --checkAuthenticationCode(code)-------------------->
+WaitRegistration{terms}     --registerUser(first_name, last_name)  (new user)-->
 WaitPassword{hint}          --checkAuthenticationPassword(password)  (2FA only)->
+WaitPremiumPurchase{product}  in-store purchase required — dead end (no answer)
 Ready                         logged in; normal updates flow
 Closed                        loggingOut / closing / closed — tear down
 ```
@@ -49,10 +56,18 @@ Closed                        loggingOut / closing / closed — tear down
   whose link is rendered as a QR code and scanned on an already signed-in device.
   No input is taken there — the flow advances on the next update (to `Ready`, or
   `WaitPassword` if 2FA is set).
+- **Email login** (`WaitEmailAddress` → `WaitEmailCode{pattern}`) and **new-user
+  registration** (`WaitRegistration{terms}`) are answered the same way — submit the
+  email/code, or accept the terms and register a name. The states a given account
+  hits depend on its setup; only those it reaches are driven.
+- **Premium purchase** (`WaitPremiumPurchase{product}`) is modeled but has no answer
+  here: it needs an App Store / Play in-store purchase. The flow reports it as a
+  dead end (the harness errors out) rather than hanging on a silent unknown.
 - `WaitPassword` is **skipped entirely** when the account has no 2FA.
-- The projection ([`AuthState::from_tdlib`]) is **total** over TDLib's enum: every
-  state maps to a handled variant or to `AuthState::Unsupported(name)`, so a TDLib
-  state we don't handle can never silently masquerade as one we do.
+- The projection ([`AuthState::from_tdlib`]) is **total** by *exhaustive* match over
+  TDLib's (closed) enum — every state maps to a handled variant, with no catch-all —
+  so a state added by a future TDLib version is a compile error here, never a silent
+  misclassification.
 - The driver does not consume the update stream itself — that stays on the bridge
   so other subsystems can observe auth transitions too. The owning loop feeds each
   update to `Login::on_update` and calls the matching handler.
@@ -133,16 +148,19 @@ deliberate, documented exception; the future TUI will suppress it.)
 
 ## Out of scope
 
-`AuthState::Unsupported(name)` carries the TDLib state name so callers can report
-precisely instead of hanging. These are tracked as follow-up issues, not handled
-yet:
+Every TDLib authorization state is now modeled and mapped — there is no
+`AuthState::Unsupported` catch-all anymore. What remains out of scope is narrower:
+specific *answers* a headless client can't give, not whole states.
 
-- `waitRegistration` — new-user sign-up;
-- `waitEmailAddress` / `waitEmailCode` — email-based login;
-- `waitPremiumPurchase`.
+- **Premium purchase** (`waitPremiumPurchase`) is modeled and surfaced, but can't
+  be *completed* here: it needs an App Store / Play in-store purchase. The state is
+  reported as a dead end rather than hung on.
+- At `waitEmailCode`, only the **emailed code** answer is wired; the **Apple ID /
+  Google ID** token answers TDLib would also accept there are mobile-only and not
+  implemented.
 
-(`waitOtherDeviceConfirmation` — QR login — is now handled; see the state machine
-above.)
+A user who hits the premium dead end logs in on a mobile app first; everything
+else completes headlessly.
 
 ## Trying it
 
