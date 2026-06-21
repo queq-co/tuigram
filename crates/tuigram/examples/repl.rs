@@ -198,17 +198,53 @@ async fn dispatch(
             println!("  {link}");
             println!("Waiting for confirmation…");
         }
+        AuthState::WaitEmailAddress => loop {
+            let email = prompt("Email address for login: ")?;
+            match login.submit_email_address(email).await {
+                Ok(()) => break,
+                Err(e) => report_retry(&e),
+            }
+        },
+        AuthState::WaitEmailCode { email_pattern } => {
+            println!("  A login code was sent to {email_pattern}.");
+            loop {
+                let code = prompt("Email login code: ")?;
+                match login.submit_email_code(code).await {
+                    Ok(()) => break,
+                    Err(e) => report_retry(&e),
+                }
+            }
+        }
+        AuthState::WaitRegistration { terms_of_service } => {
+            // Unregistered number: create the account. Show the terms first so
+            // accepting (by registering) is informed.
+            if !terms_of_service.is_empty() {
+                println!("\nTerms of service:\n{terms_of_service}\n");
+            }
+            println!("This phone number isn't registered yet — create the account.");
+            loop {
+                let first = prompt("First name: ")?;
+                let last = prompt("Last name (optional): ")?;
+                match login.register(first, last).await {
+                    Ok(()) => break,
+                    Err(e) => report_retry(&e),
+                }
+            }
+        }
+        AuthState::WaitPremiumPurchase { store_product_id } => {
+            // No headless answer exists: completing this needs an App Store / Play
+            // in-store purchase. Report the dead end rather than hang.
+            return Err(format!(
+                "login requires buying Telegram Premium (store product \
+                 {store_product_id}) as an in-store purchase, which this headless \
+                 client can't perform — log in on a mobile app first"
+            )
+            .into());
+        }
         AuthState::Ready => return Ok(Flow::Done),
         AuthState::Closed => {
             println!("\nSession closed (logged out or shutting down).");
             return Ok(Flow::Done);
-        }
-        AuthState::Unsupported(name) => {
-            return Err(format!(
-                "login reached an unsupported state ({name}); this harness handles \
-                 the phone path (number + code + 2FA password) and QR login only"
-            )
-            .into());
         }
     }
     Ok(Flow::Continue)
