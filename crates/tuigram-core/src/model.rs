@@ -431,13 +431,13 @@ impl SecretChat {
 
     /// Whether the chat is established and usable for messaging.
     ///
-    /// Text (and, later, media) sends only succeed once the key exchange has
+    /// Both text and media sends only succeed once the key exchange has
     /// completed — TDLib rejects a send to a [`Pending`](SecretChatState::Pending)
     /// or [`Closed`](SecretChatState::Closed) chat. A driver gates the compose path
     /// on this so it never posts into a chat the server will refuse; the message
     /// itself then flows through the ordinary
     /// [`MessageStore`](crate::messages::MessageStore) keyed by the chat's id, no
-    /// secret-chat-specific routing required.
+    /// secret-chat-specific routing required for either.
     #[must_use]
     pub fn is_ready(&self) -> bool {
         self.state == SecretChatState::Ready

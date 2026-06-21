@@ -2327,4 +2327,87 @@ mod tests {
             assert_eq!(ids(&store.history(chat_id)), vec![5]);
         }
     }
+
+    /// Secret chat media messaging — the follow-up deferred from #54. Media rides
+    /// the secret chat's ordinary chat id just as text does:
+    /// [`send_media`](SendRequests::send_media) posts a file-backed message
+    /// optimistically and the lifecycle reconciles it through the same
+    /// [`MessageStore`], the file-backed content surviving the temp→real swap. The
+    /// readiness gate is shared with text — there is no media-specific rule — so
+    /// these reuse [`SecretChat::is_ready`] rather than restating one.
+    mod secret_chat_media {
+        use super::*;
+        use crate::model::{SecretChat, SecretChatState};
+
+        /// A ready secret chat and the ordinary chat id it is reached by.
+        fn ready_secret_chat() -> (SecretChat, i64) {
+            (
+                SecretChat {
+                    id: 7,
+                    user_id: 42,
+                    state: SecretChatState::Ready,
+                    is_outbound: true,
+                    key_hash: "fingerprint".to_owned(),
+                },
+                -7, // the chat id behind the secret chat
+            )
+        }
+
+        #[tokio::test]
+        async fn media_sent_to_a_secret_chat_returns_an_optimistic_pending_message() {
+            let (chat, chat_id) = ready_secret_chat();
+            // Compose only when ready — the same gate text uses, no media-specific one.
+            assert!(chat.is_ready());
+
+            // Drive the media seam on the secret chat's chat id; the caller gets the
+            // same optimistic Pending message back as for any chat.
+            let spy = MediaSpy::default();
+            let media = OutgoingMedia::Photo {
+                path: "/tmp/secret.jpg".to_owned(),
+                caption: FormattedText {
+                    text: "for your eyes only".to_owned(),
+                    entities: vec![],
+                },
+            };
+            let optimistic = spy.send_media(chat_id, None, media.clone()).await.unwrap();
+
+            assert_eq!(*spy.sent.borrow(), Some((chat_id, None, media)));
+            assert_eq!(optimistic.send_state, SendState::Pending);
+        }
+
+        #[test]
+        fn media_in_a_secret_chat_reconciles_and_keeps_its_content() {
+            let (chat, chat_id) = ready_secret_chat();
+            assert!(chat.is_ready());
+
+            // The optimistic photo lands Pending under a temp id, carrying photo
+            // content, on the secret chat's chat id — no special handling.
+            let mut store = MessageStore::new();
+            store.reduce(&Update::NewMessage(UpdateNewMessage {
+                message: td_photo_message(
+                    chat_id,
+                    5001,
+                    "pic",
+                    Some(MessageSendingState::Pending(
+                        MessageSendingStatePending::default(),
+                    )),
+                ),
+            }));
+            let pending = store.get(chat_id, 5001).unwrap();
+            assert_eq!(pending.send_state, SendState::Pending);
+            assert!(matches!(pending.content, MessageContent::Photo(_)));
+
+            // Success swaps the temp id for the server's, in place, and the photo
+            // content survives — identical to a non-secret chat, no special routing.
+            store.reduce(&Update::MessageSendSucceeded(UpdateMessageSendSucceeded {
+                message: td_photo_message(chat_id, 8001, "pic", None),
+                old_message_id: 5001,
+            }));
+            assert!(store.get(chat_id, 5001).is_none());
+            let settled = store.get(chat_id, 8001).unwrap();
+            assert_eq!(settled.send_state, SendState::Sent);
+            assert!(matches!(settled.content, MessageContent::Photo(_)));
+            assert_eq!(store.count(chat_id), 1);
+        }
+    }
 }
