@@ -4,6 +4,7 @@
 //! unit-tested without a TTY. Phases 2–3 (auth, chats, messages) live here;
 //! the Ratatui front-end (Phases 4–5) depends on this crate.
 
+pub mod actions;
 pub mod auth;
 pub mod bridge;
 pub mod chats;
@@ -16,6 +17,7 @@ pub mod router;
 pub mod session;
 pub mod users;
 
+pub use actions::{ChatActionRequests, ChatActionStore};
 pub use auth::{AuthRequests, AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
 pub use chats::{
@@ -32,10 +34,10 @@ pub use messages::{
     SendRequests, load_history, search_chat, search_global,
 };
 pub use model::{
-    Animation, Audio, Chat, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition, Contact,
-    Document, Draft, EntityKind, File, FileRef, FormattedText, Location, Message, MessageContent,
-    OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, Reaction, ReactionKind, SendState,
-    Sender, Sticker, TextEntity, User, UserKind, Venue, Video, Voice,
+    Animation, Audio, Chat, ChatAction, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition,
+    Contact, Document, Draft, EntityKind, File, FileRef, FormattedText, Location, Message,
+    MessageContent, OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, Reaction,
+    ReactionKind, SendState, Sender, Sticker, TextEntity, User, UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
