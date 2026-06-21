@@ -12,10 +12,11 @@
 //! only the requests it makes. [`Bridge`] implements it via its public id; the
 //! chats/messages modules own their own request traits the same way.
 //!
-//! Phase 2 scope is **phone number + login code + 2FA password**. QR login
-//! (`waitOtherDeviceConfirmation`), new-user registration, email, and premium
-//! purchase are surfaced as [`AuthState::Unsupported`] for follow-up issues
-//! rather than handled here.
+//! The phone path — **phone number + login code + 2FA password** — and **QR
+//! login** (`waitOtherDeviceConfirmation`: request a code, scan the link on an
+//! already-signed-in device) are both handled here. New-user registration,
+//! email, and premium purchase remain surfaced as [`AuthState::Unsupported`]
+//! for follow-up issues rather than handled here.
 //!
 //! Secrets are never retained: the login code and the 2FA password are taken by
 //! value and moved straight into their TDLib request (see the threat model).
@@ -57,6 +58,15 @@ pub trait AuthRequests {
 
     /// Answer `WaitPhoneNumber` — submit the phone number and request a code.
     async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError>;
+
+    /// Answer `WaitPhoneNumber` the other way — request QR-code authentication
+    /// instead of a phone number.
+    ///
+    /// TDLib responds by moving to `WaitOtherDeviceConfirmation`, carrying a
+    /// `tg://login` link to render as a QR code; scanning it on an already
+    /// signed-in device completes the login (which may then still require the
+    /// 2FA password). Carries no credential payload of its own.
+    async fn request_qr_code_authentication(&self) -> Result<(), TdError>;
 
     /// Answer `WaitCode` — submit the login code the user received.
     async fn check_authentication_code(&self, code: String) -> Result<(), TdError>;
@@ -112,6 +122,11 @@ impl AuthRequests for Bridge {
         tdlib_rs::functions::set_authentication_phone_number(phone_number, None, self.id()).await
     }
 
+    async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+        // Empty other_user_ids: authenticate only this account, not extra users.
+        tdlib_rs::functions::request_qr_code_authentication(vec![], self.id()).await
+    }
+
     async fn check_authentication_code(&self, code: String) -> Result<(), TdError> {
         tdlib_rs::functions::check_authentication_code(code, self.id()).await
     }
@@ -144,13 +159,18 @@ pub enum AuthState {
     /// 2FA is enabled; needs the account password. Carries the user's hint
     /// (may be empty) for display — never the password itself.
     WaitPassword { hint: String },
+    /// QR login was requested; TDLib is waiting for the link to be scanned on an
+    /// already signed-in device. Carries the `tg://login` link to render as a QR
+    /// code. No input is taken here — the confirmation happens on the other
+    /// device — so the flow advances on the next `updateAuthorizationState`.
+    WaitOtherDeviceConfirmation { link: String },
     /// Logged in; normal updates flow.
     Ready,
     /// Logging out, closing, or closed — terminal; tear down the session.
     Closed,
-    /// A login state outside Phase 2 scope (QR confirmation, new-user
-    /// registration, email, premium purchase). Carries the TDLib state name so
-    /// callers can report precisely. Tracked as follow-up issues.
+    /// A login state not yet handled (new-user registration, email, premium
+    /// purchase). Carries the TDLib state name so callers can report precisely.
+    /// Tracked as follow-up issues.
     Unsupported(&'static str),
 }
 
@@ -173,8 +193,10 @@ impl AuthState {
             AuthorizationState::LoggingOut
             | AuthorizationState::Closing
             | AuthorizationState::Closed => Self::Closed,
-            AuthorizationState::WaitOtherDeviceConfirmation(_) => {
-                Self::Unsupported("waitOtherDeviceConfirmation")
+            AuthorizationState::WaitOtherDeviceConfirmation(c) => {
+                Self::WaitOtherDeviceConfirmation {
+                    link: c.link.clone(),
+                }
             }
             AuthorizationState::WaitRegistration(_) => Self::Unsupported("waitRegistration"),
             AuthorizationState::WaitEmailAddress(_) => Self::Unsupported("waitEmailAddress"),
@@ -240,6 +262,14 @@ impl<'a, C: AuthRequests> Login<'a, C> {
     /// format; TDLib then delivers a code and transitions to `WaitCode`.
     pub async fn submit_phone_number(&self, phone_number: String) -> Result<(), TdError> {
         self.client.set_phone_number(phone_number).await
+    }
+
+    /// Answer [`AuthState::WaitPhoneNumber`] with QR login instead of a phone
+    /// number. TDLib transitions to
+    /// [`AuthState::WaitOtherDeviceConfirmation`], whose `link` is rendered as a
+    /// QR code and scanned on an already signed-in device.
+    pub async fn request_qr_code(&self) -> Result<(), TdError> {
+        self.client.request_qr_code_authentication().await
     }
 
     /// Answer [`AuthState::WaitCode`] with the code the user received.
@@ -317,15 +347,22 @@ mod tests {
     }
 
     #[test]
-    fn out_of_scope_states_are_unsupported_not_misclassified() {
+    fn qr_login_state_surfaces_its_link() {
         let qr = AuthorizationState::WaitOtherDeviceConfirmation(
-            AuthorizationStateWaitOtherDeviceConfirmation::default(),
+            AuthorizationStateWaitOtherDeviceConfirmation {
+                link: "tg://login?token=abc".to_owned(),
+            },
         );
         assert_eq!(
             AuthState::from_tdlib(&qr),
-            AuthState::Unsupported("waitOtherDeviceConfirmation")
+            AuthState::WaitOtherDeviceConfirmation {
+                link: "tg://login?token=abc".to_owned()
+            }
         );
+    }
 
+    #[test]
+    fn still_unsupported_states_are_named_not_misclassified() {
         let registration =
             AuthorizationState::WaitRegistration(AuthorizationStateWaitRegistration::default());
         assert_eq!(
@@ -340,6 +377,13 @@ mod tests {
         assert!(AuthState::Closed.is_terminal());
         assert!(!AuthState::WaitPhoneNumber.is_terminal());
         assert!(!AuthState::WaitCode.is_terminal());
+        // QR confirmation still waits on the other device — not terminal.
+        assert!(
+            !AuthState::WaitOtherDeviceConfirmation {
+                link: String::new()
+            }
+            .is_terminal()
+        );
     }
 
     /// Records which handler the driver invoked and with what argument, so a
@@ -376,6 +420,12 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push(format!("set_phone_number({phone_number})"));
+            Ok(())
+        }
+        async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push("request_qr_code_authentication()".to_owned());
             Ok(())
         }
         async fn check_authentication_code(&self, code: String) -> Result<(), TdError> {
@@ -491,6 +541,45 @@ mod tests {
         assert_eq!(
             client.calls(),
             vec!["check_authentication_code(99999)".to_owned()]
+        );
+    }
+
+    /// QR login is the alternative answer to `WaitPhoneNumber`: request a QR
+    /// code, surface the scan link from `WaitOtherDeviceConfirmation`, then let
+    /// the confirmation on the other device carry the flow to `Ready` — with no
+    /// further input here, and no network.
+    #[tokio::test]
+    async fn qr_login_flow_requests_a_code_then_confirms_on_the_other_device() {
+        let client = SpyClient::default();
+        let mut login = Login::new(&client);
+
+        login.on_update(&AuthorizationState::WaitPhoneNumber);
+        assert_eq!(*login.state(), AuthState::WaitPhoneNumber);
+
+        // Choose QR instead of typing a phone number.
+        login.request_qr_code().await.unwrap();
+
+        // TDLib answers with the link to render and scan.
+        login.on_update(&AuthorizationState::WaitOtherDeviceConfirmation(
+            AuthorizationStateWaitOtherDeviceConfirmation {
+                link: "tg://login?token=xyz".to_owned(),
+            },
+        ));
+        assert_eq!(
+            *login.state(),
+            AuthState::WaitOtherDeviceConfirmation {
+                link: "tg://login?token=xyz".to_owned()
+            }
+        );
+        assert!(!login.state().is_terminal());
+
+        // The other device confirms; login completes with no further input.
+        login.on_update(&AuthorizationState::Ready);
+        assert_eq!(*login.state(), AuthState::Ready);
+
+        assert_eq!(
+            client.calls(),
+            vec!["request_qr_code_authentication()".to_owned()]
         );
     }
 }

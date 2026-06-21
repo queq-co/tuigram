@@ -191,6 +191,13 @@ async fn dispatch(
                 }
             }
         }
+        AuthState::WaitOtherDeviceConfirmation { link } => {
+            // QR login: nothing to read here — TDLib advances on its own once the
+            // link is scanned on an already signed-in device. Show it and wait.
+            println!("\nScan this link on a signed-in Telegram device to confirm login:");
+            println!("  {link}");
+            println!("Waiting for confirmation…");
+        }
         AuthState::Ready => return Ok(Flow::Done),
         AuthState::Closed => {
             println!("\nSession closed (logged out or shutting down).");
@@ -199,7 +206,7 @@ async fn dispatch(
         AuthState::Unsupported(name) => {
             return Err(format!(
                 "login reached an unsupported state ({name}); this harness handles \
-                 phone number + login code + 2FA password only"
+                 the phone path (number + code + 2FA password) and QR login only"
             )
             .into());
         }
