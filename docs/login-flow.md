@@ -7,9 +7,10 @@
 > and [research/app-registration-security.md](research/app-registration-security.md)
 > (`api_id` policy + session protection).
 
-Scope is **phone number + login code + 2FA password** — the path a normal user
-hits. QR login, new-user registration, email, and premium purchase are out of
-scope and surfaced explicitly (see [Out of scope](#out-of-scope)).
+Scope is the **phone path** — phone number + login code + 2FA password, the
+route a normal user hits — plus **QR login** (request a code, scan the link on an
+already signed-in device). New-user registration, email, and premium purchase
+remain out of scope and are surfaced explicitly (see [Out of scope](#out-of-scope)).
 
 ## The pieces
 
@@ -33,14 +34,21 @@ stream onto a reduced [`auth::AuthState`] and answers each waiting state through
 the [`bridge::TgClient`] seam.
 
 ```
-WaitTdlibParameters  --setTdlibParameters(api_id, api_hash, dirs, key)-->
-WaitPhoneNumber      --setAuthenticationPhoneNumber(phone)-------------->
-WaitCode             --checkAuthenticationCode(code)-------------------->
-WaitPassword{hint}   --checkAuthenticationPassword(password)  (2FA only)->
-Ready                  logged in; normal updates flow
-Closed                 loggingOut / closing / closed — tear down
+WaitTdlibParameters         --setTdlibParameters(api_id, api_hash, dirs, key)-->
+WaitPhoneNumber             --setAuthenticationPhoneNumber(phone)-------------->
+  └─ or QR:                 --requestQrCodeAuthentication()------------------->
+WaitOtherDeviceConfirmation{link}  scan link on a signed-in device (no input)-->
+WaitCode                    --checkAuthenticationCode(code)-------------------->
+WaitPassword{hint}          --checkAuthenticationPassword(password)  (2FA only)->
+Ready                         logged in; normal updates flow
+Closed                        loggingOut / closing / closed — tear down
 ```
 
+- At `WaitPhoneNumber`, **QR login** is the alternative answer:
+  `requestQrCodeAuthentication` moves TDLib to `WaitOtherDeviceConfirmation{link}`,
+  whose link is rendered as a QR code and scanned on an already signed-in device.
+  No input is taken there — the flow advances on the next update (to `Ready`, or
+  `WaitPassword` if 2FA is set).
 - `WaitPassword` is **skipped entirely** when the account has no 2FA.
 - The projection ([`AuthState::from_tdlib`]) is **total** over TDLib's enum: every
   state maps to a handled variant or to `AuthState::Unsupported(name)`, so a TDLib
@@ -127,12 +135,14 @@ deliberate, documented exception; the future TUI will suppress it.)
 
 `AuthState::Unsupported(name)` carries the TDLib state name so callers can report
 precisely instead of hanging. These are tracked as follow-up issues, not handled
-in Phase 2:
+yet:
 
-- `waitOtherDeviceConfirmation` — QR login;
 - `waitRegistration` — new-user sign-up;
 - `waitEmailAddress` / `waitEmailCode` — email-based login;
 - `waitPremiumPurchase`.
+
+(`waitOtherDeviceConfirmation` — QR login — is now handled; see the state machine
+above.)
 
 ## Trying it
 
