@@ -2242,4 +2242,89 @@ mod tests {
         assert_eq!(spy.calls.borrow().pinned, Some((10, 5, true, true)));
         assert_eq!(spy.calls.borrow().unpinned, Some((10, 5)));
     }
+
+    /// Secret chat text messaging (#54). A secret chat is reached by an ordinary
+    /// chat id, so text sent and received in one rides the same [`MessageStore`]
+    /// and send lifecycle as any chat — there is no secret-chat-specific routing.
+    /// These exercise that path on a secret chat's chat id; the only rule the
+    /// lifecycle adds is that a send waits for the chat to be ready.
+    mod secret_chat_text {
+        use super::*;
+        use crate::model::{SecretChat, SecretChatState};
+
+        /// A secret chat in `state`, with the ordinary chat id it is reached by.
+        /// The id is just another `i64` to the store; readiness lives on the record.
+        fn secret_chat(state: SecretChatState) -> (SecretChat, i64) {
+            let key_hash = if matches!(state, SecretChatState::Ready) {
+                "fingerprint".to_owned()
+            } else {
+                String::new()
+            };
+            (
+                SecretChat {
+                    id: 7,
+                    user_id: 42,
+                    state,
+                    is_outbound: true,
+                    key_hash,
+                },
+                -7, // the chat id behind the secret chat
+            )
+        }
+
+        #[test]
+        fn only_a_ready_secret_chat_is_messageable() {
+            // The compose gate: text only flows once the key exchange completes.
+            assert!(secret_chat(SecretChatState::Ready).0.is_ready());
+            assert!(!secret_chat(SecretChatState::Pending).0.is_ready());
+            assert!(!secret_chat(SecretChatState::Closed).0.is_ready());
+        }
+
+        #[test]
+        fn text_received_in_a_secret_chat_folds_like_any_chat() {
+            let (chat, chat_id) = secret_chat(SecretChatState::Ready);
+            assert!(chat.is_ready());
+
+            // An incoming secret-chat message arrives as updateNewMessage on the
+            // chat id and folds into the store with no special handling.
+            let mut store = MessageStore::new();
+            store.reduce(&new_message(chat_id, 30));
+
+            assert_eq!(ids(&store.history(chat_id)), vec![30]);
+            assert_eq!(store.get(chat_id, 30).unwrap().text(), Some("m30"));
+        }
+
+        #[tokio::test]
+        async fn text_sent_to_a_secret_chat_reconciles_through_the_send_lifecycle() {
+            let (chat, chat_id) = secret_chat(SecretChatState::Ready);
+            assert!(chat.is_ready());
+
+            // Compose only when ready: drive the send seam on the chat id; the
+            // caller gets the optimistic Pending message back, as for any chat.
+            let spy = SendSpy {
+                last: RefCell::new(None),
+            };
+            let body = FormattedText {
+                text: "ack".to_owned(),
+                entities: vec![],
+            };
+            let optimistic = spy.send_text(chat_id, None, body.clone()).await.unwrap();
+            assert_eq!(*spy.last.borrow(), Some((chat_id, None, body)));
+            assert_eq!(optimistic.send_state, SendState::Pending);
+
+            // The lifecycle then folds identically: the optimistic message lands
+            // Pending under a temp id, then reconciles to its real id on success.
+            let mut store = MessageStore::new();
+            store.reduce(&pending_message(chat_id, 1001));
+            assert_eq!(
+                store.get(chat_id, 1001).unwrap().send_state,
+                SendState::Pending
+            );
+
+            store.reduce(&send_succeeded(chat_id, 1001, 5));
+            assert!(store.get(chat_id, 1001).is_none());
+            assert_eq!(store.get(chat_id, 5).unwrap().send_state, SendState::Sent);
+            assert_eq!(ids(&store.history(chat_id)), vec![5]);
+        }
+    }
 }

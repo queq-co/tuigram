@@ -22,6 +22,19 @@
 //! Creating one returns the newly created [`Chat`] (which also arrives as
 //! `updateNewChat` and folds into the [chat store](crate::chats::ChatStore)); the
 //! secret-chat record itself follows as `updateSecretChat`.
+//!
+//! **Text messaging** needs nothing of its own here. A secret chat is reached by
+//! its ordinary chat id, so text sent and received in one flows through the same
+//! [`MessageStore`](crate::messages::MessageStore) and send lifecycle as any other
+//! chat — `updateNewMessage` folds an incoming message, [`send_text`] posts an
+//! outgoing one optimistically, and `updateMessageSendSucceeded`/`Failed` reconcile
+//! it — with no secret-chat-specific routing. The one rule the lifecycle adds is
+//! readiness: a send only succeeds once the chat is
+//! [`Ready`](crate::model::SecretChatState::Ready), so a driver gates the compose
+//! path on [`SecretChat::is_ready`]. (Sending **media** into a secret chat is a
+//! follow-up; this covers text only.)
+//!
+//! [`send_text`]: crate::messages::SendRequests::send_text
 
 use std::collections::HashMap;
 
