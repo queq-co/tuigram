@@ -20,12 +20,12 @@
 //! for this model.
 
 use tdlib_rs::enums::{
-    ChatList as TdChatList, ChatType as TdChatType, InputFile as TdInputFile,
-    InputMessageContent as TdInputMessageContent, InputMessageReplyTo as TdInputMessageReplyTo,
-    MessageContent as TdMessageContent, MessageSender as TdMessageSender,
-    MessageSendingState as TdMessageSendingState, PollType as TdPollType,
-    ReactionType as TdReactionType, TextEntityType as TdTextEntityType, UserStatus as TdUserStatus,
-    UserType as TdUserType,
+    ChatAction as TdChatAction, ChatList as TdChatList, ChatType as TdChatType,
+    InputFile as TdInputFile, InputMessageContent as TdInputMessageContent,
+    InputMessageReplyTo as TdInputMessageReplyTo, MessageContent as TdMessageContent,
+    MessageSender as TdMessageSender, MessageSendingState as TdMessageSendingState,
+    PollType as TdPollType, ReactionType as TdReactionType, TextEntityType as TdTextEntityType,
+    UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
     Chat as TdChat, ChatFolderInfo as TdChatFolderInfo, ChatListFolder,
@@ -44,7 +44,7 @@ use tdlib_rs::types::{
 };
 
 /// Who sent a message.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Sender {
     /// A user, by user id.
     User(i64),
@@ -110,6 +110,120 @@ impl Presence {
             TdUserStatus::Recently(_) => Self::Recently,
             TdUserStatus::LastWeek(_) => Self::LastWeek,
             TdUserStatus::LastMonth(_) => Self::LastMonth,
+        }
+    }
+}
+
+/// A transient activity a sender is performing in a chat — tuigram's projection
+/// of TDLib's `ChatAction`, the "X is typing…" / "X is sending a photo…" status.
+///
+/// Total over the enum with no catch-all, the same discipline as [`Presence`]: a
+/// new `ChatAction` variant fails to compile here until it is classified. Two
+/// deliberate projections: the upload-progress percentage and the watched emoji
+/// are dropped — the view needs to know *what* a sender is doing, not how far
+/// along — and `chatActionCancel` maps to `None` in
+/// [`from_tdlib`](Self::from_tdlib) rather than to a variant, because a cancel is
+/// the *absence* of an activity (it clears the sender from the typing view), not
+/// an activity of its own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChatAction {
+    /// Typing a text message.
+    Typing,
+    /// Recording a video.
+    RecordingVideo,
+    /// Uploading a video.
+    UploadingVideo,
+    /// Recording a voice note.
+    RecordingVoiceNote,
+    /// Uploading a voice note.
+    UploadingVoiceNote,
+    /// Uploading a photo.
+    UploadingPhoto,
+    /// Uploading a document.
+    UploadingDocument,
+    /// Picking a sticker to send.
+    ChoosingSticker,
+    /// Picking a location or venue to send.
+    ChoosingLocation,
+    /// Picking a contact to send.
+    ChoosingContact,
+    /// Started to play a game.
+    StartPlayingGame,
+    /// Recording a round video note.
+    RecordingVideoNote,
+    /// Uploading a round video note.
+    UploadingVideoNote,
+    /// Watching animations sent by the other party (an animated emoji tap).
+    WatchingAnimations,
+}
+
+impl ChatAction {
+    /// Project TDLib's `ChatAction`. Returns `None` for `chatActionCancel`, which
+    /// the [chat-action store](crate::actions::ChatActionStore) folds as "this
+    /// sender stopped" rather than as an activity.
+    #[must_use]
+    pub fn from_tdlib(action: &TdChatAction) -> Option<Self> {
+        match action {
+            TdChatAction::Typing => Some(Self::Typing),
+            TdChatAction::RecordingVideo => Some(Self::RecordingVideo),
+            TdChatAction::UploadingVideo(_) => Some(Self::UploadingVideo),
+            TdChatAction::RecordingVoiceNote => Some(Self::RecordingVoiceNote),
+            TdChatAction::UploadingVoiceNote(_) => Some(Self::UploadingVoiceNote),
+            TdChatAction::UploadingPhoto(_) => Some(Self::UploadingPhoto),
+            TdChatAction::UploadingDocument(_) => Some(Self::UploadingDocument),
+            TdChatAction::ChoosingSticker => Some(Self::ChoosingSticker),
+            TdChatAction::ChoosingLocation => Some(Self::ChoosingLocation),
+            TdChatAction::ChoosingContact => Some(Self::ChoosingContact),
+            TdChatAction::StartPlayingGame => Some(Self::StartPlayingGame),
+            TdChatAction::RecordingVideoNote => Some(Self::RecordingVideoNote),
+            TdChatAction::UploadingVideoNote(_) => Some(Self::UploadingVideoNote),
+            TdChatAction::WatchingAnimations(_) => Some(Self::WatchingAnimations),
+            TdChatAction::Cancel => None,
+        }
+    }
+
+    /// Lower back to TDLib's `ChatAction`, for broadcasting our own activity over
+    /// [`ChatActionRequests::send_chat_action`](crate::actions::ChatActionRequests::send_chat_action).
+    /// The dropped upload progress is sent as `0` and the watched emoji as empty —
+    /// the model carries neither — which is harmless for an advisory status. The
+    /// inverse of [`from_tdlib`](Self::from_tdlib) over the activity variants;
+    /// cancel is expressed by sending `None`, never by this method.
+    #[must_use]
+    pub fn to_tdlib(&self) -> TdChatAction {
+        use tdlib_rs::types::{
+            ChatActionUploadingDocument, ChatActionUploadingPhoto, ChatActionUploadingVideo,
+            ChatActionUploadingVideoNote, ChatActionUploadingVoiceNote,
+            ChatActionWatchingAnimations,
+        };
+        match self {
+            Self::Typing => TdChatAction::Typing,
+            Self::RecordingVideo => TdChatAction::RecordingVideo,
+            Self::UploadingVideo => {
+                TdChatAction::UploadingVideo(ChatActionUploadingVideo { progress: 0 })
+            }
+            Self::RecordingVoiceNote => TdChatAction::RecordingVoiceNote,
+            Self::UploadingVoiceNote => {
+                TdChatAction::UploadingVoiceNote(ChatActionUploadingVoiceNote { progress: 0 })
+            }
+            Self::UploadingPhoto => {
+                TdChatAction::UploadingPhoto(ChatActionUploadingPhoto { progress: 0 })
+            }
+            Self::UploadingDocument => {
+                TdChatAction::UploadingDocument(ChatActionUploadingDocument { progress: 0 })
+            }
+            Self::ChoosingSticker => TdChatAction::ChoosingSticker,
+            Self::ChoosingLocation => TdChatAction::ChoosingLocation,
+            Self::ChoosingContact => TdChatAction::ChoosingContact,
+            Self::StartPlayingGame => TdChatAction::StartPlayingGame,
+            Self::RecordingVideoNote => TdChatAction::RecordingVideoNote,
+            Self::UploadingVideoNote => {
+                TdChatAction::UploadingVideoNote(ChatActionUploadingVideoNote { progress: 0 })
+            }
+            Self::WatchingAnimations => {
+                TdChatAction::WatchingAnimations(ChatActionWatchingAnimations {
+                    emoji: String::new(),
+                })
+            }
         }
     }
 }

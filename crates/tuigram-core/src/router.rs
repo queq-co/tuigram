@@ -44,6 +44,11 @@ pub trait UpdateSink {
     /// into the files store, so media content resolves to transferable bytes.
     fn reduce_file(&mut self, update: &Update);
 
+    /// Fold a chat-action update (`updateChatAction`: a sender started or
+    /// cancelled an activity) into the transient typing view. Advisory state,
+    /// never persisted into the message store.
+    fn reduce_action(&mut self, update: &Update);
+
     /// Recover from a broadcast overflow: `skipped` updates were dropped before
     /// the router caught up, so the folded state may be stale and must be
     /// re-queried. Handling is mandatory — a lag is never silently ignored.
@@ -65,6 +70,8 @@ enum Route {
     User,
     /// Folded by the files reducer (#44).
     File,
+    /// Folded by the chat-action reducer (#52) — the transient typing view.
+    Action,
     /// Not account content this router folds; dropped here.
     Ignored,
 }
@@ -98,6 +105,9 @@ fn classify(update: &Update) -> Route {
         | Update::DeleteMessages(_) => Route::Message,
         Update::User(_) | Update::UserStatus(_) => Route::User,
         Update::File(_) => Route::File,
+        // updateChatAction is transient typing/recording presence (#52): the
+        // chat-action store folds it into a separate view, never into history.
+        Update::ChatAction(_) => Route::Action,
         _ => Route::Ignored,
     }
 }
@@ -127,6 +137,7 @@ impl<S: UpdateSink> Router<S> {
             Route::Message => self.sink.reduce_message(update),
             Route::User => self.sink.reduce_user(update),
             Route::File => self.sink.reduce_file(update),
+            Route::Action => self.sink.reduce_action(update),
             Route::Ignored => {}
         }
     }
@@ -165,6 +176,7 @@ mod tests {
         message: u32,
         user: u32,
         file: u32,
+        action: u32,
         lagged: Vec<u64>,
     }
 
@@ -180,6 +192,9 @@ mod tests {
         }
         fn reduce_file(&mut self, _update: &Update) {
             self.file += 1;
+        }
+        fn reduce_action(&mut self, _update: &Update) {
+            self.action += 1;
         }
         fn resync_after_lag(&mut self, skipped: u64) {
             self.lagged.push(skipped);
@@ -259,6 +274,17 @@ mod tests {
                 id: 7,
                 ..Default::default()
             },
+        })
+    }
+
+    fn chat_action() -> Update {
+        Update::ChatAction(tdlib_rs::types::UpdateChatAction {
+            chat_id: 1,
+            topic_id: None,
+            sender_id: tdlib_rs::enums::MessageSender::User(tdlib_rs::types::MessageSenderUser {
+                user_id: 7,
+            }),
+            action: tdlib_rs::enums::ChatAction::Typing,
         })
     }
 
@@ -345,6 +371,18 @@ mod tests {
     }
 
     #[test]
+    fn chat_action_updates_route_to_the_action_reducer() {
+        // updateChatAction is transient typing presence, folded into its own view.
+        let mut router = Router::new(SpySink::default());
+        router.apply(&chat_action());
+        let sink = router.sink;
+        assert_eq!(sink.action, 1);
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+        assert_eq!(sink.user, 0);
+    }
+
+    #[test]
     fn unrelated_updates_route_to_no_reducer() {
         let mut router = Router::new(SpySink::default());
         router.apply(&unrelated());
@@ -353,6 +391,7 @@ mod tests {
         assert_eq!(sink.message, 0);
         assert_eq!(sink.user, 0);
         assert_eq!(sink.file, 0);
+        assert_eq!(sink.action, 0);
     }
 
     #[tokio::test]

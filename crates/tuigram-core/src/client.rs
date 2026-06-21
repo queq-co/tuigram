@@ -39,6 +39,7 @@ use tdlib_rs::enums::Update;
 use tdlib_rs::types::Error as TdError;
 use tokio::task::JoinHandle;
 
+use crate::actions::ChatActionStore;
 use crate::bridge::Bridge;
 use crate::chats::ChatStore;
 use crate::files::FileStore;
@@ -58,6 +59,7 @@ pub struct AccountState {
     messages: MessageStore,
     users: UserStore,
     files: FileStore,
+    actions: ChatActionStore,
 }
 
 impl AccountState {
@@ -91,6 +93,14 @@ impl AccountState {
         &self.files
     }
 
+    /// The transient chat-action view, for the facade's read side — who is
+    /// currently typing/recording/uploading in a chat (e.g.
+    /// `client.read(|s| s.actions().actors(chat_id))`). Never history.
+    #[must_use]
+    pub fn actions(&self) -> &ChatActionStore {
+        &self.actions
+    }
+
     /// Fold a chat-list update into the chat store.
     fn reduce_chat(&mut self, update: &Update) {
         self.chats.reduce(update);
@@ -109,6 +119,11 @@ impl AccountState {
     /// Fold a file update into the files store.
     fn reduce_file(&mut self, update: &Update) {
         self.files.reduce(update);
+    }
+
+    /// Fold a chat-action update into the transient typing view.
+    fn reduce_action(&mut self, update: &Update) {
+        self.actions.reduce(update);
     }
 
     /// Merge a fetched history page into the message store. Unlike live messages,
@@ -157,6 +172,12 @@ impl UpdateSink for SharedState {
         self.lock()
             .expect("account state mutex poisoned")
             .reduce_file(update);
+    }
+
+    fn reduce_action(&mut self, update: &Update) {
+        self.lock()
+            .expect("account state mutex poisoned")
+            .reduce_action(update);
     }
 
     fn resync_after_lag(&mut self, skipped: u64) {
