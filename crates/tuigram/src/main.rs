@@ -14,6 +14,8 @@ mod conversation;
 mod event;
 mod forward;
 mod keymap;
+mod mediaform;
+mod reactions;
 mod search;
 mod terminal;
 mod textinput;
