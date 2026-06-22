@@ -14,7 +14,8 @@ use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
 };
 
 use tuigram_core::model::{Chat, FormattedText, Message, MessageContent, ReactionKind, Sender};
@@ -22,6 +23,7 @@ use tuigram_core::model::{Chat, FormattedText, Message, MessageContent, Reaction
 use crate::app::App;
 use crate::composer::ComposerMode;
 use crate::conversation::ConversationView;
+use crate::keymap::{self, Focus};
 
 /// Chat-list pane width, as a percentage of the terminal; the conversation pane
 /// fills the remainder. (The research doc allows fixed *or* percentage width;
@@ -36,6 +38,9 @@ const SELECTED_SYMBOL: &str = "▶ ";
 
 /// Hint shown in the composer while its buffer is empty.
 const COMPOSER_PLACEHOLDER: &str = "type a message…";
+
+/// Marker prefixed to the focused pane's border title.
+const FOCUS_MARKER: &str = "●";
 
 /// Render the whole UI for one frame from the current `App` state.
 pub fn ui(frame: &mut Frame, app: &App) {
@@ -54,6 +59,24 @@ pub fn ui(frame: &mut Frame, app: &App) {
     render_chat_list(frame, list_area, app);
     render_conversation(frame, history_area, app);
     render_composer(frame, composer_area, app);
+
+    // The help overlay floats above the panes when toggled on.
+    if app.help_visible() {
+        render_help(frame, frame.area());
+    }
+}
+
+/// A pane's bordered block, with the focus highlight applied when `focused`: a
+/// marker prefixed to the title and a bold border, so the active pane is obvious.
+fn pane_block(title: String, focused: bool) -> Block<'static> {
+    let block = Block::bordered();
+    if focused {
+        block
+            .title(format!("{FOCUS_MARKER}{title}"))
+            .border_style(Style::new().add_modifier(Modifier::BOLD))
+    } else {
+        block.title(title)
+    }
 }
 
 /// Left pane: the chat list (#80). Renders the active list's chats — each a title
@@ -62,7 +85,10 @@ pub fn ui(frame: &mut Frame, app: &App) {
 /// the selection are driven through [`App`]'s reducer by the keymap.
 fn render_chat_list(frame: &mut Frame, area: Rect, app: &App) {
     let view = app.chat_list();
-    let block = Block::bordered().title(format!(" Chats — {} ", view.active_label()));
+    let block = pane_block(
+        format!(" Chats — {} ", view.active_label()),
+        app.focus() == Focus::ChatList,
+    );
 
     let chats = view.active_chats();
     if chats.is_empty() {
@@ -122,7 +148,8 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.truncate(inner_rows);
 
-    let history = Paragraph::new(lines).block(Block::bordered().title(" Conversation "));
+    let block = pane_block(" Conversation ".to_owned(), app.focus() == Focus::History);
+    let history = Paragraph::new(lines).block(block);
     frame.render_widget(history, area);
 
     // The scrollbar tracks the message offset, inset one row so it rides the
@@ -145,14 +172,14 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
 /// it and the status bar (#88) takes over the heartbeat/quit hint.
 fn render_conversation_placeholder(frame: &mut Frame, area: Rect, app: &App) {
     let body = format!(
-        "tuigram — Phase 5 TUI skeleton\n\ncore heartbeats: {}\n\npress q / Esc / Ctrl-C to quit",
+        "tuigram — Phase 5 TUI skeleton\n\ncore heartbeats: {}\n\npress ? for help · q / Ctrl-C to quit",
         app.beats()
     );
-    let widget = Paragraph::new(body).alignment(Alignment::Center).block(
-        Block::bordered()
-            .title(" tuigram ")
-            .title_alignment(Alignment::Center),
-    );
+    let block = pane_block(" tuigram ".to_owned(), app.focus() == Focus::History)
+        .title_alignment(Alignment::Center);
+    let widget = Paragraph::new(body)
+        .alignment(Alignment::Center)
+        .block(block);
     frame.render_widget(widget, area);
 }
 
@@ -302,7 +329,10 @@ fn reaction_symbol(kind: &ReactionKind) -> String {
 /// empty, otherwise the text with a reverse-video block marking the cursor.
 fn render_composer(frame: &mut Frame, area: Rect, app: &App) {
     let composer = app.composer();
-    let block = Block::bordered().title(composer_title(composer.mode()));
+    let block = pane_block(
+        composer_title(composer.mode()),
+        app.focus() == Focus::Composer,
+    );
 
     let line = if composer.is_empty() {
         Line::from(Span::styled(
@@ -349,6 +379,58 @@ fn input_line(text: &str, cursor: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The help overlay: a centred, bordered popup listing the active key bindings,
+/// generated from the keymap so it always matches what the keys actually do.
+fn render_help(frame: &mut Frame, area: Rect) {
+    let lines = help_lines();
+    let content_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let popup = centered_rect(content_width + 4, lines.len() as u16 + 2, area);
+    // `Clear` wipes the panes underneath so the overlay reads as a modal.
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Help ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// The help overlay's body, one block per [`keymap::HelpSection`]: a bold heading
+/// then each binding's keys and description.
+fn help_lines() -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (i, section) in keymap::help_sections().into_iter().enumerate() {
+        if i > 0 {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            section.title,
+            Style::new().add_modifier(Modifier::BOLD),
+        )));
+        for entry in section.entries {
+            lines.push(Line::from(format!(
+                "  {:<13}{}",
+                entry.keys, entry.description
+            )));
+        }
+    }
+    lines
+}
+
+/// A `width × height` rectangle centred within `area`, clamped to fit it.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    }
+}
+
 /// Shorten `s` to at most `max` characters, ending in an ellipsis when clipped, so
 /// a long reply preview cannot overrun the composer's border title.
 fn truncate(s: &str, max: usize) -> String {
@@ -393,6 +475,39 @@ mod tests {
         assert!(text.contains("tuigram"), "conversation pane");
         assert!(text.contains("Message"), "composer pane");
         assert!(text.contains("quit"), "quit hint");
+    }
+
+    #[test]
+    fn the_focused_pane_carries_the_focus_marker() {
+        use crate::keymap::Focus;
+        let mut app = App::new();
+        app.dispatch(crate::app::Action::SetFocus(Focus::Composer));
+        let buffer = render(&app, 80, 24);
+        // The composer (focused) shows the marker on its border; the chat-list
+        // title row (top, unfocused) does not.
+        let composer_row = row_text(&buffer, 24 - COMPOSER_HEIGHT);
+        assert!(composer_row.contains('●'), "focused composer is marked");
+        assert!(
+            !row_text(&buffer, 0).contains('●'),
+            "unfocused chat list is unmarked"
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_lists_bindings_when_toggled() {
+        let mut app = App::new();
+        assert!(
+            !flatten(&render(&app, 80, 24)).contains(" Help "),
+            "no overlay until toggled"
+        );
+        app.dispatch(crate::app::Action::ToggleHelp);
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Help"), "overlay title");
+        assert!(text.contains("quit"), "documents a binding");
+        assert!(
+            text.contains("focus next pane"),
+            "documents focus switching"
+        );
     }
 
     #[test]
