@@ -68,6 +68,10 @@ pub enum Overlay {
     SearchResults,
     /// The forward target picker: choose a destination chat and confirm.
     Forward,
+    /// The reaction picker: choose an emoji to toggle on the selected message.
+    Reaction,
+    /// The send-media prompt: type a local path and an optional caption.
+    SendMedia,
 }
 
 /// The focus context a binding applies in. `Global` always applies; `Nav` applies
@@ -226,6 +230,27 @@ const BINDINGS: &[Binding] = &[
         keys: "i",
         description: "write a message",
     },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('r')]),
+        action: Action::ReactionOpen,
+        keys: "r",
+        description: "react to the selected message",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('p')]),
+        action: Action::PinToggle,
+        keys: "p",
+        description: "pin / unpin the selected message",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('a')]),
+        action: Action::AttachOpen,
+        keys: "a",
+        description: "attach / send media",
+    },
     // Composer — editing keys; any other printable character inserts (see resolve).
     Binding {
         context: Context::Composer,
@@ -320,6 +345,8 @@ pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
         Overlay::SearchInput => resolve_search_input(key),
         Overlay::SearchResults => resolve_search_results(key),
         Overlay::Forward => resolve_forward(key),
+        Overlay::Reaction => resolve_reaction(key),
+        Overlay::SendMedia => resolve_send_media(key),
     }
 }
 
@@ -398,6 +425,43 @@ fn resolve_forward(key: &KeyEvent) -> Action {
         KeyCode::Char('k') | KeyCode::Up => Action::ForwardPrev,
         KeyCode::Enter => Action::ForwardConfirm,
         _ => Action::Noop,
+    }
+}
+
+/// The reaction picker: navigate the emoji palette, Enter toggles the chosen
+/// reaction on the selected message, Esc cancels.
+fn resolve_reaction(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::ReactionCancel,
+        KeyCode::Char('j') | KeyCode::Down => Action::ReactionNext,
+        KeyCode::Char('k') | KeyCode::Up => Action::ReactionPrev,
+        KeyCode::Enter => Action::ReactionConfirm,
+        _ => Action::Noop,
+    }
+}
+
+/// The send-media prompt: typing edits the focused field, Tab switches fields,
+/// Enter confirms the send, Esc cancels.
+fn resolve_send_media(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::AttachCancel,
+        KeyCode::Enter => Action::AttachConfirm,
+        KeyCode::Tab => Action::AttachToggleField,
+        KeyCode::Backspace => Action::AttachBackspace,
+        KeyCode::Left => Action::AttachLeft,
+        KeyCode::Right => Action::AttachRight,
+        KeyCode::Home => Action::AttachHome,
+        KeyCode::End => Action::AttachEnd,
+        _ => match printable(key) {
+            Some(c) => Action::AttachInput(c),
+            None => Action::Noop,
+        },
     }
 }
 
@@ -628,11 +692,57 @@ mod tests {
     }
 
     #[test]
+    fn history_keys_act_on_the_selected_message() {
+        // r / p / a operate on the selected message in the history pane.
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('r')),
+            Action::ReactionOpen
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('p')),
+            Action::PinToggle
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('a')),
+            Action::AttachOpen
+        );
+        // The same letters are plain text in the composer, not history commands.
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char('r')),
+            Action::ComposerInput('r')
+        );
+        // …and unbound in the chat list (history-only context).
+        assert_eq!(resolved(Focus::ChatList, KeyCode::Char('p')), Action::Noop);
+    }
+
+    #[test]
+    fn the_reaction_overlay_navigates_the_palette_and_confirms() {
+        let at = |code| resolve(Focus::History, Overlay::Reaction, &key(code));
+        assert_eq!(at(KeyCode::Char('j')), Action::ReactionNext);
+        assert_eq!(at(KeyCode::Up), Action::ReactionPrev);
+        assert_eq!(at(KeyCode::Enter), Action::ReactionConfirm);
+        assert_eq!(at(KeyCode::Esc), Action::ReactionCancel);
+    }
+
+    #[test]
+    fn the_send_media_overlay_edits_fields_and_confirms() {
+        let at = |code| resolve(Focus::History, Overlay::SendMedia, &key(code));
+        // Focus is ignored — the overlay owns the keys. Printables edit the field.
+        assert_eq!(at(KeyCode::Char('a')), Action::AttachInput('a'));
+        assert_eq!(at(KeyCode::Tab), Action::AttachToggleField);
+        assert_eq!(at(KeyCode::Backspace), Action::AttachBackspace);
+        assert_eq!(at(KeyCode::Enter), Action::AttachConfirm);
+        assert_eq!(at(KeyCode::Esc), Action::AttachCancel);
+    }
+
+    #[test]
     fn ctrl_c_quits_from_every_overlay() {
         for overlay in [
             Overlay::SearchInput,
             Overlay::SearchResults,
             Overlay::Forward,
+            Overlay::Reaction,
+            Overlay::SendMedia,
         ] {
             assert_eq!(resolve(Focus::ChatList, overlay, &ctrl('c')), Action::Quit);
         }

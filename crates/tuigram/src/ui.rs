@@ -18,12 +18,15 @@ use ratatui::widgets::{
     ScrollbarState,
 };
 
-use tuigram_core::model::{Chat, FormattedText, Message, MessageContent, ReactionKind, Sender};
+use tuigram_core::model::{
+    Chat, File, FileRef, FormattedText, Message, MessageContent, ReactionKind, Sender,
+};
 
 use crate::app::App;
 use crate::composer::ComposerMode;
 use crate::conversation::ConversationView;
 use crate::keymap::{self, Focus, Overlay};
+use crate::mediaform::MediaField;
 
 /// Chat-list pane width, as a percentage of the terminal; the conversation pane
 /// fills the remainder. (The research doc allows fixed *or* percentage width;
@@ -67,6 +70,8 @@ pub fn ui(frame: &mut Frame, app: &App) {
         Overlay::SearchInput => render_search_input(frame, frame.area(), app),
         Overlay::SearchResults => render_search_results(frame, frame.area(), app),
         Overlay::Forward => render_forward(frame, frame.area(), app),
+        Overlay::Reaction => render_reaction(frame, frame.area(), app),
+        Overlay::SendMedia => render_send_media(frame, frame.area(), app),
     }
 }
 
@@ -144,11 +149,13 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     // history. `inner` excludes the block's top and bottom borders.
     let inner_rows = area.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    for message in view.messages().iter().skip(view.offset()) {
+    // The message at the offset (the first built) is the selected one — the
+    // cursor the reaction/pin affordances act on — so it carries the marker.
+    for (i, message) in view.messages().iter().skip(view.offset()).enumerate() {
         if lines.len() >= inner_rows {
             break;
         }
-        lines.extend(message_lines(view, message));
+        lines.extend(message_lines(view, message, i == 0));
     }
     lines.truncate(inner_rows);
 
@@ -187,11 +194,15 @@ fn render_conversation_placeholder(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(widget, area);
 }
 
-/// The lines for one message: a bold sender/timestamp header (with a pin marker
-/// when pinned), the body or a media placeholder, an optional reaction line, and
-/// a blank separator below.
-fn message_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>> {
+/// The lines for one message: a bold sender/timestamp header (with a selection
+/// marker when this is the cursor message and a pin marker when pinned), the body
+/// or a media placeholder, a download-progress line for media being fetched, an
+/// optional reaction line, and a blank separator below.
+fn message_lines(view: &ConversationView, message: &Message, selected: bool) -> Vec<Line<'static>> {
     let mut header = String::new();
+    if selected {
+        header.push_str(SELECTED_SYMBOL);
+    }
     if view.is_pinned(message.id) {
         header.push_str("📌 ");
     }
@@ -204,11 +215,62 @@ fn message_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static
         Style::new().add_modifier(Modifier::BOLD),
     ))];
     lines.extend(content_lines(&message.content));
+    if let Some(progress) = download_line(view, &message.content) {
+        lines.push(progress);
+    }
     if let Some(reactions) = reaction_line(message) {
         lines.push(reactions);
     }
     lines.push(Line::from(""));
     lines
+}
+
+/// The file a media message references, if any — the key into the download store
+/// for the progress indicator. Non-file content (text, location, poll, …) has none.
+fn content_file(content: &MessageContent) -> Option<FileRef> {
+    match content {
+        MessageContent::Photo(p) => Some(p.file),
+        MessageContent::Video(v) => Some(v.file),
+        MessageContent::Document(d) => Some(d.file),
+        MessageContent::Audio(a) => Some(a.file),
+        MessageContent::Voice(v) => Some(v.file),
+        MessageContent::Sticker(s) => Some(s.file),
+        MessageContent::Animation(a) => Some(a.file),
+        MessageContent::Text(_)
+        | MessageContent::Location(_)
+        | MessageContent::Venue(_)
+        | MessageContent::Contact(_)
+        | MessageContent::Poll(_)
+        | MessageContent::Unsupported(_) => None,
+    }
+}
+
+/// The download-progress line for a media message, driven by the file's transfer
+/// state: a dim percentage while a download is active, a saved marker once it is
+/// present, or `None` when the file is unknown or not being fetched.
+fn download_line(view: &ConversationView, content: &MessageContent) -> Option<Line<'static>> {
+    let file = view.download(content_file(content)?.id)?;
+    let text = if file.is_downloading_active {
+        format!("⬇ downloading {}%", percent(file))
+    } else if file.is_present() {
+        "✓ saved".to_owned()
+    } else {
+        return None;
+    };
+    Some(Line::from(Span::styled(
+        text,
+        Style::new().add_modifier(Modifier::DIM),
+    )))
+}
+
+/// A file's download progress as a whole percentage of its best-known total size,
+/// clamped to 0–100; `0` when the total is unknown.
+fn percent(file: &File) -> i64 {
+    let total = file.total_size();
+    if total <= 0 {
+        return 0;
+    }
+    (file.downloaded_size * 100 / total).clamp(0, 100)
 }
 
 /// The header's name for a message: "You" for our own messages, else the sender's
@@ -534,6 +596,89 @@ fn render_forward(frame: &mut Frame, area: Rect, app: &App) {
         forward.targets().selected(),
         "j / k pick · Enter send · Esc cancel",
     );
+}
+
+/// The reaction picker (#85): a centred modal listing the emoji palette with the
+/// selected one marked. Confirming toggles it on the selected message.
+fn render_reaction(frame: &mut Frame, area: Rect, app: &App) {
+    let picker = app.reaction();
+    let items: Vec<ListItem> = picker
+        .palette()
+        .iter()
+        .map(|emoji| ListItem::new((*emoji).to_owned()))
+        .collect();
+    render_list_modal(
+        frame,
+        area,
+        " React ".to_owned(),
+        items,
+        picker.selected(),
+        "j / k move · Enter toggle · Esc cancel",
+    );
+}
+
+/// The send-media prompt (#85): a centred modal with a local-path field over an
+/// optional caption field — paths only, never bytes — and a key hint. The focused
+/// field shows the caret via the reused [`input_line`]; the other shows its text or
+/// a dim placeholder.
+fn render_send_media(frame: &mut Frame, area: Rect, app: &App) {
+    let media = app.media();
+    let lines = vec![
+        media_field_line(
+            "path",
+            media.path(),
+            media.field() == MediaField::Path,
+            media.cursor(),
+            "(local file path)",
+        ),
+        media_field_line(
+            "caption",
+            media.caption(),
+            media.field() == MediaField::Caption,
+            media.cursor(),
+            "(optional)",
+        ),
+        Line::from(""),
+        hint_line("Tab switch field · Enter send · Esc cancel"),
+    ];
+
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Send media ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// One labelled field of the send-media prompt: a padded label then the value —
+/// the focused field with a caret (via [`input_line`]), an unfocused empty field a
+/// dim placeholder, otherwise the plain text.
+fn media_field_line(
+    label: &str,
+    text: &str,
+    focused: bool,
+    cursor: usize,
+    placeholder: &'static str,
+) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{label:<9}"),
+        Style::new().add_modifier(Modifier::BOLD),
+    )];
+    if focused {
+        spans.extend(input_line(text, cursor).spans);
+    } else if text.is_empty() {
+        spans.push(Span::styled(
+            placeholder,
+            Style::new().add_modifier(Modifier::DIM),
+        ));
+    } else {
+        spans.push(Span::raw(text.to_owned()));
+    }
+    Line::from(spans)
 }
 
 /// A centred modal holding a selectable list over a dim key hint — the shared shape
@@ -1032,5 +1177,84 @@ mod tests {
             "first target selected"
         );
         assert!(text.contains("Enter send"), "key hint");
+    }
+
+    // --- media, reactions & pins (#85) ---
+
+    #[test]
+    fn the_selected_history_message_carries_the_cursor_marker() {
+        let buffer = render(
+            &app_with_history(vec![text_message(1, "first"), text_message(2, "second")]),
+            80,
+            24,
+        );
+        // The cursor sits on the top (offset) message; the marker is on its header.
+        assert!(
+            row_containing(&buffer, "User 1").contains('▶'),
+            "selected message marked"
+        );
+        assert!(
+            !row_containing(&buffer, "User 2").contains('▶'),
+            "unselected message unmarked"
+        );
+    }
+
+    #[test]
+    fn a_media_download_in_progress_shows_a_percentage() {
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut view = ConversationView::from_messages(vec![photo], HashSet::new());
+        view.set_download(File {
+            id: 7,
+            size: 100,
+            downloaded_size: 45,
+            is_downloading_active: true,
+            ..File::default()
+        });
+        let text = flatten(&render(&App::with_conversation(view), 80, 24));
+        assert!(text.contains("[Photo]"), "media placeholder");
+        assert!(
+            text.contains("downloading 45%"),
+            "download progress indicator"
+        );
+    }
+
+    #[test]
+    fn the_reaction_picker_lists_the_emoji_palette() {
+        let mut app = app_with_history(vec![text_message(1, "nice")]);
+        app.dispatch(Action::ReactionOpen);
+        let buffer = render(&app, 80, 24);
+        let text = flatten(&buffer);
+        assert!(text.contains("React"), "reaction overlay title");
+        assert!(text.contains('👍'), "an emoji from the palette");
+        assert!(text.contains("Enter toggle"), "key hint");
+        // The first palette entry is selected.
+        assert!(
+            row_containing(&buffer, "👍").contains('▶'),
+            "first emoji selected"
+        );
+    }
+
+    #[test]
+    fn the_send_media_prompt_shows_the_path_and_caption_fields() {
+        let mut app = app_with_history(vec![text_message(1, "hi")]);
+        app.dispatch(Action::AttachOpen);
+        for c in "/tmp/a.png".chars() {
+            app.dispatch(Action::AttachInput(c));
+        }
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Send media"), "prompt title");
+        assert!(text.contains("path"), "path field label");
+        assert!(text.contains("/tmp/a.png"), "the typed path");
+        assert!(text.contains("caption"), "caption field label");
+        assert!(text.contains("(optional)"), "empty caption placeholder");
+        assert!(text.contains("Tab switch"), "key hint");
     }
 }

@@ -12,6 +12,8 @@ use crate::conversation::ConversationView;
 use crate::event::AppEvent;
 use crate::forward::ForwardView;
 use crate::keymap::{self, Focus, Overlay};
+use crate::mediaform::MediaDraft;
+use crate::reactions::ReactionPicker;
 use crate::search::SearchView;
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
@@ -99,6 +101,43 @@ pub enum Action {
     ForwardConfirm,
     /// Cancel the forward and return to the search results.
     ForwardCancel,
+    /// Pin or unpin the selected history message. Phase 6 also calls core; for now
+    /// it flips the local pinned state behind the 📌 indicator.
+    PinToggle,
+    /// Open the reaction picker on the selected history message (a no-op with no
+    /// selected message).
+    ReactionOpen,
+    /// Move the reaction-picker selection to the next emoji.
+    ReactionNext,
+    /// Move the reaction-picker selection to the previous emoji.
+    ReactionPrev,
+    /// Toggle the picked emoji on the selected message and close the picker. Phase
+    /// 6 dispatches the core add/remove; for now it reflects optimistically.
+    ReactionConfirm,
+    /// Close the reaction picker without changing anything.
+    ReactionCancel,
+    /// Open the send-media prompt on a fresh, empty path/caption.
+    AttachOpen,
+    /// Insert a typed character into the focused send-media field.
+    AttachInput(char),
+    /// Delete the character before the focused send-media field's cursor.
+    AttachBackspace,
+    /// Move the focused send-media field's cursor one character left.
+    AttachLeft,
+    /// Move the focused send-media field's cursor one character right.
+    AttachRight,
+    /// Move the focused send-media field's cursor to the start of the line.
+    AttachHome,
+    /// Move the focused send-media field's cursor to the end of the line.
+    AttachEnd,
+    /// Move send-media editing between the path and caption fields (Tab).
+    AttachToggleField,
+    /// Confirm the send-media prompt (a no-op without a path). Phase 6 builds the
+    /// [`OutgoingMedia`](tuigram_core::model::OutgoingMedia) and sends it; for now
+    /// it just closes the prompt.
+    AttachConfirm,
+    /// Cancel the send-media prompt without sending.
+    AttachCancel,
     /// Tear down and exit the loop.
     Quit,
 }
@@ -133,6 +172,12 @@ pub struct App {
     /// The forward overlay's state: the messages being forwarded and the target
     /// picker. Inert until a forward is started.
     forward: ForwardView,
+    /// The reaction picker's state: the emoji palette and the selection. Reset each
+    /// time the picker opens.
+    reaction: ReactionPicker,
+    /// The send-media prompt's state: the path and caption being typed. Reset each
+    /// time the prompt opens.
+    media: MediaDraft,
 }
 
 impl App {
@@ -197,6 +242,16 @@ impl App {
     /// The forward overlay's state, for rendering the target picker.
     pub fn forward(&self) -> &ForwardView {
         &self.forward
+    }
+
+    /// The reaction picker's state, for rendering the emoji palette.
+    pub fn reaction(&self) -> &ReactionPicker {
+        &self.reaction
+    }
+
+    /// The send-media prompt's state, for rendering the path/caption fields.
+    pub fn media(&self) -> &MediaDraft {
+        &self.media
     }
 
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
@@ -431,6 +486,93 @@ impl App {
             Action::ForwardCancel => {
                 // Back to the results the forward was started from.
                 self.overlay = Overlay::SearchResults;
+                self.dirty = true;
+            }
+            Action::PinToggle => {
+                // Pin/unpin the selected message. Phase 6 also calls core's
+                // pin/unpin; for now the local flip drives the 📌 indicator. A no-op
+                // on an empty history (no selected message).
+                if let Some(id) = self.conversation.selected_message().map(|m| m.id) {
+                    self.conversation.toggle_pin(id);
+                    self.dirty = true;
+                }
+            }
+            Action::ReactionOpen => {
+                // Open the picker only when there is a message to react to.
+                if self.conversation.selected_message().is_some() {
+                    self.reaction = ReactionPicker::new();
+                    self.overlay = Overlay::Reaction;
+                    self.dirty = true;
+                }
+            }
+            Action::ReactionNext => {
+                self.reaction.select_next();
+                self.dirty = true;
+            }
+            Action::ReactionPrev => {
+                self.reaction.select_prev();
+                self.dirty = true;
+            }
+            Action::ReactionConfirm => {
+                // Toggle the picked emoji on the selected message and close. Phase 6
+                // dispatches the core add/remove and folds the real counts; here the
+                // optimistic flip updates the `{emoji×n*}` chips directly.
+                if let Some(id) = self.conversation.selected_message().map(|m| m.id) {
+                    self.conversation
+                        .toggle_reaction(id, self.reaction.selected_emoji());
+                }
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::ReactionCancel => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::AttachOpen => {
+                // A fresh prompt each time, so a previous path never leaks in.
+                self.media = MediaDraft::default();
+                self.overlay = Overlay::SendMedia;
+                self.dirty = true;
+            }
+            Action::AttachInput(c) => {
+                self.media.insert(c);
+                self.dirty = true;
+            }
+            Action::AttachBackspace => {
+                self.media.backspace();
+                self.dirty = true;
+            }
+            Action::AttachLeft => {
+                self.media.move_left();
+                self.dirty = true;
+            }
+            Action::AttachRight => {
+                self.media.move_right();
+                self.dirty = true;
+            }
+            Action::AttachHome => {
+                self.media.move_home();
+                self.dirty = true;
+            }
+            Action::AttachEnd => {
+                self.media.move_end();
+                self.dirty = true;
+            }
+            Action::AttachToggleField => {
+                self.media.toggle_field();
+                self.dirty = true;
+            }
+            Action::AttachConfirm => {
+                // Phase 6 builds the `OutgoingMedia` from the prompt and calls
+                // `send_media`; for now confirming with a path just closes the
+                // prompt, and an empty path is a no-op that keeps it open.
+                if self.media.is_sendable() {
+                    self.overlay = Overlay::None;
+                    self.dirty = true;
+                }
+            }
+            Action::AttachCancel => {
+                self.overlay = Overlay::None;
                 self.dirty = true;
             }
             Action::Quit => self.should_quit = true,
@@ -771,6 +913,151 @@ mod tests {
         assert_eq!(
             app.on_terminal_event(key(KeyCode::Char('j'), KeyModifiers::NONE)),
             Action::SearchInput('j')
+        );
+    }
+
+    // --- media, reactions & pins (#85) ---
+
+    use tuigram_core::model::ReactionKind;
+
+    /// An app whose history holds two text messages, the first (oldest, at the top)
+    /// the selected one.
+    fn app_with_history() -> App {
+        use crate::conversation::{ConversationView, sample_message};
+        use std::collections::HashSet;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let messages = (1..=2)
+            .map(|i| {
+                sample_message(
+                    i,
+                    MessageContent::Text(FormattedText {
+                        text: format!("m{i}"),
+                        entities: Vec::new(),
+                    }),
+                )
+            })
+            .collect();
+        App::with_conversation(ConversationView::from_messages(messages, HashSet::new()))
+    }
+
+    #[test]
+    fn pin_toggles_the_selected_message_and_dirties() {
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        app.clear_dirty();
+        app.dispatch(Action::PinToggle);
+        assert!(app.conversation().is_pinned(id), "pinned");
+        assert!(app.is_dirty());
+        app.dispatch(Action::PinToggle);
+        assert!(!app.conversation().is_pinned(id), "unpinned again");
+    }
+
+    #[test]
+    fn pin_on_an_empty_history_is_a_noop() {
+        let mut app = App::new();
+        app.clear_dirty();
+        app.dispatch(Action::PinToggle);
+        assert!(!app.is_dirty(), "no selected message, nothing changes");
+    }
+
+    #[test]
+    fn reacting_opens_the_picker_then_confirm_toggles_the_reaction() {
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        app.dispatch(Action::ReactionOpen);
+        assert_eq!(app.overlay(), Overlay::Reaction);
+        // Pick the second emoji, confirm — it lands on the selected message.
+        app.dispatch(Action::ReactionNext);
+        let chosen = app.reaction().selected_emoji();
+        app.dispatch(Action::ReactionConfirm);
+        assert_eq!(app.overlay(), Overlay::None, "confirm closes the picker");
+        let message = app.conversation().messages().iter().find(|m| m.id == id);
+        let reactions = &message.unwrap().reactions;
+        assert_eq!(reactions.len(), 1);
+        assert!(reactions[0].is_chosen, "our reaction is recorded");
+        assert_eq!(reactions[0].kind, ReactionKind::Emoji(chosen.to_owned()));
+    }
+
+    #[test]
+    fn reacting_with_no_selected_message_does_not_open() {
+        let mut app = App::new();
+        app.dispatch(Action::ReactionOpen);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "nothing to react to, stays closed"
+        );
+    }
+
+    #[test]
+    fn cancelling_the_reaction_picker_changes_nothing() {
+        let mut app = app_with_history();
+        app.dispatch(Action::ReactionOpen);
+        app.dispatch(Action::ReactionCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(
+            app.conversation()
+                .messages()
+                .iter()
+                .all(|m| m.reactions.is_empty()),
+            "cancel adds no reaction"
+        );
+    }
+
+    #[test]
+    fn attaching_opens_a_fresh_prompt_and_edits_the_fields() {
+        let mut app = app_with_history();
+        app.dispatch(Action::AttachOpen);
+        assert_eq!(app.overlay(), Overlay::SendMedia);
+        for c in "/tmp/a.png".chars() {
+            app.dispatch(Action::AttachInput(c));
+        }
+        app.dispatch(Action::AttachToggleField);
+        for c in "hi".chars() {
+            app.dispatch(Action::AttachInput(c));
+        }
+        assert_eq!(app.media().path(), "/tmp/a.png");
+        assert_eq!(app.media().caption(), "hi");
+    }
+
+    #[test]
+    fn confirming_an_empty_attach_keeps_the_prompt_open() {
+        let mut app = app_with_history();
+        app.dispatch(Action::AttachOpen);
+        app.dispatch(Action::AttachConfirm);
+        assert_eq!(
+            app.overlay(),
+            Overlay::SendMedia,
+            "no path, nothing to send"
+        );
+        // A path makes it sendable; confirm then closes.
+        for c in "/tmp/a.png".chars() {
+            app.dispatch(Action::AttachInput(c));
+        }
+        app.dispatch(Action::AttachConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+    }
+
+    #[test]
+    fn reopening_attach_starts_from_an_empty_prompt() {
+        let mut app = app_with_history();
+        app.dispatch(Action::AttachOpen);
+        app.dispatch(Action::AttachInput('x'));
+        app.dispatch(Action::AttachCancel);
+        app.dispatch(Action::AttachOpen);
+        assert_eq!(app.media().path(), "", "reopened prompt starts empty");
+    }
+
+    #[test]
+    fn history_keys_resolve_through_the_send_media_overlay() {
+        let mut app = app_with_history();
+        app.dispatch(Action::SetFocus(Focus::History));
+        app.dispatch(Action::AttachOpen);
+        // `a` would open attach in the history; inside the prompt it types.
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            Action::AttachInput('a')
         );
     }
 }

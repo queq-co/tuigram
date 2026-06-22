@@ -15,22 +15,33 @@
 //! the render windows forward from there so a long history never builds the whole
 //! buffer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use tuigram_core::model::Message;
+use tuigram_core::model::{File, Message, Reaction, ReactionKind};
 
 /// The history pane's state: the open chat's messages (oldest first), which of
-/// them are pinned, and the scroll offset. Empty until Phase 6 projects the core
-/// message store into it.
+/// them are pinned, the scroll offset, and the download state of any media files
+/// the visible messages reference. Empty until Phase 6 projects the core message
+/// and file stores into it.
+///
+/// The scroll **offset** doubles as the **message cursor**: the message at the
+/// offset — the topmost one drawn — is the *selected* message that the
+/// reaction/pin affordances (#85) act on, marked in the pane. This reuses #81's
+/// `j`/`k` history navigation as the cursor rather than introducing a second,
+/// independently moved selection; finer in-pane selection is a follow-up.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationView {
     /// Messages in chronological order — index `0` is the oldest, drawn at the top.
     messages: Vec<Message>,
     /// Ids of the chat's pinned messages, for the pinned indicator.
     pinned: HashSet<i64>,
-    /// Index of the topmost message to draw. Clamped to a valid row, or `0` when
-    /// there are no messages.
+    /// Index of the topmost message to draw — also the selected-message cursor.
+    /// Clamped to a valid row, or `0` when there are no messages.
     offset: usize,
+    /// Download state of media files referenced by the messages, keyed by TDLib
+    /// file id, for the download-progress indicator (#85). Phase 6 projects this
+    /// from the core [`FileStore`](tuigram_core::files::FileStore); empty until then.
+    downloads: HashMap<i32, File>,
 }
 
 impl ConversationView {
@@ -47,6 +58,7 @@ impl ConversationView {
             messages,
             pinned,
             offset: 0,
+            downloads: HashMap::new(),
         }
     }
 
@@ -78,6 +90,75 @@ impl ConversationView {
     #[must_use]
     pub fn is_pinned(&self, id: i64) -> bool {
         self.pinned.contains(&id)
+    }
+
+    /// The selected message — the one at the scroll [`offset`](Self::offset),
+    /// drawn at the top of the pane — or `None` on an empty history. The reaction
+    /// and pin affordances act on this message.
+    #[must_use]
+    pub fn selected_message(&self) -> Option<&Message> {
+        self.messages.get(self.offset)
+    }
+
+    /// Toggle the pinned state of message `id`: pin it if it is not pinned, unpin
+    /// it if it is. The optimistic local flip behind the pin action; Phase 6 also
+    /// calls [`PinRequests`](tuigram_core::PinRequests) and lets the resulting
+    /// `updateMessageIsPinned` reconcile this set.
+    pub fn toggle_pin(&mut self, id: i64) {
+        if !self.pinned.remove(&id) {
+            self.pinned.insert(id);
+        }
+    }
+
+    /// Toggle tuigram's own `emoji` reaction on message `id`, updating the
+    /// message's reaction buckets the existing `{emoji×n*}` rendering reads:
+    /// adding our choice creates or increments the bucket and marks it chosen;
+    /// removing it decrements (dropping a bucket that reaches zero). A no-op if no
+    /// message has that id.
+    ///
+    /// This is the optimistic local reflection of the reaction picker; Phase 6
+    /// also calls [`ReactionRequests`](tuigram_core::ReactionRequests) and lets the
+    /// resulting `updateMessageInteractionInfo` fold the authoritative counts.
+    pub fn toggle_reaction(&mut self, id: i64, emoji: &str) {
+        let Some(message) = self.messages.iter_mut().find(|m| m.id == id) else {
+            return;
+        };
+        let kind = ReactionKind::Emoji(emoji.to_owned());
+        match message.reactions.iter().position(|r| r.kind == kind) {
+            Some(i) if message.reactions[i].is_chosen => {
+                // Remove our own reaction; drop the bucket if we were the last.
+                message.reactions[i].count -= 1;
+                message.reactions[i].is_chosen = false;
+                if message.reactions[i].count <= 0 {
+                    message.reactions.remove(i);
+                }
+            }
+            Some(i) => {
+                // Others have it; add our choice to the existing bucket.
+                message.reactions[i].count += 1;
+                message.reactions[i].is_chosen = true;
+            }
+            None => message.reactions.push(Reaction {
+                kind,
+                count: 1,
+                is_chosen: true,
+            }),
+        }
+    }
+
+    /// The download state of the file with TDLib id `file_id`, if known — the
+    /// source of the media download-progress indicator.
+    #[must_use]
+    pub fn download(&self, file_id: i32) -> Option<&File> {
+        self.downloads.get(&file_id)
+    }
+
+    /// Record (or replace) the download state of a file, keyed by its id. The seam
+    /// Phase 6 fills from the core [`FileStore`](tuigram_core::files::FileStore) on
+    /// each `updateFile`; until then only the render tests call it.
+    #[allow(dead_code)]
+    pub fn set_download(&mut self, file: File) {
+        self.downloads.insert(file.id, file);
     }
 
     /// Scroll one message toward the newest, clamping at the last message. A no-op
@@ -181,5 +262,74 @@ mod tests {
         let view = ConversationView::from_messages(vec![text(7, "hi")], HashSet::from([7]));
         assert!(view.is_pinned(7));
         assert!(!view.is_pinned(8));
+    }
+
+    #[test]
+    fn the_selected_message_is_the_one_at_the_offset() {
+        let mut view = history(3);
+        assert_eq!(view.selected_message().map(|m| m.id), Some(0), "top first");
+        view.scroll_down();
+        assert_eq!(view.selected_message().map(|m| m.id), Some(1));
+        assert_eq!(ConversationView::default().selected_message(), None);
+    }
+
+    #[test]
+    fn toggling_a_pin_flips_membership_both_ways() {
+        let mut view = ConversationView::from_messages(vec![text(7, "hi")], HashSet::new());
+        assert!(!view.is_pinned(7));
+        view.toggle_pin(7);
+        assert!(view.is_pinned(7), "pinned");
+        view.toggle_pin(7);
+        assert!(!view.is_pinned(7), "unpinned again");
+    }
+
+    #[test]
+    fn toggling_a_reaction_adds_then_removes_our_choice() {
+        let mut view = ConversationView::from_messages(vec![text(1, "nice")], HashSet::new());
+        view.toggle_reaction(1, "👍");
+        let reactions = &view.messages()[0].reactions;
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].kind, ReactionKind::Emoji("👍".to_owned()));
+        assert_eq!(reactions[0].count, 1);
+        assert!(reactions[0].is_chosen);
+        // Toggling the same emoji off drops the bucket (we were the only reactor).
+        view.toggle_reaction(1, "👍");
+        assert!(view.messages()[0].reactions.is_empty());
+    }
+
+    #[test]
+    fn toggling_a_reaction_others_already_have_keeps_the_bucket() {
+        let mut message = text(1, "nice");
+        message.reactions = vec![Reaction {
+            kind: ReactionKind::Emoji("🔥".to_owned()),
+            count: 2,
+            is_chosen: false,
+        }];
+        let mut view = ConversationView::from_messages(vec![message], HashSet::new());
+        view.toggle_reaction(1, "🔥");
+        let bucket = &view.messages()[0].reactions[0];
+        assert_eq!(bucket.count, 3, "our choice adds to the existing count");
+        assert!(bucket.is_chosen);
+        // Removing ours leaves the others' reaction behind.
+        view.toggle_reaction(1, "🔥");
+        let bucket = &view.messages()[0].reactions[0];
+        assert_eq!(bucket.count, 2);
+        assert!(!bucket.is_chosen);
+    }
+
+    #[test]
+    fn a_recorded_download_is_read_back_by_file_id() {
+        let mut view = ConversationView::default();
+        assert!(view.download(42).is_none());
+        view.set_download(File {
+            id: 42,
+            size: 100,
+            downloaded_size: 45,
+            is_downloading_active: true,
+            ..File::default()
+        });
+        let file = view.download(42).expect("recorded download");
+        assert_eq!(file.downloaded_size, 45);
+        assert!(file.is_downloading_active);
     }
 }
