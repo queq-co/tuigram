@@ -21,6 +21,13 @@ tokio = { version = "1", default-features = false }
 # Stream adapters over tokio channels (BroadcastStream + StreamExt) for the
 # TDLib update stream exposed by tuigram-core's bridge.
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+# TUI stack for the `tuigram` binary (Phase 5). Pinned to one crossterm major:
+# Ratatui 0.30.x defaults to crossterm 0.29, and mixing crossterm majors gives
+# separate event queues + separate raw-mode tracking (lost events, terminal not
+# restored on exit). The `event-stream` feature turns terminal input into an
+# async Stream feeding the central tokio::select! loop. See research/ratatui.md.
+ratatui = { version = "0.30" }
+crossterm = { version = "0.29", features = ["event-stream"] }
 # Config (de)serialization for ~/.config/tuigram/config.toml (api_id/api_hash).
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1" }

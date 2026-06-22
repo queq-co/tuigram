@@ -17,12 +17,13 @@ path = "src/main.rs"
 
 [features]
 # Manual, interactive headless harness (#9, #22; examples/repl.rs). Off by default
-# so it is excluded from the product binary and from default CI — it needs a real
-# account and a TTY. It logs in and then drops into a stdin REPL that drives the
-# Phase 3 client surface (list chats, open a chat, send/reply/edit/delete/read).
-# Run it with:
+# so it is excluded from default CI — it needs a real account and a TTY. It logs
+# in and then drops into a stdin REPL that drives the Phase 3 client surface (list
+# chats, open a chat, send/reply/edit/delete/read). The async deps it needs are
+# now always present (the TUI itself runs on tokio), so this is a build-gate
+# marker only. Run it with:
 #   cargo run -p tuigram --example repl --features login-harness
-login-harness = ["dep:tokio", "dep:tokio-stream"]
+login-harness = []
 
 [[example]]
 name = "repl"
@@ -30,8 +31,14 @@ required-features = ["login-harness"]
 
 [dependencies]
 tuigram-core = { path = "../tuigram-core" }
-# Async runtime + update-stream adapter, used only by the headless harness
-# example. `time` paces a brief settle after async loads so the router's folded
-# snapshot is current before the REPL reads it back.
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread", "macros", "time"] }
-tokio-stream = { workspace = true, optional = true }
+# Async runtime for the central tokio::select! event loop (Phase 5). The TUI is
+# I/O-bound on terminal events + core updates, not CPU-bound, but the multi-thread
+# runtime lets blocking core work run off the render thread. `time` drives the
+# render tick; `sync` carries the mpsc AppEvent channel from core. The headless
+# REPL example reuses the same runtime.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+# StreamExt over crossterm's EventStream (and the core update stream in the REPL).
+tokio-stream = { workspace = true }
+# Ratatui front-end + crossterm backend (terminal lifecycle, async input events).
+ratatui = { workspace = true }
+crossterm = { workspace = true }
