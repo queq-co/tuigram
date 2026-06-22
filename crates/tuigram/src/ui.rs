@@ -5,19 +5,22 @@
 //! This is the three-pane chat skeleton (issue #79): an outer horizontal split
 //! of a **chat list** (left) and a **conversation** (right), with the right pane
 //! split vertically into a scrolling **message history** over a fixed-height
-//! **composer**. The chat-list pane is live (issue #80); the conversation and
-//! composer are still placeholders each later `ui:` issue fills in, writing its
-//! tests against the `TestBackend` harness below.
+//! **composer**. The chat-list pane (issue #80) and the conversation history
+//! (issue #81) are live; the composer is still a placeholder issue #82 fills in,
+//! writing its tests against the `TestBackend` harness below.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
-use tuigram_core::model::Chat;
+use tuigram_core::model::{Chat, FormattedText, Message, MessageContent, ReactionKind, Sender};
 
 use crate::app::App;
+use crate::conversation::ConversationView;
 
 /// Chat-list pane width, as a percentage of the terminal; the conversation pane
 /// fills the remainder. (The research doc allows fixed *or* percentage width;
@@ -45,7 +48,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
             .areas(convo_area);
 
     render_chat_list(frame, list_area, app);
-    render_history(frame, history_area, app);
+    render_conversation(frame, history_area, app);
     render_composer(frame, composer_area);
 }
 
@@ -90,9 +93,53 @@ fn chat_item(chat: &Chat) -> ListItem<'static> {
     ListItem::new(Line::from(spans))
 }
 
-/// Right/top pane: the conversation history. Placeholder until issue #81; for now
-/// it doubles as the liveness view, echoing the core heartbeat count.
-fn render_history(frame: &mut Frame, area: Rect, app: &App) {
+/// Right/top pane: the conversation history (#81). Renders the open chat's
+/// messages — each a sender/timestamp header, a body or media placeholder, and a
+/// reaction line — windowed forward from the scroll offset so a long history never
+/// builds the whole buffer, with a scrollbar tracking the offset. An empty history
+/// (the Phase 5 pre-data state) keeps the welcome/liveness placeholder.
+fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
+    let view = app.conversation();
+    if view.is_empty() {
+        render_conversation_placeholder(frame, area, app);
+        return;
+    }
+
+    // Window forward from the offset: format messages until the visible rows are
+    // full, building at most one message past the boundary — never the whole
+    // history. `inner` excludes the block's top and bottom borders.
+    let inner_rows = area.height.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    for message in view.messages().iter().skip(view.offset()) {
+        if lines.len() >= inner_rows {
+            break;
+        }
+        lines.extend(message_lines(view, message));
+    }
+    lines.truncate(inner_rows);
+
+    let history = Paragraph::new(lines).block(Block::bordered().title(" Conversation "));
+    frame.render_widget(history, area);
+
+    // The scrollbar tracks the message offset, inset one row so it rides the
+    // right border between the block's corners.
+    let mut scrollbar_state = ScrollbarState::new(view.len()).position(view.offset());
+    frame.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        area.inner(Margin {
+            vertical: 1,
+            horizontal: 0,
+        }),
+        &mut scrollbar_state,
+    );
+}
+
+/// The pre-data conversation pane: a welcome banner that doubles as the liveness
+/// view, echoing the core heartbeat count until real history (Phase 6) replaces
+/// it and the status bar (#88) takes over the heartbeat/quit hint.
+fn render_conversation_placeholder(frame: &mut Frame, area: Rect, app: &App) {
     let body = format!(
         "tuigram — Phase 5 TUI skeleton\n\ncore heartbeats: {}\n\npress q / Esc / Ctrl-C to quit",
         app.beats()
@@ -103,6 +150,146 @@ fn render_history(frame: &mut Frame, area: Rect, app: &App) {
             .title_alignment(Alignment::Center),
     );
     frame.render_widget(widget, area);
+}
+
+/// The lines for one message: a bold sender/timestamp header (with a pin marker
+/// when pinned), the body or a media placeholder, an optional reaction line, and
+/// a blank separator below.
+fn message_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>> {
+    let mut header = String::new();
+    if view.is_pinned(message.id) {
+        header.push_str("📌 ");
+    }
+    header.push_str(&sender_label(message));
+    header.push_str("  ");
+    header.push_str(&hour_minute(message.date));
+
+    let mut lines = vec![Line::from(Span::styled(
+        header,
+        Style::new().add_modifier(Modifier::BOLD),
+    ))];
+    lines.extend(content_lines(&message.content));
+    if let Some(reactions) = reaction_line(message) {
+        lines.push(reactions);
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
+/// The header's name for a message: "You" for our own messages, else the sender's
+/// id. Resolving ids to display names needs the user/chat store, which Phase 6
+/// wires; until then the id keeps the header unambiguous.
+fn sender_label(message: &Message) -> String {
+    if message.is_outgoing {
+        return "You".to_owned();
+    }
+    match message.sender {
+        Sender::User(id) => format!("User {id}"),
+        Sender::Chat(id) => format!("Chat {id}"),
+    }
+}
+
+/// Format a Unix timestamp as `HH:MM` in UTC. Local-time conversion needs a
+/// timezone database the core does not carry yet (a follow-up); UTC keeps the
+/// header deterministic and snapshot-testable in the meantime.
+fn hour_minute(date: i32) -> String {
+    let seconds = i64::from(date).rem_euclid(86_400);
+    format!("{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60)
+}
+
+/// The body lines for a message's content: the text for a text message, or a
+/// `[Kind]` placeholder for media (with its caption, when set, on the lines
+/// below). Media bytes are not rendered in a terminal; the placeholder names what
+/// the message carries.
+fn content_lines(content: &MessageContent) -> Vec<Line<'static>> {
+    match content {
+        MessageContent::Text(text) => text_lines(text),
+        MessageContent::Photo(p) => placeholder_lines("[Photo]", &p.caption),
+        MessageContent::Video(v) => placeholder_lines("[Video]", &v.caption),
+        MessageContent::Document(d) => placeholder_lines(
+            &format!("[Document {}]", trimmed_name(&d.file_name)),
+            &d.caption,
+        ),
+        MessageContent::Audio(a) => placeholder_lines("[Audio]", &a.caption),
+        MessageContent::Voice(v) => placeholder_lines("[Voice]", &v.caption),
+        MessageContent::Sticker(s) => one_line(format!("[Sticker {}]", s.emoji).trim_end()),
+        MessageContent::Animation(a) => placeholder_lines("[GIF]", &a.caption),
+        MessageContent::Location(_) => one_line("[Location]"),
+        MessageContent::Venue(v) => one_line(format!("[Venue {}]", v.title).trim_end()),
+        MessageContent::Contact(c) => {
+            one_line(format!("[Contact {} {}]", c.first_name, c.last_name).trim_end())
+        }
+        MessageContent::Poll(p) => one_line(format!("[Poll] {}", p.question.text)),
+        MessageContent::Unsupported(name) => one_line(format!("[{name}]")),
+    }
+}
+
+/// The lines of a text body, preserving its own line breaks. Empty text still
+/// yields one (empty) line so the header is not left bodyless.
+fn text_lines(text: &FormattedText) -> Vec<Line<'static>> {
+    text.text
+        .split('\n')
+        .map(|line| Line::from(line.to_owned()))
+        .collect()
+}
+
+/// A media placeholder line, with the caption's lines below it when non-empty.
+fn placeholder_lines(label: &str, caption: &FormattedText) -> Vec<Line<'static>> {
+    let mut lines = one_line(label);
+    if !caption.text.is_empty() {
+        lines.extend(text_lines(caption));
+    }
+    lines
+}
+
+/// A single owned line from a string.
+fn one_line(text: impl Into<String>) -> Vec<Line<'static>> {
+    vec![Line::from(text.into())]
+}
+
+/// A file name with surrounding whitespace removed, for the document placeholder.
+fn trimmed_name(name: &str) -> &str {
+    name.trim()
+}
+
+/// The reaction line for a message, or `None` when it has none. Each bucket reads
+/// `{emoji×count}`, with a trailing `*` inside the braces for the reaction this
+/// account chose, and chosen buckets drawn bold.
+fn reaction_line(message: &Message) -> Option<Line<'static>> {
+    if message.reactions.is_empty() {
+        return None;
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, reaction) in message.reactions.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let chosen = if reaction.is_chosen { "*" } else { "" };
+        let chip = format!(
+            "{{{}×{}{}}}",
+            reaction_symbol(&reaction.kind),
+            reaction.count,
+            chosen
+        );
+        let style = if reaction.is_chosen {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        spans.push(Span::styled(chip, style));
+    }
+    Some(Line::from(spans))
+}
+
+/// The glyph shown for a reaction bucket: the emoji itself, a star for the paid
+/// channel reaction, or a generic marker for a custom emoji (its sticker can't be
+/// drawn in a terminal).
+fn reaction_symbol(kind: &ReactionKind) -> String {
+    match kind {
+        ReactionKind::Emoji(emoji) => emoji.clone(),
+        ReactionKind::Paid => "⭐".to_owned(),
+        ReactionKind::CustomEmoji(_) => "🧩".to_owned(),
+    }
 }
 
 /// Right/bottom pane: the message composer. Placeholder until issue #82.
@@ -266,5 +453,113 @@ mod tests {
         assert!(text.contains("Chats — Archive"), "archive label");
         assert!(text.contains("Old Friend"), "archive chat");
         assert!(!text.contains("Alice"), "main chats gone");
+    }
+
+    // --- conversation / history pane (#81) ---
+
+    use crate::conversation::{ConversationView, sample_message};
+    use std::collections::HashSet;
+    use tuigram_core::model::{FileRef, Photo, Reaction};
+
+    /// A text message with the given id and body.
+    fn text_message(id: i64, body: &str) -> Message {
+        sample_message(
+            id,
+            MessageContent::Text(FormattedText {
+                text: body.to_owned(),
+                entities: Vec::new(),
+            }),
+        )
+    }
+
+    /// An app whose history holds `messages`, none pinned.
+    fn app_with_history(messages: Vec<Message>) -> App {
+        App::with_conversation(ConversationView::from_messages(messages, HashSet::new()))
+    }
+
+    #[test]
+    fn empty_history_keeps_the_welcome_placeholder() {
+        // With no open chat, the pane is the welcome/liveness view, not history.
+        let text = flatten(&render(&App::new(), 80, 24));
+        assert!(text.contains("tuigram — Phase 5"), "welcome banner");
+        assert!(text.contains("quit"), "quit hint");
+    }
+
+    #[test]
+    fn short_history_renders_each_message_body() {
+        let app = app_with_history(vec![
+            text_message(1, "hello there"),
+            text_message(2, "general kenobi"),
+        ]);
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Conversation"), "pane title");
+        assert!(text.contains("hello there"), "first body");
+        assert!(text.contains("general kenobi"), "second body");
+    }
+
+    #[test]
+    fn long_history_is_windowed_not_fully_built() {
+        // 100 messages into a short pane: only the top slice is built, so a
+        // far-down message is never rendered (the whole buffer is not assembled).
+        let messages = (0..100)
+            .map(|i| text_message(i, &format!("msg-{i}")))
+            .collect();
+        let text = flatten(&render(&app_with_history(messages), 40, 10));
+        assert!(text.contains("msg-0"), "top of the window present");
+        assert!(!text.contains("msg-50"), "far-down message not built");
+    }
+
+    #[test]
+    fn scrolling_down_advances_the_visible_window() {
+        let messages = (0..100)
+            .map(|i| text_message(i, &format!("msg-{i}")))
+            .collect();
+        let mut app = app_with_history(messages);
+        for _ in 0..40 {
+            app.dispatch(Action::ScrollDown);
+        }
+        let text = flatten(&render(&app, 40, 10));
+        assert!(!text.contains("msg-0"), "scrolled past the top");
+        assert!(text.contains("msg-40"), "new offset is visible");
+    }
+
+    #[test]
+    fn a_reaction_renders_as_a_chip_with_a_chosen_marker() {
+        let mut message = text_message(1, "nice");
+        message.reactions = vec![Reaction {
+            kind: ReactionKind::Emoji("👍".to_owned()),
+            count: 3,
+            is_chosen: true,
+        }];
+        let buffer = render(&app_with_history(vec![message]), 80, 24);
+        // `{👍×3*}` — the `*` flags the reaction this account chose. A wide emoji
+        // occupies two cells (the trailing one a space), so assert on the emoji
+        // and the space-free `×3*` tail rather than their adjacency.
+        let row = row_containing(&buffer, "×3*");
+        assert!(row.contains('👍'), "reaction emoji");
+        assert!(row.contains("×3*"), "count and chosen marker");
+    }
+
+    #[test]
+    fn a_photo_renders_as_a_media_placeholder() {
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(0),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let text = flatten(&render(&app_with_history(vec![photo]), 80, 24));
+        assert!(text.contains("[Photo]"), "photo placeholder");
+    }
+
+    #[test]
+    fn a_pinned_message_shows_the_pin_marker() {
+        let view =
+            ConversationView::from_messages(vec![text_message(7, "pinned")], HashSet::from([7]));
+        let text = flatten(&render(&App::with_conversation(view), 80, 24));
+        assert!(text.contains("📌"), "pin marker on the pinned message");
     }
 }
