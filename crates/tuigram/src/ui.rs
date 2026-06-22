@@ -23,7 +23,7 @@ use tuigram_core::model::{Chat, FormattedText, Message, MessageContent, Reaction
 use crate::app::App;
 use crate::composer::ComposerMode;
 use crate::conversation::ConversationView;
-use crate::keymap::{self, Focus};
+use crate::keymap::{self, Focus, Overlay};
 
 /// Chat-list pane width, as a percentage of the terminal; the conversation pane
 /// fills the remainder. (The research doc allows fixed *or* percentage width;
@@ -60,9 +60,13 @@ pub fn ui(frame: &mut Frame, app: &App) {
     render_conversation(frame, history_area, app);
     render_composer(frame, composer_area, app);
 
-    // The help overlay floats above the panes when toggled on.
-    if app.help_visible() {
-        render_help(frame, frame.area());
+    // A modal overlay floats above the panes, capturing input while open.
+    match app.overlay() {
+        Overlay::None => {}
+        Overlay::Help => render_help(frame, frame.area()),
+        Overlay::SearchInput => render_search_input(frame, frame.area(), app),
+        Overlay::SearchResults => render_search_results(frame, frame.area(), app),
+        Overlay::Forward => render_forward(frame, frame.area(), app),
     }
 }
 
@@ -429,6 +433,140 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         width: w,
         height: h,
     }
+}
+
+/// Width of the search/forward modal popups, clamped to the terminal by
+/// [`centered_rect`].
+const OVERLAY_WIDTH: u16 = 56;
+
+/// A dim hint line, for the key reminder along the bottom of a modal.
+fn hint_line(hint: &'static str) -> Line<'static> {
+    Line::from(Span::styled(hint, Style::new().add_modifier(Modifier::DIM)))
+}
+
+/// The search query line (#84): a centred modal with the editable query over a key
+/// hint. The query reuses the composer's [`input_line`] so the cursor renders
+/// identically; an empty query shows a dim prompt instead.
+fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
+    let search = app.search();
+    let query = if search.query().is_empty() {
+        Line::from(Span::styled(
+            "type to search messages…",
+            Style::new().add_modifier(Modifier::DIM),
+        ))
+    } else {
+        input_line(search.query(), search.cursor())
+    };
+    let lines = vec![
+        query,
+        Line::from(""),
+        hint_line("Enter to search · Esc to cancel"),
+    ];
+
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Search ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// The search results overlay (#84): a centred modal listing the hits — a separate
+/// view over the conversation, never a rewrite of the history pane — with the
+/// selected hit marked. An empty result set shows a "no matches" note.
+fn render_search_results(frame: &mut Frame, area: Rect, app: &App) {
+    let search = app.search();
+    let title = format!(
+        " Results — \"{}\" ({}) ",
+        truncate(search.query(), 30),
+        search.results().len()
+    );
+    if search.results().is_empty() {
+        let popup = centered_rect(OVERLAY_WIDTH, 3, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new("no matches").block(
+                Block::bordered()
+                    .title(title)
+                    .title_alignment(Alignment::Center),
+            ),
+            popup,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = search
+        .results()
+        .iter()
+        .map(|hit| ListItem::new(hit.preview.clone()))
+        .collect();
+    render_list_modal(
+        frame,
+        area,
+        title,
+        items,
+        search.selected(),
+        "j / k move · f forward · Esc close",
+    );
+}
+
+/// The forward target picker (#84): a centred modal that **reuses the chat-list
+/// widget** to choose where the selected message(s) go, with a key hint along the
+/// bottom.
+fn render_forward(frame: &mut Frame, area: Rect, app: &App) {
+    let forward = app.forward();
+    let title = format!(" Forward {} message(s) to… ", forward.count());
+    let items: Vec<ListItem> = forward
+        .targets()
+        .active_chats()
+        .iter()
+        .map(chat_item)
+        .collect();
+    render_list_modal(
+        frame,
+        area,
+        title,
+        items,
+        forward.targets().selected(),
+        "j / k pick · Enter send · Esc cancel",
+    );
+}
+
+/// A centred modal holding a selectable list over a dim key hint — the shared shape
+/// of the search-results and forward-target overlays. Sized to the items, clamped
+/// to `area`.
+fn render_list_modal(
+    frame: &mut Frame,
+    area: Rect,
+    title: String,
+    items: Vec<ListItem>,
+    selected: usize,
+    hint: &'static str,
+) {
+    // Border (2) + the hint row (1) frame the list rows.
+    let height = items.len() as u16 + 3;
+    let popup = centered_rect(OVERLAY_WIDTH, height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(title)
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [list_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    let list = List::new(items)
+        .highlight_symbol(SELECTED_SYMBOL)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(Some(selected));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(Paragraph::new(hint_line(hint)), hint_area);
 }
 
 /// Shorten `s` to at most `max` characters, ending in an ellipsis when clipped, so
@@ -813,5 +951,86 @@ mod tests {
             cursor_symbol(&buffer).is_some(),
             "cursor on the prefilled text"
         );
+    }
+
+    // --- search & forward overlays (#84) ---
+
+    use crate::search::SearchHit;
+
+    /// An app sitting on the search results overlay: two chats and two hits, after
+    /// opening search and submitting. The state a forward is started from.
+    fn app_on_results() -> App {
+        let mut app = app_with_lists(); // Main: Alice/Bob/Carol, Archive: Old Friend
+        app.dispatch(Action::SearchOpen);
+        app.inject_search_results(vec![
+            SearchHit::new(1, 10, "Alice: hello there"),
+            SearchHit::new(2, 20, "Bob: general kenobi"),
+        ]);
+        app.dispatch(Action::SearchSubmit);
+        app
+    }
+
+    #[test]
+    fn the_search_input_overlay_shows_the_typed_query() {
+        let mut app = App::new();
+        app.dispatch(Action::SearchOpen);
+        for c in "kenobi".chars() {
+            app.dispatch(Action::SearchInput(c));
+        }
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Search"), "search overlay title");
+        assert!(text.contains("kenobi"), "the typed query");
+        assert!(text.contains("Enter to search"), "key hint");
+    }
+
+    #[test]
+    fn the_search_input_overlay_prompts_while_the_query_is_empty() {
+        let mut app = App::new();
+        app.dispatch(Action::SearchOpen);
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("type to search"), "empty-query prompt");
+    }
+
+    #[test]
+    fn the_results_overlay_lists_hits_as_a_separate_view() {
+        let buffer = render(&app_on_results(), 80, 24);
+        let text = flatten(&buffer);
+        assert!(text.contains("Results"), "results overlay title");
+        assert!(text.contains("(2)"), "hit count in the title");
+        assert!(text.contains("Alice: hello there"), "first hit");
+        assert!(text.contains("Bob: general kenobi"), "second hit");
+        // The selected (first) hit carries the marker; navigation moves it.
+        assert!(
+            row_containing(&buffer, "Alice: hello there").contains('▶'),
+            "selected hit marked"
+        );
+    }
+
+    #[test]
+    fn the_results_overlay_reports_no_matches_when_empty() {
+        let mut app = App::new();
+        app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchSubmit); // no hits injected
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Results"), "results overlay title");
+        assert!(text.contains("no matches"), "empty-results note");
+    }
+
+    #[test]
+    fn the_forward_picker_reuses_the_chat_list_as_targets() {
+        let mut app = app_on_results();
+        app.dispatch(Action::ForwardOpen);
+        let buffer = render(&app, 80, 24);
+        let text = flatten(&buffer);
+        assert!(text.contains("Forward"), "forward overlay title");
+        assert!(text.contains("1 message"), "count of messages forwarded");
+        // The picker shows the chat list's chats as destinations, first selected.
+        assert!(text.contains("Alice"), "target chat from the chat list");
+        assert!(text.contains("Bob"), "another target chat");
+        assert!(
+            row_containing(&buffer, "Alice").contains('▶'),
+            "first target selected"
+        );
+        assert!(text.contains("Enter send"), "key hint");
     }
 }

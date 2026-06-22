@@ -8,13 +8,14 @@
 //! consumes the buffer, so the editing and mode behaviour is exercised headlessly
 //! today.
 //!
-//! The cursor is tracked as a **character** index into the text (`0..=chars`), so
-//! editing stays correct across multi-byte input; the byte offset is derived only
-//! when the `String` itself is mutated. The full keymap and focus model that route
-//! keys here (and decide when typing inserts versus drives navigation) arrive in
-//! issue #83; this module is the state those keys mutate.
+//! The editable buffer and cursor live in a shared [`TextInput`] primitive (cursor
+//! math is character-indexed there, so editing stays correct across multi-byte
+//! input); this module adds the messaging *mode* on top — compose, reply, or edit —
+//! and the submit/cancel semantics those imply.
 //!
 //! [`Client::send_message`]: tuigram_core::Client
+
+use crate::textinput::TextInput;
 
 /// What the composer is currently acting on. The mode drives the pane's indicator
 /// and, in Phase 6, whether a submit sends a new message, a reply, or an edit.
@@ -44,15 +45,13 @@ pub enum ComposerMode {
     },
 }
 
-/// The composer pane's state: the input buffer, the cursor (a character index into
-/// it), and the current [mode](ComposerMode). Empty and in [`Compose`](ComposerMode::Compose)
+/// The composer pane's state: the input buffer (a shared [`TextInput`]) and the
+/// current [mode](ComposerMode). Empty and in [`Compose`](ComposerMode::Compose)
 /// by default — the pre-data Phase 5 state.
 #[derive(Debug, Clone, Default)]
 pub struct Composer {
-    /// The text the user has typed.
-    text: String,
-    /// Cursor position as a count of characters to its left, in `0..=chars`.
-    cursor: usize,
+    /// The editable buffer and cursor.
+    input: TextInput,
     /// What a submit will do, and what the indicator shows.
     mode: ComposerMode,
 }
@@ -61,13 +60,13 @@ impl Composer {
     /// The current input text.
     #[must_use]
     pub fn text(&self) -> &str {
-        &self.text
+        self.input.text()
     }
 
     /// The cursor position, as a character index in `0..=chars`.
     #[must_use]
     pub fn cursor(&self) -> usize {
-        self.cursor
+        self.input.cursor()
     }
 
     /// The current mode (compose, reply, or edit).
@@ -79,57 +78,37 @@ impl Composer {
     /// Whether the input buffer is empty (drives the placeholder vs. the cursor).
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
-    }
-
-    /// Number of characters in the buffer — the cursor's upper bound.
-    fn char_count(&self) -> usize {
-        self.text.chars().count()
-    }
-
-    /// The byte offset of character index `i`, or the buffer length when `i` is at
-    /// or past the end. Used only to splice the `String` at the cursor.
-    fn byte_at(&self, i: usize) -> usize {
-        self.text
-            .char_indices()
-            .nth(i)
-            .map_or(self.text.len(), |(b, _)| b)
+        self.input.is_empty()
     }
 
     /// Insert a character at the cursor and step the cursor past it.
     pub fn insert(&mut self, c: char) {
-        let at = self.byte_at(self.cursor);
-        self.text.insert(at, c);
-        self.cursor += 1;
+        self.input.insert(c);
     }
 
     /// Delete the character before the cursor (Backspace). A no-op at the start.
     pub fn backspace(&mut self) {
-        if self.cursor > 0 {
-            let at = self.byte_at(self.cursor - 1);
-            self.text.remove(at);
-            self.cursor -= 1;
-        }
+        self.input.backspace();
     }
 
     /// Move the cursor one character left, clamping at the start.
     pub fn move_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
+        self.input.move_left();
     }
 
     /// Move the cursor one character right, clamping at the end.
     pub fn move_right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.char_count());
+        self.input.move_right();
     }
 
     /// Move the cursor to the start of the line (Home).
     pub fn move_home(&mut self) {
-        self.cursor = 0;
+        self.input.move_home();
     }
 
     /// Move the cursor to the end of the line (End).
     pub fn move_end(&mut self) {
-        self.cursor = self.char_count();
+        self.input.move_end();
     }
 
     /// Enter reply mode against `message_id`, showing `preview` in the indicator.
@@ -154,16 +133,14 @@ impl Composer {
     /// render tests exercise it directly.
     #[allow(dead_code)]
     pub fn edit(&mut self, message_id: i64, text: String) {
-        self.text = text;
-        self.cursor = self.char_count();
+        self.input.set(text);
         self.mode = ComposerMode::Edit { message_id };
     }
 
     /// Cancel back to plain compose: drop any reply/edit context and clear the
     /// buffer (an edit's pre-filled text is discarded, not sent).
     pub fn cancel(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
+        self.input.clear();
         self.mode = ComposerMode::Compose;
     }
 
@@ -175,11 +152,10 @@ impl Composer {
     /// edit per the [mode](Self::mode) at the call site; Phase 5 simply consumes it.
     #[must_use]
     pub fn submit(&mut self) -> Option<String> {
-        if self.text.trim().is_empty() {
+        if self.input.text().trim().is_empty() {
             return None;
         }
-        let text = std::mem::take(&mut self.text);
-        self.cursor = 0;
+        let text = self.input.take();
         self.mode = ComposerMode::Compose;
         Some(text)
     }
