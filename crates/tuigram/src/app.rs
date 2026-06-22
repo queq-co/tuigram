@@ -6,6 +6,7 @@
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::chat_list::ChatListView;
 use crate::event::AppEvent;
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
@@ -19,6 +20,14 @@ pub enum Action {
     Render,
     /// A heartbeat from core — placeholder until Phase 6 wires the real `Client`.
     Beat,
+    /// Move the chat-list selection down one row.
+    SelectNext,
+    /// Move the chat-list selection up one row.
+    SelectPrev,
+    /// Switch to the next chat list (Main → Archive → folders → Main).
+    NextList,
+    /// Switch to the previous chat list, wrapping.
+    PrevList,
     /// Tear down and exit the loop.
     Quit,
 }
@@ -34,6 +43,9 @@ pub struct App {
     /// Count of core heartbeats applied — proof the mpsc arm is live until the
     /// real update stream replaces the fake source in Phase 6.
     beats: u64,
+    /// The left pane's chat-list view: the lists, the active one, and the
+    /// selection. Empty until Phase 6 projects the core store into it.
+    chat_list: ChatListView,
 }
 
 impl App {
@@ -55,6 +67,21 @@ impl App {
 
     pub fn beats(&self) -> u64 {
         self.beats
+    }
+
+    /// The chat-list view the left pane renders from.
+    pub fn chat_list(&self) -> &ChatListView {
+        &self.chat_list
+    }
+
+    /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
+    /// The seam Phase 6 (and the render tests) use to inject a populated view.
+    #[cfg(test)]
+    pub fn with_chat_list(chat_list: ChatListView) -> Self {
+        Self {
+            chat_list,
+            ..Self::new()
+        }
     }
 
     /// Called by the loop after a successful `terminal.draw`.
@@ -82,6 +109,12 @@ impl App {
         match (key.modifiers, key.code) {
             (KeyModifiers::CONTROL, KeyCode::Char('c')) => Action::Quit,
             (_, KeyCode::Char('q') | KeyCode::Esc) => Action::Quit,
+            // Chat-list navigation (arrows + vim j/k); the full keymap and focus
+            // model arrive in #83, which may rebind these.
+            (_, KeyCode::Down | KeyCode::Char('j')) => Action::SelectNext,
+            (_, KeyCode::Up | KeyCode::Char('k')) => Action::SelectPrev,
+            (_, KeyCode::Tab) => Action::NextList,
+            (_, KeyCode::BackTab) => Action::PrevList,
             _ => Action::Noop,
         }
     }
@@ -101,6 +134,22 @@ impl App {
             Action::Render => self.dirty = true,
             Action::Beat => {
                 self.beats += 1;
+                self.dirty = true;
+            }
+            Action::SelectNext => {
+                self.chat_list.select_next();
+                self.dirty = true;
+            }
+            Action::SelectPrev => {
+                self.chat_list.select_prev();
+                self.dirty = true;
+            }
+            Action::NextList => {
+                self.chat_list.next_list();
+                self.dirty = true;
+            }
+            Action::PrevList => {
+                self.chat_list.prev_list();
                 self.dirty = true;
             }
             Action::Quit => self.should_quit = true,
@@ -182,5 +231,35 @@ mod tests {
         assert!(!app.is_dirty());
         assert!(!app.should_quit());
         assert_eq!(app.beats(), 0);
+    }
+
+    #[test]
+    fn arrows_and_tab_map_to_chat_list_navigation() {
+        let app = App::new();
+        let mapped = |code| app.on_terminal_event(key(code, KeyModifiers::NONE));
+        assert_eq!(mapped(KeyCode::Down), Action::SelectNext);
+        assert_eq!(mapped(KeyCode::Char('j')), Action::SelectNext);
+        assert_eq!(mapped(KeyCode::Up), Action::SelectPrev);
+        assert_eq!(mapped(KeyCode::Char('k')), Action::SelectPrev);
+        assert_eq!(mapped(KeyCode::Tab), Action::NextList);
+        assert_eq!(mapped(KeyCode::BackTab), Action::PrevList);
+    }
+
+    #[test]
+    fn select_next_advances_the_chat_selection_and_dirties() {
+        use crate::chat_list::{ChatList, ChatListView, sample_chat};
+        use tuigram_core::model::ChatListKind;
+
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "A", 0), sample_chat(2, "B", 0)],
+        }]);
+        let mut app = App::with_chat_list(view);
+        app.clear_dirty();
+
+        app.dispatch(Action::SelectNext);
+        assert_eq!(app.chat_list().selected(), 1);
+        assert!(app.is_dirty());
     }
 }
