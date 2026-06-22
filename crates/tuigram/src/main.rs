@@ -8,6 +8,7 @@
 //! change when they do.
 
 mod app;
+mod chat_list;
 mod event;
 mod terminal;
 mod ui;
