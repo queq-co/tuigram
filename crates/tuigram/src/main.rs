@@ -9,6 +9,7 @@
 
 mod app;
 mod chat_list;
+mod conversation;
 mod event;
 mod terminal;
 mod ui;

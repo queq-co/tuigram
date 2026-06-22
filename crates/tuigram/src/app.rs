@@ -7,6 +7,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::chat_list::ChatListView;
+use crate::conversation::ConversationView;
 use crate::event::AppEvent;
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
@@ -28,6 +29,10 @@ pub enum Action {
     NextList,
     /// Switch to the previous chat list, wrapping.
     PrevList,
+    /// Scroll the conversation history one message toward the newest.
+    ScrollDown,
+    /// Scroll the conversation history one message toward the oldest.
+    ScrollUp,
     /// Tear down and exit the loop.
     Quit,
 }
@@ -46,6 +51,9 @@ pub struct App {
     /// The left pane's chat-list view: the lists, the active one, and the
     /// selection. Empty until Phase 6 projects the core store into it.
     chat_list: ChatListView,
+    /// The right pane's conversation view: the open chat's messages and the
+    /// scroll offset. Empty until Phase 6 projects the core store into it.
+    conversation: ConversationView,
 }
 
 impl App {
@@ -74,12 +82,27 @@ impl App {
         &self.chat_list
     }
 
+    /// The conversation view the history pane renders from.
+    pub fn conversation(&self) -> &ConversationView {
+        &self.conversation
+    }
+
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
     /// The seam Phase 6 (and the render tests) use to inject a populated view.
     #[cfg(test)]
     pub fn with_chat_list(chat_list: ChatListView) -> Self {
         Self {
             chat_list,
+            ..Self::new()
+        }
+    }
+
+    /// A fresh app showing `conversation`, marked dirty so the first frame paints.
+    /// The seam Phase 6 (and the render tests) use to inject a populated history.
+    #[cfg(test)]
+    pub fn with_conversation(conversation: ConversationView) -> Self {
+        Self {
+            conversation,
             ..Self::new()
         }
     }
@@ -115,6 +138,10 @@ impl App {
             (_, KeyCode::Up | KeyCode::Char('k')) => Action::SelectPrev,
             (_, KeyCode::Tab) => Action::NextList,
             (_, KeyCode::BackTab) => Action::PrevList,
+            // Conversation history scrolling. PageUp/PageDown stay clear of the
+            // chat-list keys above; #83 owns the focus model and full keymap.
+            (_, KeyCode::PageDown) => Action::ScrollDown,
+            (_, KeyCode::PageUp) => Action::ScrollUp,
             _ => Action::Noop,
         }
     }
@@ -150,6 +177,14 @@ impl App {
             }
             Action::PrevList => {
                 self.chat_list.prev_list();
+                self.dirty = true;
+            }
+            Action::ScrollDown => {
+                self.conversation.scroll_down();
+                self.dirty = true;
+            }
+            Action::ScrollUp => {
+                self.conversation.scroll_up();
                 self.dirty = true;
             }
             Action::Quit => self.should_quit = true,
@@ -243,6 +278,34 @@ mod tests {
         assert_eq!(mapped(KeyCode::Char('k')), Action::SelectPrev);
         assert_eq!(mapped(KeyCode::Tab), Action::NextList);
         assert_eq!(mapped(KeyCode::BackTab), Action::PrevList);
+        assert_eq!(mapped(KeyCode::PageDown), Action::ScrollDown);
+        assert_eq!(mapped(KeyCode::PageUp), Action::ScrollUp);
+    }
+
+    #[test]
+    fn scroll_down_advances_the_history_offset_and_dirties() {
+        use crate::conversation::{ConversationView, sample_message};
+        use std::collections::HashSet;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let messages = (0..3)
+            .map(|i| {
+                sample_message(
+                    i,
+                    MessageContent::Text(FormattedText {
+                        text: format!("m{i}"),
+                        entities: Vec::new(),
+                    }),
+                )
+            })
+            .collect();
+        let mut app =
+            App::with_conversation(ConversationView::from_messages(messages, HashSet::new()));
+        app.clear_dirty();
+
+        app.dispatch(Action::ScrollDown);
+        assert_eq!(app.conversation().offset(), 1);
+        assert!(app.is_dirty());
     }
 
     #[test]
