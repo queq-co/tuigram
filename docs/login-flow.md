@@ -164,7 +164,7 @@ else completes headlessly.
 
 ## Trying it
 
-The login path has no UI yet (that is Phase 4). A feature-gated harness drives it
+The login path has no UI yet (that is Phase 5). A feature-gated harness drives it
 end to end against a real account over stdin:
 
 ```text
