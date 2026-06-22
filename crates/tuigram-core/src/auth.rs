@@ -113,6 +113,15 @@ pub trait AuthRequests {
     /// `api_id`/`api_hash` and the storage encryption key untouched — those are
     /// reused for the next login, not part of the account session.
     async fn log_out(&self) -> Result<(), TdError>;
+
+    /// Cleanly close the TDLib instance, flushing and properly closing the local
+    /// database before driving authorization to `Closed`.
+    ///
+    /// Unlike [`log_out`](Self::log_out) this preserves the session and all local
+    /// data — it is the clean-shutdown counterpart, called before the process
+    /// exits so the on-disk database is never left mid-write (which would leave it
+    /// malformed for the next run to open). Carries no payload.
+    async fn close(&self) -> Result<(), TdError>;
 }
 
 impl AuthRequests for Bridge {
@@ -183,6 +192,10 @@ impl AuthRequests for Bridge {
 
     async fn log_out(&self) -> Result<(), TdError> {
         tdlib_rs::functions::log_out(self.id()).await
+    }
+
+    async fn close(&self) -> Result<(), TdError> {
+        tdlib_rs::functions::close(self.id()).await
     }
 }
 
@@ -611,6 +624,10 @@ mod tests {
             self.calls.borrow_mut().push("log_out()".to_owned());
             Ok(())
         }
+        async fn close(&self) -> Result<(), TdError> {
+            self.calls.borrow_mut().push("close()".to_owned());
+            Ok(())
+        }
     }
 
     fn params() -> ClientParameters {
@@ -689,6 +706,16 @@ mod tests {
         let client = SpyClient::default();
         client.log_out().await.unwrap();
         assert_eq!(client.calls(), vec!["log_out()".to_owned()]);
+    }
+
+    /// Clean close threads through the same seam — the one call, no payload — so a
+    /// harness can flush and close the database before exit over `C: AuthRequests`
+    /// with no network and no live `tdjson`.
+    #[tokio::test]
+    async fn close_threads_through_the_seam() {
+        let client = SpyClient::default();
+        client.close().await.unwrap();
+        assert_eq!(client.calls(), vec!["close()".to_owned()]);
     }
 
     /// A login without 2FA skips `WaitPassword` entirely.
