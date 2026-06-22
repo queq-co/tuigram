@@ -50,12 +50,12 @@ use tuigram_core::enums::Update;
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
     ApiCredentials, AuthRequests, AuthState, Bridge, Chat, ChatAction, ChatActionRequests,
-    ChatKind, Client, ClientParameters, CredentialError, CredentialResolver, DOWNLOAD_PRIORITY,
-    DeleteRequests, EditRequests, FileRequests, FormattedText, HistoryRequests, Login, Message,
-    MessageContent, NEWEST, Onboarding, OutgoingMedia, PinRequests, Reaction, ReactionKind,
-    ReactionRequests, ReadRequests, SecretChatRequests, SecretChatState, SendRequests, SendState,
-    Sender, SessionStorage, TgClient, UpdateStream, load_archive_list, load_folder_list,
-    load_main_list,
+    ChatKind, Client, ClientParameters, ConnectionState, CredentialError, CredentialResolver,
+    DOWNLOAD_PRIORITY, DeleteRequests, EditRequests, FileRequests, FormattedText, HistoryRequests,
+    Login, Message, MessageContent, NEWEST, Onboarding, OutgoingMedia, PinRequests, Reaction,
+    ReactionKind, ReactionRequests, ReadRequests, SecretChatRequests, SecretChatState,
+    SendRequests, SendState, Sender, SessionStorage, TgClient, UpdateStream, load_archive_list,
+    load_folder_list, load_main_list,
 };
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
@@ -383,6 +383,8 @@ async fn run_repl(client: &Client) -> Fallible {
                 Ok(secret_chat_id) => close_secret_chat(client, secret_chat_id).await,
                 Err(_) => println!("usage: secret-close <secret_chat_id>"),
             },
+            "status" => show_status(client),
+            "resync" => resync(client).await,
             "logout" => {
                 if logout(client).await == Flow::Done {
                     return Ok(());
@@ -390,6 +392,49 @@ async fn run_repl(client: &Client) -> Fallible {
             }
             other => println!("Unknown command: {other:?}. Type `help`."),
         }
+    }
+}
+
+/// Print the transport's connection/sync status and whether a dropped-update gap
+/// is outstanding — the harness window onto what a TUI status bar would show.
+fn show_status(client: &Client) {
+    let (state, needs_resync, dropped) = client.read(|s| {
+        (
+            s.connection().state(),
+            s.needs_resync(),
+            s.dropped_updates(),
+        )
+    });
+    println!("Connection: {}", connection_label(state));
+    if needs_resync {
+        println!("Sync: STALE — {dropped} update(s) dropped since the last resync; run `resync`.");
+    } else if dropped > 0 {
+        println!("Sync: in sync ({dropped} update(s) dropped earlier, since recovered).");
+    } else {
+        println!("Sync: in sync.");
+    }
+}
+
+/// Re-query the chat list after a dropped-update gap, then report the new status.
+async fn resync(client: &Client) {
+    match client.resync().await {
+        Ok(()) => {
+            tokio::time::sleep(SETTLE).await;
+            println!("Resynced the Main chat list.");
+            show_status(client);
+        }
+        Err(e) => println!("Resync failed: {} {}", e.code, e.message),
+    }
+}
+
+/// A human-readable label for a [`ConnectionState`], for `status`.
+fn connection_label(state: ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::WaitingForNetwork => "waiting for network",
+        ConnectionState::Connecting => "connecting",
+        ConnectionState::ConnectingToProxy => "connecting (via proxy)",
+        ConnectionState::Updating => "updating (catching up)",
+        ConnectionState::Ready => "ready (in sync)",
     }
 }
 
@@ -1196,6 +1241,8 @@ fn print_help() {
          \x20 secret-new <user_id>               start a secret chat with a user\n\
          \x20 secrets                            list known secret chats + state\n\
          \x20 secret-close <secret_id>           close a secret chat\n\
+         \x20 status                             show connection/sync status + any dropped-update gap\n\
+         \x20 resync                             re-query the chat list after a dropped-update gap\n\
          \x20 logout                             end the session and exit (next run logs in fresh)\n\
          \x20 help                               show this help\n\
          \x20 quit                               exit (Ctrl-D also works)"
