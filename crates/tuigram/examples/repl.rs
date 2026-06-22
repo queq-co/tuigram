@@ -1,5 +1,5 @@
-//! Headless REPL harness (#9, #22) — drives the Phase 3 client end-to-end over
-//! stdin against a real account, before the TUI (Phase 4) exists.
+//! Headless REPL harness (#9, #22, #57) — drives the Phase 3 + Phase 4 client
+//! end-to-end over stdin against a real account, before the TUI (Phase 5) exists.
 //!
 //! This is a **manual verification tool**, not the product: it is feature-gated
 //! (`login-harness`) and off by default, so it is excluded from the product
@@ -15,10 +15,16 @@
 //! ([`tuigram_core::Bridge`]), and the auth state machine
 //! ([`tuigram_core::Login`]) — to log in, then hands the authenticated bridge to
 //! the [`tuigram_core::Client`] facade and drops into a stdin REPL. The REPL
-//! exercises the Phase 3 surface: list chats, open a chat (load + view history),
-//! send, reply, edit, delete, mark read, and log out. Reads come from the
-//! facade's folded snapshot (kept current by its single update router); writes go
-//! over the bridge's per-domain request traits.
+//! exercises the Phase 3 surface — list chats, open a chat (load + view history),
+//! send, reply, edit, delete, mark read, search, forward, log out — and the
+//! Phase 4 surface on top: download/inspect a message's media and send media
+//! (#1–#2, #4), list the archive and folders (#5–#6), react and pin (#8), send a
+//! typing action (#9), and create/list/close secret chats (#10–#11; open and send
+//! reuse the ordinary chat-id commands). Reads come from the facade's folded
+//! snapshot (kept current by its single update router); writes go over the
+//! bridge's per-domain request traits. `search` is the exception that returns its
+//! hits directly: they print from the facade's transient `SearchResults` and never
+//! fold into the snapshot, so a search leaves loaded history untouched.
 //!
 //! `logout` invalidates the account session and wipes TDLib's local database, so
 //! the next run starts at a fresh login rather than resuming the persisted
@@ -31,7 +37,9 @@
 //! typed — acceptable for a developer harness; the future TUI will suppress it.)
 //! The REPL never logs message content on its own: it prints a chat's messages
 //! only when the operator explicitly asks (`open` / `history`), and never echoes
-//! the unsolicited live stream.
+//! the unsolicited live stream. Media is handled by **path only** — `download`
+//! reports the local path TDLib writes to and `sendmedia` takes a local path; the
+//! file's bytes are never opened, read, or logged by the harness.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -41,15 +49,21 @@ use tokio_stream::StreamExt;
 use tuigram_core::enums::Update;
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
-    ApiCredentials, AuthRequests, AuthState, Bridge, Client, ClientParameters, CredentialError,
-    CredentialResolver, FormattedText, Login, Message, MessageContent, MessageRequests, NEWEST,
-    Onboarding, SendState, Sender, SessionStorage, TgClient, UpdateStream, load_main_list,
+    ApiCredentials, AuthRequests, AuthState, Bridge, Chat, ChatAction, ChatActionRequests,
+    ChatKind, Client, ClientParameters, CredentialError, CredentialResolver, DOWNLOAD_PRIORITY,
+    DeleteRequests, EditRequests, FileRequests, FormattedText, HistoryRequests, Login, Message,
+    MessageContent, NEWEST, Onboarding, OutgoingMedia, PinRequests, Reaction, ReactionKind,
+    ReactionRequests, ReadRequests, SecretChatRequests, SecretChatState, SendRequests, SendState,
+    Sender, SessionStorage, TgClient, UpdateStream, load_archive_list, load_folder_list,
+    load_main_list,
 };
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
 
 /// How many of a chat's most recent messages a single `open` pulls.
 const HISTORY_PAGE: i32 = 50;
+/// How many search hits to request per page; the facade pages to exhaustion.
+const SEARCH_PAGE: i32 = 50;
 /// How many chats to ask the Main list for on startup.
 const CHATS_PAGE: i32 = 100;
 /// A brief pause after an async load so the router has folded the resulting
@@ -185,17 +199,60 @@ async fn dispatch(
                 }
             }
         }
+        AuthState::WaitOtherDeviceConfirmation { link } => {
+            // QR login: nothing to read here — TDLib advances on its own once the
+            // link is scanned on an already signed-in device. Show it and wait.
+            println!("\nScan this link on a signed-in Telegram device to confirm login:");
+            println!("  {link}");
+            println!("Waiting for confirmation…");
+        }
+        AuthState::WaitEmailAddress => loop {
+            let email = prompt("Email address for login: ")?;
+            match login.submit_email_address(email).await {
+                Ok(()) => break,
+                Err(e) => report_retry(&e),
+            }
+        },
+        AuthState::WaitEmailCode { email_pattern } => {
+            println!("  A login code was sent to {email_pattern}.");
+            loop {
+                let code = prompt("Email login code: ")?;
+                match login.submit_email_code(code).await {
+                    Ok(()) => break,
+                    Err(e) => report_retry(&e),
+                }
+            }
+        }
+        AuthState::WaitRegistration { terms_of_service } => {
+            // Unregistered number: create the account. Show the terms first so
+            // accepting (by registering) is informed.
+            if !terms_of_service.is_empty() {
+                println!("\nTerms of service:\n{terms_of_service}\n");
+            }
+            println!("This phone number isn't registered yet — create the account.");
+            loop {
+                let first = prompt("First name: ")?;
+                let last = prompt("Last name (optional): ")?;
+                match login.register(first, last).await {
+                    Ok(()) => break,
+                    Err(e) => report_retry(&e),
+                }
+            }
+        }
+        AuthState::WaitPremiumPurchase { store_product_id } => {
+            // No headless answer exists: completing this needs an App Store / Play
+            // in-store purchase. Report the dead end rather than hang.
+            return Err(format!(
+                "login requires buying Telegram Premium (store product \
+                 {store_product_id}) as an in-store purchase, which this headless \
+                 client can't perform — log in on a mobile app first"
+            )
+            .into());
+        }
         AuthState::Ready => return Ok(Flow::Done),
         AuthState::Closed => {
             println!("\nSession closed (logged out or shutting down).");
             return Ok(Flow::Done);
-        }
-        AuthState::Unsupported(name) => {
-            return Err(format!(
-                "login reached an unsupported state ({name}); this harness handles \
-                 phone number + login code + 2FA password only"
-            )
-            .into());
         }
     }
     Ok(Flow::Continue)
@@ -270,6 +327,62 @@ async fn run_repl(client: &Client) -> Fallible {
                 Ok(chat_id) => mark_read(client, chat_id).await,
                 Err(e) => println!("{e}"),
             },
+            "search" => run_search(client, rest).await,
+            "forward" => match parse_forward(rest) {
+                Ok((from, ids, to)) => forward_messages(client, from, ids, to).await,
+                Err(e) => println!("{e}"),
+            },
+            "download" => match parse_chat_msg(rest) {
+                Ok((chat_id, message_id)) => download_media(client, chat_id, message_id).await,
+                Err(e) => println!("{e}"),
+            },
+            "file" => match rest.trim().parse::<i32>() {
+                Ok(file_id) => show_file(client, file_id),
+                Err(_) => println!("usage: file <file_id>"),
+            },
+            "sendmedia" => match parse_sendmedia(rest) {
+                Ok((chat_id, media)) => send_media(client, chat_id, media).await,
+                Err(e) => println!("{e}"),
+            },
+            "archive" => list_archive(client).await,
+            "folders" => list_folders(client),
+            "folder" => match parse_chat(rest) {
+                Ok(folder_id) => open_folder(client, folder_id as i32).await,
+                Err(_) => println!("usage: folder <folder_id>"),
+            },
+            "react" => match parse_chat_msg_emoji(rest) {
+                Ok((chat_id, message_id, emoji)) => {
+                    set_reaction(client, chat_id, message_id, emoji, true).await;
+                }
+                Err(e) => println!("{e}"),
+            },
+            "unreact" => match parse_chat_msg_emoji(rest) {
+                Ok((chat_id, message_id, emoji)) => {
+                    set_reaction(client, chat_id, message_id, emoji, false).await;
+                }
+                Err(e) => println!("{e}"),
+            },
+            "pin" => match parse_chat_msg(rest) {
+                Ok((chat_id, message_id)) => set_pin(client, chat_id, message_id, true).await,
+                Err(e) => println!("{e}"),
+            },
+            "unpin" => match parse_chat_msg(rest) {
+                Ok((chat_id, message_id)) => set_pin(client, chat_id, message_id, false).await,
+                Err(e) => println!("{e}"),
+            },
+            "typing" => match parse_chat(rest) {
+                Ok(chat_id) => send_typing(client, chat_id).await,
+                Err(e) => println!("{e}"),
+            },
+            "secret-new" => match rest.trim().parse::<i64>() {
+                Ok(user_id) => new_secret_chat(client, user_id).await,
+                Err(_) => println!("usage: secret-new <user_id>"),
+            },
+            "secrets" => list_secret_chats(client),
+            "secret-close" => match rest.trim().parse::<i32>() {
+                Ok(secret_chat_id) => close_secret_chat(client, secret_chat_id).await,
+                Err(_) => println!("usage: secret-close <secret_chat_id>"),
+            },
             "logout" => {
                 if logout(client).await == Flow::Done {
                     return Ok(());
@@ -287,13 +400,27 @@ fn list_chats(client: &Client) {
             .chats()
             .main_list()
             .iter()
-            .map(|c| format!("  {:>14}  unread {:<5} {}", c.id, c.unread_count, c.title))
-            .collect::<Vec<_>>()
+            .map(format_chat_row)
+            .collect()
     });
+    print_chat_rows(
+        rows,
+        "Chats (most recent first):",
+        "(no chats loaded yet — they fold in asynchronously; try `chats` again)",
+    );
+}
+
+/// Format one chat-list row: id, unread count, title.
+fn format_chat_row(c: &&Chat) -> String {
+    format!("  {:>14}  unread {:<5} {}", c.id, c.unread_count, c.title)
+}
+
+/// Print a list of chat rows under a header, or an `empty` notice if there are none.
+fn print_chat_rows(rows: Vec<String>, header: &str, empty: &str) {
     if rows.is_empty() {
-        println!("(no chats loaded yet — they fold in asynchronously; try `chats` again)");
+        println!("{empty}");
     } else {
-        println!("Chats (most recent first):");
+        println!("{header}");
         for row in rows {
             println!("{row}");
         }
@@ -404,6 +531,347 @@ async fn mark_read(client: &Client, chat_id: i64) {
     }
 }
 
+/// Run a message search and print the hits straight from the returned transient
+/// view. With a leading chat id the search is scoped to that chat; otherwise it
+/// is account-wide. The results never fold into the folded snapshot, so the live
+/// history store is untouched — this prints from the [`SearchResults`] directly,
+/// not from `client.read`.
+async fn run_search(client: &Client, rest: &str) {
+    let (scope, query) = parse_search(rest);
+    if query.is_empty() {
+        println!("usage: search [chat] <query>");
+        return;
+    }
+    let results = match scope {
+        // No sender filter from the REPL; the facade still threads one through.
+        Some(chat_id) => client.search_chat(chat_id, query, None, SEARCH_PAGE).await,
+        None => client.search_messages(query, SEARCH_PAGE).await,
+    };
+    match results {
+        Ok(hits) if hits.is_empty() => println!("(no matches)"),
+        Ok(hits) => {
+            println!("{} match(es):", hits.len());
+            for m in hits.messages() {
+                // Prefix the chat so global hits across chats are distinguishable.
+                println!(
+                    "  chat {:>14} {}",
+                    m.chat_id,
+                    format_message(m).trim_start()
+                );
+            }
+        }
+        Err(e) => println!("Search failed: {} {}", e.code, e.message),
+    }
+}
+
+/// Forward messages from one chat into another, carrying the usual "forwarded
+/// from" attribution. The forwarded copies fold into the target chat via the
+/// router on the optimistic-send lifecycle, so `history <to>` shows them settle.
+async fn forward_messages(client: &Client, from: i64, ids: Vec<i64>, to: i64) {
+    let count = ids.len();
+    match client.forward_messages(from, ids, to, false, false).await {
+        Ok(msgs) => {
+            let temp_ids = msgs
+                .iter()
+                .map(|m| m.id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "Forwarded {count} message(s) to {to} (optimistic ids {temp_ids}). \
+                 `history {to}` to follow them."
+            );
+        }
+        Err(e) => println!("Forward failed: {} {}", e.code, e.message),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Media (Phase 4: #1–#2 download/inspect, #4 send)
+// ----------------------------------------------------------------------------
+
+/// Download the media attached to a known message and report its local path.
+/// Looks the file id up from the folded snapshot, asks TDLib to download it, then
+/// — once `updateFile` has folded the progress — prints the path. The bytes are
+/// never read or logged, only the path TDLib writes them to.
+async fn download_media(client: &Client, chat_id: i64, message_id: i64) {
+    let file_id = client.read(|state| {
+        state
+            .messages()
+            .history(chat_id)
+            .iter()
+            .find(|m| m.id == message_id)
+            .and_then(|m| media_file_id(&m.content))
+    });
+    let Some(file_id) = file_id else {
+        println!("(no downloadable media on {message_id} in {chat_id} — `open {chat_id}` first?)");
+        return;
+    };
+    if let Err(e) = client
+        .bridge()
+        .download_file(file_id, DOWNLOAD_PRIORITY)
+        .await
+    {
+        println!("Download failed: {} {}", e.code, e.message);
+        return;
+    }
+    tokio::time::sleep(SETTLE).await;
+    show_file(client, file_id);
+}
+
+/// Print a file's transfer state from the folded `FileStore`: progress and the
+/// local path once it exists. Never opens or reads the file's bytes.
+fn show_file(client: &Client, file_id: i32) {
+    let line = client.read(|state| {
+        state.files().get(file_id).map(|f| {
+            let dest = if f.local_path.is_empty() {
+                "(not on disk yet)".to_owned()
+            } else {
+                f.local_path.clone()
+            };
+            let status = if f.is_downloading_completed {
+                "complete"
+            } else if f.is_downloading_active {
+                "downloading"
+            } else {
+                "idle"
+            };
+            format!(
+                "file {file_id}: {status}, {}/{} bytes -> {dest}",
+                f.downloaded_size, f.size
+            )
+        })
+    });
+    match line {
+        Some(line) => println!("{line}"),
+        None => println!("(file {file_id} unknown yet — it folds in as it transfers)"),
+    }
+}
+
+/// The downloadable file id of a media message, if it carries one.
+fn media_file_id(content: &MessageContent) -> Option<i32> {
+    let id = match content {
+        MessageContent::Photo(p) => p.file.id,
+        MessageContent::Video(v) => v.file.id,
+        MessageContent::Document(d) => d.file.id,
+        MessageContent::Audio(a) => a.file.id,
+        MessageContent::Voice(v) => v.file.id,
+        MessageContent::Animation(a) => a.file.id,
+        MessageContent::Sticker(s) => s.file.id,
+        _ => return None,
+    };
+    Some(id)
+}
+
+/// Send a local media file to a chat. The optimistic message folds in like a text
+/// send; the upload streams as `updateFile` (watch it with `file`) and the send
+/// reconciles — `history <chat>` follows both. Only the path is handled here,
+/// never the file's bytes.
+async fn send_media(client: &Client, chat_id: i64, media: OutgoingMedia) {
+    match client.bridge().send_media(chat_id, None, media).await {
+        Ok(msg) => println!(
+            "Uploading (optimistic id {}). `history {chat_id}` to follow it.",
+            msg.id
+        ),
+        Err(e) => println!("Send failed: {} {}", e.code, e.message),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Archive + folders (Phase 4: #5–#6)
+// ----------------------------------------------------------------------------
+
+/// Load and print the Archive chat list, the same shape as `chats`.
+async fn list_archive(client: &Client) {
+    if let Err(e) = load_archive_list(client.bridge(), CHATS_PAGE).await {
+        println!("Could not load the archive: {} {}", e.code, e.message);
+        return;
+    }
+    tokio::time::sleep(SETTLE).await;
+    let rows = client.read(|state| {
+        state
+            .chats()
+            .archive_list()
+            .iter()
+            .map(format_chat_row)
+            .collect()
+    });
+    print_chat_rows(rows, "Archived chats:", "(no archived chats)");
+}
+
+/// List the user's chat folders (id + title) from the folded snapshot. Folders
+/// arrive as `updateChatFolders` and fold on their own; `folder <id>` lists a
+/// folder's chats.
+fn list_folders(client: &Client) {
+    let rows = client.read(|state| {
+        state
+            .chats()
+            .folders()
+            .iter()
+            .map(|f| format!("  {:>6}  {}", f.id, f.title))
+            .collect::<Vec<_>>()
+    });
+    print_chat_rows(rows, "Folders:", "(no folders defined)");
+}
+
+/// Load and print a folder's chats by folder id.
+async fn open_folder(client: &Client, folder_id: i32) {
+    if let Err(e) = load_folder_list(client.bridge(), folder_id, CHATS_PAGE).await {
+        println!(
+            "Could not load folder {folder_id}: {} {}",
+            e.code, e.message
+        );
+        return;
+    }
+    tokio::time::sleep(SETTLE).await;
+    let rows = client.read(|state| {
+        state
+            .chats()
+            .folder_list(folder_id)
+            .iter()
+            .map(format_chat_row)
+            .collect()
+    });
+    print_chat_rows(
+        rows,
+        &format!("Folder {folder_id} chats:"),
+        &format!("(folder {folder_id} has no loaded chats — is the id right?)"),
+    );
+}
+
+// ----------------------------------------------------------------------------
+// Reactions + pins (Phase 4: #8)
+// ----------------------------------------------------------------------------
+
+/// Add or remove our emoji reaction on a message. The new counts fold via
+/// `updateMessageInteractionInfo`; `history <chat>` shows them (reactions print
+/// inline after the body).
+async fn set_reaction(client: &Client, chat_id: i64, message_id: i64, emoji: String, add: bool) {
+    let bridge = client.bridge();
+    let result = if add {
+        bridge
+            .add_message_reaction(chat_id, message_id, emoji)
+            .await
+    } else {
+        bridge
+            .remove_message_reaction(chat_id, message_id, emoji)
+            .await
+    };
+    match result {
+        Ok(()) => {
+            let verb = if add { "Reacted to" } else { "Un-reacted from" };
+            println!("{verb} {message_id}. `history {chat_id}` to see the counts.");
+        }
+        Err(e) => println!("Reaction failed: {} {}", e.code, e.message),
+    }
+}
+
+/// Pin or unpin a message in a chat. Pins fold into the chat's pinned set
+/// (`updateChatPinnedMessage`/`updateMessageIsPinned`). Pins silently (no member
+/// notification) and chat-wide, not only for us.
+async fn set_pin(client: &Client, chat_id: i64, message_id: i64, pin: bool) {
+    let bridge = client.bridge();
+    let result = if pin {
+        bridge
+            .pin_chat_message(chat_id, message_id, true, false)
+            .await
+    } else {
+        bridge.unpin_chat_message(chat_id, message_id).await
+    };
+    match result {
+        Ok(()) => {
+            let verb = if pin { "Pinned" } else { "Unpinned" };
+            println!("{verb} {message_id} in {chat_id}.");
+        }
+        Err(e) => println!("Pin failed: {} {}", e.code, e.message),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Chat actions (Phase 4: #9)
+// ----------------------------------------------------------------------------
+
+/// Broadcast a one-shot "typing…" action to a chat. Advisory and best-effort: the
+/// server expires it after a few seconds and never echoes our own action back, so
+/// there is nothing to fold — this just fires it.
+async fn send_typing(client: &Client, chat_id: i64) {
+    match client
+        .bridge()
+        .send_chat_action(chat_id, Some(ChatAction::Typing))
+        .await
+    {
+        Ok(()) => println!("Sent a typing action to {chat_id} (expires on its own)."),
+        Err(e) => println!("Chat action failed: {} {}", e.code, e.message),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Secret chats (Phase 4: #10–#11)
+// ----------------------------------------------------------------------------
+
+/// Create a new secret chat with a user. Returns the new chat synchronously; its
+/// encryption record arrives as `updateSecretChat` (see `secrets`). It starts
+/// pending until the partner's device completes the key exchange — once ready,
+/// send/open it by its chat id with the ordinary `send`/`open`.
+async fn new_secret_chat(client: &Client, user_id: i64) {
+    match client.bridge().create_new_secret_chat(user_id).await {
+        Ok(chat) => println!(
+            "Secret chat created (chat id {}). `secrets` for its state; \
+             `open {}` / `send {} <text>` once it's ready.",
+            chat.id, chat.id, chat.id
+        ),
+        Err(e) => println!("Could not create secret chat: {} {}", e.code, e.message),
+    }
+}
+
+/// List the secret chats among the loaded Main list, joining each
+/// [`ChatKind::Secret`] to its encryption record: lifecycle state, who opened it,
+/// and whether the key-verification hash has arrived (size only — never the bytes).
+fn list_secret_chats(client: &Client) {
+    let rows =
+        client.read(|state| {
+            state
+            .chats()
+            .main_list()
+            .iter()
+            .filter_map(|c| match &c.kind {
+                ChatKind::Secret { secret_chat_id, .. } => {
+                    let sc = state.secret_chats().get(*secret_chat_id)?;
+                    let state_str = match sc.state {
+                        SecretChatState::Pending => "pending",
+                        SecretChatState::Ready => "ready",
+                        SecretChatState::Closed => "closed",
+                    };
+                    let who = if sc.is_outbound { "outbound" } else { "inbound" };
+                    let key = if sc.key_hash.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" key:{}B", sc.key_hash.len())
+                    };
+                    Some(format!(
+                        "  chat {:>14}  secret {secret_chat_id:<4} {state_str} ({who}){key}  {}",
+                        c.id, c.title
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+        });
+    print_chat_rows(
+        rows,
+        "Secret chats:",
+        "(no secret chats in the loaded Main list — `secret-new <user_id>` to start one)",
+    );
+}
+
+/// Close a secret chat by its secret-chat id. The state advances to closed via
+/// `updateSecretChat`; `secrets` reflects it.
+async fn close_secret_chat(client: &Client, secret_chat_id: i32) {
+    match client.bridge().close_secret_chat(secret_chat_id).await {
+        Ok(()) => println!("Closed secret chat {secret_chat_id}."),
+        Err(e) => println!("Close failed: {} {}", e.code, e.message),
+    }
+}
+
 /// Log out: invalidate the session, wait for TDLib to clear it, then end the
 /// REPL so the next run starts at a fresh login. A failed request stays in the
 /// REPL ([`Flow::Continue`]); a successful one exits ([`Flow::Done`]).
@@ -450,11 +918,89 @@ fn format_message(m: &Message) -> String {
         SendState::Pending => " [sending…]",
         SendState::Failed { .. } => " [failed]",
     };
+    // Append a media caption inline when there is one, so a photo/video with a
+    // caption reads as `<photo 1280x720> nice view` rather than dropping the text.
+    let caption = |c: &FormattedText| {
+        if c.text.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", c.text)
+        }
+    };
     let body = match &m.content {
         MessageContent::Text(t) => t.text.clone(),
+        MessageContent::Photo(p) => {
+            format!("<photo {}x{}>{}", p.width, p.height, caption(&p.caption))
+        }
+        MessageContent::Video(v) => format!(
+            "<video {}x{} {}s>{}",
+            v.width,
+            v.height,
+            v.duration,
+            caption(&v.caption)
+        ),
+        MessageContent::Document(d) => {
+            format!("<document {}>{}", d.file_name, caption(&d.caption))
+        }
+        MessageContent::Audio(a) => {
+            format!(
+                "<audio {} — {}>{}",
+                a.performer,
+                a.title,
+                caption(&a.caption)
+            )
+        }
+        MessageContent::Voice(v) => format!("<voice {}s>{}", v.duration, caption(&v.caption)),
+        MessageContent::Sticker(s) => format!("<sticker {} {}x{}>", s.emoji, s.width, s.height),
+        MessageContent::Animation(a) => format!(
+            "<animation {}x{} {}s>{}",
+            a.width,
+            a.height,
+            a.duration,
+            caption(&a.caption)
+        ),
+        MessageContent::Location(l) => {
+            format!("<location {:.5},{:.5}>", l.latitude, l.longitude)
+        }
+        MessageContent::Venue(v) => format!("<venue {} — {}>", v.title, v.address),
+        MessageContent::Contact(c) => {
+            format!(
+                "<contact {} {} {}>",
+                c.first_name, c.last_name, c.phone_number
+            )
+        }
+        MessageContent::Poll(p) => {
+            format!("<poll {} ({} options)>", p.question.text, p.options.len())
+        }
         MessageContent::Unsupported(name) => format!("<{name}>"),
     };
-    format!("  [{}] {who}{state}: {body}", m.id)
+    format!(
+        "  [{}] {who}{state}: {body}{}",
+        m.id,
+        format_reactions(&m.reactions)
+    )
+}
+
+/// Render a message's reaction buckets inline, e.g. ` {👍×3* ❤×1}`, where `*`
+/// marks a reaction our own account chose. Empty when there are none.
+fn format_reactions(reactions: &[Reaction]) -> String {
+    if reactions.is_empty() {
+        return String::new();
+    }
+    let parts = reactions
+        .iter()
+        .map(|r| {
+            let label = match &r.kind {
+                ReactionKind::Emoji(e) => e.clone(),
+                ReactionKind::CustomEmoji(id) => format!("custom:{id}"),
+                ReactionKind::Paid => "⭐paid".to_owned(),
+            };
+            let chosen = if r.is_chosen { "*" } else { "" };
+            format!("{label}×{}{chosen}", r.count)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(" {{{parts}}}")
 }
 
 // ----------------------------------------------------------------------------
@@ -522,6 +1068,106 @@ fn parse_delete(rest: &str) -> Result<(i64, i64, bool), String> {
     Ok((chat_id, message_id, revoke))
 }
 
+/// Parse `search`'s argument: an optional leading chat id followed by the query.
+/// A first token that parses as an integer (with a non-empty remainder) scopes
+/// the search to that chat; otherwise the whole string is a global query. A
+/// global query that begins with a bare number is therefore read as a chat id —
+/// an accepted ambiguity for this harness.
+fn parse_search(rest: &str) -> (Option<i64>, String) {
+    let rest = rest.trim();
+    let (head, tail) = split_first(rest);
+    match head.parse::<i64>() {
+        Ok(chat_id) if !tail.is_empty() => (Some(chat_id), tail.to_owned()),
+        _ => (None, rest.to_owned()),
+    }
+}
+
+/// Parse `forward <from_chat> <msg_ids> <to_chat>`, where `msg_ids` is one id or
+/// a comma-separated list with no spaces (e.g. `101,102,103`).
+fn parse_forward(rest: &str) -> Result<(i64, Vec<i64>, i64), String> {
+    let usage = "usage: forward <from_chat> <msg_id[,msg_id...]> <to_chat>";
+    let mut parts = rest.split_whitespace();
+    let from = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| usage.to_owned())?;
+    let ids_raw = parts.next().ok_or_else(|| usage.to_owned())?;
+    let to = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| usage.to_owned())?;
+    if parts.next().is_some() {
+        return Err(usage.to_owned());
+    }
+    let message_ids = ids_raw
+        .split(',')
+        .map(str::parse)
+        .collect::<Result<Vec<i64>, _>>()
+        .map_err(|_| usage.to_owned())?;
+    if message_ids.is_empty() {
+        return Err(usage.to_owned());
+    }
+    Ok((from, message_ids, to))
+}
+
+/// Parse `<chat_id> <message_id>`.
+fn parse_chat_msg(rest: &str) -> Result<(i64, i64), String> {
+    let usage = "usage: <command> <chat_id> <message_id>";
+    let mut parts = rest.split_whitespace();
+    let chat_id = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| usage.to_owned())?;
+    let message_id = parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| usage.to_owned())?;
+    Ok((chat_id, message_id))
+}
+
+/// Parse `<chat_id> <message_id> <emoji>`.
+fn parse_chat_msg_emoji(rest: &str) -> Result<(i64, i64, String), String> {
+    let usage = "usage: <command> <chat_id> <message_id> <emoji>";
+    let (chat, after) = split_first(rest.trim());
+    let (msg, emoji) = split_first(after);
+    let chat_id = chat.parse().map_err(|_| usage.to_owned())?;
+    let message_id = msg.parse().map_err(|_| usage.to_owned())?;
+    if emoji.is_empty() {
+        return Err(usage.to_owned());
+    }
+    Ok((chat_id, message_id, emoji.to_owned()))
+}
+
+/// Parse `<chat_id> <photo|video|document> <path> [caption...]` into the chat and
+/// an [`OutgoingMedia`]. The path is a single whitespace-free token; everything
+/// after it is an optional caption.
+fn parse_sendmedia(rest: &str) -> Result<(i64, OutgoingMedia), String> {
+    let usage = "usage: sendmedia <chat_id> <photo|video|document> <path> [caption]";
+    let (chat, after) = split_first(rest.trim());
+    let (kind, after) = split_first(after);
+    let (path, caption_text) = split_first(after);
+    let chat_id = chat.parse().map_err(|_| usage.to_owned())?;
+    if path.is_empty() {
+        return Err(usage.to_owned());
+    }
+    let path = path.to_owned();
+    let caption = FormattedText {
+        text: caption_text.to_owned(),
+        entities: vec![],
+    };
+    let media = match kind {
+        "photo" => OutgoingMedia::Photo { path, caption },
+        "video" => OutgoingMedia::Video { path, caption },
+        "document" | "doc" => OutgoingMedia::Document { path, caption },
+        other => {
+            return Err(format!(
+                "unknown media kind {other:?}; use photo, video, or document"
+            ));
+        }
+    };
+    Ok((chat_id, media))
+}
+
 /// The command reference, shown on entry and on `help`.
 fn print_help() {
     println!(
@@ -534,6 +1180,22 @@ fn print_help() {
          \x20 edit <chat> <msg> <text>           edit one of your messages\n\
          \x20 delete <chat> <msg> [all]          delete a message (all = for everyone)\n\
          \x20 read <chat>                        mark a chat's known messages read\n\
+         \x20 search [chat] <query>             search one chat (with id) or the whole account\n\
+         \x20 forward <from> <ids> <to>          forward msg ids (comma-separated) between chats\n\
+         \x20 download <chat> <msg>              download a message's media; show the local path\n\
+         \x20 file <file_id>                     show a file's transfer state + local path\n\
+         \x20 sendmedia <chat> <kind> <path> [cap]  send photo|video|document from a local path\n\
+         \x20 archive                            list the Archive chat list\n\
+         \x20 folders                            list chat folders\n\
+         \x20 folder <id>                        list a folder's chats\n\
+         \x20 react <chat> <msg> <emoji>         add an emoji reaction\n\
+         \x20 unreact <chat> <msg> <emoji>       remove your emoji reaction\n\
+         \x20 pin <chat> <msg>                   pin a message (silently, chat-wide)\n\
+         \x20 unpin <chat> <msg>                 unpin a message\n\
+         \x20 typing <chat>                      send a one-shot typing action\n\
+         \x20 secret-new <user_id>               start a secret chat with a user\n\
+         \x20 secrets                            list known secret chats + state\n\
+         \x20 secret-close <secret_id>           close a secret chat\n\
          \x20 logout                             end the session and exit (next run logs in fresh)\n\
          \x20 help                               show this help\n\
          \x20 quit                               exit (Ctrl-D also works)"
@@ -648,9 +1310,10 @@ fn print_intro() {
          no official Telegram branding or logo.\n\
          \n\
          This harness logs in to a real Telegram account over stdin and then\n\
-         drives the client (list/open chats, send, reply, edit, delete, read) to\n\
-         verify the core before the TUI exists. Your credentials, login code, and\n\
-         2FA password are never logged.\n",
+         drives the client (chats, messages, media, archive/folders, reactions,\n\
+         pins, typing, and secret chats) to verify the core before the TUI exists.\n\
+         Your credentials, login code, and 2FA password are never logged, and\n\
+         media is handled by local path only — file bytes are never read or logged.\n",
         tuigram_core::version()
     );
 }

@@ -4,32 +4,45 @@
 //! unit-tested without a TTY. Phases 2–3 (auth, chats, messages) live here;
 //! the Ratatui front-end (Phases 4–5) depends on this crate.
 
+pub mod actions;
 pub mod auth;
 pub mod bridge;
 pub mod chats;
 pub mod client;
 pub mod credentials;
+pub mod files;
 pub mod messages;
 pub mod model;
 pub mod router;
+pub mod secret_chats;
 pub mod session;
 pub mod users;
 
+pub use actions::{ChatActionRequests, ChatActionStore};
 pub use auth::{AuthRequests, AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
-pub use chats::{CHATS_EXHAUSTED, ChatRequests, ChatStore, load_main_list};
+pub use chats::{
+    CHATS_EXHAUSTED, ChatRequests, ChatStore, load_archive_list, load_folder_list, load_main_list,
+};
 pub use client::{AccountState, Client};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };
+pub use files::{DOWNLOAD_PRIORITY, FileRequests, FileStore};
 pub use messages::{
-    MessageRequests, MessageStore, NEWEST, SearchPage, SearchResults, load_history,
+    DeleteRequests, EditRequests, ForwardRequests, HistoryRequests, MessageRequests, MessageStore,
+    NEWEST, PinRequests, ReactionRequests, ReadRequests, SearchPage, SearchRequests, SearchResults,
+    SendRequests, load_history, search_chat, search_global,
 };
 pub use model::{
-    Chat, ChatKind, ChatListKind, ChatPosition, Draft, EntityKind, FormattedText, Message,
-    MessageContent, Presence, SendState, Sender, TextEntity, User, UserKind,
+    Animation, Audio, Chat, ChatAction, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition,
+    Contact, Document, Draft, EntityKind, File, FileRef, FormattedText, Location, Message,
+    MessageContent, OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, Reaction,
+    ReactionKind, SecretChat, SecretChatState, SendState, Sender, Sticker, TextEntity, User,
+    UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
+pub use secret_chats::{SecretChatRequests, SecretChatStore};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
 pub use users::{UserRequests, UserStore};
 

@@ -12,13 +12,23 @@
 //! only the requests it makes. [`Bridge`] implements it via its public id; the
 //! chats/messages modules own their own request traits the same way.
 //!
-//! Phase 2 scope is **phone number + login code + 2FA password**. QR login
-//! (`waitOtherDeviceConfirmation`), new-user registration, email, and premium
-//! purchase are surfaced as [`AuthState::Unsupported`] for follow-up issues
-//! rather than handled here.
+//! Every TDLib authorization state is handled. The phone path — **phone number +
+//! login code + 2FA password** — plus **QR login** (`waitOtherDeviceConfirmation`:
+//! request a code, scan the link on an already-signed-in device), **new-user
+//! registration** (`waitRegistration`: accept the terms of service and submit a
+//! name), and **email login** (`waitEmailAddress` / `waitEmailCode`) are all driven
+//! to completion. **Premium purchase** (`waitPremiumPurchase`) is modeled and
+//! surfaced explicitly as a dead end — completing it needs an App Store / Play
+//! in-store purchase a headless client can't perform — so the flow reports it
+//! rather than hanging on a silent unknown.
 //!
-//! Secrets are never retained: the login code and the 2FA password are taken by
-//! value and moved straight into their TDLib request (see the threat model).
+//! The projection is total by *exhaustive* match over TDLib's (closed)
+//! [`AuthorizationState`] enum: there is no catch-all, so a state added by a future
+//! TDLib version is a compile error here, never a silent misclassification.
+//!
+//! Secrets are never retained: the login code, the email code, and the 2FA
+//! password are taken by value and moved straight into their TDLib request (see
+//! the threat model).
 
 use crate::bridge::{Bridge, ClientParameters};
 use tdlib_rs::enums::AuthorizationState;
@@ -58,6 +68,15 @@ pub trait AuthRequests {
     /// Answer `WaitPhoneNumber` — submit the phone number and request a code.
     async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError>;
 
+    /// Answer `WaitPhoneNumber` the other way — request QR-code authentication
+    /// instead of a phone number.
+    ///
+    /// TDLib responds by moving to `WaitOtherDeviceConfirmation`, carrying a
+    /// `tg://login` link to render as a QR code; scanning it on an already
+    /// signed-in device completes the login (which may then still require the
+    /// 2FA password). Carries no credential payload of its own.
+    async fn request_qr_code_authentication(&self) -> Result<(), TdError>;
+
     /// Answer `WaitCode` — submit the login code the user received.
     async fn check_authentication_code(&self, code: String) -> Result<(), TdError>;
 
@@ -66,6 +85,25 @@ pub trait AuthRequests {
     /// The password is moved straight into the TDLib request and never retained
     /// (see the threat model).
     async fn check_authentication_password(&self, password: String) -> Result<(), TdError>;
+
+    /// Answer `WaitRegistration` — accept the terms of service and register the
+    /// new user with a first and last name.
+    ///
+    /// Reached when the phone number isn't tied to an account yet. The names are
+    /// not credentials; `disable_notification` is left `false`, letting TDLib
+    /// notify contacts of the new account as it defaults to.
+    async fn register_user(&self, first_name: String, last_name: String) -> Result<(), TdError>;
+
+    /// Answer `WaitEmailAddress` — submit the user's email address, which TDLib
+    /// then sends an authentication code to (moving to `WaitEmailCode`).
+    async fn set_authentication_email_address(&self, email_address: String) -> Result<(), TdError>;
+
+    /// Answer `WaitEmailCode` — submit the code delivered to the email address.
+    ///
+    /// Wraps the code in `EmailAddressAuthentication::Code`; the Apple/Google ID
+    /// token answers TDLib also accepts here are out of scope for a headless
+    /// client. The code is moved straight into the request and never retained.
+    async fn check_authentication_email_code(&self, code: String) -> Result<(), TdError>;
 
     /// Log out of the current account.
     ///
@@ -112,12 +150,35 @@ impl AuthRequests for Bridge {
         tdlib_rs::functions::set_authentication_phone_number(phone_number, None, self.id()).await
     }
 
+    async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+        // Empty other_user_ids: authenticate only this account, not extra users.
+        tdlib_rs::functions::request_qr_code_authentication(vec![], self.id()).await
+    }
+
     async fn check_authentication_code(&self, code: String) -> Result<(), TdError> {
         tdlib_rs::functions::check_authentication_code(code, self.id()).await
     }
 
     async fn check_authentication_password(&self, password: String) -> Result<(), TdError> {
         tdlib_rs::functions::check_authentication_password(password, self.id()).await
+    }
+
+    async fn register_user(&self, first_name: String, last_name: String) -> Result<(), TdError> {
+        // disable_notification = false: let TDLib notify contacts of the new account.
+        tdlib_rs::functions::register_user(first_name, last_name, false, self.id()).await
+    }
+
+    async fn set_authentication_email_address(&self, email_address: String) -> Result<(), TdError> {
+        tdlib_rs::functions::set_authentication_email_address(email_address, self.id()).await
+    }
+
+    async fn check_authentication_email_code(&self, code: String) -> Result<(), TdError> {
+        // Headless clients only deliver the emailed code; Apple/Google ID tokens
+        // (the enum's other variants) aren't reachable here.
+        let code = tdlib_rs::enums::EmailAddressAuthentication::Code(
+            tdlib_rs::types::EmailAddressAuthenticationCode { code },
+        );
+        tdlib_rs::functions::check_authentication_email_code(code, self.id()).await
     }
 
     async fn log_out(&self) -> Result<(), TdError> {
@@ -144,22 +205,41 @@ pub enum AuthState {
     /// 2FA is enabled; needs the account password. Carries the user's hint
     /// (may be empty) for display — never the password itself.
     WaitPassword { hint: String },
+    /// QR login was requested; TDLib is waiting for the link to be scanned on an
+    /// already signed-in device. Carries the `tg://login` link to render as a QR
+    /// code. No input is taken here — the confirmation happens on the other
+    /// device — so the flow advances on the next `updateAuthorizationState`.
+    WaitOtherDeviceConfirmation { link: String },
+    /// New-user registration: the phone number isn't tied to an account yet, so
+    /// TDLib needs a first and last name to create one. Carries the
+    /// terms-of-service text the user must accept before [`Login::register`]
+    /// submits the name.
+    WaitRegistration { terms_of_service: String },
+    /// Email-based login: TDLib needs the user's email address, answered with
+    /// [`Login::submit_email_address`]. (Apple/Google ID sign-in — the other
+    /// answers TDLib would take here — is out of scope for a headless client.)
+    WaitEmailAddress,
+    /// An email authentication code was sent; needs the code, answered with
+    /// [`Login::submit_email_code`]. Carries the masked address pattern (e.g.
+    /// `a***@example.com`) so the UI can show which inbox to check — never a code.
+    WaitEmailCode { email_pattern: String },
+    /// Login requires buying Telegram Premium as an in-store (App Store / Play)
+    /// purchase, which a headless client can't perform. Modeled and surfaced
+    /// explicitly — carrying the store product id — so the flow reports a dead end
+    /// rather than hanging; there is no request that answers it here.
+    WaitPremiumPurchase { store_product_id: String },
     /// Logged in; normal updates flow.
     Ready,
     /// Logging out, closing, or closed — terminal; tear down the session.
     Closed,
-    /// A login state outside Phase 2 scope (QR confirmation, new-user
-    /// registration, email, premium purchase). Carries the TDLib state name so
-    /// callers can report precisely. Tracked as follow-up issues.
-    Unsupported(&'static str),
 }
 
 impl AuthState {
     /// Project a TDLib [`AuthorizationState`] onto tuigram's [`AuthState`].
     ///
-    /// Total over TDLib's enum: every state maps to a handled variant or to
-    /// [`AuthState::Unsupported`], so a new TDLib state can never silently
-    /// masquerade as a handled one.
+    /// Total over TDLib's enum by *exhaustive* match — every state maps to a
+    /// handled variant, with no catch-all — so a state added by a future TDLib
+    /// version is a compile error here rather than a silent misclassification.
     #[must_use]
     pub fn from_tdlib(state: &AuthorizationState) -> Self {
         match state {
@@ -173,13 +253,21 @@ impl AuthState {
             AuthorizationState::LoggingOut
             | AuthorizationState::Closing
             | AuthorizationState::Closed => Self::Closed,
-            AuthorizationState::WaitOtherDeviceConfirmation(_) => {
-                Self::Unsupported("waitOtherDeviceConfirmation")
+            AuthorizationState::WaitOtherDeviceConfirmation(c) => {
+                Self::WaitOtherDeviceConfirmation {
+                    link: c.link.clone(),
+                }
             }
-            AuthorizationState::WaitRegistration(_) => Self::Unsupported("waitRegistration"),
-            AuthorizationState::WaitEmailAddress(_) => Self::Unsupported("waitEmailAddress"),
-            AuthorizationState::WaitEmailCode(_) => Self::Unsupported("waitEmailCode"),
-            AuthorizationState::WaitPremiumPurchase(_) => Self::Unsupported("waitPremiumPurchase"),
+            AuthorizationState::WaitRegistration(r) => Self::WaitRegistration {
+                terms_of_service: r.terms_of_service.text.text.clone(),
+            },
+            AuthorizationState::WaitEmailAddress(_) => Self::WaitEmailAddress,
+            AuthorizationState::WaitEmailCode(c) => Self::WaitEmailCode {
+                email_pattern: c.code_info.email_address_pattern.clone(),
+            },
+            AuthorizationState::WaitPremiumPurchase(p) => Self::WaitPremiumPurchase {
+                store_product_id: p.store_product_id.clone(),
+            },
         }
     }
 
@@ -242,6 +330,14 @@ impl<'a, C: AuthRequests> Login<'a, C> {
         self.client.set_phone_number(phone_number).await
     }
 
+    /// Answer [`AuthState::WaitPhoneNumber`] with QR login instead of a phone
+    /// number. TDLib transitions to
+    /// [`AuthState::WaitOtherDeviceConfirmation`], whose `link` is rendered as a
+    /// QR code and scanned on an already signed-in device.
+    pub async fn request_qr_code(&self) -> Result<(), TdError> {
+        self.client.request_qr_code_authentication().await
+    }
+
     /// Answer [`AuthState::WaitCode`] with the code the user received.
     pub async fn submit_code(&self, code: String) -> Result<(), TdError> {
         self.client.check_authentication_code(code).await
@@ -253,6 +349,26 @@ impl<'a, C: AuthRequests> Login<'a, C> {
     pub async fn submit_password(&self, password: String) -> Result<(), TdError> {
         self.client.check_authentication_password(password).await
     }
+
+    /// Answer [`AuthState::WaitRegistration`] — accept the terms of service and
+    /// register a new account with the given first and last name.
+    pub async fn register(&self, first_name: String, last_name: String) -> Result<(), TdError> {
+        self.client.register_user(first_name, last_name).await
+    }
+
+    /// Answer [`AuthState::WaitEmailAddress`] with the user's email address; TDLib
+    /// then sends a code and transitions to [`AuthState::WaitEmailCode`].
+    pub async fn submit_email_address(&self, email_address: String) -> Result<(), TdError> {
+        self.client
+            .set_authentication_email_address(email_address)
+            .await
+    }
+
+    /// Answer [`AuthState::WaitEmailCode`] with the code delivered to the email
+    /// address. The code is moved straight into the request and never stored.
+    pub async fn submit_email_code(&self, code: String) -> Result<(), TdError> {
+        self.client.check_authentication_email_code(code).await
+    }
 }
 
 #[cfg(test)]
@@ -262,8 +378,10 @@ mod tests {
     use tdlib_rs::enums::AuthenticationCodeType;
     use tdlib_rs::types::{
         AuthenticationCodeInfo, AuthenticationCodeTypeSms, AuthorizationStateWaitCode,
+        AuthorizationStateWaitEmailAddress, AuthorizationStateWaitEmailCode,
         AuthorizationStateWaitOtherDeviceConfirmation, AuthorizationStateWaitPassword,
-        AuthorizationStateWaitRegistration,
+        AuthorizationStateWaitPremiumPurchase, AuthorizationStateWaitRegistration,
+        EmailAddressAuthenticationCodeInfo, FormattedText, TermsOfService,
     };
 
     /// A `WaitCode` state. Its payload is irrelevant to the projection (which
@@ -317,21 +435,80 @@ mod tests {
     }
 
     #[test]
-    fn out_of_scope_states_are_unsupported_not_misclassified() {
+    fn qr_login_state_surfaces_its_link() {
         let qr = AuthorizationState::WaitOtherDeviceConfirmation(
-            AuthorizationStateWaitOtherDeviceConfirmation::default(),
+            AuthorizationStateWaitOtherDeviceConfirmation {
+                link: "tg://login?token=abc".to_owned(),
+            },
         );
         assert_eq!(
             AuthState::from_tdlib(&qr),
-            AuthState::Unsupported("waitOtherDeviceConfirmation")
+            AuthState::WaitOtherDeviceConfirmation {
+                link: "tg://login?token=abc".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn registration_state_surfaces_the_terms_of_service() {
+        let reg = AuthorizationState::WaitRegistration(AuthorizationStateWaitRegistration {
+            terms_of_service: TermsOfService {
+                text: FormattedText {
+                    text: "Be excellent to each other.".to_owned(),
+                    entities: vec![],
+                },
+                min_user_age: 0,
+                show_popup: true,
+            },
+        });
+        assert_eq!(
+            AuthState::from_tdlib(&reg),
+            AuthState::WaitRegistration {
+                terms_of_service: "Be excellent to each other.".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn email_states_surface_the_prompt_and_the_masked_pattern() {
+        assert_eq!(
+            AuthState::from_tdlib(&AuthorizationState::WaitEmailAddress(
+                AuthorizationStateWaitEmailAddress::default()
+            )),
+            AuthState::WaitEmailAddress
         );
 
-        let registration =
-            AuthorizationState::WaitRegistration(AuthorizationStateWaitRegistration::default());
+        let code = AuthorizationState::WaitEmailCode(AuthorizationStateWaitEmailCode {
+            code_info: EmailAddressAuthenticationCodeInfo {
+                email_address_pattern: "a***@example.com".to_owned(),
+                length: 6,
+            },
+            ..Default::default()
+        });
         assert_eq!(
-            AuthState::from_tdlib(&registration),
-            AuthState::Unsupported("waitRegistration")
+            AuthState::from_tdlib(&code),
+            AuthState::WaitEmailCode {
+                email_pattern: "a***@example.com".to_owned()
+            }
         );
+    }
+
+    #[test]
+    fn premium_purchase_is_modeled_as_a_dead_end_not_unsupported() {
+        let premium =
+            AuthorizationState::WaitPremiumPurchase(AuthorizationStateWaitPremiumPurchase {
+                store_product_id: "tg_premium_monthly".to_owned(),
+                ..Default::default()
+            });
+        let state = AuthState::from_tdlib(&premium);
+        assert_eq!(
+            state,
+            AuthState::WaitPremiumPurchase {
+                store_product_id: "tg_premium_monthly".to_owned()
+            }
+        );
+        // A dead end for a headless client, but not a torn-down session.
+        assert!(!state.is_terminal());
     }
 
     #[test]
@@ -340,6 +517,13 @@ mod tests {
         assert!(AuthState::Closed.is_terminal());
         assert!(!AuthState::WaitPhoneNumber.is_terminal());
         assert!(!AuthState::WaitCode.is_terminal());
+        // QR confirmation still waits on the other device — not terminal.
+        assert!(
+            !AuthState::WaitOtherDeviceConfirmation {
+                link: String::new()
+            }
+            .is_terminal()
+        );
     }
 
     /// Records which handler the driver invoked and with what argument, so a
@@ -378,6 +562,12 @@ mod tests {
                 .push(format!("set_phone_number({phone_number})"));
             Ok(())
         }
+        async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push("request_qr_code_authentication()".to_owned());
+            Ok(())
+        }
         async fn check_authentication_code(&self, code: String) -> Result<(), TdError> {
             self.calls
                 .borrow_mut()
@@ -390,6 +580,31 @@ mod tests {
             self.calls
                 .borrow_mut()
                 .push("check_authentication_password(<redacted>)".to_owned());
+            Ok(())
+        }
+        async fn register_user(
+            &self,
+            first_name: String,
+            last_name: String,
+        ) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("register_user({first_name},{last_name})"));
+            Ok(())
+        }
+        async fn set_authentication_email_address(
+            &self,
+            email_address: String,
+        ) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("set_authentication_email_address({email_address})"));
+            Ok(())
+        }
+        async fn check_authentication_email_code(&self, code: String) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("check_authentication_email_code({code})"));
             Ok(())
         }
         async fn log_out(&self) -> Result<(), TdError> {
@@ -491,6 +706,117 @@ mod tests {
         assert_eq!(
             client.calls(),
             vec!["check_authentication_code(99999)".to_owned()]
+        );
+    }
+
+    /// QR login is the alternative answer to `WaitPhoneNumber`: request a QR
+    /// code, surface the scan link from `WaitOtherDeviceConfirmation`, then let
+    /// the confirmation on the other device carry the flow to `Ready` — with no
+    /// further input here, and no network.
+    #[tokio::test]
+    async fn qr_login_flow_requests_a_code_then_confirms_on_the_other_device() {
+        let client = SpyClient::default();
+        let mut login = Login::new(&client);
+
+        login.on_update(&AuthorizationState::WaitPhoneNumber);
+        assert_eq!(*login.state(), AuthState::WaitPhoneNumber);
+
+        // Choose QR instead of typing a phone number.
+        login.request_qr_code().await.unwrap();
+
+        // TDLib answers with the link to render and scan.
+        login.on_update(&AuthorizationState::WaitOtherDeviceConfirmation(
+            AuthorizationStateWaitOtherDeviceConfirmation {
+                link: "tg://login?token=xyz".to_owned(),
+            },
+        ));
+        assert_eq!(
+            *login.state(),
+            AuthState::WaitOtherDeviceConfirmation {
+                link: "tg://login?token=xyz".to_owned()
+            }
+        );
+        assert!(!login.state().is_terminal());
+
+        // The other device confirms; login completes with no further input.
+        login.on_update(&AuthorizationState::Ready);
+        assert_eq!(*login.state(), AuthState::Ready);
+
+        assert_eq!(
+            client.calls(),
+            vec!["request_qr_code_authentication()".to_owned()]
+        );
+    }
+
+    /// A new-user login: an unregistered phone number routes through email
+    /// verification and then registration. Each state surfaces through
+    /// `AuthState` (the email-code one carrying its masked pattern, the
+    /// registration one its terms text) and is answered through the seam — no
+    /// network, no live `tdjson`.
+    #[tokio::test]
+    async fn new_user_flow_does_email_then_registration() {
+        let client = SpyClient::default();
+        let mut login = Login::new(&client);
+
+        login.on_update(&AuthorizationState::WaitEmailAddress(
+            AuthorizationStateWaitEmailAddress::default(),
+        ));
+        assert_eq!(*login.state(), AuthState::WaitEmailAddress);
+        login
+            .submit_email_address("user@example.com".to_owned())
+            .await
+            .unwrap();
+
+        login.on_update(&AuthorizationState::WaitEmailCode(
+            AuthorizationStateWaitEmailCode {
+                code_info: EmailAddressAuthenticationCodeInfo {
+                    email_address_pattern: "u***@example.com".to_owned(),
+                    length: 6,
+                },
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            *login.state(),
+            AuthState::WaitEmailCode {
+                email_pattern: "u***@example.com".to_owned()
+            }
+        );
+        login.submit_email_code("424242".to_owned()).await.unwrap();
+
+        login.on_update(&AuthorizationState::WaitRegistration(
+            AuthorizationStateWaitRegistration {
+                terms_of_service: TermsOfService {
+                    text: FormattedText {
+                        text: "tos".to_owned(),
+                        entities: vec![],
+                    },
+                    min_user_age: 0,
+                    show_popup: false,
+                },
+            },
+        ));
+        assert_eq!(
+            *login.state(),
+            AuthState::WaitRegistration {
+                terms_of_service: "tos".to_owned()
+            }
+        );
+        login
+            .register("Ada".to_owned(), "Lovelace".to_owned())
+            .await
+            .unwrap();
+
+        login.on_update(&AuthorizationState::Ready);
+        assert_eq!(*login.state(), AuthState::Ready);
+
+        assert_eq!(
+            client.calls(),
+            vec![
+                "set_authentication_email_address(user@example.com)".to_owned(),
+                "check_authentication_email_code(424242)".to_owned(),
+                "register_user(Ada,Lovelace)".to_owned(),
+            ]
         );
     }
 }

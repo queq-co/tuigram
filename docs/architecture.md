@@ -2,7 +2,9 @@
 
 > Living document. The Phase 1 open decisions are now resolved (see below) and
 > implemented across Phase 2; Phase 3 builds the headless core client on top of
-> them. Later phases extend rather than revisit these decisions.
+> them, and Phase 4 extends that client (media, archive/folders, search/forward,
+> reactions/pins, chat actions, secret chats, full login) without revisiting it.
+> Later phases extend rather than revisit these decisions.
 
 ## Goals
 
@@ -91,3 +93,26 @@ edit, delete, read state, drafts) on the Phase 2 bridge. Two decisions shape it;
   own trait (`ChatRequests`/`MessageRequests`/`UserRequests`), segregated exactly
   as `AuthRequests` was, so the [bridge](../crates/tuigram-core/src/bridge.rs)
   stays pure transport.
+
+## Resolved decisions (Phase 4 — extended client features)
+
+Phase 4 widens the headless client (structured media content + a download/upload
+lifecycle, the Archive list and folders, message search and forward, reactions and
+pins, chat actions, secret chats) and finishes the login machine. Its one
+architectural decision is **not to make a new one**;
+[headless-client.md](headless-client.md) (which documents the core and extended
+surface as one client) holds the full reasoning.
+
+- **Extend the Phase 3 pattern, don't revisit it.** Every new capability is the
+  same shape as before: a new domain is a write-seam + a read-store the single
+  router folds into (files, chat actions, secret chats), and a widened domain just
+  adds requests and folds to an existing one (messages gain media/reactions/pins/
+  search/forward; chats gain archive/folders). The router stays logic-free, the
+  bridge stays pure transport, and request traits stay segregated per domain — so
+  the surface grows O(1) without a central file accreting knowledge. Two existing
+  invariants are deliberately **kept, not relaxed**: `MessageContent::from_tdlib`
+  stays **total** (real variants now, the rest still `Unsupported(name)`), and with
+  every login state handled, `AuthState::from_tdlib` becomes total by *exhaustive*
+  match — a future TDLib state is a compile error, not a silent miss. Search is the
+  one read that stays *beside* the fold rather than in it: it returns a transient
+  result view so a query never mutates the owned history.

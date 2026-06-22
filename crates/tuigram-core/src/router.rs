@@ -29,7 +29,7 @@ use crate::bridge::RouterEvent;
 /// the router's classification.
 pub trait UpdateSink {
     /// Fold a chat-list update (new chat, position/order, last message, read
-    /// state) into the chat snapshot.
+    /// state, draft, folder list) into the chat snapshot.
     fn reduce_chat(&mut self, update: &Update);
 
     /// Fold a message update (new message, send-lifecycle, content edit,
@@ -39,6 +39,19 @@ pub trait UpdateSink {
     /// Fold a user update (new/changed user record, presence change) into the
     /// users store, so senders and private chats resolve to names.
     fn reduce_user(&mut self, update: &Update);
+
+    /// Fold a file update (`updateFile`: download/upload progress, local path)
+    /// into the files store, so media content resolves to transferable bytes.
+    fn reduce_file(&mut self, update: &Update);
+
+    /// Fold a chat-action update (`updateChatAction`: a sender started or
+    /// cancelled an activity) into the transient typing view. Advisory state,
+    /// never persisted into the message store.
+    fn reduce_action(&mut self, update: &Update);
+
+    /// Fold a secret-chat update (`updateSecretChat`: lifecycle/key state of an
+    /// end-to-end encrypted chat) into the secret-chat store.
+    fn reduce_secret_chat(&mut self, update: &Update);
 
     /// Recover from a broadcast overflow: `skipped` updates were dropped before
     /// the router caught up, so the folded state may be stale and must be
@@ -59,6 +72,12 @@ enum Route {
     Message,
     /// Folded by the users reducer (#35).
     User,
+    /// Folded by the files reducer (#44).
+    File,
+    /// Folded by the chat-action reducer (#52) — the transient typing view.
+    Action,
+    /// Folded by the secret-chat reducer (#53) — the E2E chat lifecycle.
+    SecretChat,
     /// Not account content this router folds; dropped here.
     Ignored,
 }
@@ -78,13 +97,26 @@ fn classify(update: &Update) -> Route {
         | Update::ChatLastMessage(_)
         | Update::ChatReadInbox(_)
         | Update::ChatReadOutbox(_)
-        | Update::ChatDraftMessage(_) => Route::Chat,
+        | Update::ChatDraftMessage(_)
+        | Update::ChatFolders(_)
+        // A message's pinned state is chat state (#51): the chat store folds it
+        // onto the chat's pinned-message set, not the per-message store.
+        | Update::MessageIsPinned(_) => Route::Chat,
         Update::NewMessage(_)
         | Update::MessageSendSucceeded(_)
         | Update::MessageSendFailed(_)
         | Update::MessageContent(_)
+        // A reaction change (#51) folds onto the message itself.
+        | Update::MessageInteractionInfo(_)
         | Update::DeleteMessages(_) => Route::Message,
         Update::User(_) | Update::UserStatus(_) => Route::User,
+        Update::File(_) => Route::File,
+        // updateChatAction is transient typing/recording presence (#52): the
+        // chat-action store folds it into a separate view, never into history.
+        Update::ChatAction(_) => Route::Action,
+        // updateSecretChat is the E2E chat lifecycle (#53), folded into the
+        // secret-chat store keyed by secret_chat_id.
+        Update::SecretChat(_) => Route::SecretChat,
         _ => Route::Ignored,
     }
 }
@@ -113,6 +145,9 @@ impl<S: UpdateSink> Router<S> {
             Route::Chat => self.sink.reduce_chat(update),
             Route::Message => self.sink.reduce_message(update),
             Route::User => self.sink.reduce_user(update),
+            Route::File => self.sink.reduce_file(update),
+            Route::Action => self.sink.reduce_action(update),
+            Route::SecretChat => self.sink.reduce_secret_chat(update),
             Route::Ignored => {}
         }
     }
@@ -150,6 +185,9 @@ mod tests {
         chat: u32,
         message: u32,
         user: u32,
+        file: u32,
+        action: u32,
+        secret_chat: u32,
         lagged: Vec<u64>,
     }
 
@@ -162,6 +200,15 @@ mod tests {
         }
         fn reduce_user(&mut self, _update: &Update) {
             self.user += 1;
+        }
+        fn reduce_file(&mut self, _update: &Update) {
+            self.file += 1;
+        }
+        fn reduce_action(&mut self, _update: &Update) {
+            self.action += 1;
+        }
+        fn reduce_secret_chat(&mut self, _update: &Update) {
+            self.secret_chat += 1;
         }
         fn resync_after_lag(&mut self, skipped: u64) {
             self.lagged.push(skipped);
@@ -195,6 +242,14 @@ mod tests {
         })
     }
 
+    fn chat_folders() -> Update {
+        Update::ChatFolders(tdlib_rs::types::UpdateChatFolders {
+            chat_folders: Vec::new(),
+            main_chat_list_position: 0,
+            are_tags_enabled: false,
+        })
+    }
+
     fn delete_messages() -> Update {
         Update::DeleteMessages(UpdateDeleteMessages {
             chat_id: 1,
@@ -204,10 +259,59 @@ mod tests {
         })
     }
 
+    fn message_interaction_info() -> Update {
+        Update::MessageInteractionInfo(tdlib_rs::types::UpdateMessageInteractionInfo {
+            chat_id: 1,
+            message_id: 2,
+            interaction_info: None,
+        })
+    }
+
+    fn message_is_pinned() -> Update {
+        Update::MessageIsPinned(tdlib_rs::types::UpdateMessageIsPinned {
+            chat_id: 1,
+            message_id: 2,
+            is_pinned: true,
+        })
+    }
+
     fn user_status() -> Update {
         Update::UserStatus(tdlib_rs::types::UpdateUserStatus {
             user_id: 7,
             status: tdlib_rs::enums::UserStatus::Recently(Default::default()),
+        })
+    }
+
+    fn file_update() -> Update {
+        Update::File(tdlib_rs::types::UpdateFile {
+            file: tdlib_rs::types::File {
+                id: 7,
+                ..Default::default()
+            },
+        })
+    }
+
+    fn chat_action() -> Update {
+        Update::ChatAction(tdlib_rs::types::UpdateChatAction {
+            chat_id: 1,
+            topic_id: None,
+            sender_id: tdlib_rs::enums::MessageSender::User(tdlib_rs::types::MessageSenderUser {
+                user_id: 7,
+            }),
+            action: tdlib_rs::enums::ChatAction::Typing,
+        })
+    }
+
+    fn secret_chat() -> Update {
+        Update::SecretChat(tdlib_rs::types::UpdateSecretChat {
+            secret_chat: tdlib_rs::types::SecretChat {
+                id: 5,
+                user_id: 7,
+                state: tdlib_rs::enums::SecretChatState::Pending,
+                is_outbound: true,
+                key_hash: String::new(),
+                layer: 144,
+            },
         })
     }
 
@@ -224,8 +328,9 @@ mod tests {
         let mut router = Router::new(SpySink::default());
         router.apply(&chat_read_inbox());
         router.apply(&chat_last_message());
+        router.apply(&chat_folders());
         let sink = router.sink;
-        assert_eq!(sink.chat, 2);
+        assert_eq!(sink.chat, 3);
         assert_eq!(sink.message, 0);
     }
 
@@ -251,11 +356,66 @@ mod tests {
     }
 
     #[test]
+    fn reaction_updates_route_to_the_message_reducer() {
+        // updateMessageInteractionInfo folds onto the message (its reactions).
+        let mut router = Router::new(SpySink::default());
+        router.apply(&message_interaction_info());
+        let sink = router.sink;
+        assert_eq!(sink.message, 1);
+        assert_eq!(sink.chat, 0);
+    }
+
+    #[test]
+    fn message_pin_updates_route_to_the_chat_reducer() {
+        // updateMessageIsPinned is chat state (the chat's pinned-message set), so
+        // it routes to the chat reducer, not the message store.
+        let mut router = Router::new(SpySink::default());
+        router.apply(&message_is_pinned());
+        let sink = router.sink;
+        assert_eq!(sink.chat, 1);
+        assert_eq!(sink.message, 0);
+    }
+
+    #[test]
     fn user_updates_route_to_the_user_reducer() {
         let mut router = Router::new(SpySink::default());
         router.apply(&user_status());
         let sink = router.sink;
         assert_eq!(sink.user, 1);
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+    }
+
+    #[test]
+    fn file_updates_route_to_the_file_reducer() {
+        let mut router = Router::new(SpySink::default());
+        router.apply(&file_update());
+        let sink = router.sink;
+        assert_eq!(sink.file, 1);
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+        assert_eq!(sink.user, 0);
+    }
+
+    #[test]
+    fn chat_action_updates_route_to_the_action_reducer() {
+        // updateChatAction is transient typing presence, folded into its own view.
+        let mut router = Router::new(SpySink::default());
+        router.apply(&chat_action());
+        let sink = router.sink;
+        assert_eq!(sink.action, 1);
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+        assert_eq!(sink.user, 0);
+    }
+
+    #[test]
+    fn secret_chat_updates_route_to_the_secret_chat_reducer() {
+        // updateSecretChat is the E2E chat lifecycle, folded into its own store.
+        let mut router = Router::new(SpySink::default());
+        router.apply(&secret_chat());
+        let sink = router.sink;
+        assert_eq!(sink.secret_chat, 1);
         assert_eq!(sink.chat, 0);
         assert_eq!(sink.message, 0);
     }
@@ -268,6 +428,9 @@ mod tests {
         assert_eq!(sink.chat, 0);
         assert_eq!(sink.message, 0);
         assert_eq!(sink.user, 0);
+        assert_eq!(sink.file, 0);
+        assert_eq!(sink.action, 0);
+        assert_eq!(sink.secret_chat, 0);
     }
 
     #[tokio::test]
