@@ -42,12 +42,18 @@ use tokio::task::JoinHandle;
 use crate::actions::ChatActionStore;
 use crate::bridge::Bridge;
 use crate::chats::ChatStore;
+use crate::connection::ConnectionStore;
 use crate::files::FileStore;
 use crate::messages::{ForwardRequests, MessageStore, SearchResults};
 use crate::model::{Message, Sender};
 use crate::router::{Router, UpdateSink};
 use crate::secret_chats::SecretChatStore;
 use crate::users::UserStore;
+
+/// How many chats [`Client::resync`] re-requests for the Main list when
+/// recovering from a dropped-update gap. Matches the harness's startup page size;
+/// TDLib re-emits the current chats as updates the router folds.
+const RESYNC_CHATS_PAGE: i32 = 100;
 
 /// The account content the router folds updates into: the chat list (#17) and
 /// per-chat messages (#18).
@@ -62,6 +68,14 @@ pub struct AccountState {
     files: FileStore,
     actions: ChatActionStore,
     secret_chats: SecretChatStore,
+    connection: ConnectionStore,
+    /// Set when the router reports a dropped-update gap (a broadcast overflow);
+    /// cleared once the affected state has been re-queried (see
+    /// [`Client::resync`]). While set, the folded snapshot may be missing updates.
+    needs_resync: bool,
+    /// Cumulative count of updates dropped across every un-recovered lag this
+    /// session, kept as a diagnostic even after a resync clears `needs_resync`.
+    dropped_updates: u64,
 }
 
 impl AccountState {
@@ -111,6 +125,31 @@ impl AccountState {
         &self.secret_chats
     }
 
+    /// The transport's connection/sync status, for the facade's read side — what a
+    /// "Connecting…/Updating…" indicator renders (e.g.
+    /// `client.read(|s| s.connection().is_ready())`).
+    #[must_use]
+    pub fn connection(&self) -> &ConnectionStore {
+        &self.connection
+    }
+
+    /// Whether a dropped-update gap has gone unrecovered: the router reported a
+    /// broadcast overflow and the snapshot may be missing updates until a
+    /// [`Client::resync`] re-queries the affected state. Read by the app to decide
+    /// when to trigger that recovery.
+    #[must_use]
+    pub fn needs_resync(&self) -> bool {
+        self.needs_resync
+    }
+
+    /// Cumulative number of updates dropped across every un-recovered lag this
+    /// session — a diagnostic that survives a resync, unlike
+    /// [`needs_resync`](Self::needs_resync).
+    #[must_use]
+    pub fn dropped_updates(&self) -> u64 {
+        self.dropped_updates
+    }
+
     /// Fold a chat-list update into the chat store.
     fn reduce_chat(&mut self, update: &Update) {
         self.chats.reduce(update);
@@ -141,6 +180,11 @@ impl AccountState {
         self.secret_chats.reduce(update);
     }
 
+    /// Fold a connection-state update into the connection store.
+    fn reduce_connection(&mut self, update: &Update) {
+        self.connection.reduce(update);
+    }
+
     /// Merge a fetched history page into the message store. Unlike live messages,
     /// `getChatHistory` returns its page in the response rather than as updates,
     /// so the fetcher folds it in here — alongside the live messages the router
@@ -149,12 +193,26 @@ impl AccountState {
         self.messages.merge(page);
     }
 
-    /// Recover from a dropped-update gap by re-querying the affected state.
-    /// The re-query requests belong to the chat/message domains (#17/#18); until
-    /// then this records nothing and simply does not pretend the gap didn't
-    /// happen — the router still surfaces every lag here rather than swallowing
-    /// it upstream.
-    fn resync_after_lag(&mut self, _skipped: u64) {}
+    /// Record a dropped-update gap so it is recoverable instead of silently lost.
+    ///
+    /// A broadcast overflow means `skipped` updates never reached the fold, so the
+    /// snapshot may now be missing chat/message/state changes. The fold itself
+    /// cannot issue the re-query — it has no bridge — so it marks the account
+    /// stale and accumulates the drop count; the recovery request lives at the
+    /// facade ([`Client::resync`]), which the app triggers on seeing
+    /// [`needs_resync`](Self::needs_resync). This replaces the former silent no-op:
+    /// a lag is now observable and actionable.
+    fn resync_after_lag(&mut self, skipped: u64) {
+        self.needs_resync = true;
+        self.dropped_updates = self.dropped_updates.saturating_add(skipped);
+    }
+
+    /// Clear the resync flag once the affected state has been re-queried (see
+    /// [`Client::resync`]). Leaves the cumulative
+    /// [`dropped_updates`](Self::dropped_updates) diagnostic intact.
+    fn mark_resynced(&mut self) {
+        self.needs_resync = false;
+    }
 }
 
 /// Thread-safe handle to the account state, shared between the router task
@@ -199,6 +257,12 @@ impl UpdateSink for SharedState {
         self.lock()
             .expect("account state mutex poisoned")
             .reduce_secret_chat(update);
+    }
+
+    fn reduce_connection(&mut self, update: &Update) {
+        self.lock()
+            .expect("account state mutex poisoned")
+            .reduce_connection(update);
     }
 
     fn resync_after_lag(&mut self, skipped: u64) {
@@ -269,6 +333,27 @@ impl Client {
             .lock()
             .expect("account state mutex poisoned")
             .merge_history(page);
+    }
+
+    /// Recover from a dropped-update gap by re-querying the chat lists.
+    ///
+    /// When the router reports a broadcast overflow the folded snapshot may be
+    /// missing updates, surfaced as [`needs_resync`](Self::needs_resync). This
+    /// reloads the Main chat list over the bridge — TDLib re-emits the current
+    /// chats as updates the router folds — then clears the flag. Re-paging the
+    /// *open* chat's history is the caller's complementary job (the core does not
+    /// track which chat the UI has open); this restores the always-present chat
+    /// list, the part of the snapshot a lag most visibly corrupts.
+    ///
+    /// On a failed reload the flag is left set so the caller can retry; the error
+    /// is returned.
+    pub async fn resync(&self) -> Result<(), TdError> {
+        crate::chats::load_main_list(&self.bridge, RESYNC_CHATS_PAGE).await?;
+        self.state
+            .lock()
+            .expect("account state mutex poisoned")
+            .mark_resynced();
+        Ok(())
     }
 
     /// Search one chat for `query`, paging to exhaustion into a transient
@@ -369,8 +454,44 @@ mod tests {
 
         Router::new(Arc::clone(&state)).run(events).await;
 
-        // Readable through the same lock the facade's `read` uses.
-        let _guard = state.lock().expect("mutex usable after the router ran");
+        // Readable through the same lock the facade's `read` uses, and the lag was
+        // recorded through the shared sink rather than swallowed.
+        let guard = state.lock().expect("mutex usable after the router ran");
+        assert!(guard.needs_resync());
+        assert_eq!(guard.dropped_updates(), 3);
+    }
+
+    #[test]
+    fn connection_updates_fold_into_the_connection_store() {
+        use crate::connection::ConnectionState;
+        use tdlib_rs::enums::ConnectionState as Tc;
+        use tdlib_rs::types::UpdateConnectionState;
+
+        let mut state = AccountState::default();
+        assert!(!state.connection().is_ready());
+
+        state.reduce_connection(&Update::ConnectionState(UpdateConnectionState {
+            state: Tc::Ready,
+        }));
+        assert!(state.connection().is_ready());
+        assert_eq!(state.connection().state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn a_lag_marks_the_account_for_resync_and_accumulates_the_drop_count() {
+        let mut state = AccountState::default();
+        assert!(!state.needs_resync());
+        assert_eq!(state.dropped_updates(), 0);
+
+        state.resync_after_lag(5);
+        state.resync_after_lag(2);
+        assert!(state.needs_resync());
+        assert_eq!(state.dropped_updates(), 7);
+
+        // A resync clears the flag but keeps the cumulative diagnostic.
+        state.mark_resynced();
+        assert!(!state.needs_resync());
+        assert_eq!(state.dropped_updates(), 7);
     }
 
     /// A fetched history page folds into the message store and is readable back,
