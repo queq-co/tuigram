@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio_stream::StreamExt;
-use tuigram_core::enums::Update;
+use tuigram_core::enums::{AuthorizationState, Update};
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
     ApiCredentials, AuthRequests, AuthState, Bridge, Chat, ChatAction, ChatActionRequests,
@@ -886,16 +886,28 @@ async fn logout(client: &Client) -> Flow {
     Flow::Done
 }
 
-/// After `log_out`, wait for TDLib to leave `Ready`. `logOut` clears the session
-/// asynchronously (`Ready` -> `LoggingOut` -> `WaitPhoneNumber`), and we want
-/// that to have taken effect before the process exits. Bounded (~5s) so a stuck
-/// logout cannot hang the harness.
+/// After `log_out`, wait for TDLib to *finish* clearing the session before the
+/// process exits, so the next run starts with no session on disk and behaves
+/// exactly like a first-time login.
+///
+/// `logOut` is asynchronous: TDLib invalidates the session server-side and
+/// destroys all local data, driving authorization `Ready` -> `LoggingOut` ->
+/// `Closing` -> `Closed`. It is only *done* once it leaves those in-progress
+/// states — returning at the first transition (the previous behaviour: "no
+/// longer `Ready`") exits while the local database is still being wiped, leaving
+/// a half-cleared session the next run can neither resume nor cleanly replace,
+/// which is what blocked logging back in. So keep waiting while the state is
+/// `Ready`/`LoggingOut`/`Closing`, and return only once the teardown has settled
+/// (`Closed`, a fresh wait state, or the client is gone). Bounded (~5s) so a
+/// stuck logout cannot hang the harness.
 async fn wait_until_logged_out(bridge: &Bridge) {
     for _ in 0..50 {
         match bridge.authorization_state().await {
-            Ok(state) if AuthState::from_tdlib(&state) == AuthState::Ready => {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+            Ok(
+                AuthorizationState::Ready
+                | AuthorizationState::LoggingOut
+                | AuthorizationState::Closing,
+            ) => tokio::time::sleep(Duration::from_millis(100)).await,
             _ => return,
         }
     }
