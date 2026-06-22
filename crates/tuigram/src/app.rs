@@ -4,17 +4,18 @@
 //! marks the frame dirty, and the loop repaints from the new state. Nothing here
 //! touches the terminal or awaits — it stays a pure, unit-testable reducer.
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::Event;
 
 use crate::chat_list::ChatListView;
 use crate::composer::Composer;
 use crate::conversation::ConversationView;
 use crate::event::AppEvent;
+use crate::keymap::{self, Focus};
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
 /// render tick, core updates) is funnelled through this enum before it touches
 /// `App`, so all state changes share one code path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     /// Nothing to do (e.g. an unbound key).
     Noop,
@@ -22,6 +23,15 @@ pub enum Action {
     Render,
     /// A heartbeat from core — placeholder until Phase 6 wires the real `Client`.
     Beat,
+    /// Move input focus to the next pane (chat list → history → composer → …).
+    FocusNext,
+    /// Move input focus to the previous pane, wrapping.
+    FocusPrev,
+    /// Move input focus directly to a specific pane (e.g. Enter on a chat opens
+    /// the history; `i` in the history jumps to the composer).
+    SetFocus(Focus),
+    /// Show or hide the help overlay.
+    ToggleHelp,
     /// Move the chat-list selection down one row.
     SelectNext,
     /// Move the chat-list selection up one row.
@@ -34,10 +44,8 @@ pub enum Action {
     ScrollDown,
     /// Scroll the conversation history one message toward the oldest.
     ScrollUp,
-    /// Insert a typed character into the composer at the cursor. Dispatched by the
-    /// tests today; the key route that emits it (printable input, which collides
-    /// with the q/j/k bindings) lands with #83's focus model.
-    #[allow(dead_code)]
+    /// Insert a typed character into the composer at the cursor — the keymap's
+    /// printable-input fall-through when the composer is focused.
     ComposerInput(char),
     /// Delete the character before the composer cursor (Backspace).
     ComposerBackspace,
@@ -52,10 +60,8 @@ pub enum Action {
     /// Send the composer's buffer (a no-op when it is empty). The text is routed
     /// to core in Phase 6; for now the buffer is just consumed.
     ComposerSubmit,
-    /// Drop any reply/edit context and clear the composer back to plain compose.
-    /// The cancel key collides with Esc/quit, so its binding waits on #83's focus
-    /// model; the tests dispatch it directly until then.
-    #[allow(dead_code)]
+    /// Drop any reply/edit context and clear the composer back to plain compose
+    /// (the composer's Esc binding).
     ComposerCancel,
     /// Tear down and exit the loop.
     Quit,
@@ -80,6 +86,11 @@ pub struct App {
     conversation: ConversationView,
     /// The bottom pane's composer: the input buffer, cursor, and reply/edit mode.
     composer: Composer,
+    /// Which pane currently receives input; drives both key resolution and the
+    /// focused-pane border highlight.
+    focus: Focus,
+    /// Whether the help overlay is shown over the panes.
+    help_visible: bool,
 }
 
 impl App {
@@ -116,6 +127,16 @@ impl App {
     /// The composer the bottom pane renders from.
     pub fn composer(&self) -> &Composer {
         &self.composer
+    }
+
+    /// Which pane currently has input focus, for the focused-border highlight.
+    pub fn focus(&self) -> Focus {
+        self.focus
+    }
+
+    /// Whether the help overlay is currently shown.
+    pub fn help_visible(&self) -> bool {
+        self.help_visible
     }
 
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
@@ -155,46 +176,15 @@ impl App {
 
     /// Map a raw crossterm event to an [`Action`]. Pure: no state changes here,
     /// so key bindings are trivially unit-testable.
+    ///
+    /// Key events are resolved through the central [`keymap`] against the current
+    /// focus and help-overlay state, so this stays a thin adapter and the bindings
+    /// live in one place.
     pub fn on_terminal_event(&self, event: Event) -> Action {
         match event {
-            Event::Key(key) => Self::on_key(key),
+            Event::Key(key) => keymap::resolve(self.focus, self.help_visible, &key),
             // A resize must repaint against the new viewport.
             Event::Resize(_, _) => Action::Render,
-            _ => Action::Noop,
-        }
-    }
-
-    fn on_key(key: KeyEvent) -> Action {
-        // crossterm on Windows reports both Press and Release; act on Press
-        // (and the kindless Unix events, which are not Release) only.
-        if key.kind == KeyEventKind::Release {
-            return Action::Noop;
-        }
-        match (key.modifiers, key.code) {
-            (KeyModifiers::CONTROL, KeyCode::Char('c')) => Action::Quit,
-            (_, KeyCode::Char('q') | KeyCode::Esc) => Action::Quit,
-            // Chat-list navigation (arrows + vim j/k); the full keymap and focus
-            // model arrive in #83, which may rebind these.
-            (_, KeyCode::Down | KeyCode::Char('j')) => Action::SelectNext,
-            (_, KeyCode::Up | KeyCode::Char('k')) => Action::SelectPrev,
-            (_, KeyCode::Tab) => Action::NextList,
-            (_, KeyCode::BackTab) => Action::PrevList,
-            // Conversation history scrolling. PageUp/PageDown stay clear of the
-            // chat-list keys above; #83 owns the focus model and full keymap.
-            (_, KeyCode::PageDown) => Action::ScrollDown,
-            (_, KeyCode::PageUp) => Action::ScrollUp,
-            // Composer (#82). Enter sends; the editing/navigation keys mutate the
-            // input buffer. These bind only keys the panes above leave free, so the
-            // composer is usable before #83's focus model arrives. Routing printable
-            // characters into the composer collides with the q/j/k bindings above,
-            // and a cancel key collides with Esc/quit, so both wait on that focus
-            // model — `ComposerInput`/`ComposerCancel` are dispatched directly for now.
-            (_, KeyCode::Enter) => Action::ComposerSubmit,
-            (_, KeyCode::Backspace) => Action::ComposerBackspace,
-            (_, KeyCode::Left) => Action::ComposerLeft,
-            (_, KeyCode::Right) => Action::ComposerRight,
-            (_, KeyCode::Home) => Action::ComposerHome,
-            (_, KeyCode::End) => Action::ComposerEnd,
             _ => Action::Noop,
         }
     }
@@ -214,6 +204,22 @@ impl App {
             Action::Render => self.dirty = true,
             Action::Beat => {
                 self.beats += 1;
+                self.dirty = true;
+            }
+            Action::FocusNext => {
+                self.focus = self.focus.next();
+                self.dirty = true;
+            }
+            Action::FocusPrev => {
+                self.focus = self.focus.prev();
+                self.dirty = true;
+            }
+            Action::SetFocus(focus) => {
+                self.focus = focus;
+                self.dirty = true;
+            }
+            Action::ToggleHelp => {
+                self.help_visible = !self.help_visible;
                 self.dirty = true;
             }
             Action::SelectNext => {
@@ -284,25 +290,27 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
     fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
         Event::Key(KeyEvent::new(code, modifiers))
     }
 
     #[test]
-    fn q_esc_and_ctrl_c_quit() {
-        let app = App::new();
+    fn q_and_ctrl_c_quit_from_a_nav_pane() {
+        let app = App::new(); // lands focused on the chat list
         assert_eq!(
             app.on_terminal_event(key(KeyCode::Char('q'), KeyModifiers::NONE)),
             Action::Quit
         );
         assert_eq!(
-            app.on_terminal_event(key(KeyCode::Esc, KeyModifiers::NONE)),
-            Action::Quit
-        );
-        assert_eq!(
             app.on_terminal_event(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
             Action::Quit
+        );
+        // Esc is the composer's cancel key now, not a global quit — unbound here.
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::Noop
         );
     }
 
@@ -358,17 +366,60 @@ mod tests {
     }
 
     #[test]
-    fn arrows_and_tab_map_to_chat_list_navigation() {
-        let app = App::new();
+    fn chat_list_focus_maps_navigation_keys() {
+        let app = App::new(); // default focus: the chat list
         let mapped = |code| app.on_terminal_event(key(code, KeyModifiers::NONE));
         assert_eq!(mapped(KeyCode::Down), Action::SelectNext);
         assert_eq!(mapped(KeyCode::Char('j')), Action::SelectNext);
         assert_eq!(mapped(KeyCode::Up), Action::SelectPrev);
         assert_eq!(mapped(KeyCode::Char('k')), Action::SelectPrev);
-        assert_eq!(mapped(KeyCode::Tab), Action::NextList);
-        assert_eq!(mapped(KeyCode::BackTab), Action::PrevList);
-        assert_eq!(mapped(KeyCode::PageDown), Action::ScrollDown);
-        assert_eq!(mapped(KeyCode::PageUp), Action::ScrollUp);
+        assert_eq!(mapped(KeyCode::Char(']')), Action::NextList);
+        assert_eq!(mapped(KeyCode::Char('[')), Action::PrevList);
+        // Tab now switches panes; Enter opens the selected chat in the history.
+        assert_eq!(mapped(KeyCode::Tab), Action::FocusNext);
+        assert_eq!(mapped(KeyCode::Enter), Action::SetFocus(Focus::History));
+    }
+
+    #[test]
+    fn key_resolution_follows_the_focused_pane() {
+        let mut app = App::new();
+        app.dispatch(Action::SetFocus(Focus::History));
+        // `j` scrolls in the history, where the same key selected in the list.
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Action::ScrollDown
+        );
+    }
+
+    #[test]
+    fn focus_cycles_through_the_panes_and_dirties() {
+        let mut app = App::new();
+        assert_eq!(app.focus(), Focus::ChatList);
+        app.clear_dirty();
+        app.dispatch(Action::FocusNext);
+        assert_eq!(app.focus(), Focus::History);
+        assert!(app.is_dirty());
+        app.dispatch(Action::FocusNext);
+        assert_eq!(app.focus(), Focus::Composer);
+        app.dispatch(Action::FocusNext);
+        assert_eq!(app.focus(), Focus::ChatList, "wraps back to the start");
+        app.dispatch(Action::FocusPrev);
+        assert_eq!(app.focus(), Focus::Composer, "and back the other way");
+    }
+
+    #[test]
+    fn toggle_help_shows_then_hides_the_overlay_and_a_key_dismisses_it() {
+        let mut app = App::new();
+        assert!(!app.help_visible());
+        app.dispatch(Action::ToggleHelp);
+        assert!(app.help_visible());
+        // While open the overlay is modal: any key resolves to a dismiss.
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Action::ToggleHelp
+        );
+        app.dispatch(Action::ToggleHelp);
+        assert!(!app.help_visible());
     }
 
     #[test]
@@ -398,8 +449,9 @@ mod tests {
     }
 
     #[test]
-    fn composer_editing_keys_map_to_composer_actions() {
-        let app = App::new();
+    fn composer_focus_maps_editing_keys_and_inserts_text() {
+        let mut app = App::new();
+        app.dispatch(Action::SetFocus(Focus::Composer));
         let mapped = |code| app.on_terminal_event(key(code, KeyModifiers::NONE));
         assert_eq!(mapped(KeyCode::Enter), Action::ComposerSubmit);
         assert_eq!(mapped(KeyCode::Backspace), Action::ComposerBackspace);
@@ -407,6 +459,9 @@ mod tests {
         assert_eq!(mapped(KeyCode::Right), Action::ComposerRight);
         assert_eq!(mapped(KeyCode::Home), Action::ComposerHome);
         assert_eq!(mapped(KeyCode::End), Action::ComposerEnd);
+        assert_eq!(mapped(KeyCode::Esc), Action::ComposerCancel);
+        // An unbound printable key inserts rather than running a command.
+        assert_eq!(mapped(KeyCode::Char('q')), Action::ComposerInput('q'));
     }
 
     #[test]
