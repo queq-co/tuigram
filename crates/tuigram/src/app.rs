@@ -7,6 +7,7 @@
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::chat_list::ChatListView;
+use crate::composer::Composer;
 use crate::conversation::ConversationView;
 use crate::event::AppEvent;
 
@@ -33,6 +34,29 @@ pub enum Action {
     ScrollDown,
     /// Scroll the conversation history one message toward the oldest.
     ScrollUp,
+    /// Insert a typed character into the composer at the cursor. Dispatched by the
+    /// tests today; the key route that emits it (printable input, which collides
+    /// with the q/j/k bindings) lands with #83's focus model.
+    #[allow(dead_code)]
+    ComposerInput(char),
+    /// Delete the character before the composer cursor (Backspace).
+    ComposerBackspace,
+    /// Move the composer cursor one character left.
+    ComposerLeft,
+    /// Move the composer cursor one character right.
+    ComposerRight,
+    /// Move the composer cursor to the start of the line.
+    ComposerHome,
+    /// Move the composer cursor to the end of the line.
+    ComposerEnd,
+    /// Send the composer's buffer (a no-op when it is empty). The text is routed
+    /// to core in Phase 6; for now the buffer is just consumed.
+    ComposerSubmit,
+    /// Drop any reply/edit context and clear the composer back to plain compose.
+    /// The cancel key collides with Esc/quit, so its binding waits on #83's focus
+    /// model; the tests dispatch it directly until then.
+    #[allow(dead_code)]
+    ComposerCancel,
     /// Tear down and exit the loop.
     Quit,
 }
@@ -54,6 +78,8 @@ pub struct App {
     /// The right pane's conversation view: the open chat's messages and the
     /// scroll offset. Empty until Phase 6 projects the core store into it.
     conversation: ConversationView,
+    /// The bottom pane's composer: the input buffer, cursor, and reply/edit mode.
+    composer: Composer,
 }
 
 impl App {
@@ -87,6 +113,11 @@ impl App {
         &self.conversation
     }
 
+    /// The composer the bottom pane renders from.
+    pub fn composer(&self) -> &Composer {
+        &self.composer
+    }
+
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
     /// The seam Phase 6 (and the render tests) use to inject a populated view.
     #[cfg(test)]
@@ -103,6 +134,16 @@ impl App {
     pub fn with_conversation(conversation: ConversationView) -> Self {
         Self {
             conversation,
+            ..Self::new()
+        }
+    }
+
+    /// A fresh app whose composer is `composer`, marked dirty so the first frame
+    /// paints. The seam the render tests use to inject a typed/reply/edit state.
+    #[cfg(test)]
+    pub fn with_composer(composer: Composer) -> Self {
+        Self {
+            composer,
             ..Self::new()
         }
     }
@@ -142,6 +183,18 @@ impl App {
             // chat-list keys above; #83 owns the focus model and full keymap.
             (_, KeyCode::PageDown) => Action::ScrollDown,
             (_, KeyCode::PageUp) => Action::ScrollUp,
+            // Composer (#82). Enter sends; the editing/navigation keys mutate the
+            // input buffer. These bind only keys the panes above leave free, so the
+            // composer is usable before #83's focus model arrives. Routing printable
+            // characters into the composer collides with the q/j/k bindings above,
+            // and a cancel key collides with Esc/quit, so both wait on that focus
+            // model — `ComposerInput`/`ComposerCancel` are dispatched directly for now.
+            (_, KeyCode::Enter) => Action::ComposerSubmit,
+            (_, KeyCode::Backspace) => Action::ComposerBackspace,
+            (_, KeyCode::Left) => Action::ComposerLeft,
+            (_, KeyCode::Right) => Action::ComposerRight,
+            (_, KeyCode::Home) => Action::ComposerHome,
+            (_, KeyCode::End) => Action::ComposerEnd,
             _ => Action::Noop,
         }
     }
@@ -185,6 +238,42 @@ impl App {
             }
             Action::ScrollUp => {
                 self.conversation.scroll_up();
+                self.dirty = true;
+            }
+            Action::ComposerInput(c) => {
+                self.composer.insert(c);
+                self.dirty = true;
+            }
+            Action::ComposerBackspace => {
+                self.composer.backspace();
+                self.dirty = true;
+            }
+            Action::ComposerLeft => {
+                self.composer.move_left();
+                self.dirty = true;
+            }
+            Action::ComposerRight => {
+                self.composer.move_right();
+                self.dirty = true;
+            }
+            Action::ComposerHome => {
+                self.composer.move_home();
+                self.dirty = true;
+            }
+            Action::ComposerEnd => {
+                self.composer.move_end();
+                self.dirty = true;
+            }
+            Action::ComposerSubmit => {
+                // Phase 6 routes the submitted text to core (a new message, reply,
+                // or edit per the composer's mode); for now it is consumed. An empty
+                // buffer returns `None` — the send is a no-op that does not repaint.
+                if self.composer.submit().is_some() {
+                    self.dirty = true;
+                }
+            }
+            Action::ComposerCancel => {
+                self.composer.cancel();
                 self.dirty = true;
             }
             Action::Quit => self.should_quit = true,
@@ -306,6 +395,40 @@ mod tests {
         app.dispatch(Action::ScrollDown);
         assert_eq!(app.conversation().offset(), 1);
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn composer_editing_keys_map_to_composer_actions() {
+        let app = App::new();
+        let mapped = |code| app.on_terminal_event(key(code, KeyModifiers::NONE));
+        assert_eq!(mapped(KeyCode::Enter), Action::ComposerSubmit);
+        assert_eq!(mapped(KeyCode::Backspace), Action::ComposerBackspace);
+        assert_eq!(mapped(KeyCode::Left), Action::ComposerLeft);
+        assert_eq!(mapped(KeyCode::Right), Action::ComposerRight);
+        assert_eq!(mapped(KeyCode::Home), Action::ComposerHome);
+        assert_eq!(mapped(KeyCode::End), Action::ComposerEnd);
+    }
+
+    #[test]
+    fn typing_then_submitting_routes_through_the_composer_and_dirties() {
+        let mut app = App::new();
+        app.dispatch(Action::ComposerInput('h'));
+        app.dispatch(Action::ComposerInput('i'));
+        assert_eq!(app.composer().text(), "hi");
+
+        app.clear_dirty();
+        app.dispatch(Action::ComposerSubmit);
+        assert!(app.composer().is_empty(), "buffer consumed on send");
+        assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn empty_submit_is_a_noop_and_does_not_repaint() {
+        let mut app = App::new();
+        app.clear_dirty();
+        app.dispatch(Action::ComposerSubmit);
+        assert!(app.composer().is_empty());
+        assert!(!app.is_dirty(), "an empty send changes nothing");
     }
 
     #[test]

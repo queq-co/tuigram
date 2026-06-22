@@ -5,9 +5,9 @@
 //! This is the three-pane chat skeleton (issue #79): an outer horizontal split
 //! of a **chat list** (left) and a **conversation** (right), with the right pane
 //! split vertically into a scrolling **message history** over a fixed-height
-//! **composer**. The chat-list pane (issue #80) and the conversation history
-//! (issue #81) are live; the composer is still a placeholder issue #82 fills in,
-//! writing its tests against the `TestBackend` harness below.
+//! **composer**. The chat-list pane (issue #80), the conversation history
+//! (issue #81), and the composer (issue #82) are live, each writing its tests
+//! against the `TestBackend` harness below.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
@@ -20,6 +20,7 @@ use ratatui::widgets::{
 use tuigram_core::model::{Chat, FormattedText, Message, MessageContent, ReactionKind, Sender};
 
 use crate::app::App;
+use crate::composer::ComposerMode;
 use crate::conversation::ConversationView;
 
 /// Chat-list pane width, as a percentage of the terminal; the conversation pane
@@ -32,6 +33,9 @@ const COMPOSER_HEIGHT: u16 = 3;
 
 /// Marker drawn to the left of the selected chat row.
 const SELECTED_SYMBOL: &str = "▶ ";
+
+/// Hint shown in the composer while its buffer is empty.
+const COMPOSER_PLACEHOLDER: &str = "type a message…";
 
 /// Render the whole UI for one frame from the current `App` state.
 pub fn ui(frame: &mut Frame, app: &App) {
@@ -49,7 +53,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
 
     render_chat_list(frame, list_area, app);
     render_conversation(frame, history_area, app);
-    render_composer(frame, composer_area);
+    render_composer(frame, composer_area, app);
 }
 
 /// Left pane: the chat list (#80). Renders the active list's chats — each a title
@@ -292,10 +296,67 @@ fn reaction_symbol(kind: &ReactionKind) -> String {
     }
 }
 
-/// Right/bottom pane: the message composer. Placeholder until issue #82.
-fn render_composer(frame: &mut Frame, area: Rect) {
-    let widget = Paragraph::new("type a message…").block(Block::bordered().title(" Message "));
-    frame.render_widget(widget, area);
+/// Right/bottom pane: the message composer (#82). The border title is the mode
+/// indicator — " Message " when composing, the reply target when replying, an edit
+/// marker when editing — and the inner line is the input: a dim placeholder while
+/// empty, otherwise the text with a reverse-video block marking the cursor.
+fn render_composer(frame: &mut Frame, area: Rect, app: &App) {
+    let composer = app.composer();
+    let block = Block::bordered().title(composer_title(composer.mode()));
+
+    let line = if composer.is_empty() {
+        Line::from(Span::styled(
+            COMPOSER_PLACEHOLDER,
+            Style::new().add_modifier(Modifier::DIM),
+        ))
+    } else {
+        input_line(composer.text(), composer.cursor())
+    };
+    frame.render_widget(Paragraph::new(line).block(block), area);
+}
+
+/// The composer's border title, doubling as the mode indicator: a plain label when
+/// composing, the reply target when replying (so the user sees which message), and
+/// an edit marker when editing the prefilled buffer.
+fn composer_title(mode: &ComposerMode) -> String {
+    match mode {
+        ComposerMode::Compose => " Message ".to_owned(),
+        ComposerMode::Reply { preview, .. } => format!(" Reply ↩ {} ", truncate(preview, 40)),
+        ComposerMode::Edit { .. } => " Edit ✎ ".to_owned(),
+    }
+}
+
+/// The input line with a visible cursor: the text up to the cursor, then the
+/// character under it (or a trailing space at end-of-line) drawn reverse-video so
+/// the caret shows in the `TestBackend` buffer, then the remainder.
+fn input_line(text: &str, cursor: usize) -> Line<'static> {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let cursor_style = Style::new().add_modifier(Modifier::REVERSED);
+
+    let left: String = chars[..cursor].iter().collect();
+    let mut spans = vec![Span::raw(left)];
+    match chars.get(cursor) {
+        Some(&c) => {
+            spans.push(Span::styled(c.to_string(), cursor_style));
+            let right: String = chars[cursor + 1..].iter().collect();
+            if !right.is_empty() {
+                spans.push(Span::raw(right));
+            }
+        }
+        None => spans.push(Span::styled(" ".to_owned(), cursor_style)),
+    }
+    Line::from(spans)
+}
+
+/// Shorten `s` to at most `max` characters, ending in an ellipsis when clipped, so
+/// a long reply preview cannot overrun the composer's border title.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 #[cfg(test)]
@@ -561,5 +622,81 @@ mod tests {
             ConversationView::from_messages(vec![text_message(7, "pinned")], HashSet::from([7]));
         let text = flatten(&render(&App::with_conversation(view), 80, 24));
         assert!(text.contains("📌"), "pin marker on the pinned message");
+    }
+
+    // --- composer / text input (#82) ---
+
+    use crate::composer::Composer;
+
+    /// A composer with `body` typed in and the cursor left at the end.
+    fn typed_composer(body: &str) -> Composer {
+        let mut composer = Composer::default();
+        for c in body.chars() {
+            composer.insert(c);
+        }
+        composer
+    }
+
+    /// The symbol of the reverse-video cursor cell on the composer's input row, if
+    /// one is drawn. The input row sits just above the composer's bottom border.
+    fn cursor_symbol(buffer: &Buffer) -> Option<String> {
+        let y = buffer.area.height - 2;
+        (0..buffer.area.width).find_map(|x| {
+            let cell = &buffer[(x, y)];
+            cell.modifier
+                .contains(Modifier::REVERSED)
+                .then(|| cell.symbol().to_owned())
+        })
+    }
+
+    #[test]
+    fn empty_composer_shows_the_placeholder_under_the_message_title() {
+        let buffer = render(&App::with_composer(Composer::default()), 80, 24);
+        let text = flatten(&buffer);
+        assert!(text.contains("Message"), "compose-mode title");
+        assert!(text.contains("type a message"), "empty placeholder");
+        // No caret while empty — the placeholder owns the line.
+        assert_eq!(cursor_symbol(&buffer), None);
+    }
+
+    #[test]
+    fn typing_shows_the_text_with_the_cursor_on_the_character() {
+        let mut composer = typed_composer("hi");
+        // Put the caret on the 'i' so the cursor cell carries a stable symbol.
+        composer.move_left();
+        let buffer = render(&App::with_composer(composer), 80, 24);
+        assert!(flatten(&buffer).contains("hi"), "typed text rendered");
+        assert_eq!(
+            cursor_symbol(&buffer).as_deref(),
+            Some("i"),
+            "cursor highlights the character it sits on"
+        );
+    }
+
+    #[test]
+    fn reply_mode_names_the_target_in_the_indicator() {
+        let mut composer = Composer::default();
+        composer.reply_to(7, "User 7: general kenobi".to_owned());
+        let text = flatten(&render(&App::with_composer(composer), 80, 24));
+        assert!(text.contains("Reply"), "reply indicator");
+        assert!(
+            text.contains("User 7: general kenobi"),
+            "the replied-to message"
+        );
+    }
+
+    #[test]
+    fn edit_mode_prefills_the_buffer_and_marks_the_indicator() {
+        let mut composer = Composer::default();
+        composer.edit(9, "old message".to_owned());
+        let buffer = render(&App::with_composer(composer), 80, 24);
+        let text = flatten(&buffer);
+        assert!(text.contains("Edit"), "edit indicator");
+        assert!(text.contains("old message"), "prefilled buffer");
+        // The prefilled buffer is non-empty, so the caret is drawn.
+        assert!(
+            cursor_symbol(&buffer).is_some(),
+            "cursor on the prefilled text"
+        );
     }
 }
