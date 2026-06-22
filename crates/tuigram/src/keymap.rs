@@ -51,6 +51,25 @@ impl Focus {
     }
 }
 
+/// A modal layer drawn over the three panes. While one is active it **captures**
+/// input — key resolution routes to that overlay instead of the focused pane — so
+/// at most one is open at a time. [`None`](Self::None) is the normal browsing
+/// state, where [`Focus`] drives resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Overlay {
+    /// No overlay: normal three-pane browsing, resolved against [`Focus`].
+    #[default]
+    None,
+    /// The help cheatsheet (#83): modal, any key dismisses it.
+    Help,
+    /// The search query line: typing builds the query, Enter runs it.
+    SearchInput,
+    /// The search results list: navigate hits, forward one, or close.
+    SearchResults,
+    /// The forward target picker: choose a destination chat and confirm.
+    Forward,
+}
+
 /// The focus context a binding applies in. `Global` always applies; `Nav` applies
 /// in the two read-only panes (chat list and history) where letter keys are
 /// commands rather than text.
@@ -260,6 +279,13 @@ const BINDINGS: &[Binding] = &[
     // Navigation panes (chat list + history): commands that read, not type.
     Binding {
         context: Context::Nav,
+        trigger: Trigger::Plain(&[KeyCode::Char('/')]),
+        action: Action::SearchOpen,
+        keys: "/",
+        description: "search messages",
+    },
+    Binding {
+        context: Context::Nav,
         trigger: Trigger::Plain(&[KeyCode::Char('q')]),
         action: Action::Quit,
         keys: "q",
@@ -274,24 +300,37 @@ const BINDINGS: &[Binding] = &[
     },
 ];
 
-/// Resolve a key event to an [`Action`] under the current `focus`.
+/// Resolve a key event to an [`Action`] under the current `focus` and `overlay`.
 ///
-/// Key releases are ignored (crossterm reports them on Windows). While the help
-/// overlay is open it is modal: `Ctrl-C` still quits, and any other key dismisses
-/// it. Otherwise the first binding that applies under `focus` and matches the key
-/// wins; an unmatched printable key in the composer inserts that character.
+/// Key releases are ignored (crossterm reports them on Windows). An open `overlay`
+/// **captures** input: the key is resolved against that overlay's own keys, not the
+/// focused pane. With no overlay, the first [`BINDINGS`] entry that applies under
+/// `focus` and matches the key wins; an unmatched printable key in the composer
+/// inserts that character.
+///
+/// `Ctrl-C` quits from every overlay, so the app is never trapped in a modal.
 #[must_use]
-pub fn resolve(focus: Focus, help_visible: bool, key: &KeyEvent) -> Action {
+pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::Noop;
     }
-    if help_visible {
-        if Trigger::Ctrl(KeyCode::Char('c')).matches(key) {
-            return Action::Quit;
-        }
-        // The overlay is modal: any other key just dismisses it.
-        return Action::ToggleHelp;
+    match overlay {
+        Overlay::None => resolve_panes(focus, key),
+        Overlay::Help => resolve_help(key),
+        Overlay::SearchInput => resolve_search_input(key),
+        Overlay::SearchResults => resolve_search_results(key),
+        Overlay::Forward => resolve_forward(key),
     }
+}
+
+/// Whether the key is `Ctrl-C` — the always-available quit, even inside a modal.
+fn is_quit(key: &KeyEvent) -> bool {
+    Trigger::Ctrl(KeyCode::Char('c')).matches(key)
+}
+
+/// Normal browsing: walk the keymap under `focus`, then fall through to composer
+/// text insertion for an unmatched printable key.
+fn resolve_panes(focus: Focus, key: &KeyEvent) -> Action {
     for binding in BINDINGS {
         if binding.context.applies(focus) && binding.trigger.matches(key) {
             return binding.action;
@@ -303,6 +342,63 @@ pub fn resolve(focus: Focus, help_visible: bool, key: &KeyEvent) -> Action {
         return Action::ComposerInput(c);
     }
     Action::Noop
+}
+
+/// The help overlay (#83): modal, any key dismisses it (Ctrl-C still quits).
+fn resolve_help(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        Action::Quit
+    } else {
+        Action::ToggleHelp
+    }
+}
+
+/// The search query line: typing edits the query, Enter runs it, Esc cancels.
+fn resolve_search_input(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::SearchCancel,
+        KeyCode::Enter => Action::SearchSubmit,
+        KeyCode::Backspace => Action::SearchBackspace,
+        KeyCode::Left => Action::SearchLeft,
+        KeyCode::Right => Action::SearchRight,
+        KeyCode::Home => Action::SearchHome,
+        KeyCode::End => Action::SearchEnd,
+        _ => match printable(key) {
+            Some(c) => Action::SearchInput(c),
+            None => Action::Noop,
+        },
+    }
+}
+
+/// The search results list: navigate hits, forward the selected one, or close.
+fn resolve_search_results(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::SearchCancel,
+        KeyCode::Char('j') | KeyCode::Down => Action::ResultNext,
+        KeyCode::Char('k') | KeyCode::Up => Action::ResultPrev,
+        KeyCode::Char('f') => Action::ForwardOpen,
+        _ => Action::Noop,
+    }
+}
+
+/// The forward target picker: navigate target chats, Enter confirms, Esc cancels.
+fn resolve_forward(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::ForwardCancel,
+        KeyCode::Char('j') | KeyCode::Down => Action::ForwardNext,
+        KeyCode::Char('k') | KeyCode::Up => Action::ForwardPrev,
+        KeyCode::Enter => Action::ForwardConfirm,
+        _ => Action::Noop,
+    }
 }
 
 /// The character a key would insert, or `None` for a non-printable key or one
@@ -383,7 +479,7 @@ mod tests {
     }
 
     fn resolved(focus: Focus, code: KeyCode) -> Action {
-        resolve(focus, false, &key(code))
+        resolve(focus, Overlay::None, &key(code))
     }
 
     #[test]
@@ -414,7 +510,7 @@ mod tests {
     #[test]
     fn global_bindings_apply_in_every_focus() {
         for focus in [Focus::ChatList, Focus::History, Focus::Composer] {
-            assert_eq!(resolve(focus, false, &ctrl('c')), Action::Quit);
+            assert_eq!(resolve(focus, Overlay::None, &ctrl('c')), Action::Quit);
             assert_eq!(resolved(focus, KeyCode::Tab), Action::FocusNext);
             assert_eq!(resolved(focus, KeyCode::F(1)), Action::ToggleHelp);
         }
@@ -455,24 +551,91 @@ mod tests {
     #[test]
     fn ctrl_and_alt_chords_are_not_inserted_as_text() {
         // A Ctrl/Alt chord in the composer is not printable input.
-        assert_eq!(resolve(Focus::Composer, false, &ctrl('a')), Action::Noop);
+        assert_eq!(
+            resolve(Focus::Composer, Overlay::None, &ctrl('a')),
+            Action::Noop
+        );
     }
 
     #[test]
     fn key_release_is_ignored() {
         let mut release = key(KeyCode::Char('q'));
         release.kind = KeyEventKind::Release;
-        assert_eq!(resolve(Focus::ChatList, false, &release), Action::Noop);
+        assert_eq!(
+            resolve(Focus::ChatList, Overlay::None, &release),
+            Action::Noop
+        );
     }
 
     #[test]
     fn an_open_help_overlay_is_modal() {
-        // Any key closes it, except Ctrl-C which still quits.
+        // Any key closes it, except Ctrl-C which still quits. Focus is irrelevant
+        // while a modal captures input.
         assert_eq!(
-            resolve(Focus::ChatList, true, &key(KeyCode::Char('x'))),
+            resolve(Focus::ChatList, Overlay::Help, &key(KeyCode::Char('x'))),
             Action::ToggleHelp
         );
-        assert_eq!(resolve(Focus::Composer, true, &ctrl('c')), Action::Quit);
+        assert_eq!(
+            resolve(Focus::Composer, Overlay::Help, &ctrl('c')),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn slash_opens_search_from_a_nav_pane_but_types_in_the_composer() {
+        assert_eq!(
+            resolved(Focus::ChatList, KeyCode::Char('/')),
+            Action::SearchOpen
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('/')),
+            Action::SearchOpen
+        );
+        // In the composer `/` is just text.
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char('/')),
+            Action::ComposerInput('/')
+        );
+    }
+
+    #[test]
+    fn the_search_input_overlay_edits_the_query_and_runs_on_enter() {
+        let at = |code| resolve(Focus::ChatList, Overlay::SearchInput, &key(code));
+        // Focus is ignored — the overlay owns the keys. Printables build the query.
+        assert_eq!(at(KeyCode::Char('k')), Action::SearchInput('k'));
+        assert_eq!(at(KeyCode::Backspace), Action::SearchBackspace);
+        assert_eq!(at(KeyCode::Enter), Action::SearchSubmit);
+        assert_eq!(at(KeyCode::Esc), Action::SearchCancel);
+        assert_eq!(at(KeyCode::Left), Action::SearchLeft);
+    }
+
+    #[test]
+    fn the_results_overlay_navigates_hits_and_starts_a_forward() {
+        let at = |code| resolve(Focus::ChatList, Overlay::SearchResults, &key(code));
+        assert_eq!(at(KeyCode::Char('j')), Action::ResultNext);
+        assert_eq!(at(KeyCode::Up), Action::ResultPrev);
+        assert_eq!(at(KeyCode::Char('f')), Action::ForwardOpen);
+        assert_eq!(at(KeyCode::Esc), Action::SearchCancel);
+    }
+
+    #[test]
+    fn the_forward_overlay_picks_a_target_and_confirms() {
+        let at = |code| resolve(Focus::ChatList, Overlay::Forward, &key(code));
+        assert_eq!(at(KeyCode::Char('j')), Action::ForwardNext);
+        assert_eq!(at(KeyCode::Char('k')), Action::ForwardPrev);
+        assert_eq!(at(KeyCode::Enter), Action::ForwardConfirm);
+        assert_eq!(at(KeyCode::Esc), Action::ForwardCancel);
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_every_overlay() {
+        for overlay in [
+            Overlay::SearchInput,
+            Overlay::SearchResults,
+            Overlay::Forward,
+        ] {
+            assert_eq!(resolve(Focus::ChatList, overlay, &ctrl('c')), Action::Quit);
+        }
     }
 
     #[test]

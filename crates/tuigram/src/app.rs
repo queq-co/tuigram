@@ -10,7 +10,9 @@ use crate::chat_list::ChatListView;
 use crate::composer::Composer;
 use crate::conversation::ConversationView;
 use crate::event::AppEvent;
-use crate::keymap::{self, Focus};
+use crate::forward::ForwardView;
+use crate::keymap::{self, Focus, Overlay};
+use crate::search::SearchView;
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
 /// render tick, core updates) is funnelled through this enum before it touches
@@ -63,6 +65,40 @@ pub enum Action {
     /// Drop any reply/edit context and clear the composer back to plain compose
     /// (the composer's Esc binding).
     ComposerCancel,
+    /// Open the search overlay on a fresh, empty query (`/` in a nav pane).
+    SearchOpen,
+    /// Insert a typed character into the search query at the cursor.
+    SearchInput(char),
+    /// Delete the character before the search-query cursor (Backspace).
+    SearchBackspace,
+    /// Move the search-query cursor one character left.
+    SearchLeft,
+    /// Move the search-query cursor one character right.
+    SearchRight,
+    /// Move the search-query cursor to the start of the line.
+    SearchHome,
+    /// Move the search-query cursor to the end of the line.
+    SearchEnd,
+    /// Run the typed query and switch to the results list. Phase 6 dispatches the
+    /// core search; for now the results are whatever has been injected.
+    SearchSubmit,
+    /// Close the search overlay (from either the query line or the results).
+    SearchCancel,
+    /// Move the search-results selection down one hit.
+    ResultNext,
+    /// Move the search-results selection up one hit.
+    ResultPrev,
+    /// Start forwarding the selected search hit: open the target picker.
+    ForwardOpen,
+    /// Move the forward target-picker selection down one chat.
+    ForwardNext,
+    /// Move the forward target-picker selection up one chat.
+    ForwardPrev,
+    /// Confirm the forward to the selected target. Phase 6 sends through core; for
+    /// now it just closes the picker.
+    ForwardConfirm,
+    /// Cancel the forward and return to the search results.
+    ForwardCancel,
     /// Tear down and exit the loop.
     Quit,
 }
@@ -89,8 +125,14 @@ pub struct App {
     /// Which pane currently receives input; drives both key resolution and the
     /// focused-pane border highlight.
     focus: Focus,
-    /// Whether the help overlay is shown over the panes.
-    help_visible: bool,
+    /// The modal overlay drawn over the panes, if any. While set it captures input
+    /// (key resolution routes to it instead of `focus`).
+    overlay: Overlay,
+    /// The search overlay's state: the query line and the hit list it renders from.
+    search: SearchView,
+    /// The forward overlay's state: the messages being forwarded and the target
+    /// picker. Inert until a forward is started.
+    forward: ForwardView,
 }
 
 impl App {
@@ -134,9 +176,27 @@ impl App {
         self.focus
     }
 
-    /// Whether the help overlay is currently shown.
+    /// The modal overlay currently drawn over the panes (or [`Overlay::None`]).
+    pub fn overlay(&self) -> Overlay {
+        self.overlay
+    }
+
+    /// Whether the help overlay is currently shown. A convenience predicate over
+    /// [`overlay`](Self::overlay), kept for the help tests; the render path reads
+    /// the full [`Overlay`] instead.
+    #[allow(dead_code)]
     pub fn help_visible(&self) -> bool {
-        self.help_visible
+        self.overlay == Overlay::Help
+    }
+
+    /// The search overlay's state, for rendering the query line and results.
+    pub fn search(&self) -> &SearchView {
+        &self.search
+    }
+
+    /// The forward overlay's state, for rendering the target picker.
+    pub fn forward(&self) -> &ForwardView {
+        &self.forward
     }
 
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
@@ -169,6 +229,13 @@ impl App {
         }
     }
 
+    /// Inject a search result set, standing in for the Phase 6 core search. The
+    /// seam the reducer and render tests use to drive the results/forward overlays.
+    #[cfg(test)]
+    pub fn inject_search_results(&mut self, results: Vec<crate::search::SearchHit>) {
+        self.search.set_results(results);
+    }
+
     /// Called by the loop after a successful `terminal.draw`.
     pub fn clear_dirty(&mut self) {
         self.dirty = false;
@@ -182,7 +249,7 @@ impl App {
     /// live in one place.
     pub fn on_terminal_event(&self, event: Event) -> Action {
         match event {
-            Event::Key(key) => keymap::resolve(self.focus, self.help_visible, &key),
+            Event::Key(key) => keymap::resolve(self.focus, self.overlay, &key),
             // A resize must repaint against the new viewport.
             Event::Resize(_, _) => Action::Render,
             _ => Action::Noop,
@@ -219,7 +286,13 @@ impl App {
                 self.dirty = true;
             }
             Action::ToggleHelp => {
-                self.help_visible = !self.help_visible;
+                // Toggles between no overlay and the help cheatsheet; the keymap
+                // only emits this from browsing or while help is already open.
+                self.overlay = if self.overlay == Overlay::Help {
+                    Overlay::None
+                } else {
+                    Overlay::Help
+                };
                 self.dirty = true;
             }
             Action::SelectNext => {
@@ -280,6 +353,84 @@ impl App {
             }
             Action::ComposerCancel => {
                 self.composer.cancel();
+                self.dirty = true;
+            }
+            Action::SearchOpen => {
+                // A fresh search each time, so a previous query never leaks in.
+                self.search.reset();
+                self.overlay = Overlay::SearchInput;
+                self.dirty = true;
+            }
+            Action::SearchInput(c) => {
+                self.search.insert(c);
+                self.dirty = true;
+            }
+            Action::SearchBackspace => {
+                self.search.backspace();
+                self.dirty = true;
+            }
+            Action::SearchLeft => {
+                self.search.move_left();
+                self.dirty = true;
+            }
+            Action::SearchRight => {
+                self.search.move_right();
+                self.dirty = true;
+            }
+            Action::SearchHome => {
+                self.search.move_home();
+                self.dirty = true;
+            }
+            Action::SearchEnd => {
+                self.search.move_end();
+                self.dirty = true;
+            }
+            Action::SearchSubmit => {
+                // Phase 6 runs the query against core and folds the hits in through
+                // `set_results`; for now we just switch to the (injected-or-empty)
+                // results list so the overlay flow is exercised headlessly.
+                self.overlay = Overlay::SearchResults;
+                self.dirty = true;
+            }
+            Action::SearchCancel => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::ResultNext => {
+                self.search.select_next();
+                self.dirty = true;
+            }
+            Action::ResultPrev => {
+                self.search.select_prev();
+                self.dirty = true;
+            }
+            Action::ForwardOpen => {
+                // Forward the selected hit. The picker reuses a snapshot of the
+                // chat list as its target list. No selected hit (empty results) is
+                // a no-op that stays on the results overlay.
+                if let Some(message_id) = self.search.selected_hit().map(|h| h.message_id) {
+                    self.forward = ForwardView::new(vec![message_id], self.chat_list.clone());
+                    self.overlay = Overlay::Forward;
+                    self.dirty = true;
+                }
+            }
+            Action::ForwardNext => {
+                self.forward.select_next();
+                self.dirty = true;
+            }
+            Action::ForwardPrev => {
+                self.forward.select_prev();
+                self.dirty = true;
+            }
+            Action::ForwardConfirm => {
+                // Phase 6 calls `Client::forward_messages` to the selected target;
+                // for now confirming just closes the picker back to browsing.
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::ForwardCancel => {
+                // Back to the results the forward was started from.
+                self.overlay = Overlay::SearchResults;
                 self.dirty = true;
             }
             Action::Quit => self.should_quit = true,
@@ -502,5 +653,124 @@ mod tests {
         app.dispatch(Action::SelectNext);
         assert_eq!(app.chat_list().selected(), 1);
         assert!(app.is_dirty());
+    }
+
+    // --- search & forward overlays (#84) ---
+
+    use crate::search::SearchHit;
+
+    /// An app with two chats and a two-hit search result set, sitting on the
+    /// results overlay — the state a forward is started from.
+    fn app_on_results() -> App {
+        use crate::chat_list::{ChatList, ChatListView, sample_chat};
+        use tuigram_core::model::ChatListKind;
+
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
+        }]);
+        let mut app = App::with_chat_list(view);
+        app.dispatch(Action::SearchOpen);
+        // Hits arrive (Phase 6: from the core search) before we land on results.
+        app.inject_search_results(vec![
+            SearchHit::new(1, 10, "Alice: hello"),
+            SearchHit::new(2, 20, "Bob: kenobi"),
+        ]);
+        app.dispatch(Action::SearchSubmit);
+        app
+    }
+
+    #[test]
+    fn opening_search_enters_the_input_overlay_on_a_fresh_query() {
+        let mut app = App::new();
+        // Type into a search, cancel, reopen — the old query must not leak in.
+        app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchInput('x'));
+        app.dispatch(Action::SearchCancel);
+        app.dispatch(Action::SearchOpen);
+        assert_eq!(app.overlay(), Overlay::SearchInput);
+        assert_eq!(app.search().query(), "", "reopened search starts empty");
+    }
+
+    #[test]
+    fn typing_a_query_then_submitting_moves_to_the_results_overlay() {
+        let mut app = App::new();
+        app.dispatch(Action::SearchOpen);
+        for c in "hi".chars() {
+            app.dispatch(Action::SearchInput(c));
+        }
+        assert_eq!(app.search().query(), "hi");
+        app.dispatch(Action::SearchSubmit);
+        assert_eq!(app.overlay(), Overlay::SearchResults);
+    }
+
+    #[test]
+    fn navigating_results_moves_the_selection() {
+        let mut app = app_on_results();
+        assert_eq!(app.search().selected(), 0);
+        app.dispatch(Action::ResultNext);
+        assert_eq!(app.search().selected(), 1);
+        app.dispatch(Action::ResultPrev);
+        assert_eq!(app.search().selected(), 0);
+    }
+
+    #[test]
+    fn forwarding_a_hit_opens_the_target_picker_with_that_message() {
+        let mut app = app_on_results();
+        app.dispatch(Action::ResultNext); // select Bob's hit (message 20)
+        app.dispatch(Action::ForwardOpen);
+        assert_eq!(app.overlay(), Overlay::Forward);
+        assert_eq!(app.forward().message_ids(), &[20]);
+        // The picker reuses the chat list as its target list.
+        assert_eq!(
+            app.forward().selected_target().map(|c| c.title.as_str()),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn forward_picks_a_target_then_confirms_back_to_browsing() {
+        let mut app = app_on_results();
+        app.dispatch(Action::ForwardOpen);
+        app.dispatch(Action::ForwardNext);
+        assert_eq!(
+            app.forward().selected_target().map(|c| c.title.as_str()),
+            Some("Bob")
+        );
+        app.dispatch(Action::ForwardConfirm);
+        assert_eq!(app.overlay(), Overlay::None, "confirm closes the modal");
+    }
+
+    #[test]
+    fn cancelling_a_forward_returns_to_the_results() {
+        let mut app = app_on_results();
+        app.dispatch(Action::ForwardOpen);
+        app.dispatch(Action::ForwardCancel);
+        assert_eq!(app.overlay(), Overlay::SearchResults);
+    }
+
+    #[test]
+    fn forwarding_with_no_hits_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchSubmit); // empty results
+        app.dispatch(Action::ForwardOpen);
+        assert_eq!(
+            app.overlay(),
+            Overlay::SearchResults,
+            "no hit to forward, stays put"
+        );
+    }
+
+    #[test]
+    fn search_keys_resolve_through_the_overlay_not_the_panes() {
+        let mut app = App::new();
+        app.dispatch(Action::SearchOpen);
+        // `j` would select a chat in browse mode; in the search input it types.
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Char('j'), KeyModifiers::NONE)),
+            Action::SearchInput('j')
+        );
     }
 }

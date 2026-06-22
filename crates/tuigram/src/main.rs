@@ -12,8 +12,11 @@ mod chat_list;
 mod composer;
 mod conversation;
 mod event;
+mod forward;
 mod keymap;
+mod search;
 mod terminal;
+mod textinput;
 mod ui;
 
 use std::io;
