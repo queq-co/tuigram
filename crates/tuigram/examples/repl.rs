@@ -77,7 +77,13 @@ async fn main() -> Fallible {
     let bridge = authenticate().await?;
     println!("\nLogged in. Entering the headless REPL — type `help` for commands.\n");
     let client = Client::start(bridge);
-    run_repl(&client).await
+    let result = run_repl(&client).await;
+    // Flush and cleanly close TDLib's database before exit — on every path
+    // (`quit`, EOF, or `logout`). Dropping the bridge only stops the receive
+    // loop; without an explicit close TDLib's SQLite database is left mid-write
+    // and the next run fails to open it ("database disk image is malformed").
+    shutdown(&client).await;
+    result
 }
 
 // ----------------------------------------------------------------------------
@@ -872,43 +878,48 @@ async fn close_secret_chat(client: &Client, secret_chat_id: i32) {
     }
 }
 
-/// Log out: invalidate the session, wait for TDLib to clear it, then end the
-/// REPL so the next run starts at a fresh login. A failed request stays in the
-/// REPL ([`Flow::Continue`]); a successful one exits ([`Flow::Done`]).
+/// Log out: invalidate the session, wait for TDLib to *fully* clear it, then end
+/// the REPL so the next run starts at a fresh login. A failed request stays in
+/// the REPL ([`Flow::Continue`]); a successful one exits ([`Flow::Done`]).
+///
+/// `logOut` is asynchronous — TDLib invalidates the session server-side and
+/// destroys all local data, driving authorization through `Closing` to `Closed`.
+/// Waiting for `Closed` here is what makes the next run start with no session on
+/// disk and behave exactly like a first-time login; returning early would strand
+/// a half-cleared session the next run can neither resume nor cleanly replace.
 async fn logout(client: &Client) -> Flow {
     println!("Logging out…");
     if let Err(e) = client.bridge().log_out().await {
         println!("Logout failed: {} {}", e.code, e.message);
         return Flow::Continue;
     }
-    wait_until_logged_out(client.bridge()).await;
+    wait_until_closed(client.bridge()).await;
     println!("Logged out. The local session has been cleared — re-run to sign in again.");
     Flow::Done
 }
 
-/// After `log_out`, wait for TDLib to *finish* clearing the session before the
-/// process exits, so the next run starts with no session on disk and behaves
-/// exactly like a first-time login.
-///
-/// `logOut` is asynchronous: TDLib invalidates the session server-side and
-/// destroys all local data, driving authorization `Ready` -> `LoggingOut` ->
-/// `Closing` -> `Closed`. It is only *done* once it leaves those in-progress
-/// states — returning at the first transition (the previous behaviour: "no
-/// longer `Ready`") exits while the local database is still being wiped, leaving
-/// a half-cleared session the next run can neither resume nor cleanly replace,
-/// which is what blocked logging back in. So keep waiting while the state is
-/// `Ready`/`LoggingOut`/`Closing`, and return only once the teardown has settled
-/// (`Closed`, a fresh wait state, or the client is gone). Bounded (~5s) so a
-/// stuck logout cannot hang the harness.
-async fn wait_until_logged_out(bridge: &Bridge) {
+/// Cleanly close the TDLib instance before the process exits, so its database is
+/// flushed and properly closed rather than left mid-write. Called on every exit
+/// path; harmless when the session is already gone (e.g. straight after
+/// `logout`) — the `close` request just fails and the wait returns at once.
+async fn shutdown(client: &Client) {
+    // Ignore the result: an already-closing/closed client (the usual case after
+    // `logout`) rejects it, which is exactly the state we want.
+    let _ = client.bridge().close().await;
+    wait_until_closed(client.bridge()).await;
+}
+
+/// Wait for TDLib to reach `Closed` — the signal that `log_out`/`close` has
+/// finished flushing and closing the local database. Both teardown paths drive
+/// authorization through `Closing` to `Closed`; returning before then would exit
+/// with the database mid-write, leaving it malformed for the next run. Bounded
+/// (~5s) so a stuck teardown cannot hang the harness; a query that errors (the
+/// client is already gone) counts as closed.
+async fn wait_until_closed(bridge: &Bridge) {
     for _ in 0..50 {
         match bridge.authorization_state().await {
-            Ok(
-                AuthorizationState::Ready
-                | AuthorizationState::LoggingOut
-                | AuthorizationState::Closing,
-            ) => tokio::time::sleep(Duration::from_millis(100)).await,
-            _ => return,
+            Ok(AuthorizationState::Closed) | Err(_) => return,
+            Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
         }
     }
 }
