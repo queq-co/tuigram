@@ -26,9 +26,13 @@ pub enum Action {
     /// Nothing to do (e.g. an unbound key).
     Noop,
     /// Mark the frame dirty so the loop repaints, with no other state change.
+    /// The catch-all for a core signal whose data the panes do not project yet
+    /// (chats/messages/files/auth): repaint and let the projection read it back.
     Render,
-    /// A heartbeat from core — placeholder until Phase 6 wires the real `Client`.
-    Beat,
+    /// Fold the core link's connection state into the status bar — the reduction
+    /// of an [`AppEvent::Connection`](crate::event::AppEvent::Connection) from the
+    /// live `updateConnectionState` feed.
+    SetConnection(ConnectionState),
     /// Move input focus to the next pane (chat list → history → composer → …).
     FocusNext,
     /// Move input focus to the previous pane, wrapping.
@@ -165,9 +169,6 @@ pub struct App {
     should_quit: bool,
     /// Set when visible state changed since the last paint; cleared after `draw`.
     dirty: bool,
-    /// Count of core heartbeats applied — proof the mpsc arm is live until the
-    /// real update stream replaces the fake source in Phase 6.
-    beats: u64,
     /// The left pane's chat-list view: the lists, the active one, and the
     /// selection. Empty until Phase 6 projects the core store into it.
     chat_list: ChatListView,
@@ -219,10 +220,6 @@ impl App {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
-    }
-
-    pub fn beats(&self) -> u64 {
-        self.beats
     }
 
     /// The chat-list view the left pane renders from.
@@ -294,10 +291,9 @@ impl App {
         &self.notifications
     }
 
-    /// Set the connection state — Phase 6 calls this on a TDLib
-    /// `updateConnectionState`. Unused in the binary until that wiring lands; the
-    /// status-bar render and the reducer tests drive it for now.
-    #[allow(dead_code)]
+    /// Fold a connection-state change into the status bar — driven by
+    /// [`Action::SetConnection`], the reduction of the live
+    /// `updateConnectionState` feed (#110). Repaints only on an actual change.
     pub fn set_connection(&mut self, state: ConnectionState) {
         if self.connection != state {
             self.connection = state;
@@ -371,10 +367,20 @@ impl App {
         }
     }
 
-    /// Map a core [`AppEvent`] to an [`Action`].
+    /// Map a core [`AppEvent`] to an [`Action`]. Pure: the live source already
+    /// classified the update, so this only chooses the reduction.
+    ///
+    /// Connection changes fold into the status bar; every other signal is a
+    /// repaint nudge for now — projecting the folded chats/messages/files into the
+    /// panes is a later Phase 6 issue, and this is the seam it slots into.
     pub fn on_app_event(&self, event: AppEvent) -> Action {
         match event {
-            AppEvent::Beat => Action::Beat,
+            AppEvent::Connection(state) => Action::SetConnection(state),
+            AppEvent::Auth
+            | AppEvent::Chats
+            | AppEvent::Messages
+            | AppEvent::File
+            | AppEvent::Lagged => Action::Render,
         }
     }
 
@@ -384,13 +390,7 @@ impl App {
         match action {
             Action::Noop => {}
             Action::Render => self.dirty = true,
-            Action::Beat => {
-                // The heartbeat doubles as the toast clock: each beat ages the
-                // current toast, popping it when it expires (#88).
-                self.beats += 1;
-                self.notifications.tick();
-                self.dirty = true;
-            }
+            Action::SetConnection(state) => self.set_connection(state),
             Action::FocusNext => {
                 self.focus = self.focus.next();
                 self.dirty = true;
@@ -739,13 +739,33 @@ mod tests {
     }
 
     #[test]
-    fn beat_counts_and_dirties() {
+    fn a_connection_event_folds_into_the_status_bar() {
         let mut app = App::new();
+        assert_eq!(app.connection(), ConnectionState::Connecting);
+        // The live source classifies updateConnectionState into Connection(state);
+        // on_app_event reduces it to SetConnection, dispatch folds it.
+        let action = app.on_app_event(AppEvent::Connection(ConnectionState::Ready));
+        assert_eq!(action, Action::SetConnection(ConnectionState::Ready));
         app.clear_dirty();
-        let action = app.on_app_event(AppEvent::Beat);
         app.dispatch(action);
-        assert_eq!(app.beats(), 1);
+        assert_eq!(app.connection(), ConnectionState::Ready);
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn data_signals_map_to_a_repaint() {
+        // Until the panes project the folded state, every non-connection signal is
+        // a repaint nudge — each variant maps, so the mpsc arm is exercised whole.
+        let app = App::new();
+        for event in [
+            AppEvent::Auth,
+            AppEvent::Chats,
+            AppEvent::Messages,
+            AppEvent::File,
+            AppEvent::Lagged,
+        ] {
+            assert_eq!(app.on_app_event(event), Action::Render);
+        }
     }
 
     #[test]
@@ -755,7 +775,6 @@ mod tests {
         app.dispatch(Action::Noop);
         assert!(!app.is_dirty());
         assert!(!app.should_quit());
-        assert_eq!(app.beats(), 0);
     }
 
     #[test]
@@ -1296,20 +1315,6 @@ mod tests {
         assert_eq!(
             app.notifications().current().unwrap().line(),
             "✗ send failed (FLOOD_WAIT)"
-        );
-    }
-
-    #[test]
-    fn the_heartbeat_ages_a_toast_out() {
-        let mut app = App::new();
-        app.notify(Notice::info("download complete"));
-        // Beat is the toast clock: enough beats expire it.
-        for _ in 0..10 {
-            app.dispatch(Action::Beat);
-        }
-        assert!(
-            app.notifications().current().is_none(),
-            "the toast timed out"
         );
     }
 

@@ -179,9 +179,15 @@ impl Notifications {
         self.queue.pop_front();
     }
 
-    /// Age the current toast by one heartbeat, dropping it when it expires.
-    /// Returns whether a toast was removed — the only change the render path must
-    /// repaint for, since a still-counting toast looks the same.
+    /// Age the current toast by one tick, dropping it when it expires. Returns
+    /// whether a toast was removed — the only change the render path must repaint
+    /// for, since a still-counting toast looks the same.
+    ///
+    /// The clock that drove this was the Phase-5 heartbeat, removed with the fake
+    /// source in #110; the real wall-clock clock returns alongside the toast
+    /// producers in a later Phase 6 issue (no toast is enqueued until then, so the
+    /// queue is empty and unaged in the binary meanwhile).
+    #[allow(dead_code)]
     pub fn tick(&mut self) -> bool {
         if let Some(front) = self.queue.front_mut() {
             front.ttl = front.ttl.saturating_sub(1);

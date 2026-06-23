@@ -10,9 +10,10 @@
 //! Phase 6 (#109) bootstraps a real [`tuigram_core::Client`] before the loop: the
 //! [`bootstrap`] module resolves credentials, drives login to `Ready` on the
 //! plain terminal, and starts the update router. `main` holds that one handle
-//! across the TUI run and closes TDLib cleanly on exit. The loop itself is still
-//! fed by the temporary fake source — #110 swaps that for the client's update
-//! stream without changing the loop's shape.
+//! across the TUI run and closes TDLib cleanly on exit. The loop is fed by the
+//! live core source (#110): [`spawn_core_source`] forwards the client's update
+//! stream onto the same mpsc arm the fake heartbeat used, classified into
+//! [`AppEvent`](crate::event::AppEvent)s — the loop's shape is unchanged.
 
 mod app;
 mod bootstrap;
@@ -39,16 +40,15 @@ use std::time::Duration;
 use crossterm::event::EventStream;
 use tokio_stream::StreamExt;
 
+use tuigram_core::Client;
+
 use crate::app::{Action, App};
-use crate::event::spawn_fake_source;
+use crate::event::spawn_core_source;
 use crate::terminal::{TerminalGuard, install_panic_hook};
 
 /// Render cadence cap (~30 FPS). Bounds repaint rate independently of network
 /// latency, so the UI stays smooth while core is mid-request.
 const FRAME: Duration = Duration::from_millis(33);
-
-/// Fake core heartbeat period (placeholder until Phase 6's real update stream).
-const HEARTBEAT: Duration = Duration::from_secs(1);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -73,7 +73,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let result = run(&mut guard).await;
+    let result = run(&mut guard, &client).await;
     // Restore explicitly before any error reaches the user's normal screen.
     // (`guard`'s Drop would also restore, but make the ordering obvious.)
     drop(guard);
@@ -92,12 +92,13 @@ async fn main() -> ExitCode {
 }
 
 /// The central event loop. Owns no terminal lifecycle (that is `guard`'s job) and
-/// awaits only the `select!` sources — never the `draw`.
-async fn run(guard: &mut TerminalGuard) -> io::Result<()> {
+/// awaits only the `select!` sources — never the `draw`. The `client` feeds the
+/// core arm: [`spawn_core_source`] subscribes to its live update stream.
+async fn run(guard: &mut TerminalGuard, client: &Client) -> io::Result<()> {
     let mut app = App::new();
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(FRAME);
-    let mut core_rx = spawn_fake_source(HEARTBEAT);
+    let mut core_rx = spawn_core_source(client);
 
     while !app.should_quit() {
         if app.is_dirty() {
@@ -119,8 +120,9 @@ async fn run(guard: &mut TerminalGuard) -> io::Result<()> {
             },
             // Render tick: mark dirty so clocks/animations repaint on cadence.
             _ = tick.tick() => app.dispatch(Action::Render),
-            // Core events (fake for now). `None` => the source ended; keep
-            // running so the UI stays usable without it.
+            // Live core events. `None` => the source ended (the bridge closed its
+            // broadcast on shutdown); keep running so a late teardown can't wedge
+            // the loop — the quit path drives the exit.
             maybe_app_event = core_rx.recv() => {
                 if let Some(app_event) = maybe_app_event {
                     let action = app.on_app_event(app_event);
