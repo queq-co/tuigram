@@ -19,7 +19,9 @@
 //! folded chat list back from the client and projects the left pane (#113),
 //! paging each list to exhaustion on demand; on a message signal it reads the open
 //! chat's folded history back and projects the conversation pane (#114), paging a
-//! page at a time as the user opens a chat and scrolls up. `main` closes TDLib
+//! page at a time as the user opens a chat and scrolls up. While a chat is open the
+//! loop acknowledges its unread messages to Telegram through the read seam (#115),
+//! so the unread badge clears here and on the user's other clients. `main` closes TDLib
 //! cleanly on every exit path, including a login the user quit before the facade
 //! ever started.
 
@@ -41,7 +43,7 @@ mod terminal;
 mod textinput;
 mod ui;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -53,7 +55,8 @@ use tokio_stream::StreamExt;
 
 use tuigram_core::model::ChatListKind;
 use tuigram_core::{
-    Client, HistoryRequests, NEWEST, load_archive_list, load_folder_list, load_main_list,
+    Client, HistoryRequests, NEWEST, ReadRequests, load_archive_list, load_folder_list,
+    load_main_list,
 };
 
 use crate::app::{Action, App};
@@ -242,6 +245,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // The user may have opened a different chat, or asked (scroll-up at the top)
         // for older history — drive the open chat's paging and projection.
         drive_open_chat(&mut app, client, &mut history, &history_tx);
+        // With the open chat resolved and its history possibly just filled,
+        // acknowledge its unread messages to Telegram (clears the unread badge).
+        drive_read_state(client, &mut history);
     }
 
     Ok(())
@@ -269,6 +275,12 @@ struct HistoryState {
     loading: HashSet<i64>,
     /// Chats whose start-of-history was reached, so we stop paging older.
     exhausted: HashSet<i64>,
+    /// Per-chat high-water mark of the newest message id already acknowledged as
+    /// read (#115). A re-projection or render tick fires many times before the
+    /// resulting `updateChatReadInbox` lands, so this de-dupes the `view_messages`
+    /// call to one per new horizon — without it the loop would re-send the same
+    /// view on every frame until the fold caught up.
+    read_through: HashMap<i64, i64>,
 }
 
 /// The chat to show in the conversation pane: the chat-list selection while the
@@ -320,6 +332,47 @@ fn drive_open_chat(
         history.loading.insert(chat_id);
         spawn_history_page(client, chat_id, anchor, history_tx.clone());
     }
+}
+
+/// Acknowledge the open chat's unread messages to Telegram (#115). When a chat is
+/// open and its newest loaded incoming message is newer than the chat's read
+/// horizon, send the unread ids through [`ReadRequests::view_messages`]
+/// (`force_read`, the `ChatHistory` source): TDLib advances the read marker and
+/// replies with `updateChatReadInbox`, which the chat store folds and the loop
+/// re-projects, clearing the unread badge here and on the user's other clients.
+///
+/// Two things bound the traffic: `read_through` de-dupes so one `view_messages`
+/// fires per new horizon (not once per frame), and the open gate is the focused
+/// history pane — browsing the list never marks a chat read. The send is advisory
+/// and fire-and-forget, matching the seam's contract: the read path never waits on
+/// it, and a failed view simply leaves the chat unread until a newer message (or a
+/// later open) re-triggers.
+fn drive_read_state(client: &Arc<Client>, history: &mut HistoryState) {
+    let Some(chat_id) = history.open else { return };
+    // The chat's server read horizon, and the loaded incoming messages past it
+    // (oldest first, since the store is keyed by ascending id).
+    let unread: Vec<i64> = client.read(|s| {
+        let last_read = s
+            .chats()
+            .get(chat_id)
+            .map_or(0, |chat| chat.last_read_inbox_message_id);
+        s.messages()
+            .history(chat_id)
+            .into_iter()
+            .filter(|message| !message.is_outgoing && message.id > last_read)
+            .map(|message| message.id)
+            .collect()
+    });
+    // Nothing unread loaded, or already acknowledged up to the newest: no view.
+    let Some(&newest) = unread.last() else { return };
+    if newest <= history.read_through.get(&chat_id).copied().unwrap_or(0) {
+        return;
+    }
+    history.read_through.insert(chat_id, newest);
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        let _ = client.bridge().view_messages(chat_id, unread).await;
+    });
 }
 
 /// Read the open chat's folded history and pinned ids back from the `Client` and
