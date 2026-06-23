@@ -1,61 +1,56 @@
-//! Pre-TUI bootstrap (Phase 6 #109): stand up a live, authenticated
-//! [`Client`] before the terminal UI takes the screen.
+//! Pre-TUI bootstrap (Phase 6 #109, #111): stand up an *initialized* TDLib
+//! [`Bridge`] on the plain terminal, before the login screens take over inside
+//! the TUI.
 //!
 //! The facade pattern is "drive login to `Ready`, *then* [`Client::start`]"
-//! (see `docs/architecture.md`). Login is interactive, so this runs on the
-//! **plain** terminal — before [`TerminalGuard`](crate::terminal::TerminalGuard)
-//! puts it into raw mode / the alternate screen — resolving credentials,
-//! opening secure session storage, driving the auth state machine over stdin,
-//! and handing the authenticated bridge to the facade.
+//! (see `docs/architecture.md`). The login itself moved into the TUI's own
+//! screens in #111 ([`crate::login::run_login`]); what stays on the **plain**
+//! terminal — before [`TerminalGuard`](crate::terminal::TerminalGuard) enters
+//! raw mode / the alternate screen — is the non-interactive client setup that is
+//! not part of account login: resolving credentials (with first-run onboarding),
+//! opening secure session storage, and sending `setTdlibParameters`.
 //!
-//! This stdin login is **temporary scaffolding**: Phase 6 #111 moves login into
-//! the TUI's own login screens and deletes the prompting here. Until then it is
-//! the smallest thing that gets the rest of Phase 6 a real `Client` to build
-//! against. It mirrors the headless REPL harness's `authenticate()` (kept
-//! separate because an example cannot import a binary's modules).
+//! `setTdlibParameters` is the first request of every run and the one that
+//! surfaces a bad `api_id` as `API_ID_PUBLISHED_FLOOD`; keeping it here means
+//! that failure prints its actionable, multi-line guidance on the normal screen
+//! rather than as a single line inside a raw-mode TUI. Once it returns, TDLib
+//! advances to the first login state and the TUI drives the rest.
 //!
-//! Secrets are handled exactly as the library is: the login code and 2FA
-//! password are read, moved straight into their TDLib request, and never logged
-//! or stored; TDLib's own logging is silenced by [`Login`] before the first
-//! credential-bearing request. Credentials and the session live only where
-//! `tuigram-core` puts them (the `600` config and secure session storage) — the
-//! binary never writes them itself.
+//! Secrets are handled exactly as the library is: TDLib's own logging is silenced
+//! by [`Login::set_parameters`] before the first credential-bearing request
+//! (including the `api_id`/`api_hash` in the parameters themselves). Credentials
+//! and the session live only where `tuigram-core` puts them (the `600` config and
+//! secure session storage) — the binary never writes them itself.
 
 use std::error::Error;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use tokio_stream::StreamExt;
-use tuigram_core::enums::{AuthorizationState, Update};
+use tuigram_core::enums::AuthorizationState;
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
-    ApiCredentials, AuthRequests, AuthState, Bridge, Client, ClientParameters, CredentialError,
-    CredentialResolver, Login, Onboarding, SessionStorage, TgClient, UpdateStream,
-    is_api_id_published_flood,
+    ApiCredentials, AuthRequests, AuthState, Bridge, ClientParameters, CredentialError,
+    CredentialResolver, Login, Onboarding, SessionStorage, is_api_id_published_flood,
 };
 
 /// Any bootstrap failure, surfaced to the user before the TUI starts.
 type BootResult<T> = Result<T, Box<dyn Error>>;
 
-/// Resolve credentials, open storage, drive login to `Ready`, and start the
-/// update router — returning the one live [`Client`] handle `main` holds.
+/// Resolve credentials, open storage, and initialize TDLib — returning the
+/// initialized (but not-yet-logged-in) [`Bridge`] `main` holds across the login
+/// screens and the run loop.
 ///
 /// Runs entirely on the plain terminal; on any failure it returns an error for
-/// `main` to print and exit on, having never entered the TUI.
-pub async fn bootstrap() -> BootResult<Client> {
+/// `main` to print and exit on, having never entered the TUI. Login (phone, code,
+/// 2FA, QR, …) happens afterwards inside the TUI via [`crate::login::run_login`].
+pub async fn bootstrap() -> BootResult<Bridge> {
     print_intro();
-    let bridge = authenticate().await?;
-    println!("\nLogged in. Starting tuigram…\n");
-    Ok(Client::start(bridge))
-}
 
-/// Resolve credentials, open storage, and drive login to `Ready`, returning the
-/// authenticated bridge for the facade to take over.
-async fn authenticate() -> BootResult<Bridge> {
     // Resolve credentials (env -> config -> first-run onboarding). Onboarding
     // prompts only when neither env nor config supplies them, and the captured
-    // values are persisted to the 600 config so this happens once.
+    // values are persisted to the 600 config so this happens once. This is
+    // credential setup, not account login, so it legitimately uses stdin here.
     let resolver = CredentialResolver::from_environment()?;
     let onboarding = StdinOnboarding::new(resolver.config_path().to_path_buf());
     let creds = resolver.resolve(&onboarding)?;
@@ -64,179 +59,45 @@ async fn authenticate() -> BootResult<Bridge> {
     let session = SessionStorage::open()?;
 
     let bridge = Bridge::new();
-    // Subscribe before driving so transitions emitted during login are captured.
-    let mut updates = bridge.updates();
     let params = build_parameters(&creds, &session);
-
-    // `Login` borrows the bridge for the duration of `drive_login`; once that
-    // returns the borrow is released and the owned bridge can move to the facade.
-    match drive_login(&bridge, &mut updates, params).await? {
-        AuthState::Ready => Ok(bridge),
-        AuthState::Closed => Err("session closed before it became ready".into()),
-        other => Err(format!("login ended in a non-ready state: {other:?}").into()),
-    }
+    initialize(&bridge, params).await?;
+    Ok(bridge)
 }
 
-/// Answer each waiting authorization state from stdin until login reaches a
-/// terminal state, which is returned.
-async fn drive_login(
-    bridge: &Bridge,
-    updates: &mut UpdateStream,
-    params: ClientParameters,
-) -> BootResult<AuthState> {
-    let mut login = Login::new(bridge);
-    let mut params = Some(params);
-    let mut last: Option<AuthState> = None;
-
-    // Prime with the current state in case TDLib's startup update fired before we
-    // subscribed; every subsequent transition arrives on the update stream.
-    let initial = bridge.authorization_state().await.map_err(td)?;
-    login.on_update(&initial);
-    if dispatch(&login, &mut params, &mut last).await? == Flow::Done {
-        return Ok(login.state().clone());
-    }
-
-    while let Some(update) = updates.next().await {
-        if let Update::AuthorizationState(u) = update {
-            login.on_update(&u.authorization_state);
-            if dispatch(&login, &mut params, &mut last).await? == Flow::Done {
-                return Ok(login.state().clone());
-            }
-        }
-    }
-
-    Err("TDLib update stream ended before login completed".into())
-}
-
-/// Whether the login flow is still in progress or has reached a terminal state.
-#[derive(PartialEq, Eq)]
-enum Flow {
-    Continue,
-    Done,
-}
-
-/// Answer the current [`AuthState`], prompting the user as needed.
+/// Send `setTdlibParameters` so the client is initialized before the TUI takes
+/// over login. A fresh process always begins at `WaitTdlibParameters`; a
+/// persisted session still needs the parameters set before TDLib will report
+/// `Ready`. Either way one request advances the state machine to the first login
+/// state the TUI then drives.
 ///
-/// Skips a state identical to the one just handled — TDLib re-emits the startup
-/// `WaitTdlibParameters` after we prime from a direct query, and a wrong entry is
-/// re-prompted in-handler rather than via a fresh update, so the only same-state
-/// repeats reaching here are duplicates safe to ignore.
-async fn dispatch(
-    login: &Login<'_, Bridge>,
-    params: &mut Option<ClientParameters>,
-    last: &mut Option<AuthState>,
-) -> BootResult<Flow> {
-    let state = login.state().clone();
-    if last.as_ref() == Some(&state) {
-        return Ok(Flow::Continue);
+/// `set_parameters` first drops TDLib's log verbosity — ahead of any credential,
+/// including the `api_id`/`api_hash` it carries. A bad `api_id` surfaces here (or
+/// on the first network request) as `API_ID_PUBLISHED_FLOOD`; it becomes the
+/// actionable guidance on the plain terminal rather than a line inside the TUI.
+async fn initialize(bridge: &Bridge, params: ClientParameters) -> BootResult<()> {
+    let login = Login::new(bridge);
+    let state = AuthState::from_tdlib(&bridge.authorization_state().await.map_err(td)?);
+    if state == AuthState::WaitTdlibParameters {
+        login
+            .set_parameters(params)
+            .await
+            .map_err(|e| flood_or(e, td))?;
     }
-    *last = Some(state.clone());
-
-    match state {
-        AuthState::WaitTdlibParameters => {
-            let params = params
-                .take()
-                .ok_or("TDLib requested setTdlibParameters more than once")?;
-            // A bad api_id surfaces here (or on the first network request) as
-            // API_ID_PUBLISHED_FLOOD; turn it into the actionable guidance.
-            login
-                .set_parameters(params)
-                .await
-                .map_err(|e| flood_or(e, td))?;
-        }
-        AuthState::WaitPhoneNumber => loop {
-            let phone = prompt("Phone number (international format, e.g. +15551234567): ")?;
-            match login.submit_phone_number(phone).await {
-                Ok(()) => break,
-                Err(e) => retry_or_flood(&e)?,
-            }
-        },
-        AuthState::WaitCode => loop {
-            let code = prompt("Login code (sent to you by Telegram): ")?;
-            match login.submit_code(code).await {
-                Ok(()) => break,
-                Err(e) => retry_or_flood(&e)?,
-            }
-        },
-        AuthState::WaitPassword { hint } => {
-            if !hint.is_empty() {
-                println!("  Two-step verification hint: {hint}");
-            }
-            loop {
-                let password = prompt("Two-step verification password (input is visible): ")?;
-                match login.submit_password(password).await {
-                    Ok(()) => break,
-                    Err(e) => retry_or_flood(&e)?,
-                }
-            }
-        }
-        AuthState::WaitOtherDeviceConfirmation { link } => {
-            // QR login: nothing to read here — TDLib advances on its own once the
-            // link is scanned on an already signed-in device. Show it and wait.
-            println!("\nScan this link on a signed-in Telegram device to confirm login:");
-            println!("  {link}");
-            println!("Waiting for confirmation…");
-        }
-        AuthState::WaitEmailAddress => loop {
-            let email = prompt("Email address for login: ")?;
-            match login.submit_email_address(email).await {
-                Ok(()) => break,
-                Err(e) => retry_or_flood(&e)?,
-            }
-        },
-        AuthState::WaitEmailCode { email_pattern } => {
-            println!("  A login code was sent to {email_pattern}.");
-            loop {
-                let code = prompt("Email login code: ")?;
-                match login.submit_email_code(code).await {
-                    Ok(()) => break,
-                    Err(e) => retry_or_flood(&e)?,
-                }
-            }
-        }
-        AuthState::WaitRegistration { terms_of_service } => {
-            // Unregistered number: create the account. Show the terms first so
-            // accepting (by registering) is informed.
-            if !terms_of_service.is_empty() {
-                println!("\nTerms of service:\n{terms_of_service}\n");
-            }
-            println!("This phone number isn't registered yet — create the account.");
-            loop {
-                let first = prompt("First name: ")?;
-                let last = prompt("Last name (optional): ")?;
-                match login.register(first, last).await {
-                    Ok(()) => break,
-                    Err(e) => retry_or_flood(&e)?,
-                }
-            }
-        }
-        AuthState::WaitPremiumPurchase { store_product_id } => {
-            // No headless answer exists: completing this needs an App Store / Play
-            // in-store purchase. Report the dead end rather than hang.
-            return Err(format!(
-                "login requires buying Telegram Premium (store product \
-                 {store_product_id}) as an in-store purchase, which this client \
-                 can't perform — log in on a mobile app first"
-            )
-            .into());
-        }
-        AuthState::Ready => return Ok(Flow::Done),
-        AuthState::Closed => {
-            println!("\nSession closed (logged out or shutting down).");
-            return Ok(Flow::Done);
-        }
-    }
-    Ok(Flow::Continue)
+    Ok(())
 }
 
 /// Cleanly close the TDLib instance before the process exits, so its database is
 /// flushed and properly closed rather than left mid-write. Without this, the next
 /// run fails to open a half-written database ("database disk image is malformed").
-pub async fn shutdown(client: &Client) {
+///
+/// Takes the [`Bridge`] directly so it serves both exit paths: a successful run
+/// (via `client.bridge()`) and a login that quit before [`Client::start`] was
+/// ever called, where there is no `Client` yet — only the bridge.
+pub async fn shutdown(bridge: &Bridge) {
     // Ignore the result: an already-closing/closed client rejects `close`, which
     // is exactly the state we want.
-    let _ = client.bridge().close().await;
-    wait_until_closed(client.bridge()).await;
+    let _ = bridge.close().await;
+    wait_until_closed(bridge).await;
 }
 
 /// Wait for TDLib to reach `Closed` — the signal that `close` has finished
@@ -321,18 +182,6 @@ fn prompt(label: &str) -> BootResult<String> {
         return Err("input closed (EOF)".into());
     }
     Ok(line.trim().to_owned())
-}
-
-/// Report a rejected entry (bad phone/code/password) and signal a re-prompt,
-/// unless the failure is the published-api_id flood — which no retry can fix, so
-/// it is surfaced as a fatal, actionable error instead. The TDLib message is an
-/// error code (e.g. `PHONE_CODE_INVALID`), never the input.
-fn retry_or_flood(e: &TdError) -> BootResult<()> {
-    if is_api_id_published_flood(e) {
-        return Err(Box::new(CredentialError::PublishedApiIdFlood));
-    }
-    eprintln!("  Rejected ({}): {}. Try again.", e.code, e.message);
-    Ok(())
 }
 
 /// Map a fatal login error: the published-api_id flood becomes its actionable
