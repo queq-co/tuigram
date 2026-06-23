@@ -17,24 +17,32 @@
 //! the password is rendered masked, and every transition resets the fields so an
 //! entry never carries from one screen to the next.
 //!
-//! Like the other Phase 5 view-models, the live wiring — feeding TDLib's
-//! `updateAuthorizationState` into [`LoginView::set_state`] and dispatching each
-//! [`LoginAnswer`] over the bridge — arrives with the core update stream in Phase
-//! 6; nothing in the product binary mounts these screens yet, so the whole module
-//! is exercised headlessly (unit tests for the input handling, snapshot tests for
-//! the screens) rather than from `main`.
-#![allow(dead_code)]
+//! Phase 6 (#111) mounts these screens: [`run_login`] drives the TUI login loop
+//! over the real bridge — feeding TDLib's `updateAuthorizationState` into
+//! [`LoginView::set_state`], dispatching each [`LoginAnswer`] through the core
+//! [`Login`] / [`AuthRequests`](tuigram_core::AuthRequests) seam, and returning
+//! once login reaches a terminal state so `main` gates the three-pane UI behind
+//! `Ready`. The pure view-model is still exercised headlessly (unit tests for the
+//! input handling and the answer→request mapping, snapshot tests for the screens);
+//! the async loop itself is a real-TDLib lifecycle path verified via the REPL
+//! (#123), not in CI.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::io;
+
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use qrcodegen::{QrCode, QrCodeEcc};
 use ratatui::Frame;
 use ratatui::layout::Alignment;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
+use tokio_stream::StreamExt;
 
-use tuigram_core::AuthState;
+use tuigram_core::enums::Update;
+use tuigram_core::types::Error as TdError;
+use tuigram_core::{AuthRequests, AuthState, Bridge, Login, TgClient};
 
+use crate::terminal::TerminalGuard;
 use crate::textinput::TextInput;
 use crate::ui::{hint_line, input_line};
 
@@ -158,6 +166,12 @@ pub struct LoginView {
     input: TextInput,
     /// The registration screen's multi-field form.
     register: RegisterForm,
+    /// A rejected-submit message to show under the field — a TDLib error *code*
+    /// (e.g. `PHONE_CODE_INVALID`), never the user's input. TDLib does not emit a
+    /// new state when it rejects an answer (it stays on the same waiting screen),
+    /// so this is how a wrong code/password is surfaced before the retry. Cleared
+    /// on every transition and at the start of each new submit.
+    error: Option<String>,
 }
 
 impl Default for LoginView {
@@ -181,6 +195,7 @@ impl LoginView {
             state,
             input: TextInput::default(),
             register: RegisterForm::default(),
+            error: None,
         }
     }
 
@@ -188,6 +203,19 @@ impl LoginView {
     #[must_use]
     pub fn state(&self) -> &AuthState {
         &self.state
+    }
+
+    /// The current rejected-submit message, if any — shown under the field.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Set or clear the rejected-submit message. The owning loop clears it
+    /// (`None`) before each submit and sets it (the TDLib error code) when a
+    /// submit is rejected; a transition clears it via [`set_state`](Self::set_state).
+    pub fn set_error(&mut self, error: Option<String>) {
+        self.error = error;
     }
 
     /// The single-field screens' editable input (phone/code/password/email).
@@ -209,6 +237,7 @@ impl LoginView {
         self.state = state;
         self.input = TextInput::default();
         self.register = RegisterForm::default();
+        self.error = None;
     }
 
     /// Map a keystroke onto a [`LoginOutcome`] for the active screen. Pure over the
@@ -356,12 +385,156 @@ fn printable(key: &KeyEvent) -> Option<char> {
     }
 }
 
+// --- driver ----------------------------------------------------------------
+
+/// How the TUI login loop ended, returned by [`run_login`] for `main` to gate on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginEnd {
+    /// Login reached `Ready`: hand the bridge to the facade and run the TUI.
+    Ready,
+    /// The user quit (Ctrl-C, or stdin closed) before logging in.
+    Quit,
+    /// TDLib closed the session (logged out / shutting down) before it was ready.
+    Closed,
+}
+
+/// Drive login inside the TUI: render one screen per waiting [`AuthState`], feed
+/// each `updateAuthorizationState` into the [`LoginView`], and dispatch every
+/// submitted [`LoginAnswer`] through the core [`Login`] seam — until login reaches
+/// a terminal state (or the user quits), which is returned so `main` gates the
+/// three-pane UI behind `Ready`.
+///
+/// The bridge is already initialized (`setTdlibParameters` sent in
+/// [`bootstrap`](crate::bootstrap)); this only answers the *login* states. It
+/// borrows the bridge for the duration, so once it returns the borrow is released
+/// and the owned bridge can move to
+/// [`Client::start`](tuigram_core::Client::start).
+pub async fn run_login(guard: &mut TerminalGuard, bridge: &Bridge) -> io::Result<LoginEnd> {
+    let login = Login::new(bridge);
+    let mut view = LoginView::new();
+    let mut updates = bridge.updates();
+    let mut input = EventStream::new();
+
+    // Prime the current state: TDLib's first login update may have fired before we
+    // subscribed, or a persisted session may already be `Ready`. Every subsequent
+    // transition arrives on the update stream below.
+    match bridge.authorization_state().await {
+        Ok(state) => view.set_state(AuthState::from_tdlib(&state)),
+        // Failing the state query this early means the bridge is already gone;
+        // treat it as a closed session rather than wedge on a screen that can't
+        // advance.
+        Err(_) => return Ok(LoginEnd::Closed),
+    }
+    if let Some(end) = terminal_end(view.state()) {
+        return Ok(end);
+    }
+
+    let mut dirty = true;
+    loop {
+        if dirty {
+            guard.terminal_mut().draw(|frame| login_ui(frame, &view))?;
+            dirty = false;
+        }
+
+        tokio::select! {
+            // Keystrokes drive the active screen.
+            maybe_event = input.next() => match maybe_event {
+                Some(Ok(Event::Key(key))) => match view.on_key(&key) {
+                    LoginOutcome::Unchanged => {}
+                    LoginOutcome::Dirty => dirty = true,
+                    LoginOutcome::Submit(answer) => {
+                        // Clear any prior rejection, then answer. A rejected submit
+                        // surfaces the TDLib code under the field; TDLib emits no new
+                        // state for it, so the same screen stays up for the retry.
+                        view.set_error(None);
+                        if let Err(e) = submit_answer(&login, answer).await {
+                            view.set_error(Some(error_line(&e)));
+                        }
+                        dirty = true;
+                    }
+                    LoginOutcome::Quit => return Ok(LoginEnd::Quit),
+                },
+                // A resize must repaint against the new viewport.
+                Some(Ok(Event::Resize(_, _))) => dirty = true,
+                Some(Ok(_)) => {}
+                // Transient read error: ignore and re-enter the loop.
+                Some(Err(_)) => {}
+                // stdin closed: quit rather than spin on a dead stream.
+                None => return Ok(LoginEnd::Quit),
+            },
+            // TDLib drives the state machine: each transition swaps the screen.
+            maybe_update = updates.next() => match maybe_update {
+                Some(Update::AuthorizationState(u)) => {
+                    view.set_state(AuthState::from_tdlib(&u.authorization_state));
+                    if let Some(end) = terminal_end(view.state()) {
+                        return Ok(end);
+                    }
+                    dirty = true;
+                }
+                // Other updates don't matter until login is done; the router folds
+                // them once the facade starts.
+                Some(_) => {}
+                // The bridge closed its update stream: the session is gone.
+                None => return Ok(LoginEnd::Closed),
+            }
+        }
+    }
+}
+
+/// Map a terminal [`AuthState`] onto the [`LoginEnd`] the loop returns, or `None`
+/// while login is still in progress.
+fn terminal_end(state: &AuthState) -> Option<LoginEnd> {
+    match state {
+        AuthState::Ready => Some(LoginEnd::Ready),
+        AuthState::Closed => Some(LoginEnd::Closed),
+        _ => None,
+    }
+}
+
+/// Dispatch one submitted [`LoginAnswer`] through the core [`Login`] seam. Pure
+/// routing — each answer maps to exactly one request — and generic over the
+/// request seam so it is testable against a spy with no live `tdjson`. The secret
+/// answers (code, password, email code) are moved straight into their request.
+async fn submit_answer<C: AuthRequests>(
+    login: &Login<'_, C>,
+    answer: LoginAnswer,
+) -> Result<(), TdError> {
+    match answer {
+        LoginAnswer::Phone(phone) => login.submit_phone_number(phone).await,
+        LoginAnswer::RequestQr => login.request_qr_code().await,
+        LoginAnswer::Code(code) => login.submit_code(code).await,
+        LoginAnswer::Password(password) => login.submit_password(password).await,
+        LoginAnswer::Email(email) => login.submit_email_address(email).await,
+        LoginAnswer::EmailCode(code) => login.submit_email_code(code).await,
+        LoginAnswer::Register {
+            first_name,
+            last_name,
+        } => login.register(first_name, last_name).await,
+    }
+}
+
+/// The single-line message for a rejected submit: TDLib's error text (a stable
+/// phrase like `PHONE_CODE_INVALID`), falling back to the numeric code when the
+/// text is blank. Never the user's input — TDLib names the rejection, not the
+/// value.
+fn error_line(e: &TdError) -> String {
+    if e.message.is_empty() {
+        format!("login error (code {})", e.code)
+    } else {
+        e.message.clone()
+    }
+}
+
 // --- rendering -------------------------------------------------------------
 
 /// Render the active login screen full-frame: a bordered, centred card with the
 /// screen's heading, its field(s) or message, and a key hint along the bottom.
 pub fn login_ui(frame: &mut Frame, view: &LoginView) {
     let mut lines = login_lines(view);
+    if let Some(error) = view.error() {
+        lines.push(Line::from(""));
+        lines.push(error_line_widget(error));
+    }
     lines.push(Line::from(""));
     lines.push(hint_line(login_hint(view.state())));
 
@@ -626,6 +799,15 @@ fn dim(text: impl Into<String>) -> Line<'static> {
     ))
 }
 
+/// The rejected-submit message, drawn in red with the toast error marker so a
+/// wrong code/password reads as a failure to act on, not as copy.
+fn error_line_widget(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("✗ {text}"),
+        Style::new().fg(Color::Red),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -886,5 +1068,170 @@ mod tests {
             text.contains("a***@example.com"),
             "the masked inbox pattern"
         );
+    }
+
+    // --- driver: answer dispatch & error surfacing ---
+
+    use std::cell::RefCell;
+    use tuigram_core::ClientParameters;
+    use tuigram_core::enums::AuthorizationState;
+
+    /// Records which auth request the driver dispatched, so the answer→request
+    /// mapping is asserted with no network and no live tdjson. The 2FA password is
+    /// never recorded — only that the call happened, the same rule the library
+    /// follows.
+    #[derive(Default)]
+    struct SpyAuth {
+        calls: RefCell<Vec<String>>,
+    }
+
+    impl SpyAuth {
+        fn last(&self) -> Option<String> {
+            self.calls.borrow().last().cloned()
+        }
+    }
+
+    impl AuthRequests for SpyAuth {
+        async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
+            Ok(AuthorizationState::WaitPhoneNumber)
+        }
+        async fn set_log_verbosity_level(&self, _level: i32) -> Result<(), TdError> {
+            Ok(())
+        }
+        async fn set_tdlib_parameters(&self, _params: ClientParameters) -> Result<(), TdError> {
+            Ok(())
+        }
+        async fn set_phone_number(&self, phone_number: String) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("phone({phone_number})"));
+            Ok(())
+        }
+        async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+            self.calls.borrow_mut().push("qr()".to_owned());
+            Ok(())
+        }
+        async fn check_authentication_code(&self, code: String) -> Result<(), TdError> {
+            self.calls.borrow_mut().push(format!("code({code})"));
+            Ok(())
+        }
+        async fn check_authentication_password(&self, _password: String) -> Result<(), TdError> {
+            // Record only that it was called, never the password value.
+            self.calls
+                .borrow_mut()
+                .push("password(<redacted>)".to_owned());
+            Ok(())
+        }
+        async fn register_user(
+            &self,
+            first_name: String,
+            last_name: String,
+        ) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("register({first_name},{last_name})"));
+            Ok(())
+        }
+        async fn set_authentication_email_address(
+            &self,
+            email_address: String,
+        ) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("email({email_address})"));
+            Ok(())
+        }
+        async fn check_authentication_email_code(&self, code: String) -> Result<(), TdError> {
+            self.calls.borrow_mut().push(format!("email_code({code})"));
+            Ok(())
+        }
+        async fn log_out(&self) -> Result<(), TdError> {
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), TdError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn each_answer_dispatches_its_request() {
+        let cases: Vec<(LoginAnswer, &str)> = vec![
+            (
+                LoginAnswer::Phone("+15551234567".to_owned()),
+                "phone(+15551234567)",
+            ),
+            (LoginAnswer::RequestQr, "qr()"),
+            (LoginAnswer::Code("12345".to_owned()), "code(12345)"),
+            (
+                LoginAnswer::Password("hunter2".to_owned()),
+                "password(<redacted>)",
+            ),
+            (LoginAnswer::Email("a@b.com".to_owned()), "email(a@b.com)"),
+            (
+                LoginAnswer::EmailCode("424242".to_owned()),
+                "email_code(424242)",
+            ),
+            (
+                LoginAnswer::Register {
+                    first_name: "Ada".to_owned(),
+                    last_name: "Lovelace".to_owned(),
+                },
+                "register(Ada,Lovelace)",
+            ),
+        ];
+        for (answer, expected) in cases {
+            let spy = SpyAuth::default();
+            let login = Login::new(&spy);
+            submit_answer(&login, answer).await.unwrap();
+            assert_eq!(spy.last().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn error_line_uses_the_tdlib_text_or_falls_back_to_the_code() {
+        let coded = TdError {
+            code: 400,
+            message: "PHONE_CODE_INVALID".to_owned(),
+        };
+        assert_eq!(error_line(&coded), "PHONE_CODE_INVALID");
+
+        // A blank message (no named code) still reads as an error, not an empty line.
+        let blank = TdError {
+            code: 420,
+            message: String::new(),
+        };
+        assert_eq!(error_line(&blank), "login error (code 420)");
+    }
+
+    #[test]
+    fn terminal_states_end_the_loop_others_continue() {
+        assert_eq!(terminal_end(&AuthState::Ready), Some(LoginEnd::Ready));
+        assert_eq!(terminal_end(&AuthState::Closed), Some(LoginEnd::Closed));
+        assert_eq!(terminal_end(&AuthState::WaitPhoneNumber), None);
+        assert_eq!(
+            terminal_end(&AuthState::WaitOtherDeviceConfirmation {
+                link: "tg://login?token=x".to_owned()
+            }),
+            None,
+            "QR still waits on the other device"
+        );
+    }
+
+    #[test]
+    fn a_rejected_submit_message_shows_then_clears_on_transition() {
+        let mut view = LoginView::from_state(AuthState::WaitCode);
+        assert!(view.error().is_none());
+
+        view.set_error(Some("PHONE_CODE_INVALID".to_owned()));
+        assert_eq!(view.error(), Some("PHONE_CODE_INVALID"));
+        // It renders under the field with the failure marker.
+        let text = flatten(&render(&view, 60, 20));
+        assert!(text.contains("✗ PHONE_CODE_INVALID"), "the rejection shows");
+
+        // A transition (the next waiting state) clears it, like the fields.
+        view.set_state(AuthState::WaitPassword {
+            hint: String::new(),
+        });
+        assert!(view.error().is_none(), "the error does not carry over");
     }
 }

@@ -7,13 +7,16 @@
 //! live Telegram data arrive in later Phase 5/6 issues; the loop's shape does not
 //! change when they do.
 //!
-//! Phase 6 (#109) bootstraps a real [`tuigram_core::Client`] before the loop: the
-//! [`bootstrap`] module resolves credentials, drives login to `Ready` on the
-//! plain terminal, and starts the update router. `main` holds that one handle
-//! across the TUI run and closes TDLib cleanly on exit. The loop is fed by the
-//! live core source (#110): [`spawn_core_source`] forwards the client's update
-//! stream onto the same mpsc arm the fake heartbeat used, classified into
-//! [`AppEvent`](crate::event::AppEvent)s — the loop's shape is unchanged.
+//! Phase 6 stands the real [`tuigram_core::Client`] up across three phases. #109
+//! bootstraps an *initialized* bridge on the plain terminal ([`bootstrap`]:
+//! credentials, secure storage, `setTdlibParameters`). #111 then drives **login
+//! inside the TUI** ([`run_login`]): one screen per waiting auth state, answered
+//! through the core `Login` seam, gating the three-pane UI behind `Ready` — only
+//! then does `main` hand the bridge to [`Client::start`]. The run loop is fed by
+//! the live core source (#110): [`spawn_core_source`] forwards the client's update
+//! stream onto the mpsc arm the fake heartbeat used, classified into
+//! [`AppEvent`](crate::event::AppEvent)s. `main` closes TDLib cleanly on every
+//! exit path, including a login the user quit before the facade ever started.
 
 mod app;
 mod bootstrap;
@@ -44,6 +47,7 @@ use tuigram_core::Client;
 
 use crate::app::{Action, App};
 use crate::event::spawn_core_source;
+use crate::login::{LoginEnd, run_login};
 use crate::terminal::{TerminalGuard, install_panic_hook};
 
 /// Render cadence cap (~30 FPS). Bounds repaint rate independently of network
@@ -52,35 +56,55 @@ const FRAME: Duration = Duration::from_millis(33);
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Phase 1 — bootstrap a live, authenticated `Client` on the plain terminal
-    // (interactive login), before raw mode. A failure here prints and exits
-    // without ever touching the TUI.
-    let client = match bootstrap::bootstrap().await {
-        Ok(client) => client,
+    // Phase 1 — initialize TDLib on the plain terminal (credentials, secure
+    // storage, setTdlibParameters), before raw mode. A failure here prints and
+    // exits without ever touching the TUI. Login happens later, in the TUI.
+    let bridge = match bootstrap::bootstrap().await {
+        Ok(bridge) => bridge,
         Err(err) => {
             eprintln!("tuigram: {err}");
             return ExitCode::FAILURE;
         }
     };
 
-    // Phase 2 — run the TUI over the held client handle.
     install_panic_hook();
     let mut guard = match TerminalGuard::new() {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("tuigram: could not initialize the terminal: {err}");
-            bootstrap::shutdown(&client).await;
+            bootstrap::shutdown(&bridge).await;
             return ExitCode::FAILURE;
         }
     };
-    let result = run(&mut guard, &client).await;
-    // Restore explicitly before any error reaches the user's normal screen.
-    // (`guard`'s Drop would also restore, but make the ordering obvious.)
-    drop(guard);
 
-    // Phase 3 — close TDLib cleanly so its database is flushed, not left
-    // mid-write for the next run. Runs on every exit path.
-    bootstrap::shutdown(&client).await;
+    // Phase 2 — drive login inside the TUI. Only on `Ready` does the bridge become
+    // a live `Client` and the three-pane loop run; quitting or a closed session
+    // before then skips straight to shutdown.
+    let result = match run_login(&mut guard, &bridge).await {
+        Ok(LoginEnd::Ready) => {
+            let client = Client::start(bridge);
+            let run_result = run(&mut guard, &client).await;
+            // Restore explicitly before any error reaches the normal screen.
+            // (`guard`'s Drop would also restore, but make the ordering obvious.)
+            drop(guard);
+            // Phase 3 — close TDLib cleanly so its database is flushed, not left
+            // mid-write for the next run.
+            bootstrap::shutdown(client.bridge()).await;
+            run_result
+        }
+        // The user quit or the session closed before login completed: never a
+        // `Client`, so close the bridge directly.
+        Ok(LoginEnd::Quit | LoginEnd::Closed) => {
+            drop(guard);
+            bootstrap::shutdown(&bridge).await;
+            Ok(())
+        }
+        Err(err) => {
+            drop(guard);
+            bootstrap::shutdown(&bridge).await;
+            Err(err)
+        }
+    };
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
