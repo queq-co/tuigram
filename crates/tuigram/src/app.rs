@@ -4,7 +4,10 @@
 //! marks the frame dirty, and the loop repaints from the new state. Nothing here
 //! touches the terminal or awaits — it stays a pure, unit-testable reducer.
 
+use std::collections::HashSet;
+
 use crossterm::event::Event;
+use tuigram_core::model::Message;
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::Composer;
@@ -203,6 +206,10 @@ pub struct App {
     /// The transient-toast queue (#88): one-off events and error codes that float
     /// over the panes without capturing input and age out on the heartbeat.
     notifications: Notifications,
+    /// Set when the user scrolled up while already at the oldest loaded message, a
+    /// request the loop services by paging older history (#114). The loop reads and
+    /// clears it each tick via [`take_wants_older_history`](Self::take_wants_older_history).
+    wants_older_history: bool,
 }
 
 impl App {
@@ -312,6 +319,31 @@ impl App {
         self.dirty = true;
     }
 
+    /// Re-project the conversation pane from the core
+    /// [`MessageStore`](tuigram_core::messages::MessageStore) (#114). The loop reads
+    /// the open `chat_id`'s history and pinned ids back from the `Client` on a
+    /// message signal (or a freshly-merged history page) and hands the owned
+    /// snapshot here, so `App` stays pure — the same split as
+    /// [`project_chats`](Self::project_chats). [`ConversationView::project`] keeps
+    /// the selected message under the cursor when refreshing the same chat, and
+    /// starts fresh at the top when a different chat is opened.
+    pub fn project_conversation(
+        &mut self,
+        chat_id: i64,
+        messages: Vec<Message>,
+        pinned: HashSet<i64>,
+    ) {
+        self.conversation.project(chat_id, messages, pinned);
+        self.dirty = true;
+    }
+
+    /// Take the pending "page older history" request (#114), clearing it. The loop
+    /// calls this each tick: a `true` means the user pressed up at the very top of
+    /// the loaded history, so the loop fetches the next older page for the open chat.
+    pub fn take_wants_older_history(&mut self) -> bool {
+        std::mem::take(&mut self.wants_older_history)
+    }
+
     /// Enqueue a transient toast — Phase 6 calls this for a failed action or a
     /// one-off core event. Unused in the binary until core feeds it; the heartbeat
     /// tick ages it out and [`Action::NoticeDismiss`] drops it on demand.
@@ -381,11 +413,12 @@ impl App {
     /// Map a core [`AppEvent`] to an [`Action`]. Pure: the live source already
     /// classified the update, so this only chooses the reduction.
     ///
-    /// Connection changes fold into the status bar. Chat signals don't pass
-    /// through here — the loop reads the folded list back from the `Client` and
-    /// calls [`project_chats`](Self::project_chats) directly (#113), since the
-    /// projection needs the `Client` and `App` stays pure. Every remaining signal
-    /// (messages/files/auth) is a repaint nudge until its own projection lands.
+    /// Connection changes fold into the status bar. Chat and message signals don't
+    /// pass through here — the loop reads the folded list/history back from the
+    /// `Client` and calls [`project_chats`](Self::project_chats) (#113) /
+    /// [`project_conversation`](Self::project_conversation) (#114) directly, since
+    /// the projection needs the `Client` and `App` stays pure. Every remaining
+    /// signal (files/auth) is a repaint nudge until its own projection lands.
     pub fn on_app_event(&self, event: AppEvent) -> Action {
         match event {
             AppEvent::Connection(state) => Action::SetConnection(state),
@@ -447,6 +480,11 @@ impl App {
                 self.dirty = true;
             }
             Action::ScrollUp => {
+                // A scroll-up that can't move (already at the oldest loaded message)
+                // is the request to page older history; the loop services it (#114).
+                if self.conversation.offset() == 0 && !self.conversation.is_empty() {
+                    self.wants_older_history = true;
+                }
                 self.conversation.scroll_up();
                 self.dirty = true;
             }
@@ -948,6 +986,77 @@ mod tests {
         assert_eq!(
             app.chat_list().selected_chat().map(|c| c.title.as_str()),
             Some("Alice")
+        );
+    }
+
+    #[test]
+    fn projecting_a_conversation_fills_the_history_and_dirties() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let text = |id: i64| {
+            sample_message(
+                id,
+                MessageContent::Text(FormattedText {
+                    text: format!("m{id}"),
+                    entities: Vec::new(),
+                }),
+            )
+        };
+        // Stands in for the loop's read-back of the open chat's MessageStore.
+        let mut app = App::new();
+        app.clear_dirty();
+        app.project_conversation(10, vec![text(1), text(2)], HashSet::new());
+        assert!(app.is_dirty());
+        assert_eq!(app.conversation().len(), 2);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    #[test]
+    fn scrolling_up_at_the_top_requests_older_history_once() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let messages = (1..=2)
+            .map(|i| {
+                sample_message(
+                    i,
+                    MessageContent::Text(FormattedText {
+                        text: format!("m{i}"),
+                        entities: Vec::new(),
+                    }),
+                )
+            })
+            .collect();
+        let mut app =
+            App::with_conversation(ConversationView::from_messages(messages, HashSet::new()));
+        // Move down so we are no longer at the top: a scroll-up there just moves.
+        app.dispatch(Action::ScrollDown);
+        app.dispatch(Action::ScrollUp);
+        assert!(
+            !app.take_wants_older_history(),
+            "a normal scroll-up pages nothing"
+        );
+
+        // Now at the top (offset 0): a further scroll-up is the paging request.
+        app.dispatch(Action::ScrollUp);
+        assert!(
+            app.take_wants_older_history(),
+            "up at the top requests older history"
+        );
+        assert!(
+            !app.take_wants_older_history(),
+            "the request is cleared once taken"
+        );
+    }
+
+    #[test]
+    fn scrolling_up_on_an_empty_history_requests_nothing() {
+        let mut app = App::new();
+        app.dispatch(Action::ScrollUp);
+        assert!(
+            !app.take_wants_older_history(),
+            "no history, nothing to page"
         );
     }
 
