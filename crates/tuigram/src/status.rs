@@ -14,11 +14,11 @@
 use std::collections::VecDeque;
 
 /// The core link's connection lifecycle, mirrored from TDLib's `connectionState`.
-/// A total set, so a status read is always classified; the real
-/// `updateConnectionState` folds into it in Phase 6. Some variants are only
-/// constructed by that Phase-6 fold (and the tests) for now, so the whole set is
-/// kept regardless of current construction.
-#[allow(dead_code)]
+/// A total set, so a status read is always classified. The real
+/// `updateConnectionState` folds into it live (#112): the core source projects
+/// every TDLib connection state onto a variant here
+/// ([`project_connection`](crate::event)), so each one is constructed in the
+/// binary, not just the tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
     /// No network reachable; waiting for one.
