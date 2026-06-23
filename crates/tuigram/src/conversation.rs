@@ -31,6 +31,10 @@ use tuigram_core::model::{ChatAction, File, Message, Reaction, ReactionKind};
 /// independently moved selection; finer in-pane selection is a follow-up.
 #[derive(Debug, Clone, Default)]
 pub struct ConversationView {
+    /// The chat this history belongs to, or `None` before any chat is opened.
+    /// [`project`](Self::project) reads it to tell a *refresh of the same chat*
+    /// (preserve the cursor) from *switching to a different chat* (fresh view).
+    chat_id: Option<i64>,
     /// Messages in chronological order — index `0` is the oldest, drawn at the top.
     messages: Vec<Message>,
     /// Ids of the chat's pinned messages, for the pinned indicator.
@@ -60,11 +64,50 @@ impl ConversationView {
     #[must_use]
     pub fn from_messages(messages: Vec<Message>, pinned: HashSet<i64>) -> Self {
         Self {
+            chat_id: None,
             messages,
             pinned,
             offset: 0,
             downloads: HashMap::new(),
             chat_action: None,
+        }
+    }
+
+    /// Re-project the open chat's history from the core
+    /// [`MessageStore`](tuigram_core::messages::MessageStore) (#114). The loop reads
+    /// `chat_id`'s messages (oldest first) and pinned ids back from the `Client` and
+    /// hands the owned snapshot here, so `App` stays pure — the same split as the
+    /// chat-list projection (#113).
+    ///
+    /// **Refreshing the same chat** (a live update, or a freshly-merged history
+    /// page) preserves the cursor by message *id*, not index: the selected message
+    /// keeps its place even as older messages are prepended above it or a new one
+    /// arrives below, so a background change never jumps the view. (A scroll-up at
+    /// the very top first triggers an older page; the cursor then sits one row down
+    /// from the top, so the next scroll-up reveals the newly loaded messages.)
+    ///
+    /// **Switching to a different chat** drops the previous chat's view entirely —
+    /// messages, cursor, and the per-message download/typing state — and starts
+    /// fresh at the top of the new history.
+    pub fn project(&mut self, chat_id: i64, messages: Vec<Message>, pinned: HashSet<i64>) {
+        if self.chat_id == Some(chat_id) {
+            // Same chat: keep the selected message under the cursor across the swap.
+            let anchor = self.selected_message().map(|m| m.id);
+            self.messages = messages;
+            self.pinned = pinned;
+            self.offset = anchor
+                .and_then(|id| self.messages.iter().position(|m| m.id == id))
+                .unwrap_or(self.offset)
+                .min(self.messages.len().saturating_sub(1));
+        } else {
+            // A different chat opened: a fresh view at the top, dropping the
+            // previous chat's per-message state (downloads, typing indicator).
+            *self = Self {
+                chat_id: Some(chat_id),
+                messages,
+                pinned,
+                ..Self::default()
+            };
         }
     }
 
@@ -337,6 +380,71 @@ mod tests {
         let bucket = &view.messages()[0].reactions[0];
         assert_eq!(bucket.count, 2);
         assert!(!bucket.is_chosen);
+    }
+
+    #[test]
+    fn projecting_a_chat_populates_the_history_at_the_top() {
+        let mut view = ConversationView::default();
+        view.project(
+            10,
+            vec![text(1, "a"), text(2, "b"), text(3, "c")],
+            HashSet::new(),
+        );
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.offset(), 0, "a freshly opened chat lands at the top");
+        assert_eq!(view.selected_message().map(|m| m.id), Some(1));
+    }
+
+    #[test]
+    fn refreshing_the_same_chat_keeps_the_selected_message_under_the_cursor() {
+        let mut view = ConversationView::default();
+        view.project(10, vec![text(2, "b"), text(3, "c")], HashSet::new());
+        view.scroll_down(); // select message 3
+        assert_eq!(view.selected_message().map(|m| m.id), Some(3));
+
+        // An older page is merged ahead of the loaded ones: 3 stays selected, its
+        // index shifts down by the two prepended messages.
+        view.project(
+            10,
+            vec![text(0, "x"), text(1, "y"), text(2, "b"), text(3, "c")],
+            HashSet::new(),
+        );
+        assert_eq!(
+            view.selected_message().map(|m| m.id),
+            Some(3),
+            "cursor follows the id"
+        );
+        assert_eq!(view.offset(), 3);
+    }
+
+    #[test]
+    fn a_live_message_on_the_same_chat_appears_without_moving_the_cursor() {
+        let mut view = ConversationView::default();
+        view.project(10, vec![text(1, "a"), text(2, "b")], HashSet::new());
+        // A newer message arrives; the selected (top) message is unmoved.
+        view.project(
+            10,
+            vec![text(1, "a"), text(2, "b"), text(3, "c")],
+            HashSet::new(),
+        );
+        assert_eq!(view.len(), 3);
+        assert_eq!(view.selected_message().map(|m| m.id), Some(1));
+        assert_eq!(view.offset(), 0);
+    }
+
+    #[test]
+    fn switching_chats_resets_to_a_fresh_view_at_the_top() {
+        let mut view = ConversationView::default();
+        view.project(10, vec![text(1, "a"), text(2, "b")], HashSet::from([1]));
+        view.scroll_down();
+        assert_eq!(view.offset(), 1);
+
+        // A different chat replaces everything — messages, cursor, pinned set.
+        view.project(20, vec![text(9, "z")], HashSet::new());
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.offset(), 0, "new chat starts at the top");
+        assert_eq!(view.selected_message().map(|m| m.id), Some(9));
+        assert!(!view.is_pinned(1), "the previous chat's pins are gone");
     }
 
     #[test]
