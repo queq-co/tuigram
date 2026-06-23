@@ -53,6 +53,11 @@ pub trait UpdateSink {
     /// end-to-end encrypted chat) into the secret-chat store.
     fn reduce_secret_chat(&mut self, update: &Update);
 
+    /// Fold a connection-state update (`updateConnectionState`: the transport's
+    /// link/sync status) into the connection store, for a "Connecting…/Updating…"
+    /// indicator. Carries no account content, only transport liveness.
+    fn reduce_connection(&mut self, update: &Update);
+
     /// Recover from a broadcast overflow: `skipped` updates were dropped before
     /// the router caught up, so the folded state may be stale and must be
     /// re-queried. Handling is mandatory — a lag is never silently ignored.
@@ -78,6 +83,8 @@ enum Route {
     Action,
     /// Folded by the secret-chat reducer (#53) — the E2E chat lifecycle.
     SecretChat,
+    /// Folded by the connection reducer (#99) — the transport's sync status.
+    Connection,
     /// Not account content this router folds; dropped here.
     Ignored,
 }
@@ -117,6 +124,9 @@ fn classify(update: &Update) -> Route {
         // updateSecretChat is the E2E chat lifecycle (#53), folded into the
         // secret-chat store keyed by secret_chat_id.
         Update::SecretChat(_) => Route::SecretChat,
+        // updateConnectionState is the transport's link/sync status (#99),
+        // folded into the connection store for a sync indicator.
+        Update::ConnectionState(_) => Route::Connection,
         _ => Route::Ignored,
     }
 }
@@ -148,6 +158,7 @@ impl<S: UpdateSink> Router<S> {
             Route::File => self.sink.reduce_file(update),
             Route::Action => self.sink.reduce_action(update),
             Route::SecretChat => self.sink.reduce_secret_chat(update),
+            Route::Connection => self.sink.reduce_connection(update),
             Route::Ignored => {}
         }
     }
@@ -188,6 +199,7 @@ mod tests {
         file: u32,
         action: u32,
         secret_chat: u32,
+        connection: u32,
         lagged: Vec<u64>,
     }
 
@@ -209,6 +221,9 @@ mod tests {
         }
         fn reduce_secret_chat(&mut self, _update: &Update) {
             self.secret_chat += 1;
+        }
+        fn reduce_connection(&mut self, _update: &Update) {
+            self.connection += 1;
         }
         fn resync_after_lag(&mut self, skipped: u64) {
             self.lagged.push(skipped);
@@ -312,6 +327,12 @@ mod tests {
                 key_hash: String::new(),
                 layer: 144,
             },
+        })
+    }
+
+    fn connection_state() -> Update {
+        Update::ConnectionState(tdlib_rs::types::UpdateConnectionState {
+            state: tdlib_rs::enums::ConnectionState::Updating,
         })
     }
 
@@ -421,6 +442,17 @@ mod tests {
     }
 
     #[test]
+    fn connection_updates_route_to_the_connection_reducer() {
+        // updateConnectionState is transport sync status, folded into its own store.
+        let mut router = Router::new(SpySink::default());
+        router.apply(&connection_state());
+        let sink = router.sink;
+        assert_eq!(sink.connection, 1);
+        assert_eq!(sink.chat, 0);
+        assert_eq!(sink.message, 0);
+    }
+
+    #[test]
     fn unrelated_updates_route_to_no_reducer() {
         let mut router = Router::new(SpySink::default());
         router.apply(&unrelated());
@@ -431,6 +463,7 @@ mod tests {
         assert_eq!(sink.file, 0);
         assert_eq!(sink.action, 0);
         assert_eq!(sink.secret_chat, 0);
+        assert_eq!(sink.connection, 0);
     }
 
     #[tokio::test]
