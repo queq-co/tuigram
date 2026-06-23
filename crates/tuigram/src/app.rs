@@ -16,6 +16,7 @@ use crate::mediaform::MediaDraft;
 use crate::reactions::ReactionPicker;
 use crate::search::SearchView;
 use crate::secret::{SecretChatPrompt, SecretLifecycle};
+use crate::status::{ConnectionState, Notifications};
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
 /// render tick, core updates) is funnelled through this enum before it touches
@@ -149,6 +150,9 @@ pub enum Action {
     SecretConfirm,
     /// Cancel the secret-chat prompt without acting.
     SecretCancel,
+    /// Dismiss the current transient toast immediately (#88), revealing the next
+    /// queued one. A no-op when nothing is showing.
+    NoticeDismiss,
     /// Tear down and exit the loop.
     Quit,
 }
@@ -192,6 +196,12 @@ pub struct App {
     /// The secret-chat lifecycle confirm's state (#87): the start/close action for
     /// the selected chat. `Some` only while the [`Overlay::SecretChat`] is open.
     secret: Option<SecretChatPrompt>,
+    /// The core link's connection state (#88), shown in the status bar. Defaults to
+    /// `Connecting`; Phase 6 folds `updateConnectionState` into it.
+    connection: ConnectionState,
+    /// The transient-toast queue (#88): one-off events and error codes that float
+    /// over the panes without capturing input and age out on the heartbeat.
+    notifications: Notifications,
 }
 
 impl App {
@@ -274,6 +284,36 @@ impl App {
         self.secret.as_ref()
     }
 
+    /// The core link's connection state, for the status bar's left field.
+    pub fn connection(&self) -> ConnectionState {
+        self.connection
+    }
+
+    /// The transient-toast queue, for the status overlay and a "+N more" hint.
+    pub fn notifications(&self) -> &Notifications {
+        &self.notifications
+    }
+
+    /// Set the connection state — Phase 6 calls this on a TDLib
+    /// `updateConnectionState`. Unused in the binary until that wiring lands; the
+    /// status-bar render and the reducer tests drive it for now.
+    #[allow(dead_code)]
+    pub fn set_connection(&mut self, state: ConnectionState) {
+        if self.connection != state {
+            self.connection = state;
+            self.dirty = true;
+        }
+    }
+
+    /// Enqueue a transient toast — Phase 6 calls this for a failed action or a
+    /// one-off core event. Unused in the binary until core feeds it; the heartbeat
+    /// tick ages it out and [`Action::NoticeDismiss`] drops it on demand.
+    #[allow(dead_code)]
+    pub fn notify(&mut self, notice: crate::status::Notice) {
+        self.notifications.push(notice);
+        self.dirty = true;
+    }
+
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
     /// The seam Phase 6 (and the render tests) use to inject a populated view.
     #[cfg(test)]
@@ -345,7 +385,10 @@ impl App {
             Action::Noop => {}
             Action::Render => self.dirty = true,
             Action::Beat => {
+                // The heartbeat doubles as the toast clock: each beat ages the
+                // current toast, popping it when it expires (#88).
                 self.beats += 1;
+                self.notifications.tick();
                 self.dirty = true;
             }
             Action::FocusNext => {
@@ -623,6 +666,14 @@ impl App {
                 self.secret = None;
                 self.overlay = Overlay::None;
                 self.dirty = true;
+            }
+            Action::NoticeDismiss => {
+                // Drop the showing toast (revealing any next); a no-op that does
+                // not repaint when none is up.
+                if self.notifications.current().is_some() {
+                    self.notifications.dismiss();
+                    self.dirty = true;
+                }
             }
             Action::Quit => self.should_quit = true,
         }
@@ -1211,6 +1262,85 @@ mod tests {
         assert_eq!(
             app.on_terminal_event(key(KeyCode::Char('a'), KeyModifiers::NONE)),
             Action::AttachInput('a')
+        );
+    }
+
+    // --- status bar & notifications (#88) ---
+
+    use crate::status::{ConnectionState, Notice};
+
+    #[test]
+    fn the_app_starts_connecting_and_folds_connection_updates() {
+        let mut app = App::new();
+        assert_eq!(app.connection(), ConnectionState::Connecting);
+        app.clear_dirty();
+
+        app.set_connection(ConnectionState::Ready);
+        assert_eq!(app.connection(), ConnectionState::Ready);
+        assert!(app.is_dirty(), "a state change repaints");
+
+        // Setting the same state again is a no-op that does not repaint.
+        app.clear_dirty();
+        app.set_connection(ConnectionState::Ready);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn notify_enqueues_a_toast_and_repaints() {
+        let mut app = App::new();
+        assert!(app.notifications().current().is_none());
+        app.clear_dirty();
+
+        app.notify(Notice::error("send", Some("FLOOD_WAIT")));
+        assert!(app.is_dirty());
+        assert_eq!(
+            app.notifications().current().unwrap().line(),
+            "✗ send failed (FLOOD_WAIT)"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_ages_a_toast_out() {
+        let mut app = App::new();
+        app.notify(Notice::info("download complete"));
+        // Beat is the toast clock: enough beats expire it.
+        for _ in 0..10 {
+            app.dispatch(Action::Beat);
+        }
+        assert!(
+            app.notifications().current().is_none(),
+            "the toast timed out"
+        );
+    }
+
+    #[test]
+    fn dismiss_drops_the_current_toast_and_is_a_noop_when_empty() {
+        let mut app = App::new();
+        app.notify(Notice::info("one"));
+        app.notify(Notice::info("two"));
+
+        app.dispatch(Action::NoticeDismiss);
+        assert_eq!(
+            app.notifications().current().unwrap().line(),
+            "ℹ two",
+            "the next toast shows"
+        );
+
+        app.dispatch(Action::NoticeDismiss);
+        assert!(app.notifications().current().is_none());
+
+        // Dismissing with nothing showing changes nothing.
+        app.clear_dirty();
+        app.dispatch(Action::NoticeDismiss);
+        assert!(!app.is_dirty());
+    }
+
+    #[test]
+    fn ctrl_g_dismisses_a_notification_from_a_pane() {
+        let app = App::new(); // lands on the chat list
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            Action::NoticeDismiss
         );
     }
 }

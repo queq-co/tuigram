@@ -174,6 +174,13 @@ const BINDINGS: &[Binding] = &[
         keys: "F1",
         description: "toggle help",
     },
+    Binding {
+        context: Context::Global,
+        trigger: Trigger::Ctrl(KeyCode::Char('g')),
+        action: Action::NoticeDismiss,
+        keys: "Ctrl-G",
+        description: "dismiss notification",
+    },
     // Chat list.
     Binding {
         context: Context::ChatList,
@@ -599,6 +606,12 @@ mod tests {
             assert_eq!(resolve(focus, Overlay::None, &ctrl('c')), Action::Quit);
             assert_eq!(resolved(focus, KeyCode::Tab), Action::FocusNext);
             assert_eq!(resolved(focus, KeyCode::F(1)), Action::ToggleHelp);
+            // Ctrl-G dismisses a toast everywhere — even in the composer, where a
+            // plain letter would type (it is a Ctrl chord, so it never inserts).
+            assert_eq!(
+                resolve(focus, Overlay::None, &ctrl('g')),
+                Action::NoticeDismiss
+            );
         }
     }
 
