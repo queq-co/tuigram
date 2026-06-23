@@ -98,6 +98,10 @@ either layer.
 
 ## Recommendation / decision
 
+> Realised in Phase 5 — see [tui.md](../tui.md) for what was actually built from
+> this recommendation (the event loop, `App`/`Action` model, layout, keymap, the
+> fake-source ↔ Phase 6 boundary, and the `TestBackend` harness).
+
 - **Ratatui 0.30.x + crossterm 0.29**, single crossterm major, `CrosstermBackend`.
 - **Architecture: central `tokio::select!` event loop** racing crossterm
   `EventStream`, a render tick, and an `mpsc` channel of `AppEvent`s from

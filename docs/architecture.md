@@ -4,7 +4,9 @@
 > implemented across Phase 2; Phase 3 builds the headless core client on top of
 > them, and Phase 4 extends that client (media, archive/folders, search/forward,
 > reactions/pins, chat actions, secret chats, full login) without revisiting it.
-> Later phases extend rather than revisit these decisions.
+> Phase 5 adds the Ratatui front-end as a spine over fixtures (see below;
+> [tui.md](tui.md) holds the detail). Later phases extend rather than revisit
+> these decisions.
 
 ## Goals
 
@@ -116,3 +118,40 @@ surface as one client) holds the full reasoning.
   match — a future TDLib state is a compile error, not a silent miss. Search is the
   one read that stays *beside* the fold rather than in it: it returns a transient
   result view so a query never mutates the owned history.
+
+## Resolved decisions (Phase 5 — TUI)
+
+Phase 5 builds the Ratatui front-end in the `tuigram` binary as a self-contained
+spine over **fixtures** — no live Telegram data yet. It makes no new core
+decisions; it realises the Phase 1 Ratatui research ([research/ratatui.md](research/ratatui.md))
+and is structured so Phase 6 only has to feed it. [tui.md](tui.md) holds the full
+walkthrough; the shaping decisions are:
+
+- **One central `tokio::select!` loop; nothing awaited in the draw path.** A
+  single loop in [`main.rs`](../crates/tuigram/src/main.rs) races terminal input,
+  a render tick, and a core-event channel into [`Action`]s. `terminal.draw()`
+  stays on the main task and is never awaited, so render cadence is decoupled
+  from network latency — the #1 "responsive, never block on I/O" goal. Repaint is
+  gated on a `dirty` flag; the terminal lifecycle is RAII ([`TerminalGuard`](../crates/tuigram/src/terminal.rs))
+  plus a panic hook that restores the terminal before the message prints.
+- **`App` is the single source of truth; `Action` is the only write path.** All
+  mutable state lives in one [`App`](../crates/tuigram/src/app.rs) struct; event
+  translation (`on_terminal_event`/`on_app_event`) is **pure** (event → `Action`,
+  no mutation) and `App::dispatch` is the **only** function that writes. This
+  Elm-ish split is what makes the whole UI testable without a terminal.
+- **One focus-aware keymap table.** Every binding lives in `BINDINGS`
+  ([`keymap.rs`](../crates/tuigram/src/keymap.rs)); `resolve` reads it in the
+  current `Focus`/`Overlay` and the help overlay renders the *same* table, so the
+  cheatsheet can't drift. Unbound keys in the composer fall through to text
+  insertion, so printable input needs no per-letter entry.
+- **The fake-source boundary is the only Phase 6 wiring point.**
+  [`event.rs`](../crates/tuigram/src/event.rs) defines the `AppEvent` seam and a
+  temporary heartbeat source; Phase 6 replaces the source with the real
+  [`Client`](headless-client.md) update stream and grows `AppEvent` **without the
+  loop's shape changing**. The panes already hold their view-model state and the
+  Phase-6 ingest seams (e.g. `set_connection`, `notify`), fed from fixtures for
+  now.
+- **`TestBackend` snapshots keep the UI testable with no TTY.** `ui()` is a pure
+  `fn(&mut Frame, &App)` rendered into an in-memory `Buffer`; tests assert on
+  whole-buffer text and per-row layout, alongside the headless core's plain unit
+  tests — no terminal in CI, the same discipline as the core.
