@@ -18,16 +18,47 @@
 
 use std::collections::HashMap;
 
+use tuigram_core::ChatStore;
 use tuigram_core::model::{Chat, ChatAction, ChatListKind, SecretChatState};
+
+/// Project the folded [`ChatStore`] into the view's switchable lists, in switch
+/// order: **Main**, **Archive**, then each user-defined **folder** (#113). Each
+/// list's chats are cloned out of the store already ordered (the store sorts
+/// them highest-first; this only snapshots them for display). Main and Archive
+/// are always present — Telegram's built-in lists — even when empty, so
+/// list-switching always has them; a folder appears once `updateChatFolders` has
+/// folded it into [`ChatStore::folders`].
+#[must_use]
+pub fn project_lists(chats: &ChatStore) -> Vec<ChatList> {
+    let mut lists = vec![
+        ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: chats.main_list().into_iter().cloned().collect(),
+        },
+        ChatList {
+            kind: ChatListKind::Archive,
+            label: "Archive".to_owned(),
+            chats: chats.archive_list().into_iter().cloned().collect(),
+        },
+    ];
+    for folder in chats.folders() {
+        lists.push(ChatList {
+            kind: ChatListKind::Folder(folder.id),
+            label: folder.title.clone(),
+            chats: chats.folder_list(folder.id).into_iter().cloned().collect(),
+        });
+    }
+    lists
+}
 
 /// One switchable list: its [kind](ChatListKind), the label shown in the pane
 /// title, and its chats in the order the store handed them back.
 #[derive(Debug, Clone)]
 pub struct ChatList {
-    /// Which TDLib list this is (Main, Archive, or a folder by id). Carried for
-    /// the Phase 6 projection (mapping a list back to its store query); the
-    /// render reads only the label and chats, so the binary does not read it yet.
-    #[allow(dead_code)]
+    /// Which TDLib list this is (Main, Archive, or a folder by id). Read by
+    /// [`ChatListView::project`] to preserve the active list across a
+    /// re-projection (by kind, not index) and by the loop to load it on demand.
     pub kind: ChatListKind,
     /// Display label for the pane title — "Main", "Archive", or a folder name.
     pub label: String,
@@ -105,6 +136,14 @@ impl ChatListView {
         &self.lists[self.active].label
     }
 
+    /// The active list's [kind](ChatListKind) — which core query re-projects it,
+    /// the key the loop loads on demand, and what [`project`](Self::project)
+    /// preserves the cursor against across a refresh.
+    #[must_use]
+    pub fn active_kind(&self) -> &ChatListKind {
+        &self.lists[self.active].kind
+    }
+
     /// The active list's chats, in store order.
     #[must_use]
     pub fn active_chats(&self) -> &[Chat] {
@@ -176,6 +215,38 @@ impl ChatListView {
     /// Move the selection up one row, clamping at the first row.
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Refresh the displayed lists from a fresh core projection (#113), keeping
+    /// the user where they were. The lists are replaced wholesale — Main,
+    /// Archive, each folder, in switch order, with the store's ordering preserved
+    /// verbatim — while the cursor is carried across: the active list is matched
+    /// back **by [kind](ChatListKind), not by index**, so a folder appearing or
+    /// disappearing never silently jumps the active list, and the selection is
+    /// clamped into the (possibly shorter) active list. An active list that is no
+    /// longer present falls back to the first (Main). Empty input keeps a single
+    /// empty Main, preserving the "always at least one list" invariant; the
+    /// per-chat-id secret/action maps are left intact (they project separately).
+    pub fn project(&mut self, lists: Vec<ChatList>) {
+        let active_kind = self.lists[self.active].kind.clone();
+        self.lists = if lists.is_empty() {
+            vec![ChatList {
+                kind: ChatListKind::Main,
+                label: "Main".to_owned(),
+                chats: Vec::new(),
+            }]
+        } else {
+            lists
+        };
+        self.active = self
+            .lists
+            .iter()
+            .position(|l| l.kind == active_kind)
+            .unwrap_or(0);
+        // Clamp the selection into the new active list (0 when it is empty).
+        self.selected = self
+            .selected
+            .min(self.active_chats().len().saturating_sub(1));
     }
 
     /// Switch to the next list in cycle order (Main → Archive → folders → Main),
@@ -337,6 +408,87 @@ mod tests {
         // A cancel (None) clears it.
         view.set_action(1, None);
         assert!(view.action(1).is_none(), "cancel removes the indicator");
+    }
+
+    #[test]
+    fn active_kind_tracks_the_active_list() {
+        let mut view = three_lists();
+        assert_eq!(*view.active_kind(), ChatListKind::Main);
+        view.next_list();
+        assert_eq!(*view.active_kind(), ChatListKind::Archive);
+        view.next_list();
+        assert_eq!(*view.active_kind(), ChatListKind::Folder(7));
+    }
+
+    #[test]
+    fn projecting_an_empty_store_yields_the_built_in_lists() {
+        // No chats, no folders: the projection is still the two built-in lists,
+        // in switch order, so list-switching always has somewhere to go.
+        let lists = project_lists(&ChatStore::new());
+        assert_eq!(lists.len(), 2);
+        assert_eq!(lists[0].kind, ChatListKind::Main);
+        assert_eq!(lists[0].label, "Main");
+        assert!(lists[0].chats.is_empty());
+        assert_eq!(lists[1].kind, ChatListKind::Archive);
+        assert_eq!(lists[1].label, "Archive");
+        assert!(lists[1].chats.is_empty());
+    }
+
+    #[test]
+    fn projecting_replaces_the_lists_but_preserves_the_active_kind() {
+        let mut view = three_lists();
+        view.next_list(); // active = Archive
+        assert_eq!(view.active_label(), "Archive");
+
+        // A refresh with the same kinds (different contents/order) keeps us on
+        // Archive even though its index could have shifted.
+        view.project(vec![
+            list(ChatListKind::Folder(7), "Work", &["Team"]),
+            list(ChatListKind::Main, "Main", &["X"]),
+            list(ChatListKind::Archive, "Archive", &["Old", "Older"]),
+        ]);
+        assert_eq!(view.active_label(), "Archive");
+        assert_eq!(view.active_chats().len(), 2);
+    }
+
+    #[test]
+    fn projecting_clamps_a_now_out_of_range_selection() {
+        let mut view = three_lists();
+        view.select_next();
+        view.select_next(); // selected = 2 (Carol) in the 3-chat Main list
+        assert_eq!(view.selected(), 2);
+
+        // Main shrinks to one chat: the cursor clamps into it rather than dangling.
+        view.project(vec![
+            list(ChatListKind::Main, "Main", &["Solo"]),
+            list(ChatListKind::Archive, "Archive", &["Old"]),
+        ]);
+        assert_eq!(view.selected(), 0);
+        assert_eq!(view.selected_chat().map(|c| c.title.as_str()), Some("Solo"));
+    }
+
+    #[test]
+    fn projecting_falls_back_to_main_when_the_active_list_disappears() {
+        let mut view = three_lists();
+        view.next_list();
+        view.next_list(); // active = the Work folder (7)
+        assert_eq!(view.active_label(), "Work");
+
+        // The folder is gone from the refresh (deleted): fall back to the first.
+        view.project(vec![
+            list(ChatListKind::Main, "Main", &["A"]),
+            list(ChatListKind::Archive, "Archive", &["B"]),
+        ]);
+        assert_eq!(view.active_label(), "Main");
+        assert_eq!(view.selected(), 0);
+    }
+
+    #[test]
+    fn projecting_an_empty_set_keeps_an_empty_main() {
+        let mut view = three_lists();
+        view.project(Vec::new());
+        assert_eq!(view.active_label(), "Main");
+        assert!(view.active_chats().is_empty());
     }
 
     #[test]

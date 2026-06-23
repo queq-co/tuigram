@@ -6,7 +6,7 @@
 
 use crossterm::event::Event;
 
-use crate::chat_list::ChatListView;
+use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::Composer;
 use crate::conversation::ConversationView;
 use crate::event::AppEvent;
@@ -301,6 +301,17 @@ impl App {
         }
     }
 
+    /// Re-project the chat-list pane from the core [`ChatStore`](tuigram_core::ChatStore)
+    /// (#113). The loop reads the folded lists back from the `Client` on a chat
+    /// signal and hands the owned projection here, so `App` stays pure — it never
+    /// touches the `Client`, the same split as the carried-state connection fold.
+    /// The cursor is preserved across the swap (see [`ChatListView::project`]), so
+    /// a live chat update repaints the list without moving the selection.
+    pub fn project_chats(&mut self, lists: Vec<ChatList>) {
+        self.chat_list.project(lists);
+        self.dirty = true;
+    }
+
     /// Enqueue a transient toast — Phase 6 calls this for a failed action or a
     /// one-off core event. Unused in the binary until core feeds it; the heartbeat
     /// tick ages it out and [`Action::NoticeDismiss`] drops it on demand.
@@ -370,9 +381,11 @@ impl App {
     /// Map a core [`AppEvent`] to an [`Action`]. Pure: the live source already
     /// classified the update, so this only chooses the reduction.
     ///
-    /// Connection changes fold into the status bar; every other signal is a
-    /// repaint nudge for now — projecting the folded chats/messages/files into the
-    /// panes is a later Phase 6 issue, and this is the seam it slots into.
+    /// Connection changes fold into the status bar. Chat signals don't pass
+    /// through here — the loop reads the folded list back from the `Client` and
+    /// calls [`project_chats`](Self::project_chats) directly (#113), since the
+    /// projection needs the `Client` and `App` stays pure. Every remaining signal
+    /// (messages/files/auth) is a repaint nudge until its own projection lands.
     pub fn on_app_event(&self, event: AppEvent) -> Action {
         match event {
             AppEvent::Connection(state) => Action::SetConnection(state),
@@ -914,6 +927,28 @@ mod tests {
         app.dispatch(Action::SelectNext);
         assert_eq!(app.chat_list().selected(), 1);
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn projecting_chats_refreshes_the_pane_and_dirties() {
+        use crate::chat_list::{ChatList, sample_chat};
+        use tuigram_core::model::ChatListKind;
+
+        // Stands in for the loop's read-back from the core ChatStore on a chat
+        // signal: an owned projection handed to the pure App.
+        let mut app = App::new();
+        app.clear_dirty();
+        app.project_chats(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "Alice", 3), sample_chat(2, "Bob", 0)],
+        }]);
+        assert!(app.is_dirty());
+        assert_eq!(app.chat_list().active_chats().len(), 2);
+        assert_eq!(
+            app.chat_list().selected_chat().map(|c| c.title.as_str()),
+            Some("Alice")
+        );
     }
 
     // --- search & forward overlays (#84) ---
