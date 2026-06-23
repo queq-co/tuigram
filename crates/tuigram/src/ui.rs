@@ -268,15 +268,12 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The pre-data conversation pane: a welcome banner that doubles as the liveness
-/// view, echoing the core heartbeat count until real history (Phase 6) replaces
-/// it. The quit/help hint now lives in the status bar (#88), so the banner only
-/// carries the welcome and the heartbeat proof.
+/// The pre-data conversation pane: a welcome banner shown until real history
+/// (a later Phase 6 issue) replaces it. The heartbeat counter it used to echo is
+/// gone with the fake source (#110); the connection state now lives in the status
+/// bar (#88), so the banner only carries the welcome.
 fn render_conversation_placeholder(frame: &mut Frame, area: Rect, app: &App) {
-    let body = format!(
-        "tuigram — Phase 5 TUI skeleton\n\ncore heartbeats: {}",
-        app.beats()
-    );
+    let body = "tuigram — Phase 5 TUI skeleton\n\nselect a chat to begin";
     let block = pane_block(" tuigram ".to_owned(), app.focus() == Focus::History)
         .title_alignment(Alignment::Center);
     let widget = Paragraph::new(body)
@@ -1030,14 +1027,6 @@ mod tests {
             text.contains("focus next pane"),
             "documents focus switching"
         );
-    }
-
-    #[test]
-    fn shows_heartbeat_count() {
-        let mut app = App::new();
-        app.dispatch(crate::app::Action::Beat);
-        app.dispatch(crate::app::Action::Beat);
-        assert!(flatten(&render(&app, 80, 24)).contains("heartbeats: 2"));
     }
 
     #[test]
