@@ -15,6 +15,7 @@ use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaDraft;
 use crate::reactions::ReactionPicker;
 use crate::search::SearchView;
+use crate::secret::{SecretChatPrompt, SecretLifecycle};
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
 /// render tick, core updates) is funnelled through this enum before it touches
@@ -138,6 +139,16 @@ pub enum Action {
     AttachConfirm,
     /// Cancel the send-media prompt without sending.
     AttachCancel,
+    /// Open the secret-chat lifecycle confirm for the selected chat (#87): start a
+    /// new secret chat with a private chat's user, or close an open one. A no-op
+    /// when the selection offers no lifecycle action (a group or channel).
+    SecretOpen,
+    /// Confirm the secret-chat lifecycle action and close the prompt. Phase 6 calls
+    /// the core seam (`create_new_secret_chat` / `close_secret_chat`); for now it
+    /// just closes.
+    SecretConfirm,
+    /// Cancel the secret-chat prompt without acting.
+    SecretCancel,
     /// Tear down and exit the loop.
     Quit,
 }
@@ -178,6 +189,9 @@ pub struct App {
     /// The send-media prompt's state: the path and caption being typed. Reset each
     /// time the prompt opens.
     media: MediaDraft,
+    /// The secret-chat lifecycle confirm's state (#87): the start/close action for
+    /// the selected chat. `Some` only while the [`Overlay::SecretChat`] is open.
+    secret: Option<SecretChatPrompt>,
 }
 
 impl App {
@@ -252,6 +266,12 @@ impl App {
     /// The send-media prompt's state, for rendering the path/caption fields.
     pub fn media(&self) -> &MediaDraft {
         &self.media
+    }
+
+    /// The secret-chat lifecycle prompt's state, for rendering the confirm overlay
+    /// (`None` when it is not open).
+    pub fn secret(&self) -> Option<&SecretChatPrompt> {
+        self.secret.as_ref()
     }
 
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
@@ -572,6 +592,35 @@ impl App {
                 }
             }
             Action::AttachCancel => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::SecretOpen => {
+                // Offer the lifecycle action for the selected chat — start a secret
+                // chat with a private chat's user, or close an open one. The
+                // decision reads only the chat's kind and folded state (never key
+                // material). No selected chat, or one with no action (a group), is a
+                // no-op that opens nothing.
+                if let Some(chat) = self.chat_list.selected_chat() {
+                    let state = self.chat_list.secret_state(chat.id);
+                    if let Some(lifecycle) = SecretLifecycle::for_chat(chat, state) {
+                        self.secret = Some(SecretChatPrompt::new(lifecycle, chat.title.clone()));
+                        self.overlay = Overlay::SecretChat;
+                        self.dirty = true;
+                    }
+                }
+            }
+            Action::SecretConfirm => {
+                // Phase 6 dispatches the core seam for `self.secret`'s lifecycle
+                // (`create_new_secret_chat` / `close_secret_chat`) and lets the
+                // resulting `updateSecretChat` / `updateNewChat` fold in; for now
+                // confirming just closes the prompt back to browsing.
+                self.secret = None;
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::SecretCancel => {
+                self.secret = None;
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -1047,6 +1096,110 @@ mod tests {
         app.dispatch(Action::AttachCancel);
         app.dispatch(Action::AttachOpen);
         assert_eq!(app.media().path(), "", "reopened prompt starts empty");
+    }
+
+    // --- secret chats & chat-action indicators (#87) ---
+
+    use crate::secret::SecretLifecycle;
+
+    /// An app whose chat list holds one chat, of `kind`, optionally carrying the
+    /// secret-chat `state`. The selection lands on it.
+    fn app_with_one_chat(
+        kind: tuigram_core::model::ChatKind,
+        state: Option<tuigram_core::model::SecretChatState>,
+    ) -> App {
+        use crate::chat_list::{ChatList, ChatListView, sample_chat};
+        use tuigram_core::model::ChatListKind;
+
+        let mut chat = sample_chat(5, "Mallory", 0);
+        chat.kind = kind;
+        let mut view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![chat],
+        }]);
+        if let Some(state) = state {
+            view.set_secret_state(5, state);
+        }
+        App::with_chat_list(view)
+    }
+
+    #[test]
+    fn secret_open_offers_to_start_from_a_private_chat() {
+        use tuigram_core::model::ChatKind;
+        let mut app = app_with_one_chat(ChatKind::Private { user_id: 7 }, None);
+        app.dispatch(Action::SecretOpen);
+        assert_eq!(app.overlay(), Overlay::SecretChat);
+        assert_eq!(
+            app.secret().map(|p| p.lifecycle()),
+            Some(SecretLifecycle::Start { user_id: 7 })
+        );
+    }
+
+    #[test]
+    fn secret_open_offers_to_close_an_open_secret_chat() {
+        use tuigram_core::model::{ChatKind, SecretChatState};
+        let mut app = app_with_one_chat(
+            ChatKind::Secret {
+                secret_chat_id: 9,
+                user_id: 7,
+            },
+            Some(SecretChatState::Ready),
+        );
+        app.dispatch(Action::SecretOpen);
+        assert_eq!(app.overlay(), Overlay::SecretChat);
+        assert_eq!(
+            app.secret().map(|p| p.lifecycle()),
+            Some(SecretLifecycle::Close { secret_chat_id: 9 })
+        );
+    }
+
+    #[test]
+    fn secret_open_on_a_group_opens_nothing() {
+        use tuigram_core::model::ChatKind;
+        let mut app = app_with_one_chat(ChatKind::BasicGroup { basic_group_id: 1 }, None);
+        app.clear_dirty();
+        app.dispatch(Action::SecretOpen);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "no lifecycle action, no modal"
+        );
+        assert!(app.secret().is_none());
+        assert!(!app.is_dirty(), "nothing changed");
+    }
+
+    #[test]
+    fn confirming_the_secret_prompt_closes_it() {
+        use tuigram_core::model::ChatKind;
+        let mut app = app_with_one_chat(ChatKind::Private { user_id: 7 }, None);
+        app.dispatch(Action::SecretOpen);
+        app.dispatch(Action::SecretConfirm);
+        assert_eq!(app.overlay(), Overlay::None, "confirm closes the modal");
+        assert!(app.secret().is_none(), "prompt state cleared");
+    }
+
+    #[test]
+    fn cancelling_the_secret_prompt_acts_on_nothing() {
+        use tuigram_core::model::ChatKind;
+        let mut app = app_with_one_chat(ChatKind::Private { user_id: 7 }, None);
+        app.dispatch(Action::SecretOpen);
+        app.dispatch(Action::SecretCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.secret().is_none());
+    }
+
+    #[test]
+    fn secret_keys_resolve_through_the_overlay_not_the_panes() {
+        use tuigram_core::model::ChatKind;
+        let mut app = app_with_one_chat(ChatKind::Private { user_id: 7 }, None);
+        app.dispatch(Action::SecretOpen);
+        // `s` would reopen the lifecycle in the chat list; inside the modal Enter
+        // confirms and other keys are inert — the overlay owns input.
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::SecretConfirm
+        );
     }
 
     #[test]

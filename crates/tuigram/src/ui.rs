@@ -19,8 +19,11 @@ use ratatui::widgets::{
 };
 
 use tuigram_core::model::{
-    Chat, File, FileRef, FormattedText, Message, MessageContent, ReactionKind, Sender,
+    Chat, ChatAction, ChatKind, File, FileRef, FormattedText, Message, MessageContent,
+    ReactionKind, SecretChatState, Sender,
 };
+
+use crate::chat_list::ChatListView;
 
 use crate::app::App;
 use crate::composer::ComposerMode;
@@ -72,6 +75,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
         Overlay::Forward => render_forward(frame, frame.area(), app),
         Overlay::Reaction => render_reaction(frame, frame.area(), app),
         Overlay::SendMedia => render_send_media(frame, frame.area(), app),
+        Overlay::SecretChat => render_secret_chat(frame, frame.area(), app),
     }
 }
 
@@ -105,7 +109,10 @@ fn render_chat_list(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let items: Vec<ListItem> = chats.iter().map(chat_item).collect();
+    let items: Vec<ListItem> = chats
+        .iter()
+        .map(|chat| chat_list_item(view, chat))
+        .collect();
     let list = List::new(items)
         .block(block)
         .highlight_symbol(SELECTED_SYMBOL)
@@ -119,7 +126,8 @@ fn render_chat_list(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// One chat row: the title, plus a bold unread badge when the chat has unread
-/// incoming messages.
+/// incoming messages. Used by the forward target picker, which lists plain chats;
+/// the chat-list pane uses [`chat_list_item`], which also draws the #87 markers.
 fn chat_item(chat: &Chat) -> ListItem<'static> {
     let mut spans = vec![Span::raw(chat.title.clone())];
     if chat.unread_count > 0 {
@@ -130,6 +138,66 @@ fn chat_item(chat: &Chat) -> ListItem<'static> {
         ));
     }
     ListItem::new(Line::from(spans))
+}
+
+/// One chat-list row (#80, extended in #87): a 🔒 marker and lifecycle state for a
+/// secret chat, the title, the unread badge, and a transient "typing…" indicator
+/// when someone is acting in the chat. The lifecycle state and the action are
+/// projected per chat id from the core stores (Phase 6); no encryption-key material
+/// is ever read or shown — only the [`SecretChatState`].
+fn chat_list_item(view: &ChatListView, chat: &Chat) -> ListItem<'static> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let mut spans = Vec::new();
+    if matches!(chat.kind, ChatKind::Secret { .. }) {
+        spans.push(Span::raw("🔒 "));
+    }
+    spans.push(Span::raw(chat.title.clone()));
+    if chat.unread_count > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!("({})", chat.unread_count),
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(state) = view.secret_state(chat.id) {
+        spans.push(Span::styled(format!("  · {}", secret_suffix(state)), dim));
+    }
+    if let Some(action) = view.action(chat.id) {
+        spans.push(Span::styled(format!("  {}", action_phrase(action)), dim));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+/// The lifecycle word shown after a secret chat's title (#87).
+fn secret_suffix(state: SecretChatState) -> &'static str {
+    match state {
+        SecretChatState::Pending => "pending",
+        SecretChatState::Ready => "ready",
+        SecretChatState::Closed => "closed",
+    }
+}
+
+/// The phrase for a transient chat action (#87) — the "X is typing…" text, shown
+/// in the chat-list row and the conversation header. Total over [`ChatAction`] with
+/// no catch-all, mirroring the core projection: a new activity fails to compile here
+/// until it is given a phrase.
+fn action_phrase(action: &ChatAction) -> &'static str {
+    match action {
+        ChatAction::Typing => "typing…",
+        ChatAction::RecordingVideo => "recording video…",
+        ChatAction::UploadingVideo => "sending a video…",
+        ChatAction::RecordingVoiceNote => "recording a voice message…",
+        ChatAction::UploadingVoiceNote => "sending a voice message…",
+        ChatAction::UploadingPhoto => "sending a photo…",
+        ChatAction::UploadingDocument => "sending a file…",
+        ChatAction::ChoosingSticker => "choosing a sticker…",
+        ChatAction::ChoosingLocation => "choosing a location…",
+        ChatAction::ChoosingContact => "choosing a contact…",
+        ChatAction::StartPlayingGame => "playing a game…",
+        ChatAction::RecordingVideoNote => "recording a video message…",
+        ChatAction::UploadingVideoNote => "sending a video message…",
+        ChatAction::WatchingAnimations => "watching animations…",
+    }
 }
 
 /// Right/top pane: the conversation history (#81). Renders the open chat's
@@ -159,7 +227,13 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     }
     lines.truncate(inner_rows);
 
-    let block = pane_block(" Conversation ".to_owned(), app.focus() == Focus::History);
+    // The conversation header doubles as the chat-action indicator (#87): the pane
+    // title names the transient "typing…" activity when someone is acting.
+    let title = match view.chat_action() {
+        Some(action) => format!(" Conversation — {} ", action_phrase(action)),
+        None => " Conversation ".to_owned(),
+    };
+    let block = pane_block(title, app.focus() == Focus::History);
     let history = Paragraph::new(lines).block(block);
     frame.render_widget(history, area);
 
@@ -650,6 +724,31 @@ fn render_send_media(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" Send media ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// The secret-chat lifecycle confirm overlay (#87): a centred modal posing the
+/// start/close question for the selected chat, over a key hint. Confirming runs the
+/// core seam (Phase 6); the prompt reads only the chat's kind and lifecycle state,
+/// never any key material.
+fn render_secret_chat(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(prompt) = app.secret() else {
+        return;
+    };
+    let lines = vec![
+        Line::from(prompt.prompt()),
+        Line::from(""),
+        hint_line("Enter confirm · Esc cancel"),
+    ];
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Secret chat ")
                 .title_alignment(Alignment::Center),
         ),
         popup,
@@ -1258,5 +1357,96 @@ mod tests {
         assert!(text.contains("caption"), "caption field label");
         assert!(text.contains("(optional)"), "empty caption placeholder");
         assert!(text.contains("Tab switch"), "key hint");
+    }
+
+    // --- secret chats & chat-action indicators (#87) ---
+
+    use tuigram_core::model::{ChatAction, ChatKind, SecretChatState};
+
+    /// A chat-list view holding one chat of `kind`, with an optional secret state.
+    fn view_with_one_chat(
+        title: &str,
+        kind: ChatKind,
+        state: Option<SecretChatState>,
+    ) -> ChatListView {
+        let mut chat = sample_chat(5, title, 0);
+        chat.kind = kind;
+        let mut view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![chat],
+        }]);
+        if let Some(state) = state {
+            view.set_secret_state(5, state);
+        }
+        view
+    }
+
+    #[test]
+    fn a_secret_chat_shows_the_lock_marker_and_its_lifecycle_state() {
+        let view = view_with_one_chat(
+            "Mallory",
+            ChatKind::Secret {
+                secret_chat_id: 9,
+                user_id: 7,
+            },
+            Some(SecretChatState::Pending),
+        );
+        let buffer = render(&App::with_chat_list(view), 120, 24);
+        let row = row_containing(&buffer, "Mallory");
+        assert!(row.contains('🔒'), "secret-chat marker");
+        assert!(row.contains("pending"), "lifecycle state");
+    }
+
+    #[test]
+    fn a_ready_secret_chat_renders_its_state_and_never_key_material() {
+        // The view carries only the SecretChatState, never the secret chat's
+        // key_hash, so a fingerprint can never reach the screen by construction.
+        let view = view_with_one_chat(
+            "Mallory",
+            ChatKind::Secret {
+                secret_chat_id: 9,
+                user_id: 7,
+            },
+            Some(SecretChatState::Ready),
+        );
+        let text = flatten(&render(&App::with_chat_list(view), 120, 24));
+        assert!(text.contains("ready"), "ready state shown");
+    }
+
+    #[test]
+    fn a_typing_sender_shows_an_indicator_in_the_chat_list() {
+        let mut view = view_with_one_chat("Alice", ChatKind::Private { user_id: 5 }, None);
+        view.set_action(5, Some(ChatAction::Typing));
+        let buffer = render(&App::with_chat_list(view), 120, 24);
+        assert!(
+            row_containing(&buffer, "Alice").contains("typing"),
+            "chat-list typing indicator"
+        );
+    }
+
+    #[test]
+    fn the_conversation_header_shows_a_typing_indicator() {
+        let mut view = ConversationView::from_messages(vec![text_message(1, "hi")], HashSet::new());
+        view.set_chat_action(Some(ChatAction::RecordingVoiceNote));
+        let text = flatten(&render(&App::with_conversation(view), 80, 24));
+        assert!(text.contains("Conversation"), "pane header");
+        assert!(
+            text.contains("recording a voice message"),
+            "header indicator"
+        );
+    }
+
+    #[test]
+    fn the_secret_chat_overlay_poses_the_lifecycle_question() {
+        // sample_chat(7, …) is a private chat → the offered action is "start".
+        let view = view_with_one_chat("Alice", ChatKind::Private { user_id: 7 }, None);
+        let mut app = App::with_chat_list(view);
+        app.dispatch(Action::SecretOpen);
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Secret chat"), "overlay title");
+        assert!(text.contains("Start"), "the lifecycle action");
+        assert!(text.contains("Alice"), "names the chat");
+        assert!(text.contains("Enter confirm"), "key hint");
     }
 }

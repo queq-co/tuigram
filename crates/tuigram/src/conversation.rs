@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tuigram_core::model::{File, Message, Reaction, ReactionKind};
+use tuigram_core::model::{ChatAction, File, Message, Reaction, ReactionKind};
 
 /// The history pane's state: the open chat's messages (oldest first), which of
 /// them are pinned, the scroll offset, and the download state of any media files
@@ -42,6 +42,11 @@ pub struct ConversationView {
     /// file id, for the download-progress indicator (#85). Phase 6 projects this
     /// from the core [`FileStore`](tuigram_core::files::FileStore); empty until then.
     downloads: HashMap<i32, File>,
+    /// The transient chat action in the open chat (#87) — the "typing…" indicator
+    /// shown in the conversation header. `None` when no one is acting. Phase 6
+    /// projects this from the core [`ChatActionStore`](tuigram_core::ChatActionStore);
+    /// it is never part of the message history.
+    chat_action: Option<ChatAction>,
 }
 
 impl ConversationView {
@@ -59,6 +64,7 @@ impl ConversationView {
             pinned,
             offset: 0,
             downloads: HashMap::new(),
+            chat_action: None,
         }
     }
 
@@ -151,6 +157,22 @@ impl ConversationView {
     #[must_use]
     pub fn download(&self, file_id: i32) -> Option<&File> {
         self.downloads.get(&file_id)
+    }
+
+    /// The chat action currently being performed in the open chat (#87), if any —
+    /// the "typing…" indicator drawn in the conversation header.
+    #[must_use]
+    pub fn chat_action(&self) -> Option<&ChatAction> {
+        self.chat_action.as_ref()
+    }
+
+    /// Set (or clear) the open chat's chat action: `Some` shows the header
+    /// indicator, `None` removes it (a cancel). The seam Phase 6 fills from the core
+    /// [`ChatActionStore`](tuigram_core::ChatActionStore) on each `updateChatAction`;
+    /// until then only tests call it.
+    #[allow(dead_code)]
+    pub fn set_chat_action(&mut self, action: Option<ChatAction>) {
+        self.chat_action = action;
     }
 
     /// Record (or replace) the download state of a file, keyed by its id. The seam
@@ -315,6 +337,17 @@ mod tests {
         let bucket = &view.messages()[0].reactions[0];
         assert_eq!(bucket.count, 2);
         assert!(!bucket.is_chosen);
+    }
+
+    #[test]
+    fn a_chat_action_is_recorded_then_cleared() {
+        let mut view = ConversationView::default();
+        assert!(view.chat_action().is_none(), "no one acting by default");
+        view.set_chat_action(Some(ChatAction::Typing));
+        assert_eq!(view.chat_action(), Some(&ChatAction::Typing));
+        // A cancel clears the indicator.
+        view.set_chat_action(None);
+        assert!(view.chat_action().is_none());
     }
 
     #[test]
