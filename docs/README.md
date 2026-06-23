@@ -14,6 +14,10 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
   mapping, per-domain folding (chats incl. archive/folders, messages incl. media/
   reactions/pins/search/forward, files, chat actions, secret chats, users), the
   send/download lifecycle, read state, and drafts.
+- [tui.md](tui.md) — the Phase 5 Ratatui front-end: the central `tokio::select!`
+  event loop (nothing awaited in the draw path), `App`-as-single-source-of-truth
+  + the `Action` reducer, the three-pane layout + status bar, the focus-aware
+  keymap, the fake-source ↔ Phase 6 boundary, and `TestBackend` snapshot testing.
 - [branch-model.md](branch-model.md) — how we use `develop` → PR → `main`.
 - Research (Phase 1):
   - [research/ratatui.md](research/ratatui.md) — how Ratatui works and how we'll use it.
@@ -30,5 +34,5 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
 | 2 | Secure login | Authenticate as a user via TDLib |
 | 3 | Core client features (headless) | List chats/messages, send, reply — **done** |
 | 4 | Extended client features (headless) | Media, archive/folders, search/forward, reactions/pins, chat actions, secret chats, full login — **done** |
-| 5 | TUI | Ratatui interface |
+| 5 | TUI | Ratatui interface — event loop, panes, keymap, overlays, status/toasts (fixtures) — **done** |
 | 6 | Wire Telegram ↔ TUI (MVP) | Render & interact over real data |
