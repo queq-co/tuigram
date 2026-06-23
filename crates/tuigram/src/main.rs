@@ -19,6 +19,7 @@ mod mediaform;
 mod reactions;
 mod search;
 mod secret;
+mod status;
 mod terminal;
 mod textinput;
 mod ui;

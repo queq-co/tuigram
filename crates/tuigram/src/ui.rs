@@ -30,6 +30,7 @@ use crate::composer::ComposerMode;
 use crate::conversation::ConversationView;
 use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaField;
+use crate::status::NoticeLevel;
 
 /// Chat-list pane width, as a percentage of the terminal; the conversation pane
 /// fills the remainder. (The research doc allows fixed *or* percentage width;
@@ -38,6 +39,9 @@ const CHAT_LIST_PERCENT: u16 = 30;
 
 /// Composer height in rows: one input line framed by a border.
 const COMPOSER_HEIGHT: u16 = 3;
+
+/// Status-bar height in rows: a single strip across the bottom (#88).
+const STATUS_HEIGHT: u16 = 1;
 
 /// Marker drawn to the left of the selected chat row.
 const SELECTED_SYMBOL: &str = "▶ ";
@@ -50,12 +54,17 @@ const FOCUS_MARKER: &str = "●";
 
 /// Render the whole UI for one frame from the current `App` state.
 pub fn ui(frame: &mut Frame, app: &App) {
-    // Outer split: chat list | conversation (fills the rest).
+    // Outer split: the three panes over a one-row status bar pinned to the bottom.
+    let [content_area, status_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)])
+            .areas(frame.area());
+
+    // Content split: chat list | conversation (fills the rest).
     let [list_area, convo_area] = Layout::horizontal([
         Constraint::Percentage(CHAT_LIST_PERCENT),
         Constraint::Min(0),
     ])
-    .areas(frame.area());
+    .areas(content_area);
 
     // Conversation split: message history over a fixed composer line.
     let [history_area, composer_area] =
@@ -65,6 +74,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
     render_chat_list(frame, list_area, app);
     render_conversation(frame, history_area, app);
     render_composer(frame, composer_area, app);
+    render_status_bar(frame, status_area, app);
 
     // A modal overlay floats above the panes, capturing input while open.
     match app.overlay() {
@@ -76,6 +86,12 @@ pub fn ui(frame: &mut Frame, app: &App) {
         Overlay::Reaction => render_reaction(frame, frame.area(), app),
         Overlay::SendMedia => render_send_media(frame, frame.area(), app),
         Overlay::SecretChat => render_secret_chat(frame, frame.area(), app),
+    }
+
+    // A transient toast floats over the content too, but — unlike a modal overlay
+    // — it never captures input, so the loop keeps responding while it shows.
+    if app.notifications().current().is_some() {
+        render_toast(frame, content_area, app);
     }
 }
 
@@ -254,10 +270,11 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
 
 /// The pre-data conversation pane: a welcome banner that doubles as the liveness
 /// view, echoing the core heartbeat count until real history (Phase 6) replaces
-/// it and the status bar (#88) takes over the heartbeat/quit hint.
+/// it. The quit/help hint now lives in the status bar (#88), so the banner only
+/// carries the welcome and the heartbeat proof.
 fn render_conversation_placeholder(frame: &mut Frame, area: Rect, app: &App) {
     let body = format!(
-        "tuigram — Phase 5 TUI skeleton\n\ncore heartbeats: {}\n\npress ? for help · q / Ctrl-C to quit",
+        "tuigram — Phase 5 TUI skeleton\n\ncore heartbeats: {}",
         app.beats()
     );
     let block = pane_block(" tuigram ".to_owned(), app.focus() == Focus::History)
@@ -266,6 +283,127 @@ fn render_conversation_placeholder(frame: &mut Frame, area: Rect, app: &App) {
         .alignment(Alignment::Center)
         .block(block);
     frame.render_widget(widget, area);
+}
+
+/// The persistent status bar (#88): a one-row reverse-video strip with the core
+/// connection state and current chat/context on the left and the always-available
+/// quit/help hint on the right. It takes over the quit hint the conversation
+/// placeholder used to carry, so it is present on every screen, with or without
+/// data.
+fn render_status_bar(frame: &mut Frame, area: Rect, app: &App) {
+    // A reverse-video bar sets the status row apart from the panes without relying
+    // on colour, matching the rest of the UI's Modifier-only styling.
+    let bar = Style::new().add_modifier(Modifier::REVERSED);
+    let conn = app.connection();
+    let hint = "? help · q quit ";
+
+    // One line: connection + context on the left, the quit/help hint pushed to the
+    // right by a padding span sized to fill the row.
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{} {}", conn.symbol(), conn.label()),
+            bar.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  ·  "),
+        Span::raw(status_context(app)),
+    ];
+    let used = spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum::<usize>()
+        + hint.chars().count();
+    let pad = (area.width as usize).saturating_sub(used);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::raw(hint));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+}
+
+/// The status bar's context field: the selected chat's title and the focused
+/// pane (or open overlay), so the bar always says where input is going.
+fn status_context(app: &App) -> String {
+    let chat = app
+        .chat_list()
+        .selected_chat()
+        .map_or_else(|| "no chat selected".to_owned(), |c| c.title.clone());
+    format!("{chat} — {}", mode_label(app))
+}
+
+/// The current input mode for the status bar: the open overlay's name, or the
+/// focused pane when none is up.
+fn mode_label(app: &App) -> &'static str {
+    match app.overlay() {
+        Overlay::None => match app.focus() {
+            Focus::ChatList => "chats",
+            Focus::History => "history",
+            Focus::Composer => "compose",
+        },
+        Overlay::Help => "help",
+        Overlay::SearchInput | Overlay::SearchResults => "search",
+        Overlay::Forward => "forward",
+        Overlay::Reaction => "react",
+        Overlay::SendMedia => "attach",
+        Overlay::SecretChat => "secret chat",
+    }
+}
+
+/// Toast width as a share of the content width, clamped so a long line wraps
+/// rather than spanning the screen.
+const TOAST_MAX_WIDTH: u16 = 44;
+
+/// A transient toast (#88), anchored top-right over the content: the current
+/// notice's marker and message in a small bordered box, with a "+N" title when
+/// more are queued and a dim dismiss hint. Errors are bolded. It draws nothing
+/// when the queue is empty (the caller guards that) and never captures input.
+fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
+    let notes = app.notifications();
+    let Some(notice) = notes.current() else {
+        return;
+    };
+
+    let line = notice.line();
+    let line_cols = line.chars().count();
+    let pending = notes.pending();
+    let title = if pending > 0 {
+        format!(" Notice (+{pending}) ")
+    } else {
+        " Notice ".to_owned()
+    };
+
+    // Width fits the message or the title, whichever is wider, plus borders —
+    // clamped to a readable maximum and to the content area.
+    let content_cols = (line_cols.max(title.chars().count()) + 2) as u16;
+    let width = content_cols
+        .clamp(1, TOAST_MAX_WIDTH)
+        .min(area.width.saturating_sub(2));
+    // Height: the message wrapped to the inner width, plus borders, capped to the
+    // content area.
+    let inner = width.saturating_sub(2).max(1) as usize;
+    let rows = line_cols.div_ceil(inner).max(1) as u16;
+    let height = (rows + 2).min(area.height);
+    let body = Paragraph::new(line).wrap(ratatui::widgets::Wrap { trim: false });
+
+    // Top-right, one cell in from the border so it does not sit on the corner.
+    let x = area.x + area.width.saturating_sub(width + 1);
+    let y = area.y + 1;
+    let rect = Rect {
+        x,
+        y: y.min(area.y + area.height.saturating_sub(height)),
+        width,
+        height,
+    };
+
+    let emphasis = if notice.level() == NoticeLevel::Error {
+        Style::new().add_modifier(Modifier::BOLD)
+    } else {
+        Style::new()
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        body.block(Block::bordered().title(title)).style(emphasis),
+        rect,
+    );
 }
 
 /// The lines for one message: a bold sender/timestamp header (with a selection
@@ -869,7 +1007,7 @@ mod tests {
         let buffer = render(&app, 80, 24);
         // The composer (focused) shows the marker on its border; the chat-list
         // title row (top, unfocused) does not.
-        let composer_row = row_text(&buffer, 24 - COMPOSER_HEIGHT);
+        let composer_row = row_text(&buffer, 24 - STATUS_HEIGHT - COMPOSER_HEIGHT);
         assert!(composer_row.contains('●'), "focused composer is marked");
         assert!(
             !row_text(&buffer, 0).contains('●'),
@@ -914,10 +1052,13 @@ mod tests {
     #[test]
     fn composer_is_pinned_to_the_bottom() {
         let buffer = render(&App::new(), 80, 24);
-        // The composer is the bottom COMPOSER_HEIGHT rows; its bordered title row
-        // is the first of those.
-        let composer_top = row_text(&buffer, 24 - COMPOSER_HEIGHT);
-        assert!(composer_top.contains("Message"), "composer at the bottom");
+        // The composer sits just above the one-row status bar; its bordered title
+        // row is the first of its COMPOSER_HEIGHT rows.
+        let composer_top = row_text(&buffer, 24 - STATUS_HEIGHT - COMPOSER_HEIGHT);
+        assert!(
+            composer_top.contains("Message"),
+            "composer above the status bar"
+        );
     }
 
     // --- chat-list pane (#80) ---
@@ -1139,7 +1280,9 @@ mod tests {
     /// The symbol of the reverse-video cursor cell on the composer's input row, if
     /// one is drawn. The input row sits just above the composer's bottom border.
     fn cursor_symbol(buffer: &Buffer) -> Option<String> {
-        let y = buffer.area.height - 2;
+        // The composer's input row is the middle of its three rows, which now sit
+        // just above the one-row status bar.
+        let y = buffer.area.height - STATUS_HEIGHT - COMPOSER_HEIGHT + 1;
         (0..buffer.area.width).find_map(|x| {
             let cell = &buffer[(x, y)];
             cell.modifier
@@ -1448,5 +1591,77 @@ mod tests {
         assert!(text.contains("Start"), "the lifecycle action");
         assert!(text.contains("Alice"), "names the chat");
         assert!(text.contains("Enter confirm"), "key hint");
+    }
+
+    // --- status bar & notifications (#88) ---
+
+    use crate::status::{ConnectionState, Notice};
+
+    /// The bottom status row of a rendered buffer.
+    fn status_row(buffer: &Buffer) -> String {
+        row_text(buffer, buffer.area.height - 1)
+    }
+
+    #[test]
+    fn the_status_bar_sits_on_the_bottom_row_with_connection_and_hint() {
+        let buffer = render(&App::new(), 80, 24);
+        let bar = status_row(&buffer);
+        // Default connection is "connecting…", and the quit/help hint the
+        // placeholder used to carry now lives here.
+        assert!(bar.contains("connecting"), "connection state: {bar:?}");
+        assert!(bar.contains("quit"), "quit hint on the bar");
+        assert!(bar.contains("help"), "help hint on the bar");
+    }
+
+    #[test]
+    fn the_status_bar_reflects_the_connection_state() {
+        let mut app = App::new();
+        app.set_connection(ConnectionState::Ready);
+        assert!(status_row(&render(&app, 80, 24)).contains("online"));
+    }
+
+    #[test]
+    fn the_status_bar_names_the_current_chat_and_mode() {
+        let view = view_with_one_chat("Alice", ChatKind::Private { user_id: 7 }, None);
+        let app = App::with_chat_list(view);
+        let bar = status_row(&render(&app, 80, 24));
+        assert!(bar.contains("Alice"), "current chat: {bar:?}");
+        assert!(bar.contains("chats"), "focused-pane mode");
+    }
+
+    #[test]
+    fn no_toast_renders_with_an_empty_queue() {
+        // The placeholder banner is the only thing in the conversation pane.
+        let text = flatten(&render(&App::new(), 80, 24));
+        assert!(!text.contains("Notice"), "no toast box without a notice");
+    }
+
+    #[test]
+    fn a_toast_floats_over_the_panes_with_its_message() {
+        let mut app = App::new();
+        app.notify(Notice::info("download complete"));
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Notice"), "toast box title");
+        assert!(text.contains("download complete"), "toast message");
+    }
+
+    #[test]
+    fn an_error_toast_surfaces_its_code() {
+        let mut app = App::new();
+        app.notify(Notice::error("send", Some("FLOOD_WAIT")));
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("send failed"), "error category");
+        assert!(text.contains("FLOOD_WAIT"), "error code");
+    }
+
+    #[test]
+    fn a_queued_toast_shows_a_pending_count() {
+        let mut app = App::new();
+        app.notify(Notice::info("first"));
+        app.notify(Notice::info("second"));
+        let text = flatten(&render(&app, 80, 24));
+        // The front shows; the title hints at the one waiting behind it.
+        assert!(text.contains("first"), "front toast");
+        assert!(text.contains("+1"), "pending count");
     }
 }
