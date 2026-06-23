@@ -16,7 +16,9 @@
 //! [`prev_list`](ChatListView::prev_list) cycle them and the chat store's
 //! ordering is preserved verbatim (this never re-sorts; it only points at rows).
 
-use tuigram_core::model::{Chat, ChatListKind};
+use std::collections::HashMap;
+
+use tuigram_core::model::{Chat, ChatAction, ChatListKind, SecretChatState};
 
 /// One switchable list: its [kind](ChatListKind), the label shown in the pane
 /// title, and its chats in the order the store handed them back.
@@ -45,6 +47,16 @@ pub struct ChatListView {
     /// Selection index within the active list's chats. Clamped to a valid row,
     /// or `0` when the active list is empty.
     selected: usize,
+    /// Secret-chat lifecycle state, keyed by chat id (#87). Only secret chats
+    /// appear; a chat id is globally unique, so one map spans every list. Phase 6
+    /// projects this from the core
+    /// [`SecretChatStore`](tuigram_core::SecretChatStore); never any key material,
+    /// only the [`SecretChatState`].
+    secret_states: HashMap<i64, SecretChatState>,
+    /// The transient chat action currently shown per chat id (#87) — the "typing…"
+    /// indicator. Phase 6 projects this from the core
+    /// [`ChatActionStore`](tuigram_core::ChatActionStore); empty until then.
+    actions: HashMap<i64, ChatAction>,
 }
 
 impl Default for ChatListView {
@@ -58,6 +70,8 @@ impl Default for ChatListView {
             }],
             active: 0,
             selected: 0,
+            secret_states: HashMap::new(),
+            actions: HashMap::new(),
         }
     }
 }
@@ -80,6 +94,8 @@ impl ChatListView {
             lists,
             active: 0,
             selected: 0,
+            secret_states: HashMap::new(),
+            actions: HashMap::new(),
         }
     }
 
@@ -99,6 +115,53 @@ impl ChatListView {
     #[must_use]
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    /// The chat under the selection in the active list, or `None` when the list is
+    /// empty. The chat the secret-chat lifecycle action (#87) operates on.
+    #[must_use]
+    pub fn selected_chat(&self) -> Option<&Chat> {
+        self.active_chats().get(self.selected)
+    }
+
+    /// The folded secret-chat lifecycle state for chat `chat_id`, if it is a known
+    /// secret chat (#87). `None` for an ordinary chat, or a secret chat whose
+    /// `updateSecretChat` has not arrived yet.
+    #[must_use]
+    pub fn secret_state(&self, chat_id: i64) -> Option<SecretChatState> {
+        self.secret_states.get(&chat_id).copied()
+    }
+
+    /// The chat action currently being performed in chat `chat_id`, if any (#87) —
+    /// the source of the "typing…" indicator on that row.
+    #[must_use]
+    pub fn action(&self, chat_id: i64) -> Option<&ChatAction> {
+        self.actions.get(&chat_id)
+    }
+
+    /// Record (or replace) the secret-chat lifecycle state for chat `chat_id`. The
+    /// seam Phase 6 fills from the core
+    /// [`SecretChatStore`](tuigram_core::SecretChatStore) on each `updateSecretChat`;
+    /// until then only tests call it.
+    #[allow(dead_code)]
+    pub fn set_secret_state(&mut self, chat_id: i64, state: SecretChatState) {
+        self.secret_states.insert(chat_id, state);
+    }
+
+    /// Record (or clear) the chat action for chat `chat_id`: `Some` shows the
+    /// indicator, `None` removes it (a cancel). The seam Phase 6 fills from the core
+    /// [`ChatActionStore`](tuigram_core::ChatActionStore) on each `updateChatAction`;
+    /// until then only tests call it.
+    #[allow(dead_code)]
+    pub fn set_action(&mut self, chat_id: i64, action: Option<ChatAction>) {
+        match action {
+            Some(action) => {
+                self.actions.insert(chat_id, action);
+            }
+            None => {
+                self.actions.remove(&chat_id);
+            }
+        }
     }
 
     /// Move the selection down one row, clamping at the last row. A no-op on an
@@ -239,6 +302,41 @@ mod tests {
         assert_eq!(view.active_label(), "Work");
         view.prev_list();
         assert_eq!(view.active_label(), "Archive");
+    }
+
+    #[test]
+    fn the_selected_chat_is_the_one_under_the_cursor() {
+        let mut view = three_lists();
+        assert_eq!(
+            view.selected_chat().map(|c| c.title.as_str()),
+            Some("Alice")
+        );
+        view.select_next();
+        assert_eq!(view.selected_chat().map(|c| c.title.as_str()), Some("Bob"));
+        // An empty list resolves to no selected chat rather than panicking.
+        assert!(ChatListView::default().selected_chat().is_none());
+    }
+
+    #[test]
+    fn a_secret_state_is_recorded_and_read_back_by_chat_id() {
+        let mut view = three_lists();
+        assert!(view.secret_state(0).is_none(), "no state until projected");
+        view.set_secret_state(0, SecretChatState::Pending);
+        assert_eq!(view.secret_state(0), Some(SecretChatState::Pending));
+        // A lifecycle advance overwrites in place.
+        view.set_secret_state(0, SecretChatState::Ready);
+        assert_eq!(view.secret_state(0), Some(SecretChatState::Ready));
+    }
+
+    #[test]
+    fn a_chat_action_is_recorded_then_cleared_by_chat_id() {
+        let mut view = three_lists();
+        assert!(view.action(1).is_none());
+        view.set_action(1, Some(ChatAction::Typing));
+        assert_eq!(view.action(1), Some(&ChatAction::Typing));
+        // A cancel (None) clears it.
+        view.set_action(1, None);
+        assert!(view.action(1).is_none(), "cancel removes the indicator");
     }
 
     #[test]

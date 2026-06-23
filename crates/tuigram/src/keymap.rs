@@ -72,6 +72,8 @@ pub enum Overlay {
     Reaction,
     /// The send-media prompt: type a local path and an optional caption.
     SendMedia,
+    /// The secret-chat lifecycle confirm: start or close a secret chat (#87).
+    SecretChat,
 }
 
 /// The focus context a binding applies in. `Global` always applies; `Nav` applies
@@ -207,6 +209,13 @@ const BINDINGS: &[Binding] = &[
         action: Action::SetFocus(Focus::History),
         keys: "Enter",
         description: "open in history",
+    },
+    Binding {
+        context: Context::ChatList,
+        trigger: Trigger::Plain(&[KeyCode::Char('s')]),
+        action: Action::SecretOpen,
+        keys: "s",
+        description: "secret chat: start / close",
     },
     // History.
     Binding {
@@ -347,6 +356,7 @@ pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
         Overlay::Forward => resolve_forward(key),
         Overlay::Reaction => resolve_reaction(key),
         Overlay::SendMedia => resolve_send_media(key),
+        Overlay::SecretChat => resolve_secret_chat(key),
     }
 }
 
@@ -462,6 +472,18 @@ fn resolve_send_media(key: &KeyEvent) -> Action {
             Some(c) => Action::AttachInput(c),
             None => Action::Noop,
         },
+    }
+}
+
+/// The secret-chat lifecycle confirm (#87): Enter runs the start/close, Esc cancels.
+fn resolve_secret_chat(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::SecretCancel,
+        KeyCode::Enter => Action::SecretConfirm,
+        _ => Action::Noop,
     }
 }
 
@@ -736,6 +758,30 @@ mod tests {
     }
 
     #[test]
+    fn s_opens_the_secret_chat_lifecycle_from_the_chat_list() {
+        assert_eq!(
+            resolved(Focus::ChatList, KeyCode::Char('s')),
+            Action::SecretOpen
+        );
+        // The same letter is plain text in the composer, not a command.
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char('s')),
+            Action::ComposerInput('s')
+        );
+        // …and unbound in the history (chat-list-only context).
+        assert_eq!(resolved(Focus::History, KeyCode::Char('s')), Action::Noop);
+    }
+
+    #[test]
+    fn the_secret_chat_overlay_confirms_and_cancels() {
+        let at = |code| resolve(Focus::ChatList, Overlay::SecretChat, &key(code));
+        assert_eq!(at(KeyCode::Enter), Action::SecretConfirm);
+        assert_eq!(at(KeyCode::Esc), Action::SecretCancel);
+        // Other keys do nothing while the modal is up.
+        assert_eq!(at(KeyCode::Char('x')), Action::Noop);
+    }
+
+    #[test]
     fn ctrl_c_quits_from_every_overlay() {
         for overlay in [
             Overlay::SearchInput,
@@ -743,6 +789,7 @@ mod tests {
             Overlay::Forward,
             Overlay::Reaction,
             Overlay::SendMedia,
+            Overlay::SecretChat,
         ] {
             assert_eq!(resolve(Focus::ChatList, overlay, &ctrl('c')), Action::Quit);
         }
