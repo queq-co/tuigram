@@ -424,8 +424,9 @@ fn composer_title(mode: &ComposerMode) -> String {
 
 /// The input line with a visible cursor: the text up to the cursor, then the
 /// character under it (or a trailing space at end-of-line) drawn reverse-video so
-/// the caret shows in the `TestBackend` buffer, then the remainder.
-fn input_line(text: &str, cursor: usize) -> Line<'static> {
+/// the caret shows in the `TestBackend` buffer, then the remainder. Shared with the
+/// login screens (#86) so every text field renders its caret identically.
+pub(crate) fn input_line(text: &str, cursor: usize) -> Line<'static> {
     let chars: Vec<char> = text.chars().collect();
     let cursor = cursor.min(chars.len());
     let cursor_style = Style::new().add_modifier(Modifier::REVERSED);
@@ -501,8 +502,9 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 /// [`centered_rect`].
 const OVERLAY_WIDTH: u16 = 56;
 
-/// A dim hint line, for the key reminder along the bottom of a modal.
-fn hint_line(hint: &'static str) -> Line<'static> {
+/// A dim hint line, for the key reminder along the bottom of a modal (and the
+/// login screens, #86).
+pub(crate) fn hint_line(hint: &'static str) -> Line<'static> {
     Line::from(Span::styled(hint, Style::new().add_modifier(Modifier::DIM)))
 }
 

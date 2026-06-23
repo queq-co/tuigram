@@ -40,6 +40,10 @@ keyring = { version = "4" }
 getrandom = { version = "0.4" }
 # Isolated temp dirs for filesystem unit tests (config perms, resolution order).
 tempfile = { version = "3" }
+# QR encoder for the login QR screen (#86): the `WaitOtherDeviceConfirmation`
+# link is drawn as a scannable code. Nayuki's reference implementation — pure
+# Rust, zero dependencies, deterministic output (so the render is snapshot-testable).
+qrcodegen = { version = "1.8" }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.
