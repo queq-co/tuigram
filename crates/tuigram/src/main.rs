@@ -21,7 +21,10 @@
 //! chat's folded history back and projects the conversation pane (#114), paging a
 //! page at a time as the user opens a chat and scrolls up. While a chat is open the
 //! loop acknowledges its unread messages to Telegram through the read seam (#115),
-//! so the unread badge clears here and on the user's other clients. `main` closes TDLib
+//! so the unread badge clears here and on the user's other clients. A composer
+//! submit becomes a real send, reply, or edit into the open chat through the
+//! send/edit seam (#116); the optimistic message and its delivery resolution arrive
+//! back as updates the loop re-projects. `main` closes TDLib
 //! cleanly on every exit path, including a login the user quit before the facade
 //! ever started.
 
@@ -55,15 +58,17 @@ use tokio_stream::StreamExt;
 
 use tuigram_core::model::ChatListKind;
 use tuigram_core::{
-    Client, HistoryRequests, NEWEST, ReadRequests, load_archive_list, load_folder_list,
-    load_main_list,
+    Client, EditRequests, FormattedText, HistoryRequests, NEWEST, ReadRequests, SendRequests,
+    load_archive_list, load_folder_list, load_main_list,
 };
 
 use crate::app::{Action, App};
 use crate::chat_list::project_lists;
+use crate::composer::Submission;
 use crate::event::{AppEvent, spawn_core_source};
 use crate::keymap::Focus;
 use crate::login::{LoginEnd, run_login};
+use crate::status::Notice;
 use crate::terminal::{TerminalGuard, install_panic_hook};
 
 /// Render cadence cap (~30 FPS). Bounds repaint rate independently of network
@@ -86,6 +91,12 @@ const HISTORY_PAGE: i32 = 50;
 /// them into the store and nudges the loop here to re-project; the loop coalesces
 /// these through a full store re-read, so a shallow channel suffices.
 const HISTORY_CHANNEL_DEPTH: usize = 16;
+
+/// Depth of the send → loop completion channel (#116). A composer submit spawns a
+/// fire-and-forget send/edit; only a seam-level rejection reports back (as an error
+/// toast), and those are rare and coalesced through the toast queue, so a shallow
+/// channel suffices.
+const OUTBOUND_CHANNEL_DEPTH: usize = 16;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -168,6 +179,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // so it needs an explicit completion signal).
     let mut history = HistoryState::default();
     let (history_tx, mut history_rx) = mpsc::channel::<HistoryPage>(HISTORY_CHANNEL_DEPTH);
+    // A spawned send/edit (#116) reports a seam-level rejection back here as a toast;
+    // the loop surfaces it through the notification queue.
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<Notice>(OUTBOUND_CHANNEL_DEPTH);
 
     // Kick off the landing list (Main) before the first frame; the rest load on
     // demand as the user switches to them.
@@ -238,6 +252,14 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                     }
                 }
             }
+            // A spawned send/edit was rejected at the seam (#116): float the toast.
+            // (A send that reached `Pending` resolves in the conversation instead,
+            // through the optimistic message's `Sent`/`Failed` fold.)
+            maybe_notice = outbound_rx.recv() => {
+                if let Some(notice) = maybe_notice {
+                    app.notify(notice);
+                }
+            }
         }
 
         // A list switch may have moved onto a list we have not paged yet — load it.
@@ -248,6 +270,8 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // With the open chat resolved and its history possibly just filled,
         // acknowledge its unread messages to Telegram (clears the unread badge).
         drive_read_state(client, &mut history);
+        // A composer submit becomes a real send/reply/edit into the open chat (#116).
+        drive_outbound(&mut app, client, &history, &outbound_tx);
     }
 
     Ok(())
@@ -284,11 +308,15 @@ struct HistoryState {
 }
 
 /// The chat to show in the conversation pane: the chat-list selection while the
-/// history pane is focused (Enter moves focus there to open it). `None` while the
-/// user is browsing the list, so paging through chats does not eagerly load every
-/// one — only the chat the user actually opens.
+/// history pane (or its composer) is focused. Enter moves focus to the history to
+/// open a chat; tabbing on into the composer keeps that chat open, since the
+/// composer belongs to the open conversation — so typing or sending (#116) never
+/// "closes" the chat, and its history keeps re-projecting and its unread messages
+/// keep settling (#115) while the user composes. `None` while browsing the list, so
+/// paging through chats does not eagerly load every one — only the chat the user
+/// actually opens.
 fn open_chat_id(app: &App) -> Option<i64> {
-    if app.focus() == Focus::History {
+    if matches!(app.focus(), Focus::History | Focus::Composer) {
         app.chat_list().selected_chat().map(|chat| chat.id)
     } else {
         None
@@ -373,6 +401,74 @@ fn drive_read_state(client: &Arc<Client>, history: &mut HistoryState) {
     tokio::spawn(async move {
         let _ = client.bridge().view_messages(chat_id, unread).await;
     });
+}
+
+/// Dispatch a submitted composer buffer to Telegram (#116). `App` records the
+/// submission as a pure intent; here the loop pairs it with the open chat and routes
+/// it to the matching seam — a new message or reply through
+/// [`SendRequests::send_text`], an edit through [`EditRequests::edit_text`].
+///
+/// The send is fire-and-forget, like the read path (#115): TDLib streams the
+/// optimistic `Pending` message (and later its `Sent`/`Failed` resolution) as
+/// updates the router folds and the loop re-projects, so the composer's feedback
+/// arrives through the normal pipeline rather than this call's return. Only a
+/// seam-level rejection — the request never reaching `Pending` — reports back, as an
+/// error toast on `outbound_tx`. With no chat open (an empty conversation) there is
+/// nowhere to send, so the submission is dropped.
+fn drive_outbound(
+    app: &mut App,
+    client: &Arc<Client>,
+    history: &HistoryState,
+    outbound_tx: &mpsc::Sender<Notice>,
+) {
+    let Some(submission) = app.take_outbound() else {
+        return;
+    };
+    let Some(chat_id) = history.open else { return };
+    // The toast names the failed action; an edit is reported as "edit", the rest
+    // (new message, reply) as "send".
+    let action = match submission {
+        Submission::Edit { .. } => "edit",
+        _ => "send",
+    };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        let result = match submission {
+            Submission::Send { text } => client
+                .bridge()
+                .send_text(chat_id, None, plain_text(text))
+                .await
+                .map(|_| ()),
+            Submission::Reply { reply_to, text } => client
+                .bridge()
+                .send_text(chat_id, Some(reply_to), plain_text(text))
+                .await
+                .map(|_| ()),
+            Submission::Edit { message_id, text } => client
+                .bridge()
+                .edit_text(chat_id, message_id, plain_text(text))
+                .await
+                .map(|_| ()),
+        };
+        if let Err(err) = result {
+            // The TDLib message is a fixed error code (e.g. CHAT_WRITE_FORBIDDEN),
+            // never the user's typed text — safe to show, per the toast contract.
+            let _ = outbound_tx
+                .send(Notice::error(action, Some(&err.message)))
+                .await;
+        }
+    });
+}
+
+/// A plain [`FormattedText`] (no formatting entities) for a composer send or edit
+/// (#116). The composer is a single-line plain-text input today; rich entities
+/// arrive with a later formatting pass.
+fn plain_text(text: String) -> FormattedText {
+    FormattedText {
+        text,
+        entities: Vec::new(),
+    }
 }
 
 /// Read the open chat's folded history and pinned ids back from the `Client` and

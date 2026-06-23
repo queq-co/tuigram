@@ -10,7 +10,7 @@ use crossterm::event::Event;
 use tuigram_core::model::Message;
 
 use crate::chat_list::{ChatList, ChatListView};
-use crate::composer::Composer;
+use crate::composer::{Composer, Submission};
 use crate::conversation::ConversationView;
 use crate::event::AppEvent;
 use crate::forward::ForwardView;
@@ -210,6 +210,10 @@ pub struct App {
     /// request the loop services by paging older history (#114). The loop reads and
     /// clears it each tick via [`take_wants_older_history`](Self::take_wants_older_history).
     wants_older_history: bool,
+    /// A submitted composer buffer awaiting dispatch to core (#116). `App` is pure
+    /// and never touches the `Client`, so a submit lands here and the loop drains it
+    /// via [`take_outbound`](Self::take_outbound), routing it to the send/edit seam.
+    outbound: Option<Submission>,
 }
 
 impl App {
@@ -344,10 +348,16 @@ impl App {
         std::mem::take(&mut self.wants_older_history)
     }
 
-    /// Enqueue a transient toast — Phase 6 calls this for a failed action or a
-    /// one-off core event. Unused in the binary until core feeds it; the heartbeat
-    /// tick ages it out and [`Action::NoticeDismiss`] drops it on demand.
-    #[allow(dead_code)]
+    /// Take the pending composer submission, if any (#116). The loop drains this
+    /// each tick and dispatches it to the send/edit seam; `None` means nothing was
+    /// submitted since the last drain.
+    pub fn take_outbound(&mut self) -> Option<Submission> {
+        self.outbound.take()
+    }
+
+    /// Enqueue a transient toast — a failed action (#116) or a one-off core event.
+    /// The heartbeat tick ages it out and [`Action::NoticeDismiss`] drops it on
+    /// demand.
     pub fn notify(&mut self, notice: crate::status::Notice) {
         self.notifications.push(notice);
         self.dirty = true;
@@ -513,10 +523,13 @@ impl App {
                 self.dirty = true;
             }
             Action::ComposerSubmit => {
-                // Phase 6 routes the submitted text to core (a new message, reply,
-                // or edit per the composer's mode); for now it is consumed. An empty
-                // buffer returns `None` — the send is a no-op that does not repaint.
-                if self.composer.submit().is_some() {
+                // Route the submitted buffer to core (#116): a new message, a reply,
+                // or an edit per the composer's mode. `App` is pure, so it records the
+                // resolved submission as an outbound intent the loop drains and
+                // dispatches to the send/edit seam; an empty buffer returns `None`, a
+                // no-op that does not repaint.
+                if let Some(submission) = self.composer.submit() {
+                    self.outbound = Some(submission);
                     self.dirty = true;
                 }
             }
@@ -928,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_then_submitting_routes_through_the_composer_and_dirties() {
+    fn typing_then_submitting_records_an_outbound_intent_and_dirties() {
         let mut app = App::new();
         app.dispatch(Action::ComposerInput('h'));
         app.dispatch(Action::ComposerInput('i'));
@@ -938,6 +951,14 @@ mod tests {
         app.dispatch(Action::ComposerSubmit);
         assert!(app.composer().is_empty(), "buffer consumed on send");
         assert!(app.is_dirty());
+        // The submit becomes an intent the loop drains and routes to the seam (#116).
+        assert_eq!(
+            app.take_outbound(),
+            Some(Submission::Send {
+                text: "hi".to_owned()
+            })
+        );
+        assert_eq!(app.take_outbound(), None, "drained once");
     }
 
     #[test]
@@ -947,6 +968,7 @@ mod tests {
         app.dispatch(Action::ComposerSubmit);
         assert!(app.composer().is_empty());
         assert!(!app.is_dirty(), "an empty send changes nothing");
+        assert_eq!(app.take_outbound(), None, "nothing to dispatch");
     }
 
     #[test]
