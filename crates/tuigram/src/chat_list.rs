@@ -217,6 +217,21 @@ impl ChatListView {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// Select the chat with `chat_id` in the **active** list, returning whether it
+    /// was found. Used to open a chat the user jumped to from elsewhere — a search
+    /// hit (#117). A chat not in the active list (e.g. a global hit in a folder or
+    /// the archive) leaves the selection untouched and returns `false`, so the
+    /// caller can fall back rather than jump to the wrong row.
+    pub fn select_chat(&mut self, chat_id: i64) -> bool {
+        match self.active_chats().iter().position(|c| c.id == chat_id) {
+            Some(index) => {
+                self.selected = index;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Refresh the displayed lists from a fresh core projection (#113), keeping
     /// the user where they were. The lists are replaced wholesale — Main,
     /// Archive, each folder, in switch order, with the store's ordering preserved
@@ -352,6 +367,27 @@ mod tests {
         let mut view = ChatListView::default();
         view.select_next();
         assert_eq!(view.selected(), 0);
+    }
+
+    #[test]
+    fn select_chat_moves_to_a_chat_in_the_active_list_by_id() {
+        let mut view = three_lists();
+        // Main holds Alice/Bob/Carol at ids 0/1/2.
+        assert!(view.select_chat(2));
+        assert_eq!(view.selected(), 2);
+        assert_eq!(
+            view.selected_chat().map(|c| c.title.as_str()),
+            Some("Carol")
+        );
+    }
+
+    #[test]
+    fn select_chat_for_an_id_not_in_the_active_list_is_a_noop() {
+        let mut view = three_lists();
+        view.select_chat(1);
+        // The "Old" chat lives in Archive, not the active Main list.
+        assert!(!view.select_chat(99));
+        assert_eq!(view.selected(), 1, "selection unchanged on a miss");
     }
 
     #[test]

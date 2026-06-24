@@ -99,6 +99,9 @@ pub enum Action {
     ResultNext,
     /// Move the search-results selection up one hit.
     ResultPrev,
+    /// Open the selected search hit (#117): jump to its chat and, when the message
+    /// is in the loaded history, scroll to it.
+    ResultOpen,
     /// Start forwarding the selected search hit: open the target picker.
     ForwardOpen,
     /// Move the forward target-picker selection down one chat.
@@ -214,6 +217,17 @@ pub struct App {
     /// and never touches the `Client`, so a submit lands here and the loop drains it
     /// via [`take_outbound`](Self::take_outbound), routing it to the send/edit seam.
     outbound: Option<Submission>,
+    /// A submitted search query awaiting dispatch to core (#117). Like `outbound`,
+    /// `App` records the intent and the loop drains it via
+    /// [`take_search_query`](Self::take_search_query), runs the search (in-chat or
+    /// global by context), and feeds the hits back through
+    /// [`set_search_results`](Self::set_search_results).
+    pending_search: Option<String>,
+    /// A `(chat_id, message_id)` the user opened from a search hit and wants the
+    /// conversation to land on (#117). The loop opens the chat; the next projection
+    /// of that chat scrolls to the message if it is loaded, then clears this. Cleared
+    /// on a switch to a different chat so a stale target never jumps a later view.
+    pending_jump: Option<(i64, i64)>,
 }
 
 impl App {
@@ -338,6 +352,21 @@ impl App {
         pinned: HashSet<i64>,
     ) {
         self.conversation.project(chat_id, messages, pinned);
+        // Honor a pending search-hit jump (#117): once this chat's history holds the
+        // target message, scroll to it and clear the jump. A jump for a different chat
+        // is stale (the user opened elsewhere) — drop it so it never moves a later
+        // view. A jump for this chat whose message is not loaded yet stays pending, so
+        // the landing page (which projects right after open) can still land on it.
+        if let Some((jump_chat, message_id)) = self.pending_jump {
+            // Apply the jump only for its own chat, and only once the message is
+            // loaded; clear it when applied, or when it is stale (a different chat is
+            // now open). A same-chat target whose message is not loaded yet stays
+            // pending for the landing page.
+            let applied = jump_chat == chat_id && self.conversation.select_message(message_id);
+            if applied || jump_chat != chat_id {
+                self.pending_jump = None;
+            }
+        }
         self.dirty = true;
     }
 
@@ -353,6 +382,22 @@ impl App {
     /// submitted since the last drain.
     pub fn take_outbound(&mut self) -> Option<Submission> {
         self.outbound.take()
+    }
+
+    /// Take the pending search query, if any (#117). The loop drains this each tick,
+    /// runs the search (in-chat or global by context), and feeds the projected hits
+    /// back through [`set_search_results`](Self::set_search_results); `None` means
+    /// nothing was submitted since the last drain.
+    pub fn take_search_query(&mut self) -> Option<String> {
+        self.pending_search.take()
+    }
+
+    /// Replace the search overlay's hits with a fresh, projected result set (#117),
+    /// resetting the selection to the top. The loop calls this when a spawned search
+    /// completes.
+    pub fn set_search_results(&mut self, hits: Vec<crate::search::SearchHit>) {
+        self.search.set_results(hits);
+        self.dirty = true;
     }
 
     /// Enqueue a transient toast — a failed action (#116) or a one-off core event.
@@ -393,11 +438,13 @@ impl App {
         }
     }
 
-    /// Inject a search result set, standing in for the Phase 6 core search. The
-    /// seam the reducer and render tests use to drive the results/forward overlays.
+    /// Inject a search result set, the test seam standing in for a completed core
+    /// search (#117). Delegates to [`set_search_results`](Self::set_search_results),
+    /// the same path the loop uses, so the reducer and render tests drive the
+    /// results/forward overlays exactly as the live search does.
     #[cfg(test)]
     pub fn inject_search_results(&mut self, results: Vec<crate::search::SearchHit>) {
-        self.search.set_results(results);
+        self.set_search_results(results);
     }
 
     /// Called by the loop after a successful `terminal.draw`.
@@ -568,11 +615,18 @@ impl App {
                 self.dirty = true;
             }
             Action::SearchSubmit => {
-                // Phase 6 runs the query against core and folds the hits in through
-                // `set_results`; for now we just switch to the (injected-or-empty)
-                // results list so the overlay flow is exercised headlessly.
-                self.overlay = Overlay::SearchResults;
-                self.dirty = true;
+                // Record the query as a pure intent the loop drains and runs against
+                // core (#117), then switch to the results overlay. `App` is pure, so
+                // the hits arrive later via `set_search_results`; clear any stale hits
+                // now so the overlay is empty until they land. A blank query is a
+                // no-op that stays on the input line.
+                let query = self.search.query().trim().to_owned();
+                if !query.is_empty() {
+                    self.pending_search = Some(query);
+                    self.search.set_results(Vec::new());
+                    self.overlay = Overlay::SearchResults;
+                    self.dirty = true;
+                }
             }
             Action::SearchCancel => {
                 self.overlay = Overlay::None;
@@ -585,6 +639,22 @@ impl App {
             Action::ResultPrev => {
                 self.search.select_prev();
                 self.dirty = true;
+            }
+            Action::ResultOpen => {
+                // Jump to the selected hit (#117): select its chat in the list, focus
+                // the history so the loop opens and pages it, and record the target so
+                // the next projection of that chat scrolls to the message if it is
+                // loaded. A hit whose chat is not in the active list (a global hit in a
+                // folder/archive) still closes the overlay and focuses the history; the
+                // chat just stays whatever was selected. No selected hit is a no-op.
+                if let Some(hit) = self.search.selected_hit() {
+                    let (chat_id, message_id) = (hit.chat_id, hit.message_id);
+                    self.pending_jump = Some((chat_id, message_id));
+                    self.chat_list.select_chat(chat_id);
+                    self.focus = Focus::History;
+                    self.overlay = Overlay::None;
+                    self.dirty = true;
+                }
             }
             Action::ForwardOpen => {
                 // Forward the selected hit. The picker reuses a snapshot of the
@@ -1099,12 +1169,16 @@ mod tests {
         }]);
         let mut app = App::with_chat_list(view);
         app.dispatch(Action::SearchOpen);
-        // Hits arrive (Phase 6: from the core search) before we land on results.
+        for c in "kenobi".chars() {
+            app.dispatch(Action::SearchInput(c));
+        }
+        app.dispatch(Action::SearchSubmit);
+        // The hits arrive from the core search (the loop's `set_search_results`) once
+        // it completes; inject them to stand in for that delivery.
         app.inject_search_results(vec![
             SearchHit::new(1, 10, "Alice: hello"),
             SearchHit::new(2, 20, "Bob: kenobi"),
         ]);
-        app.dispatch(Action::SearchSubmit);
         app
     }
 
@@ -1140,6 +1214,118 @@ mod tests {
         assert_eq!(app.search().selected(), 1);
         app.dispatch(Action::ResultPrev);
         assert_eq!(app.search().selected(), 0);
+    }
+
+    #[test]
+    fn submitting_an_empty_query_stays_on_the_input_with_no_intent() {
+        let mut app = App::new();
+        app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchSubmit);
+        assert_eq!(
+            app.overlay(),
+            Overlay::SearchInput,
+            "blank query does not search"
+        );
+        assert_eq!(app.take_search_query(), None, "nothing to dispatch");
+    }
+
+    #[test]
+    fn submitting_a_query_records_the_intent_clears_stale_hits_and_drains_once() {
+        // The helper already submitted "kenobi" and (via inject) holds two hits.
+        let mut app = app_on_results();
+        assert_eq!(app.search().results().len(), 2);
+
+        // A fresh search: the query becomes a pending intent and the stale hits clear
+        // until the loop feeds the new ones back.
+        app.dispatch(Action::SearchOpen);
+        for c in "vader".chars() {
+            app.dispatch(Action::SearchInput(c));
+        }
+        app.dispatch(Action::SearchSubmit);
+        assert_eq!(app.overlay(), Overlay::SearchResults);
+        assert!(
+            app.search().results().is_empty(),
+            "stale hits cleared until new ones land"
+        );
+        assert_eq!(app.take_search_query().as_deref(), Some("vader"));
+        assert_eq!(app.take_search_query(), None, "the intent is drained once");
+    }
+
+    #[test]
+    fn set_search_results_fills_the_overlay() {
+        let mut app = App::new();
+        app.set_search_results(vec![SearchHit::new(1, 5, "a hit")]);
+        assert_eq!(app.search().results().len(), 1);
+        assert_eq!(app.search().selected(), 0);
+    }
+
+    #[test]
+    fn opening_a_hit_jumps_to_its_chat_and_focuses_the_history() {
+        let mut app = app_on_results(); // chats Alice(1)/Bob(2); hits (1,10),(2,20)
+        app.dispatch(Action::ResultNext); // select Bob's hit (chat 2, message 20)
+        app.dispatch(Action::ResultOpen);
+        assert_eq!(app.overlay(), Overlay::None, "overlay closed on jump");
+        assert_eq!(
+            app.focus(),
+            Focus::History,
+            "history focused so the loop opens it"
+        );
+        assert_eq!(
+            app.chat_list().selected_chat().map(|c| c.id),
+            Some(2),
+            "the hit's chat is selected"
+        );
+    }
+
+    /// A run of text messages with the given ids, for the jump projection tests.
+    fn text_history(ids: &[i64]) -> Vec<Message> {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+        ids.iter()
+            .map(|&id| {
+                sample_message(
+                    id,
+                    MessageContent::Text(FormattedText {
+                        text: format!("m{id}"),
+                        entities: Vec::new(),
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_jump_waits_for_the_message_then_scrolls_to_it_when_it_loads() {
+        let mut app = app_on_results();
+        app.dispatch(Action::ResultOpen); // first hit: chat 1, message 10
+
+        // The first projection of chat 1 does not carry message 10 yet: no jump.
+        app.project_conversation(1, text_history(&[1, 2]), HashSet::new());
+        assert_ne!(
+            app.conversation().selected_message().map(|m| m.id),
+            Some(10),
+            "message not loaded, nothing to scroll to"
+        );
+
+        // The page carrying message 10 lands: the jump applies and clears.
+        app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
+        assert_eq!(
+            app.conversation().selected_message().map(|m| m.id),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn a_jump_is_dropped_when_a_different_chat_is_opened_first() {
+        let mut app = app_on_results();
+        app.dispatch(Action::ResultOpen); // hit for chat 1, message 10
+
+        // The user opens chat 2 before chat 1's history arrives: the stale jump drops.
+        app.project_conversation(2, text_history(&[7, 8]), HashSet::new());
+        // Chat 1's history (with message 10) arrives later, but the jump is gone, so
+        // the view lands fresh at the top (message 9) rather than chasing message 10.
+        app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(9));
     }
 
     #[test]
@@ -1181,6 +1367,7 @@ mod tests {
     fn forwarding_with_no_hits_is_a_noop() {
         let mut app = App::new();
         app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchInput('q')); // a query, but the search returns nothing
         app.dispatch(Action::SearchSubmit); // empty results
         app.dispatch(Action::ForwardOpen);
         assert_eq!(

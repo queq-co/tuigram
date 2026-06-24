@@ -15,6 +15,8 @@
 //! the composer's exactly; the results are a flat, selectable list with a clamped
 //! cursor, like the chat list.
 
+use tuigram_core::model::{Message, MessageContent};
+
 use crate::textinput::TextInput;
 
 /// One search hit, projected for display. Carries the `(chat_id, message_id)` a
@@ -30,10 +32,10 @@ pub struct SearchHit {
 }
 
 impl SearchHit {
-    /// A hit with the given identity and display preview. Phase 6 builds these from
-    /// the core result set; until then only the render tests construct them, so this
-    /// is unused in the non-test binary.
-    #[allow(dead_code)]
+    /// A hit with the given identity and display preview. The live search builds hits
+    /// through [`from_message`](Self::from_message); only the reducer/render tests
+    /// construct them directly, so this is test-only.
+    #[cfg(test)]
     #[must_use]
     pub fn new(chat_id: i64, message_id: i64, preview: impl Into<String>) -> Self {
         Self {
@@ -42,6 +44,62 @@ impl SearchHit {
             preview: preview.into(),
         }
     }
+
+    /// Project a core search hit into a display row (#117): the `(chat_id, message_id)`
+    /// a jump-to needs, and a one-line `"{chat_title}: {body}"` preview where the body
+    /// is the message text or a `[Kind]` label for media (mirroring the conversation
+    /// pane's content labels). An empty chat title (the chat is not in the folded
+    /// store yet) drops the prefix and shows the body alone.
+    #[must_use]
+    pub fn from_message(message: &Message, chat_title: &str) -> Self {
+        let body = content_summary(&message.content);
+        let preview = if chat_title.is_empty() {
+            body
+        } else {
+            format!("{chat_title}: {body}")
+        };
+        Self {
+            chat_id: message.chat_id,
+            message_id: message.id,
+            preview,
+        }
+    }
+}
+
+/// A one-line plain-text summary of a message's content for a search hit. Mirrors
+/// the conversation pane's `content_lines` labels (a text body verbatim, a `[Kind]`
+/// placeholder plus caption for media), collapsed onto a single line — internal
+/// newlines become spaces so a hit never spills across rows. Exhaustive on
+/// [`MessageContent`], so a new variant is a compile error here, not a silent blank.
+fn content_summary(content: &MessageContent) -> String {
+    let with_caption = |label: &str, caption: &str| {
+        if caption.is_empty() {
+            label.to_owned()
+        } else {
+            format!("{label} {caption}")
+        }
+    };
+    let one_line = match content {
+        MessageContent::Text(t) => t.text.clone(),
+        MessageContent::Photo(p) => with_caption("[Photo]", &p.caption.text),
+        MessageContent::Video(v) => with_caption("[Video]", &v.caption.text),
+        MessageContent::Document(d) => with_caption(
+            &format!("[Document {}]", d.file_name.trim()),
+            &d.caption.text,
+        ),
+        MessageContent::Audio(a) => with_caption("[Audio]", &a.caption.text),
+        MessageContent::Voice(v) => with_caption("[Voice]", &v.caption.text),
+        MessageContent::Sticker(s) => format!("[Sticker {}]", s.emoji).trim_end().to_owned(),
+        MessageContent::Animation(a) => with_caption("[GIF]", &a.caption.text),
+        MessageContent::Location(_) => "[Location]".to_owned(),
+        MessageContent::Venue(v) => format!("[Venue {}]", v.title).trim_end().to_owned(),
+        MessageContent::Contact(c) => format!("[Contact {} {}]", c.first_name, c.last_name)
+            .trim_end()
+            .to_owned(),
+        MessageContent::Poll(p) => format!("[Poll] {}", p.question.text),
+        MessageContent::Unsupported(name) => format!("[{name}]"),
+    };
+    one_line.replace('\n', " ")
 }
 
 /// The search overlay's state: the editable query and a snapshot of the hits with
@@ -101,9 +159,8 @@ impl SearchView {
     }
 
     /// Replace the hits with a fresh result set, resetting the selection to the top.
-    /// The seam Phase 6 (and the render tests) fill from the core result set; until
-    /// the search query is wired to core, only the tests call it.
-    #[allow(dead_code)]
+    /// Filled from the projected core result set when a search completes (#117), and
+    /// by the render tests directly.
     pub fn set_results(&mut self, results: Vec<SearchHit>) {
         self.results = results;
         self.selected = 0;
@@ -152,6 +209,40 @@ impl SearchView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::sample_message;
+    use tuigram_core::model::{FormattedText, MessageContent};
+
+    fn text_message(id: i64, body: &str) -> Message {
+        sample_message(
+            id,
+            MessageContent::Text(FormattedText {
+                text: body.to_owned(),
+                entities: Vec::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn from_message_prefixes_the_chat_title_and_collapses_newlines() {
+        let hit = SearchHit::from_message(&text_message(42, "first\nsecond"), "Alice");
+        // sample_message pins chat_id to 1.
+        assert_eq!(hit, SearchHit::new(1, 42, "Alice: first second"));
+    }
+
+    #[test]
+    fn from_message_with_no_known_title_shows_the_body_alone() {
+        let hit = SearchHit::from_message(&text_message(7, "hi"), "");
+        assert_eq!(hit.preview, "hi");
+    }
+
+    #[test]
+    fn from_message_labels_non_text_content() {
+        let hit = SearchHit::from_message(
+            &sample_message(9, MessageContent::Unsupported("Game")),
+            "Bob",
+        );
+        assert_eq!(hit.preview, "Bob: [Game]");
+    }
 
     fn hits(n: usize) -> Vec<SearchHit> {
         (0..n)
