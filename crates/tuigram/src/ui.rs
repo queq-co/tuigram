@@ -783,7 +783,7 @@ fn render_search_results(frame: &mut Frame, area: Rect, app: &App) {
         title,
         items,
         search.selected(),
-        "j / k move · f forward · Esc close",
+        "j / k move · Enter open · f forward · Esc close",
     );
 }
 
@@ -1340,11 +1340,15 @@ mod tests {
     fn app_on_results() -> App {
         let mut app = app_with_lists(); // Main: Alice/Bob/Carol, Archive: Old Friend
         app.dispatch(Action::SearchOpen);
+        for c in "kenobi".chars() {
+            app.dispatch(Action::SearchInput(c));
+        }
+        app.dispatch(Action::SearchSubmit);
+        // The hits arrive from the core search once it completes; inject them here.
         app.inject_search_results(vec![
             SearchHit::new(1, 10, "Alice: hello there"),
             SearchHit::new(2, 20, "Bob: general kenobi"),
         ]);
-        app.dispatch(Action::SearchSubmit);
         app
     }
 
@@ -1388,6 +1392,7 @@ mod tests {
     fn the_results_overlay_reports_no_matches_when_empty() {
         let mut app = App::new();
         app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchInput('q')); // a query whose search returns nothing
         app.dispatch(Action::SearchSubmit); // no hits injected
         let text = flatten(&render(&app, 80, 24));
         assert!(text.contains("Results"), "results overlay title");

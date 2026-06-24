@@ -236,6 +236,21 @@ impl ConversationView {
     pub fn scroll_up(&mut self) {
         self.offset = self.offset.saturating_sub(1);
     }
+
+    /// Move the cursor to message `message_id` if it is in the loaded history,
+    /// returning whether it was found. Used to land on a search hit the user opened
+    /// (#117): a hit already on the loaded (newest) page scrolls to it; one that has
+    /// not been paged in is a no-op (`false`), leaving the view where it was — the
+    /// caller stays at the newest page rather than chasing an unloaded message.
+    pub fn select_message(&mut self, message_id: i64) -> bool {
+        match self.messages.iter().position(|m| m.id == message_id) {
+            Some(index) => {
+                self.offset = index;
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +308,24 @@ mod tests {
         assert_eq!(view.offset(), 0);
         assert_eq!(view.messages()[0].id, 0);
         assert_eq!(view.messages()[2].id, 2);
+    }
+
+    #[test]
+    fn select_message_moves_the_cursor_to_a_loaded_id() {
+        let mut view = history(4);
+        assert!(view.select_message(2));
+        assert_eq!(view.offset(), 2);
+        assert_eq!(view.selected_message().map(|m| m.id), Some(2));
+    }
+
+    #[test]
+    fn select_message_for_an_unloaded_id_is_a_noop() {
+        let mut view = history(4);
+        view.scroll_down();
+        assert_eq!(view.offset(), 1);
+        // Id 99 is not in the loaded history: the cursor stays put.
+        assert!(!view.select_message(99));
+        assert_eq!(view.offset(), 1);
     }
 
     #[test]

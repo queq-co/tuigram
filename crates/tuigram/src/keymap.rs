@@ -417,7 +417,8 @@ fn resolve_search_input(key: &KeyEvent) -> Action {
     }
 }
 
-/// The search results list: navigate hits, forward the selected one, or close.
+/// The search results list: navigate hits, open the selected one, forward it, or
+/// close.
 fn resolve_search_results(key: &KeyEvent) -> Action {
     if is_quit(key) {
         return Action::Quit;
@@ -426,6 +427,7 @@ fn resolve_search_results(key: &KeyEvent) -> Action {
         KeyCode::Esc => Action::SearchCancel,
         KeyCode::Char('j') | KeyCode::Down => Action::ResultNext,
         KeyCode::Char('k') | KeyCode::Up => Action::ResultPrev,
+        KeyCode::Enter => Action::ResultOpen,
         KeyCode::Char('f') => Action::ForwardOpen,
         _ => Action::Noop,
     }
@@ -713,6 +715,7 @@ mod tests {
         let at = |code| resolve(Focus::ChatList, Overlay::SearchResults, &key(code));
         assert_eq!(at(KeyCode::Char('j')), Action::ResultNext);
         assert_eq!(at(KeyCode::Up), Action::ResultPrev);
+        assert_eq!(at(KeyCode::Enter), Action::ResultOpen);
         assert_eq!(at(KeyCode::Char('f')), Action::ForwardOpen);
         assert_eq!(at(KeyCode::Esc), Action::SearchCancel);
     }
