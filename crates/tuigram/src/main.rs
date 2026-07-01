@@ -27,7 +27,9 @@
 //! back as updates the loop re-projects. A submitted search query runs against the
 //! core search seam (#117) — in-chat when a chat is open, global while browsing —
 //! and its hits fill the overlay; opening a hit jumps to its chat and scrolls to the
-//! message when it is loaded. `main` closes TDLib
+//! message when it is loaded. Forwarding a hit copies its message into the picked
+//! target chat through the forward seam (#118), the copies arriving back as updates
+//! like a normal send. `main` closes TDLib
 //! cleanly on every exit path, including a login the user quit before the facade
 //! ever started.
 
@@ -61,8 +63,8 @@ use tokio_stream::StreamExt;
 
 use tuigram_core::model::ChatListKind;
 use tuigram_core::{
-    Client, EditRequests, FormattedText, HistoryRequests, NEWEST, ReadRequests, SendRequests,
-    load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
+    Client, EditRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST, ReadRequests,
+    SendRequests, load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
 };
 
 use crate::app::{Action, App};
@@ -297,6 +299,8 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         drive_outbound(&mut app, client, &history, &outbound_tx);
         // A submitted search query runs against core, in-chat or global by context (#117).
         drive_search(&mut app, client, &history, &search_tx, &outbound_tx);
+        // A confirmed forward copies its messages into the picked target chat (#118).
+        drive_forward(&mut app, client, &outbound_tx);
     }
 
     Ok(())
@@ -552,6 +556,47 @@ fn drive_search(
                     .send(Notice::error("search", Some(&err.message)))
                     .await;
             }
+        }
+    });
+}
+
+/// Dispatch a confirmed forward to Telegram (#118). `App` records the picked source,
+/// messages, and target as a pure [`ForwardIntent`](crate::forward::ForwardIntent);
+/// here the loop drains it and calls
+/// [`ForwardRequests::forward_messages`], copying the messages into the target chat.
+///
+/// The forward keeps the usual "forwarded from" attribution (`send_copy` false, so no
+/// caption to strip either) — an MVP forward, not a copy-as-own. Like the send path
+/// (#116) it is fire-and-forget: TDLib streams the optimistic `Pending` copies (and
+/// their `Sent`/`Failed` resolution) into the target chat as updates the router folds,
+/// so the forward surfaces through the normal projection pipeline rather than this
+/// call's return. Only a seam-level rejection reports back, as an error toast on
+/// `outbound_tx`.
+fn drive_forward(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Notice>) {
+    let Some(intent) = app.take_forward() else {
+        return;
+    };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        // A normal forward: keep attribution (`send_copy` false), so `remove_caption`
+        // is moot and also false.
+        let result = client
+            .bridge()
+            .forward_messages(
+                intent.from_chat_id,
+                intent.message_ids,
+                intent.to_chat_id,
+                false,
+                false,
+            )
+            .await;
+        if let Err(err) = result {
+            // The TDLib message is a fixed error code (e.g. CHAT_FORWARDS_RESTRICTED),
+            // never user content — safe to show, per the toast contract.
+            let _ = outbound_tx
+                .send(Notice::error("forward", Some(&err.message)))
+                .await;
         }
     });
 }

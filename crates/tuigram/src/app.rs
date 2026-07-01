@@ -13,7 +13,7 @@ use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
 use crate::conversation::ConversationView;
 use crate::event::AppEvent;
-use crate::forward::ForwardView;
+use crate::forward::{ForwardIntent, ForwardView};
 use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaDraft;
 use crate::reactions::ReactionPicker;
@@ -45,6 +45,10 @@ pub enum Action {
     SetFocus(Focus),
     /// Show or hide the help overlay.
     ToggleHelp,
+    /// Scroll the help overlay one line toward the end (`j` / ↓).
+    HelpScrollDown,
+    /// Scroll the help overlay one line toward the start (`k` / ↑).
+    HelpScrollUp,
     /// Move the chat-list selection down one row.
     SelectNext,
     /// Move the chat-list selection up one row.
@@ -104,14 +108,18 @@ pub enum Action {
     ResultOpen,
     /// Start forwarding the selected search hit: open the target picker.
     ForwardOpen,
+    /// Start forwarding the selected conversation message (`f` in the history pane,
+    /// as in the official client): open the target picker sourced from the open chat.
+    ForwardMessage,
     /// Move the forward target-picker selection down one chat.
     ForwardNext,
     /// Move the forward target-picker selection up one chat.
     ForwardPrev,
-    /// Confirm the forward to the selected target. Phase 6 sends through core; for
-    /// now it just closes the picker.
+    /// Confirm the forward to the selected target (#118): record the send and close
+    /// the picker back to browsing.
     ForwardConfirm,
-    /// Cancel the forward and return to the search results.
+    /// Cancel the forward, returning to wherever it was started from (the search
+    /// results, or the conversation).
     ForwardCancel,
     /// Pin or unpin the selected history message. Phase 6 also calls core; for now
     /// it flips the local pinned state behind the 📌 indicator.
@@ -189,11 +197,19 @@ pub struct App {
     /// The modal overlay drawn over the panes, if any. While set it captures input
     /// (key resolution routes to it instead of `focus`).
     overlay: Overlay,
+    /// The help overlay's scroll offset — the index of the topmost help line drawn,
+    /// so the cheatsheet can be read on a terminal too short to show it all. Reset to
+    /// the top each time help opens; clamped against [`keymap::help_line_count`].
+    help_scroll: u16,
     /// The search overlay's state: the query line and the hit list it renders from.
     search: SearchView,
     /// The forward overlay's state: the messages being forwarded and the target
     /// picker. Inert until a forward is started.
     forward: ForwardView,
+    /// Where a cancelled forward returns to — the overlay that was active when the
+    /// forward was started, so `Esc` lands back on the search results (forward from a
+    /// hit) or the conversation (forward from the history pane, `Overlay::None`).
+    forward_return: Overlay,
     /// The reaction picker's state: the emoji palette and the selection. Reset each
     /// time the picker opens.
     reaction: ReactionPicker,
@@ -228,6 +244,11 @@ pub struct App {
     /// of that chat scrolls to the message if it is loaded, then clears this. Cleared
     /// on a switch to a different chat so a stale target never jumps a later view.
     pending_jump: Option<(i64, i64)>,
+    /// A confirmed forward awaiting dispatch to core (#118). Like `outbound`, `App`
+    /// records the intent and the loop drains it via
+    /// [`take_forward`](Self::take_forward), routing it to
+    /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages).
+    pending_forward: Option<ForwardIntent>,
 }
 
 impl App {
@@ -278,6 +299,12 @@ impl App {
     #[allow(dead_code)]
     pub fn help_visible(&self) -> bool {
         self.overlay == Overlay::Help
+    }
+
+    /// The help overlay's scroll offset — the topmost help line to draw. Read by the
+    /// render to window the cheatsheet on a short terminal.
+    pub fn help_scroll(&self) -> u16 {
+        self.help_scroll
     }
 
     /// The search overlay's state, for rendering the query line and results.
@@ -390,6 +417,25 @@ impl App {
     /// nothing was submitted since the last drain.
     pub fn take_search_query(&mut self) -> Option<String> {
         self.pending_search.take()
+    }
+
+    /// Take the pending forward, if any (#118). The loop drains this each tick and
+    /// dispatches it to
+    /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages);
+    /// `None` means no forward was confirmed since the last drain.
+    pub fn take_forward(&mut self) -> Option<ForwardIntent> {
+        self.pending_forward.take()
+    }
+
+    /// Open the forward target picker for `message_id` from `source_chat_id`, shared
+    /// by the two entry points (a search hit, `ForwardOpen`; the selected history
+    /// message, `ForwardMessage`). The picker reuses a snapshot of the chat list as
+    /// its targets, and the current overlay is remembered as the cancel-return target.
+    fn open_forward(&mut self, source_chat_id: i64, message_id: i64) {
+        self.forward_return = self.overlay;
+        self.forward = ForwardView::new(source_chat_id, vec![message_id], self.chat_list.clone());
+        self.overlay = Overlay::Forward;
+        self.dirty = true;
     }
 
     /// Replace the search overlay's hits with a fresh, projected result set (#117),
@@ -508,12 +554,25 @@ impl App {
             }
             Action::ToggleHelp => {
                 // Toggles between no overlay and the help cheatsheet; the keymap
-                // only emits this from browsing or while help is already open.
+                // only emits this from browsing or while help is already open. A
+                // fresh open starts at the top of the cheatsheet.
                 self.overlay = if self.overlay == Overlay::Help {
                     Overlay::None
                 } else {
+                    self.help_scroll = 0;
                     Overlay::Help
                 };
+                self.dirty = true;
+            }
+            Action::HelpScrollDown => {
+                // Clamp at the last help line so a scroll never runs off the end; the
+                // render further clips to the popup's height.
+                let max = keymap::help_line_count().saturating_sub(1) as u16;
+                self.help_scroll = (self.help_scroll + 1).min(max);
+                self.dirty = true;
+            }
+            Action::HelpScrollUp => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
                 self.dirty = true;
             }
             Action::SelectNext => {
@@ -658,12 +717,24 @@ impl App {
             }
             Action::ForwardOpen => {
                 // Forward the selected hit. The picker reuses a snapshot of the
-                // chat list as its target list. No selected hit (empty results) is
-                // a no-op that stays on the results overlay.
-                if let Some(message_id) = self.search.selected_hit().map(|h| h.message_id) {
-                    self.forward = ForwardView::new(vec![message_id], self.chat_list.clone());
-                    self.overlay = Overlay::Forward;
-                    self.dirty = true;
+                // chat list as its target list; the hit's chat is the source the
+                // forward carries. No selected hit (empty results) is a no-op that
+                // stays on the results overlay.
+                if let Some(hit) = self.search.selected_hit() {
+                    let (source, message_id) = (hit.chat_id, hit.message_id);
+                    self.open_forward(source, message_id);
+                }
+            }
+            Action::ForwardMessage => {
+                // Forward the selected conversation message (`f` in the history pane).
+                // The message carries its own chat, which is the open chat and the
+                // forward's source. No selected message (empty history) is a no-op.
+                if let Some((source, message_id)) = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.chat_id, m.id))
+                {
+                    self.open_forward(source, message_id);
                 }
             }
             Action::ForwardNext => {
@@ -675,14 +746,24 @@ impl App {
                 self.dirty = true;
             }
             Action::ForwardConfirm => {
-                // Phase 6 calls `Client::forward_messages` to the selected target;
-                // for now confirming just closes the picker back to browsing.
+                // Record the forward as a pure intent for the loop to send through
+                // `forward_messages` (#118), then close the picker back to browsing.
+                // An empty picker (no target chat) has nowhere to send, so it just
+                // closes without recording an intent.
+                if let Some(to_chat_id) = self.forward.selected_target().map(|c| c.id) {
+                    self.pending_forward = Some(ForwardIntent {
+                        from_chat_id: self.forward.source_chat_id(),
+                        message_ids: self.forward.message_ids().to_vec(),
+                        to_chat_id,
+                    });
+                }
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
             Action::ForwardCancel => {
-                // Back to the results the forward was started from.
-                self.overlay = Overlay::SearchResults;
+                // Back to wherever the forward was started from — the search results
+                // (forward from a hit) or the conversation (forward from history).
+                self.overlay = self.forward_return;
                 self.dirty = true;
             }
             Action::PinToggle => {
@@ -954,18 +1035,42 @@ mod tests {
     }
 
     #[test]
-    fn toggle_help_shows_then_hides_the_overlay_and_a_key_dismisses_it() {
+    fn toggle_help_shows_then_hides_the_overlay_and_a_stray_key_is_ignored() {
         let mut app = App::new();
         assert!(!app.help_visible());
         app.dispatch(Action::ToggleHelp);
         assert!(app.help_visible());
-        // While open the overlay is modal: any key resolves to a dismiss.
+        // While open the overlay is modal and explicitly closed: a stray key no
+        // longer dismisses it, so a half-read page survives an accidental press.
         assert_eq!(
             app.on_terminal_event(key(KeyCode::Char('x'), KeyModifiers::NONE)),
-            Action::ToggleHelp
+            Action::Noop
         );
+        assert!(app.help_visible(), "a stray key does not close help");
         app.dispatch(Action::ToggleHelp);
         assert!(!app.help_visible());
+    }
+
+    #[test]
+    fn help_scrolls_within_bounds_and_resets_on_reopen() {
+        let mut app = App::new();
+        app.dispatch(Action::ToggleHelp);
+        assert_eq!(app.help_scroll(), 0);
+        // Scrolling up at the top is a clamped no-op.
+        app.dispatch(Action::HelpScrollUp);
+        assert_eq!(app.help_scroll(), 0);
+        app.dispatch(Action::HelpScrollDown);
+        assert_eq!(app.help_scroll(), 1);
+        // It never runs past the last help line, however many downs arrive.
+        let max = (keymap::help_line_count() - 1) as u16;
+        for _ in 0..keymap::help_line_count() + 5 {
+            app.dispatch(Action::HelpScrollDown);
+        }
+        assert_eq!(app.help_scroll(), max, "clamped at the last line");
+        // Closing and reopening starts back at the top.
+        app.dispatch(Action::ToggleHelp);
+        app.dispatch(Action::ToggleHelp);
+        assert_eq!(app.help_scroll(), 0, "reopen resets to the top");
     }
 
     #[test]
@@ -1335,6 +1440,8 @@ mod tests {
         app.dispatch(Action::ForwardOpen);
         assert_eq!(app.overlay(), Overlay::Forward);
         assert_eq!(app.forward().message_ids(), &[20]);
+        // The hit's chat (Bob, id 2) is the source the forward carries.
+        assert_eq!(app.forward().source_chat_id(), 2);
         // The picker reuses the chat list as its target list.
         assert_eq!(
             app.forward().selected_target().map(|c| c.title.as_str()),
@@ -1343,8 +1450,8 @@ mod tests {
     }
 
     #[test]
-    fn forward_picks_a_target_then_confirms_back_to_browsing() {
-        let mut app = app_on_results();
+    fn forward_picks_a_target_then_confirms_records_the_intent() {
+        let mut app = app_on_results(); // selected hit: Alice's (chat 1, message 10)
         app.dispatch(Action::ForwardOpen);
         app.dispatch(Action::ForwardNext);
         assert_eq!(
@@ -1353,6 +1460,17 @@ mod tests {
         );
         app.dispatch(Action::ForwardConfirm);
         assert_eq!(app.overlay(), Overlay::None, "confirm closes the modal");
+        // The confirmed forward is recorded for the loop: message 10 from its source
+        // chat (1) into the picked target (Bob, 2).
+        assert_eq!(
+            app.take_forward(),
+            Some(ForwardIntent {
+                from_chat_id: 1,
+                message_ids: vec![10],
+                to_chat_id: 2,
+            })
+        );
+        assert_eq!(app.take_forward(), None, "the intent is drained once");
     }
 
     #[test]
@@ -1374,6 +1492,67 @@ mod tests {
             app.overlay(),
             Overlay::SearchResults,
             "no hit to forward, stays put"
+        );
+    }
+
+    /// An app with a two-chat list and an open conversation (chat 1) — the state a
+    /// forward is started from in the history pane (`f`).
+    fn app_on_conversation() -> App {
+        use crate::chat_list::{ChatList, ChatListView, sample_chat};
+        use std::collections::HashSet;
+        use tuigram_core::model::ChatListKind;
+
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
+        }]);
+        let mut app = App::with_chat_list(view);
+        app.project_conversation(1, text_history(&[10, 11]), HashSet::new());
+        app
+    }
+
+    #[test]
+    fn forwarding_the_selected_history_message_opens_the_picker_from_the_open_chat() {
+        let mut app = app_on_conversation();
+        // The message the history pane has selected (sample_message pins chat_id to 1).
+        let selected = app.conversation().selected_message().map(|m| m.id).unwrap();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(app.overlay(), Overlay::Forward);
+        assert_eq!(app.forward().message_ids(), &[selected]);
+        assert_eq!(
+            app.forward().source_chat_id(),
+            1,
+            "sourced from the open chat"
+        );
+        // The picker reuses the chat list as its target list.
+        assert_eq!(
+            app.forward().selected_target().map(|c| c.title.as_str()),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn cancelling_a_history_forward_returns_to_the_conversation() {
+        let mut app = app_on_conversation();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(app.overlay(), Overlay::Forward);
+        app.dispatch(Action::ForwardCancel);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "cancel lands back on the conversation, not the search results"
+        );
+    }
+
+    #[test]
+    fn forwarding_from_an_empty_history_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "no selected message, nothing to forward"
         );
     }
 

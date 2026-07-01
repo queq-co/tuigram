@@ -79,7 +79,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
     // A modal overlay floats above the panes, capturing input while open.
     match app.overlay() {
         Overlay::None => {}
-        Overlay::Help => render_help(frame, frame.area()),
+        Overlay::Help => render_help(frame, frame.area(), app),
         Overlay::SearchInput => render_search_input(frame, frame.area(), app),
         Overlay::SearchResults => render_search_results(frame, frame.area(), app),
         Overlay::Forward => render_forward(frame, frame.area(), app),
@@ -656,20 +656,38 @@ pub(crate) fn input_line(text: &str, cursor: usize) -> Line<'static> {
 }
 
 /// The help overlay: a centred, bordered popup listing the active key bindings,
-/// generated from the keymap so it always matches what the keys actually do.
-fn render_help(frame: &mut Frame, area: Rect) {
+/// generated from the keymap so it always matches what the keys actually do. On a
+/// terminal too short to show every binding the body scrolls (`app.help_scroll`),
+/// with a fixed hint row along the bottom; the border and hint stay put while the
+/// bindings slide under them.
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let lines = help_lines();
     let content_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let popup = centered_rect(content_width + 4, lines.len() as u16 + 2, area);
+    // Border (2) + the hint row (1) frame the scrollable body; `centered_rect` clamps
+    // the height to the terminal, so a tall cheatsheet becomes a scroll viewport.
+    let popup = centered_rect(content_width + 4, lines.len() as u16 + 3, area);
     // `Clear` wipes the panes underneath so the overlay reads as a modal.
     frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(" Help ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [body_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    // `scroll` offsets the body; ratatui clips it to `body_area`, so the offset picks
+    // the first visible binding line. The offset is already clamped to the last line
+    // by the reducer.
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .title(" Help ")
-                .title_alignment(Alignment::Center),
-        ),
-        popup,
+        Paragraph::new(lines).scroll((app.help_scroll(), 0)),
+        body_area,
+    );
+    frame.render_widget(
+        Paragraph::new(hint_line("j / k scroll · ? / q / Esc close")),
+        hint_area,
     );
 }
 
@@ -1026,6 +1044,43 @@ mod tests {
         assert!(
             text.contains("focus next pane"),
             "documents focus switching"
+        );
+        assert!(text.contains("scroll"), "the footer hints the scroll keys");
+    }
+
+    #[test]
+    fn help_line_count_matches_the_rendered_body() {
+        // The scroll clamp keys off `keymap::help_line_count`; it must track the lines
+        // `help_lines` actually produces, or a scroll could stop short or overrun.
+        assert_eq!(keymap::help_line_count(), help_lines().len());
+    }
+
+    #[test]
+    fn a_short_terminal_scrolls_the_help_body() {
+        let mut app = App::new();
+        app.dispatch(crate::app::Action::ToggleHelp);
+        // A terminal too short to show the whole cheatsheet: the first section shows
+        // at the top, the last does not.
+        let top = flatten(&render(&app, 80, 10));
+        assert!(top.contains("Global"), "the first section is at the top");
+        assert!(
+            !top.contains("Chat list & history"),
+            "the last section is off-screen"
+        );
+        // Scroll down enough to move the first section out of the viewport; the
+        // overlay stays open (scrolling never closes it) and the footer hint is fixed.
+        for _ in 0..7 {
+            app.dispatch(crate::app::Action::HelpScrollDown);
+        }
+        assert!(app.help_visible(), "scrolling keeps the overlay open");
+        let scrolled = flatten(&render(&app, 80, 10));
+        assert!(
+            !scrolled.contains("Global"),
+            "the first section scrolled out of view"
+        );
+        assert!(
+            scrolled.contains("scroll"),
+            "the footer hint stays put while the body scrolls"
         );
     }
 
