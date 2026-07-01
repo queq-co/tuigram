@@ -60,7 +60,7 @@ pub enum Overlay {
     /// No overlay: normal three-pane browsing, resolved against [`Focus`].
     #[default]
     None,
-    /// The help cheatsheet (#83): modal, any key dismisses it.
+    /// The help cheatsheet (#83): modal and scrollable, closed only by `?`/`q`/`Esc`.
     Help,
     /// The search query line: typing builds the query, Enter runs it.
     SearchInput,
@@ -388,12 +388,19 @@ fn resolve_panes(focus: Focus, key: &KeyEvent) -> Action {
     Action::Noop
 }
 
-/// The help overlay (#83): modal, any key dismisses it (Ctrl-C still quits).
+/// The help overlay (#83): scrollable and explicitly closed. `j`/`k` (and the
+/// arrows) scroll the cheatsheet, which can run taller than a short terminal; `?`,
+/// `q`, and `Esc` close it, and `Ctrl-C` still quits. Every other key is ignored, so
+/// a stray press no longer dismisses a half-read page.
 fn resolve_help(key: &KeyEvent) -> Action {
     if is_quit(key) {
-        Action::Quit
-    } else {
-        Action::ToggleHelp
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => Action::ToggleHelp,
+        KeyCode::Char('j') | KeyCode::Down => Action::HelpScrollDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::HelpScrollUp,
+        _ => Action::Noop,
     }
 }
 
@@ -561,6 +568,19 @@ pub fn help_sections() -> Vec<HelpSection> {
         .collect()
 }
 
+/// The number of lines the help overlay renders, mirroring the layout `render_help`
+/// builds from [`help_sections`]: a heading plus one line per entry for each section,
+/// with a blank separator between sections. The help scroll offset clamps against
+/// this so a scroll can never run past the last line.
+#[must_use]
+pub fn help_line_count() -> usize {
+    help_sections()
+        .iter()
+        .enumerate()
+        .map(|(i, section)| usize::from(i > 0) + 1 + section.entries.len())
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,12 +689,28 @@ mod tests {
     }
 
     #[test]
-    fn an_open_help_overlay_is_modal() {
-        // Any key closes it, except Ctrl-C which still quits. Focus is irrelevant
-        // while a modal captures input.
+    fn an_open_help_overlay_scrolls_and_closes_explicitly() {
+        // Focus is irrelevant while a modal captures input. `j`/`k` (and the arrows)
+        // scroll rather than dismiss; only `?`/`q`/`Esc` close it, and Ctrl-C quits.
+        assert_eq!(
+            resolve(Focus::ChatList, Overlay::Help, &key(KeyCode::Char('j'))),
+            Action::HelpScrollDown
+        );
+        assert_eq!(
+            resolve(Focus::ChatList, Overlay::Help, &key(KeyCode::Up)),
+            Action::HelpScrollUp
+        );
+        for close in [KeyCode::Char('?'), KeyCode::Char('q'), KeyCode::Esc] {
+            assert_eq!(
+                resolve(Focus::ChatList, Overlay::Help, &key(close)),
+                Action::ToggleHelp,
+                "{close:?} closes the help overlay"
+            );
+        }
+        // A stray key no longer dismisses a half-read page.
         assert_eq!(
             resolve(Focus::ChatList, Overlay::Help, &key(KeyCode::Char('x'))),
-            Action::ToggleHelp
+            Action::Noop
         );
         assert_eq!(
             resolve(Focus::Composer, Overlay::Help, &ctrl('c')),

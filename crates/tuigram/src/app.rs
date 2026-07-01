@@ -45,6 +45,10 @@ pub enum Action {
     SetFocus(Focus),
     /// Show or hide the help overlay.
     ToggleHelp,
+    /// Scroll the help overlay one line toward the end (`j` / ↓).
+    HelpScrollDown,
+    /// Scroll the help overlay one line toward the start (`k` / ↑).
+    HelpScrollUp,
     /// Move the chat-list selection down one row.
     SelectNext,
     /// Move the chat-list selection up one row.
@@ -189,6 +193,10 @@ pub struct App {
     /// The modal overlay drawn over the panes, if any. While set it captures input
     /// (key resolution routes to it instead of `focus`).
     overlay: Overlay,
+    /// The help overlay's scroll offset — the index of the topmost help line drawn,
+    /// so the cheatsheet can be read on a terminal too short to show it all. Reset to
+    /// the top each time help opens; clamped against [`keymap::help_line_count`].
+    help_scroll: u16,
     /// The search overlay's state: the query line and the hit list it renders from.
     search: SearchView,
     /// The forward overlay's state: the messages being forwarded and the target
@@ -283,6 +291,12 @@ impl App {
     #[allow(dead_code)]
     pub fn help_visible(&self) -> bool {
         self.overlay == Overlay::Help
+    }
+
+    /// The help overlay's scroll offset — the topmost help line to draw. Read by the
+    /// render to window the cheatsheet on a short terminal.
+    pub fn help_scroll(&self) -> u16 {
+        self.help_scroll
     }
 
     /// The search overlay's state, for rendering the query line and results.
@@ -521,12 +535,25 @@ impl App {
             }
             Action::ToggleHelp => {
                 // Toggles between no overlay and the help cheatsheet; the keymap
-                // only emits this from browsing or while help is already open.
+                // only emits this from browsing or while help is already open. A
+                // fresh open starts at the top of the cheatsheet.
                 self.overlay = if self.overlay == Overlay::Help {
                     Overlay::None
                 } else {
+                    self.help_scroll = 0;
                     Overlay::Help
                 };
+                self.dirty = true;
+            }
+            Action::HelpScrollDown => {
+                // Clamp at the last help line so a scroll never runs off the end; the
+                // render further clips to the popup's height.
+                let max = keymap::help_line_count().saturating_sub(1) as u16;
+                self.help_scroll = (self.help_scroll + 1).min(max);
+                self.dirty = true;
+            }
+            Action::HelpScrollUp => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
                 self.dirty = true;
             }
             Action::SelectNext => {
@@ -979,18 +1006,42 @@ mod tests {
     }
 
     #[test]
-    fn toggle_help_shows_then_hides_the_overlay_and_a_key_dismisses_it() {
+    fn toggle_help_shows_then_hides_the_overlay_and_a_stray_key_is_ignored() {
         let mut app = App::new();
         assert!(!app.help_visible());
         app.dispatch(Action::ToggleHelp);
         assert!(app.help_visible());
-        // While open the overlay is modal: any key resolves to a dismiss.
+        // While open the overlay is modal and explicitly closed: a stray key no
+        // longer dismisses it, so a half-read page survives an accidental press.
         assert_eq!(
             app.on_terminal_event(key(KeyCode::Char('x'), KeyModifiers::NONE)),
-            Action::ToggleHelp
+            Action::Noop
         );
+        assert!(app.help_visible(), "a stray key does not close help");
         app.dispatch(Action::ToggleHelp);
         assert!(!app.help_visible());
+    }
+
+    #[test]
+    fn help_scrolls_within_bounds_and_resets_on_reopen() {
+        let mut app = App::new();
+        app.dispatch(Action::ToggleHelp);
+        assert_eq!(app.help_scroll(), 0);
+        // Scrolling up at the top is a clamped no-op.
+        app.dispatch(Action::HelpScrollUp);
+        assert_eq!(app.help_scroll(), 0);
+        app.dispatch(Action::HelpScrollDown);
+        assert_eq!(app.help_scroll(), 1);
+        // It never runs past the last help line, however many downs arrive.
+        let max = (keymap::help_line_count() - 1) as u16;
+        for _ in 0..keymap::help_line_count() + 5 {
+            app.dispatch(Action::HelpScrollDown);
+        }
+        assert_eq!(app.help_scroll(), max, "clamped at the last line");
+        // Closing and reopening starts back at the top.
+        app.dispatch(Action::ToggleHelp);
+        app.dispatch(Action::ToggleHelp);
+        assert_eq!(app.help_scroll(), 0, "reopen resets to the top");
     }
 
     #[test]
