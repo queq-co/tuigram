@@ -24,7 +24,10 @@
 //! so the unread badge clears here and on the user's other clients. A composer
 //! submit becomes a real send, reply, or edit into the open chat through the
 //! send/edit seam (#116); the optimistic message and its delivery resolution arrive
-//! back as updates the loop re-projects. `main` closes TDLib
+//! back as updates the loop re-projects. A submitted search query runs against the
+//! core search seam (#117) — in-chat when a chat is open, global while browsing —
+//! and its hits fill the overlay; opening a hit jumps to its chat and scrolls to the
+//! message when it is loaded. `main` closes TDLib
 //! cleanly on every exit path, including a login the user quit before the facade
 //! ever started.
 
@@ -59,7 +62,7 @@ use tokio_stream::StreamExt;
 use tuigram_core::model::ChatListKind;
 use tuigram_core::{
     Client, EditRequests, FormattedText, HistoryRequests, NEWEST, ReadRequests, SendRequests,
-    load_archive_list, load_folder_list, load_main_list,
+    load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
 };
 
 use crate::app::{Action, App};
@@ -68,6 +71,7 @@ use crate::composer::Submission;
 use crate::event::{AppEvent, spawn_core_source};
 use crate::keymap::Focus;
 use crate::login::{LoginEnd, run_login};
+use crate::search::SearchHit;
 use crate::status::Notice;
 use crate::terminal::{TerminalGuard, install_panic_hook};
 
@@ -97,6 +101,16 @@ const HISTORY_CHANNEL_DEPTH: usize = 16;
 /// toast), and those are rare and coalesced through the toast queue, so a shallow
 /// channel suffices.
 const OUTBOUND_CHANNEL_DEPTH: usize = 16;
+
+/// How many hits to request per page when running a search (#117). The core pagers
+/// (`search_chat`/`search_global`) loop to exhaustion at this granularity, so this
+/// only sizes each batch.
+const SEARCH_PAGE: i32 = 50;
+
+/// Depth of the search → loop completion channel (#117). A submit spawns one search
+/// that delivers a single projected result set when it finishes, so a shallow
+/// channel suffices.
+const SEARCH_CHANNEL_DEPTH: usize = 8;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -182,6 +196,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // A spawned send/edit (#116) reports a seam-level rejection back here as a toast;
     // the loop surfaces it through the notification queue.
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Notice>(OUTBOUND_CHANNEL_DEPTH);
+    // A spawned search (#117) reports its projected hits back here; the loop feeds
+    // them into the search overlay. (A failed search reuses `outbound_tx`'s toast.)
+    let (search_tx, mut search_rx) = mpsc::channel::<Vec<SearchHit>>(SEARCH_CHANNEL_DEPTH);
 
     // Kick off the landing list (Main) before the first frame; the rest load on
     // demand as the user switches to them.
@@ -260,6 +277,12 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                     app.notify(notice);
                 }
             }
+            // A spawned search finished (#117): fill the overlay with its hits.
+            maybe_hits = search_rx.recv() => {
+                if let Some(hits) = maybe_hits {
+                    app.set_search_results(hits);
+                }
+            }
         }
 
         // A list switch may have moved onto a list we have not paged yet — load it.
@@ -272,6 +295,8 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         drive_read_state(client, &mut history);
         // A composer submit becomes a real send/reply/edit into the open chat (#116).
         drive_outbound(&mut app, client, &history, &outbound_tx);
+        // A submitted search query runs against core, in-chat or global by context (#117).
+        drive_search(&mut app, client, &history, &search_tx, &outbound_tx);
     }
 
     Ok(())
@@ -469,6 +494,66 @@ fn plain_text(text: String) -> FormattedText {
         text,
         entities: Vec::new(),
     }
+}
+
+/// Run a submitted search query against core (#117). `App` records the query as a
+/// pure intent; here the loop drains it, picks the scope from the open chat —
+/// [`search_chat`] in the chat the user has open, [`search_global`] while browsing
+/// the list — and spawns the search off an `Arc<Client>` clone so the round-trips
+/// never block the loop.
+///
+/// On success the spawned task projects each hit into a [`SearchHit`] (reading the
+/// chat title back from the folded store for the preview) and sends the result set
+/// on `search_tx`, which the loop drains into the overlay. A failed search reuses
+/// the `outbound_tx` toast path (#116) to surface an error naming the action. Both
+/// pagers run to exhaustion, the search counterpart to a full history load.
+fn drive_search(
+    app: &mut App,
+    client: &Arc<Client>,
+    history: &HistoryState,
+    search_tx: &mpsc::Sender<Vec<SearchHit>>,
+    outbound_tx: &mpsc::Sender<Notice>,
+) {
+    let Some(query) = app.take_search_query() else {
+        return;
+    };
+    let scope = history.open;
+    let client = Arc::clone(client);
+    let search_tx = search_tx.clone();
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        let results = match scope {
+            Some(chat_id) => search_chat(client.bridge(), chat_id, query, None, SEARCH_PAGE).await,
+            None => search_global(client.bridge(), query, SEARCH_PAGE).await,
+        };
+        match results {
+            Ok(results) => {
+                // Project each hit with its chat title, read back from the folded
+                // store; an unknown chat (not folded yet) drops the title prefix.
+                let hits = client.read(|state| {
+                    results
+                        .messages()
+                        .iter()
+                        .map(|message| {
+                            let title = state
+                                .chats()
+                                .get(message.chat_id)
+                                .map_or("", |chat| chat.title.as_str());
+                            SearchHit::from_message(message, title)
+                        })
+                        .collect()
+                });
+                let _ = search_tx.send(hits).await;
+            }
+            // The TDLib message is a fixed error code, never the user's query — safe
+            // to show, per the toast contract.
+            Err(err) => {
+                let _ = outbound_tx
+                    .send(Notice::error("search", Some(&err.message)))
+                    .await;
+            }
+        }
+    });
 }
 
 /// Read the open chat's folded history and pinned ids back from the `Client` and
