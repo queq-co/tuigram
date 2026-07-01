@@ -11,12 +11,12 @@ use tuigram_core::model::Message;
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
-use crate::conversation::ConversationView;
+use crate::conversation::{ConversationView, PinIntent};
 use crate::event::AppEvent;
 use crate::forward::{ForwardIntent, ForwardView};
 use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaDraft;
-use crate::reactions::ReactionPicker;
+use crate::reactions::{ReactionIntent, ReactionPicker};
 use crate::search::SearchView;
 use crate::secret::{SecretChatPrompt, SecretLifecycle};
 use crate::status::{ConnectionState, Notifications};
@@ -127,14 +127,23 @@ pub enum Action {
     /// Open the reaction picker on the selected history message (a no-op with no
     /// selected message).
     ReactionOpen,
-    /// Move the reaction-picker selection to the next emoji.
+    /// Move the reaction-picker selection to the next emoji (palette mode).
     ReactionNext,
-    /// Move the reaction-picker selection to the previous emoji.
+    /// Move the reaction-picker selection to the previous emoji (palette mode).
     ReactionPrev,
-    /// Toggle the picked emoji on the selected message and close the picker. Phase
-    /// 6 dispatches the core add/remove; for now it reflects optimistically.
+    /// A character typed in the reaction overlay. In palette mode it is a shortcut
+    /// (`j`/`k` move, `c` opens the custom-emoji line); in custom mode it is appended
+    /// to the custom-emoji buffer. The reducer disambiguates by the picker's mode.
+    ReactionKey(char),
+    /// Delete the last character of the custom-emoji buffer (Backspace); a no-op in
+    /// palette mode.
+    ReactionBackspace,
+    /// Toggle the picked emoji — the highlighted palette one, or the typed custom one
+    /// — on the selected message and close the picker, recording the core add/remove
+    /// as a pending intent (#119).
     ReactionConfirm,
-    /// Close the reaction picker without changing anything.
+    /// Dismiss the reaction overlay: in custom mode this returns to the palette; in
+    /// palette mode it closes the overlay.
     ReactionCancel,
     /// Open the send-media prompt on a fresh, empty path/caption.
     AttachOpen,
@@ -249,6 +258,16 @@ pub struct App {
     /// [`take_forward`](Self::take_forward), routing it to
     /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages).
     pending_forward: Option<ForwardIntent>,
+    /// A confirmed reaction toggle awaiting dispatch to core (#119). `App` reflects
+    /// the toggle optimistically and records the intent; the loop drains it via
+    /// [`take_reaction`](Self::take_reaction), routing it to
+    /// [`ReactionRequests`](tuigram_core::ReactionRequests)' add/remove.
+    pending_reaction: Option<ReactionIntent>,
+    /// A confirmed pin toggle awaiting dispatch to core (#119). `App` flips the
+    /// pinned set optimistically and records the intent; the loop drains it via
+    /// [`take_pin`](Self::take_pin), routing it to
+    /// [`PinRequests`](tuigram_core::PinRequests)' pin/unpin.
+    pending_pin: Option<PinIntent>,
 }
 
 impl App {
@@ -425,6 +444,21 @@ impl App {
     /// `None` means no forward was confirmed since the last drain.
     pub fn take_forward(&mut self) -> Option<ForwardIntent> {
         self.pending_forward.take()
+    }
+
+    /// Take the pending reaction toggle, if any (#119). The loop drains this each
+    /// tick and dispatches it to
+    /// [`ReactionRequests`](tuigram_core::ReactionRequests)' add/remove on the
+    /// selected message; `None` means no reaction was confirmed since the last drain.
+    pub fn take_reaction(&mut self) -> Option<ReactionIntent> {
+        self.pending_reaction.take()
+    }
+
+    /// Take the pending pin toggle, if any (#119). The loop drains this each tick and
+    /// dispatches it to [`PinRequests`](tuigram_core::PinRequests)' pin/unpin on the
+    /// selected message; `None` means no pin was toggled since the last drain.
+    pub fn take_pin(&mut self) -> Option<PinIntent> {
+        self.pending_pin.take()
     }
 
     /// Open the forward target picker for `message_id` from `source_chat_id`, shared
@@ -767,11 +801,22 @@ impl App {
                 self.dirty = true;
             }
             Action::PinToggle => {
-                // Pin/unpin the selected message. Phase 6 also calls core's
-                // pin/unpin; for now the local flip drives the 📌 indicator. A no-op
-                // on an empty history (no selected message).
-                if let Some(id) = self.conversation.selected_message().map(|m| m.id) {
+                // Pin/unpin the selected message: flip the 📌 indicator optimistically
+                // and record the intent for the loop to send through core's pin/unpin
+                // (#119). The pre-toggle pinned state decides pin vs unpin. A no-op on
+                // an empty history (no selected message).
+                if let Some((chat_id, id)) = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.chat_id, m.id))
+                {
+                    let pin = !self.conversation.is_pinned(id);
                     self.conversation.toggle_pin(id);
+                    self.pending_pin = Some(PinIntent {
+                        chat_id,
+                        message_id: id,
+                        pin,
+                    });
                     self.dirty = true;
                 }
             }
@@ -784,26 +829,84 @@ impl App {
                 }
             }
             Action::ReactionNext => {
-                self.reaction.select_next();
-                self.dirty = true;
+                // Arrow-key nav walks the palette; ignored while typing a custom emoji.
+                if !self.reaction.is_custom() {
+                    self.reaction.select_next();
+                    self.dirty = true;
+                }
             }
             Action::ReactionPrev => {
-                self.reaction.select_prev();
-                self.dirty = true;
+                if !self.reaction.is_custom() {
+                    self.reaction.select_prev();
+                    self.dirty = true;
+                }
+            }
+            Action::ReactionKey(c) => {
+                // Custom mode: every character is buffer input (a terminal has no emoji
+                // key, so we take whatever the OS picker or a paste emits). Palette
+                // mode: `j`/`k` move and `c` opens the custom line; any other letter is
+                // ignored (reactions are emoji, not latin text).
+                if self.reaction.is_custom() {
+                    self.reaction.push(c);
+                    self.dirty = true;
+                } else {
+                    let handled = match c {
+                        'j' => {
+                            self.reaction.select_next();
+                            true
+                        }
+                        'k' => {
+                            self.reaction.select_prev();
+                            true
+                        }
+                        'c' => {
+                            self.reaction.enter_custom();
+                            true
+                        }
+                        _ => false,
+                    };
+                    self.dirty |= handled;
+                }
+            }
+            Action::ReactionBackspace => {
+                if self.reaction.is_custom() {
+                    self.reaction.backspace();
+                    self.dirty = true;
+                }
             }
             Action::ReactionConfirm => {
-                // Toggle the picked emoji on the selected message and close. Phase 6
-                // dispatches the core add/remove and folds the real counts; here the
-                // optimistic flip updates the `{emoji×n*}` chips directly.
-                if let Some(id) = self.conversation.selected_message().map(|m| m.id) {
-                    self.conversation
-                        .toggle_reaction(id, self.reaction.selected_emoji());
+                // React with the effective emoji — the typed custom one, or the
+                // highlighted palette one — then close. The optimistic flip updates the
+                // `{emoji×n*}` chips directly; the intent it records drives the core
+                // add/remove (#119), whose real counts fold in later. Whether we already
+                // had that reaction (pre-toggle) decides add vs remove. An empty custom
+                // line has nothing to send, so it just closes.
+                if let Some(emoji) = self.reaction.confirmed_emoji()
+                    && let Some((chat_id, id)) = self
+                        .conversation
+                        .selected_message()
+                        .map(|m| (m.chat_id, m.id))
+                {
+                    let add = !self.conversation.has_own_reaction(id, &emoji);
+                    self.conversation.toggle_reaction(id, &emoji);
+                    self.pending_reaction = Some(ReactionIntent {
+                        chat_id,
+                        message_id: id,
+                        emoji,
+                        add,
+                    });
                 }
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
             Action::ReactionCancel => {
-                self.overlay = Overlay::None;
+                // Esc backs out of the custom line to the palette first; a second Esc
+                // (now in palette mode) closes the overlay.
+                if self.reaction.is_custom() {
+                    self.reaction.exit_custom();
+                } else {
+                    self.overlay = Overlay::None;
+                }
                 self.dirty = true;
             }
             Action::AttachOpen => {
@@ -1569,6 +1672,7 @@ mod tests {
 
     // --- media, reactions & pins (#85) ---
 
+    use crate::reactions::ReactionIntent;
     use tuigram_core::model::ReactionKind;
 
     /// An app whose history holds two text messages, the first (oldest, at the top)
@@ -1593,15 +1697,35 @@ mod tests {
     }
 
     #[test]
-    fn pin_toggles_the_selected_message_and_dirties() {
+    fn pin_toggles_the_selected_message_and_records_the_intent() {
+        use crate::conversation::PinIntent;
         let mut app = app_with_history();
         let id = app.conversation().selected_message().unwrap().id;
         app.clear_dirty();
         app.dispatch(Action::PinToggle);
-        assert!(app.conversation().is_pinned(id), "pinned");
+        assert!(app.conversation().is_pinned(id), "pinned optimistically");
         assert!(app.is_dirty());
+        // The pin (not unpin) is recorded for the loop to send to core.
+        assert_eq!(
+            app.take_pin(),
+            Some(PinIntent {
+                chat_id: 1,
+                message_id: id,
+                pin: true,
+            })
+        );
+        assert_eq!(app.take_pin(), None, "the intent is drained once");
+        // Toggling again unpins, and records the matching unpin.
         app.dispatch(Action::PinToggle);
         assert!(!app.conversation().is_pinned(id), "unpinned again");
+        assert_eq!(
+            app.take_pin(),
+            Some(PinIntent {
+                chat_id: 1,
+                message_id: id,
+                pin: false,
+            })
+        );
     }
 
     #[test]
@@ -1610,6 +1734,7 @@ mod tests {
         app.clear_dirty();
         app.dispatch(Action::PinToggle);
         assert!(!app.is_dirty(), "no selected message, nothing changes");
+        assert_eq!(app.take_pin(), None, "no intent recorded");
     }
 
     #[test]
@@ -1628,6 +1753,45 @@ mod tests {
         assert_eq!(reactions.len(), 1);
         assert!(reactions[0].is_chosen, "our reaction is recorded");
         assert_eq!(reactions[0].kind, ReactionKind::Emoji(chosen.to_owned()));
+        // The add (a fresh reaction) is recorded for the loop to send to core.
+        assert_eq!(
+            app.take_reaction(),
+            Some(ReactionIntent {
+                chat_id: 1,
+                message_id: id,
+                emoji: chosen.to_owned(),
+                add: true,
+            })
+        );
+        assert_eq!(app.take_reaction(), None, "the intent is drained once");
+    }
+
+    #[test]
+    fn reacting_with_the_same_emoji_again_records_a_removal() {
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        // React once (add), then again with the same emoji (remove).
+        app.dispatch(Action::ReactionOpen);
+        let chosen = app.reaction().selected_emoji();
+        app.dispatch(Action::ReactionConfirm);
+        assert!(matches!(app.take_reaction(), Some(i) if i.add));
+        app.dispatch(Action::ReactionOpen);
+        app.dispatch(Action::ReactionConfirm);
+        // The optimistic bucket is gone, and the recorded intent is a removal.
+        let message = app.conversation().messages().iter().find(|m| m.id == id);
+        assert!(
+            message.unwrap().reactions.is_empty(),
+            "our reaction removed"
+        );
+        assert_eq!(
+            app.take_reaction(),
+            Some(ReactionIntent {
+                chat_id: 1,
+                message_id: id,
+                emoji: chosen.to_owned(),
+                add: false,
+            })
+        );
     }
 
     #[test]
@@ -1654,6 +1818,79 @@ mod tests {
                 .all(|m| m.reactions.is_empty()),
             "cancel adds no reaction"
         );
+        assert_eq!(app.take_reaction(), None, "cancel records no intent");
+    }
+
+    #[test]
+    fn typing_a_custom_emoji_reacts_with_it() {
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        app.dispatch(Action::ReactionOpen);
+        // `c` opens the custom line; then type a multi-scalar emoji.
+        app.dispatch(Action::ReactionKey('c'));
+        assert!(app.reaction().is_custom(), "custom line active");
+        for c in "🥳".chars() {
+            app.dispatch(Action::ReactionKey(c));
+        }
+        app.dispatch(Action::ReactionConfirm);
+        assert_eq!(app.overlay(), Overlay::None, "confirm closes the picker");
+        // The custom emoji lands on the message and is sent to core as an add.
+        let reactions = &app
+            .conversation()
+            .messages()
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .reactions;
+        assert_eq!(reactions[0].kind, ReactionKind::Emoji("🥳".to_owned()));
+        assert_eq!(
+            app.take_reaction(),
+            Some(ReactionIntent {
+                chat_id: 1,
+                message_id: id,
+                emoji: "🥳".to_owned(),
+                add: true,
+            })
+        );
+    }
+
+    #[test]
+    fn custom_line_keys_type_instead_of_navigating_and_esc_returns_to_the_palette() {
+        let mut app = app_with_history();
+        app.dispatch(Action::ReactionOpen);
+        app.dispatch(Action::ReactionKey('c'));
+        // In custom mode, `j`/`k` are literal input, not palette navigation.
+        app.dispatch(Action::ReactionKey('j'));
+        app.dispatch(Action::ReactionKey('k'));
+        assert_eq!(app.reaction().custom_input(), Some("jk"));
+        assert_eq!(app.reaction().selected(), 0, "palette cursor did not move");
+        // Backspace edits the buffer.
+        app.dispatch(Action::ReactionBackspace);
+        assert_eq!(app.reaction().custom_input(), Some("j"));
+        // Esc backs out to the palette (overlay stays open); a second Esc closes it.
+        app.dispatch(Action::ReactionCancel);
+        assert!(!app.reaction().is_custom(), "back in palette mode");
+        assert_eq!(app.overlay(), Overlay::Reaction, "overlay still open");
+        app.dispatch(Action::ReactionCancel);
+        assert_eq!(app.overlay(), Overlay::None, "second Esc closes it");
+    }
+
+    #[test]
+    fn confirming_an_empty_custom_line_reacts_with_nothing() {
+        let mut app = app_with_history();
+        app.dispatch(Action::ReactionOpen);
+        app.dispatch(Action::ReactionKey('c'));
+        // Enter with nothing typed: close the overlay, but record no reaction.
+        app.dispatch(Action::ReactionConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(
+            app.conversation()
+                .messages()
+                .iter()
+                .all(|m| m.reactions.is_empty()),
+            "empty custom line adds no reaction"
+        );
+        assert_eq!(app.take_reaction(), None, "no intent recorded");
     }
 
     #[test]

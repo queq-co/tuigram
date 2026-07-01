@@ -461,18 +461,25 @@ fn resolve_forward(key: &KeyEvent) -> Action {
     }
 }
 
-/// The reaction picker: navigate the emoji palette, Enter toggles the chosen
-/// reaction on the selected message, Esc cancels.
+/// The reaction picker: arrow keys navigate the palette, Enter toggles the chosen
+/// reaction on the selected message, Esc cancels. Character keys become
+/// [`Action::ReactionKey`] and Backspace [`Action::ReactionBackspace`] — the reducer
+/// interprets them by the picker's mode (a palette shortcut like `j`/`k`/`c`, or
+/// input for the custom-emoji line), so the keymap stays a pure function of the key.
 fn resolve_reaction(key: &KeyEvent) -> Action {
     if is_quit(key) {
         return Action::Quit;
     }
     match key.code {
         KeyCode::Esc => Action::ReactionCancel,
-        KeyCode::Char('j') | KeyCode::Down => Action::ReactionNext,
-        KeyCode::Char('k') | KeyCode::Up => Action::ReactionPrev,
         KeyCode::Enter => Action::ReactionConfirm,
-        _ => Action::Noop,
+        KeyCode::Backspace => Action::ReactionBackspace,
+        KeyCode::Down => Action::ReactionNext,
+        KeyCode::Up => Action::ReactionPrev,
+        _ => match printable(key) {
+            Some(c) => Action::ReactionKey(c),
+            None => Action::Noop,
+        },
     }
 }
 
@@ -801,10 +808,16 @@ mod tests {
     }
 
     #[test]
-    fn the_reaction_overlay_navigates_the_palette_and_confirms() {
+    fn the_reaction_overlay_routes_keys_for_the_reducer_to_interpret() {
         let at = |code| resolve(Focus::History, Overlay::Reaction, &key(code));
-        assert_eq!(at(KeyCode::Char('j')), Action::ReactionNext);
+        // Arrows navigate the palette outright; character keys are routed generically
+        // (the reducer decides palette shortcut vs custom-emoji input by mode).
+        assert_eq!(at(KeyCode::Down), Action::ReactionNext);
         assert_eq!(at(KeyCode::Up), Action::ReactionPrev);
+        assert_eq!(at(KeyCode::Char('j')), Action::ReactionKey('j'));
+        assert_eq!(at(KeyCode::Char('c')), Action::ReactionKey('c'));
+        assert_eq!(at(KeyCode::Char('🔥')), Action::ReactionKey('🔥'));
+        assert_eq!(at(KeyCode::Backspace), Action::ReactionBackspace);
         assert_eq!(at(KeyCode::Enter), Action::ReactionConfirm);
         assert_eq!(at(KeyCode::Esc), Action::ReactionCancel);
     }

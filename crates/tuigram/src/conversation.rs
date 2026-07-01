@@ -19,6 +19,26 @@ use std::collections::{HashMap, HashSet};
 
 use tuigram_core::model::{ChatAction, File, Message, Reaction, ReactionKind};
 
+/// A confirmed pin toggle, recorded by `App` as a pure intent for the loop to
+/// dispatch (#119) — the message, and whether the toggle **pinned** it or
+/// **unpinned** it. `App` never touches the `Client`, so
+/// [`PinToggle`](crate::app::Action::PinToggle) flips the pinned set optimistically
+/// and records this; the loop drains it into
+/// [`PinRequests::pin_chat_message`](tuigram_core::PinRequests::pin_chat_message) /
+/// `unpin_chat_message`, the same intent-then-drain split forwarding (#118) uses.
+/// The real `updateMessageIsPinned` then reconciles the chat's pinned set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinIntent {
+    /// The chat holding the pinned message — `pin`/`unpin_chat_message`'s chat.
+    pub chat_id: i64,
+    /// The message being pinned or unpinned, by id.
+    pub message_id: i64,
+    /// Whether the toggle pinned the message (`true` → `pin_chat_message`) or
+    /// unpinned it (`false` → `unpin_chat_message`), decided from its pre-toggle
+    /// pinned state.
+    pub pin: bool,
+}
+
 /// The history pane's state: the open chat's messages (oldest first), which of
 /// them are pinned, the scroll offset, and the download state of any media files
 /// the visible messages reference. Empty until Phase 6 projects the core message
@@ -157,6 +177,19 @@ impl ConversationView {
         if !self.pinned.remove(&id) {
             self.pinned.insert(id);
         }
+    }
+
+    /// Whether tuigram's own account has already reacted to message `id` with
+    /// `emoji`. Read *before* the optimistic [`toggle_reaction`](Self::toggle_reaction)
+    /// so the confirm can tell whether it is adding a reaction or removing one, and
+    /// record the matching core call (#119). `false` for an unknown id.
+    #[must_use]
+    pub fn has_own_reaction(&self, id: i64, emoji: &str) -> bool {
+        let kind = ReactionKind::Emoji(emoji.to_owned());
+        self.messages
+            .iter()
+            .find(|m| m.id == id)
+            .is_some_and(|m| m.reactions.iter().any(|r| r.is_chosen && r.kind == kind))
     }
 
     /// Toggle tuigram's own `emoji` reaction on message `id`, updating the
@@ -393,6 +426,28 @@ mod tests {
         // Toggling the same emoji off drops the bucket (we were the only reactor).
         view.toggle_reaction(1, "👍");
         assert!(view.messages()[0].reactions.is_empty());
+    }
+
+    #[test]
+    fn has_own_reaction_tracks_only_our_chosen_emoji() {
+        let mut message = text(1, "nice");
+        // Others reacted with 🔥, but not us.
+        message.reactions = vec![Reaction {
+            kind: ReactionKind::Emoji("🔥".to_owned()),
+            count: 2,
+            is_chosen: false,
+        }];
+        let mut view = ConversationView::from_messages(vec![message], HashSet::new());
+        assert!(
+            !view.has_own_reaction(1, "🔥"),
+            "others' reaction is not ours"
+        );
+        assert!(!view.has_own_reaction(1, "👍"), "unreacted emoji");
+        assert!(!view.has_own_reaction(99, "👍"), "unknown message");
+        // After we add 👍 it reads as ours; 🔥 (still only others') does not.
+        view.toggle_reaction(1, "👍");
+        assert!(view.has_own_reaction(1, "👍"));
+        assert!(!view.has_own_reaction(1, "🔥"));
     }
 
     #[test]
