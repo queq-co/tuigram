@@ -262,6 +262,15 @@ impl ChatStore {
         self.chats.get(&chat_id)
     }
 
+    /// Every loaded chat, in no particular order — unlike the per-list views
+    /// ([`main_list`](Self::main_list) et al.) this is not filtered by list position,
+    /// so it includes chats that have no position yet. The retention sweep (#120)
+    /// reads this to group chats by [`ChatKind`](crate::model::ChatKind); it reflects
+    /// only what has been paged in, since the app loads chats lazily.
+    pub fn iter(&self) -> impl Iterator<Item = &Chat> {
+        self.chats.values()
+    }
+
     /// Number of known chats, across all lists.
     #[must_use]
     pub fn len(&self) -> usize {
