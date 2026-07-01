@@ -108,14 +108,18 @@ pub enum Action {
     ResultOpen,
     /// Start forwarding the selected search hit: open the target picker.
     ForwardOpen,
+    /// Start forwarding the selected conversation message (`f` in the history pane,
+    /// as in the official client): open the target picker sourced from the open chat.
+    ForwardMessage,
     /// Move the forward target-picker selection down one chat.
     ForwardNext,
     /// Move the forward target-picker selection up one chat.
     ForwardPrev,
-    /// Confirm the forward to the selected target. Phase 6 sends through core; for
-    /// now it just closes the picker.
+    /// Confirm the forward to the selected target (#118): record the send and close
+    /// the picker back to browsing.
     ForwardConfirm,
-    /// Cancel the forward and return to the search results.
+    /// Cancel the forward, returning to wherever it was started from (the search
+    /// results, or the conversation).
     ForwardCancel,
     /// Pin or unpin the selected history message. Phase 6 also calls core; for now
     /// it flips the local pinned state behind the 📌 indicator.
@@ -202,6 +206,10 @@ pub struct App {
     /// The forward overlay's state: the messages being forwarded and the target
     /// picker. Inert until a forward is started.
     forward: ForwardView,
+    /// Where a cancelled forward returns to — the overlay that was active when the
+    /// forward was started, so `Esc` lands back on the search results (forward from a
+    /// hit) or the conversation (forward from the history pane, `Overlay::None`).
+    forward_return: Overlay,
     /// The reaction picker's state: the emoji palette and the selection. Reset each
     /// time the picker opens.
     reaction: ReactionPicker,
@@ -417,6 +425,17 @@ impl App {
     /// `None` means no forward was confirmed since the last drain.
     pub fn take_forward(&mut self) -> Option<ForwardIntent> {
         self.pending_forward.take()
+    }
+
+    /// Open the forward target picker for `message_id` from `source_chat_id`, shared
+    /// by the two entry points (a search hit, `ForwardOpen`; the selected history
+    /// message, `ForwardMessage`). The picker reuses a snapshot of the chat list as
+    /// its targets, and the current overlay is remembered as the cancel-return target.
+    fn open_forward(&mut self, source_chat_id: i64, message_id: i64) {
+        self.forward_return = self.overlay;
+        self.forward = ForwardView::new(source_chat_id, vec![message_id], self.chat_list.clone());
+        self.overlay = Overlay::Forward;
+        self.dirty = true;
     }
 
     /// Replace the search overlay's hits with a fresh, projected result set (#117),
@@ -703,10 +722,19 @@ impl App {
                 // stays on the results overlay.
                 if let Some(hit) = self.search.selected_hit() {
                     let (source, message_id) = (hit.chat_id, hit.message_id);
-                    self.forward =
-                        ForwardView::new(source, vec![message_id], self.chat_list.clone());
-                    self.overlay = Overlay::Forward;
-                    self.dirty = true;
+                    self.open_forward(source, message_id);
+                }
+            }
+            Action::ForwardMessage => {
+                // Forward the selected conversation message (`f` in the history pane).
+                // The message carries its own chat, which is the open chat and the
+                // forward's source. No selected message (empty history) is a no-op.
+                if let Some((source, message_id)) = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.chat_id, m.id))
+                {
+                    self.open_forward(source, message_id);
                 }
             }
             Action::ForwardNext => {
@@ -733,8 +761,9 @@ impl App {
                 self.dirty = true;
             }
             Action::ForwardCancel => {
-                // Back to the results the forward was started from.
-                self.overlay = Overlay::SearchResults;
+                // Back to wherever the forward was started from — the search results
+                // (forward from a hit) or the conversation (forward from history).
+                self.overlay = self.forward_return;
                 self.dirty = true;
             }
             Action::PinToggle => {
@@ -1463,6 +1492,67 @@ mod tests {
             app.overlay(),
             Overlay::SearchResults,
             "no hit to forward, stays put"
+        );
+    }
+
+    /// An app with a two-chat list and an open conversation (chat 1) — the state a
+    /// forward is started from in the history pane (`f`).
+    fn app_on_conversation() -> App {
+        use crate::chat_list::{ChatList, ChatListView, sample_chat};
+        use std::collections::HashSet;
+        use tuigram_core::model::ChatListKind;
+
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
+        }]);
+        let mut app = App::with_chat_list(view);
+        app.project_conversation(1, text_history(&[10, 11]), HashSet::new());
+        app
+    }
+
+    #[test]
+    fn forwarding_the_selected_history_message_opens_the_picker_from_the_open_chat() {
+        let mut app = app_on_conversation();
+        // The message the history pane has selected (sample_message pins chat_id to 1).
+        let selected = app.conversation().selected_message().map(|m| m.id).unwrap();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(app.overlay(), Overlay::Forward);
+        assert_eq!(app.forward().message_ids(), &[selected]);
+        assert_eq!(
+            app.forward().source_chat_id(),
+            1,
+            "sourced from the open chat"
+        );
+        // The picker reuses the chat list as its target list.
+        assert_eq!(
+            app.forward().selected_target().map(|c| c.title.as_str()),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn cancelling_a_history_forward_returns_to_the_conversation() {
+        let mut app = app_on_conversation();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(app.overlay(), Overlay::Forward);
+        app.dispatch(Action::ForwardCancel);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "cancel lands back on the conversation, not the search results"
+        );
+    }
+
+    #[test]
+    fn forwarding_from_an_empty_history_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "no selected message, nothing to forward"
         );
     }
 

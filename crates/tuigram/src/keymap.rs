@@ -262,6 +262,13 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('f')]),
+        action: Action::ForwardMessage,
+        keys: "f",
+        description: "forward the selected message",
+    },
+    Binding {
+        context: Context::History,
         trigger: Trigger::Plain(&[KeyCode::Char('a')]),
         action: Action::AttachOpen,
         keys: "a",
@@ -767,7 +774,7 @@ mod tests {
 
     #[test]
     fn history_keys_act_on_the_selected_message() {
-        // r / p / a operate on the selected message in the history pane.
+        // r / p / f / a operate on the selected message in the history pane.
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('r')),
             Action::ReactionOpen
@@ -775,6 +782,10 @@ mod tests {
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('p')),
             Action::PinToggle
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('f')),
+            Action::ForwardMessage
         );
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('a')),
