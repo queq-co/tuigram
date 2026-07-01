@@ -828,21 +828,87 @@ fn render_forward(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The reaction picker (#85): a centred modal listing the emoji palette with the
-/// selected one marked. Confirming toggles it on the selected message.
+/// selected one marked (palette mode), or the custom-emoji entry line (custom mode,
+/// #119). Confirming toggles the effective emoji on the selected message.
 fn render_reaction(frame: &mut Frame, area: Rect, app: &App) {
     let picker = app.reaction();
+    match picker.custom_input() {
+        Some(buffer) => render_reaction_custom(frame, area, buffer),
+        None => render_reaction_palette(frame, area, picker),
+    }
+}
+
+/// Palette mode: the emoji list with the selected one marked, over a dim affordance
+/// for the custom-emoji line and the key hint.
+fn render_reaction_palette(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &crate::reactions::ReactionPicker,
+) {
     let items: Vec<ListItem> = picker
         .palette()
         .iter()
         .map(|emoji| ListItem::new((*emoji).to_owned()))
         .collect();
-    render_list_modal(
-        frame,
-        area,
-        " React ".to_owned(),
-        items,
-        picker.selected(),
-        "j / k move · Enter toggle · Esc cancel",
+
+    // Border (2) + the palette rows + the custom affordance (1) + the hint row (1).
+    let height = items.len() as u16 + 4;
+    let popup = centered_rect(OVERLAY_WIDTH, height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(" React ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [list_area, custom_area, hint_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let list = List::new(items)
+        .highlight_symbol(SELECTED_SYMBOL)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(Some(picker.selected()));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(
+        Paragraph::new(hint_line("c  type a custom emoji")),
+        custom_area,
+    );
+    frame.render_widget(
+        Paragraph::new(hint_line("j / k move · Enter react · Esc cancel")),
+        hint_area,
+    );
+}
+
+/// Custom mode: the editable custom-emoji line (with the caret) over the key hint.
+/// The buffer takes whatever the OS emoji picker or a paste emits, so the caret sits
+/// at its end.
+fn render_reaction_custom(frame: &mut Frame, area: Rect, buffer: &str) {
+    let cursor = buffer.chars().count();
+    let mut spans = vec![Span::styled(
+        "custom ",
+        Style::new().add_modifier(Modifier::DIM),
+    )];
+    spans.extend(input_line(buffer, cursor).spans);
+    let lines = vec![
+        Line::from(spans),
+        Line::from(""),
+        hint_line("type or paste an emoji · Enter react · Esc back"),
+    ];
+
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" React ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
     );
 }
 
@@ -1527,12 +1593,32 @@ mod tests {
         let text = flatten(&buffer);
         assert!(text.contains("React"), "reaction overlay title");
         assert!(text.contains('👍'), "an emoji from the palette");
-        assert!(text.contains("Enter toggle"), "key hint");
+        assert!(text.contains("Enter react"), "key hint");
+        assert!(text.contains("custom emoji"), "the custom-entry affordance");
         // The first palette entry is selected.
         assert!(
             row_containing(&buffer, "👍").contains('▶'),
             "first emoji selected"
         );
+    }
+
+    #[test]
+    fn the_reaction_picker_shows_the_custom_entry_line() {
+        let mut app = app_with_history(vec![text_message(1, "nice")]);
+        app.dispatch(Action::ReactionOpen);
+        // Enter the custom line and type an emoji.
+        app.dispatch(Action::ReactionKey('c'));
+        app.dispatch(Action::ReactionKey('🥳'));
+        let buffer = render(&app, 80, 24);
+        let text = flatten(&buffer);
+        assert!(text.contains("custom"), "the custom-entry label");
+        assert!(text.contains('🥳'), "the typed emoji");
+        assert!(
+            text.contains("Esc back"),
+            "custom-mode hint returns to palette"
+        );
+        // The palette list is not shown while typing a custom emoji.
+        assert!(!text.contains("j / k move"), "palette hint is gone");
     }
 
     #[test]
