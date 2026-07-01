@@ -9,8 +9,10 @@
 //! [`SecretChatState`], when it is a secret chat) and decides which single
 //! lifecycle action is meaningful — start a new secret chat with a private chat's
 //! user (or with a closed secret chat's partner), or close a still-open one — and
-//! [`SecretChatPrompt`] is the confirm overlay's state. Phase 6 dispatches the core
-//! seam on confirm; Phase 5 drives the prompt headlessly and closes on confirm.
+//! [`SecretChatPrompt`] is the confirm overlay's state. Confirm records the chosen
+//! [`SecretLifecycle`] as the app's pending secret action, which the loop drains and
+//! dispatches on the core seam (#121); the resulting `updateSecretChat` folds back
+//! and re-projects the row's state.
 //!
 //! No encryption-key material is ever involved: the decision reads only the chat
 //! kind and the lifecycle state, never the secret chat's `key_hash`.
@@ -75,10 +77,9 @@ impl SecretChatPrompt {
         }
     }
 
-    /// The lifecycle action this prompt confirms — the seam Phase 6 dispatches on
-    /// confirm (`create_new_secret_chat` / `close_secret_chat`). Unread in the
-    /// non-test binary until that wiring lands.
-    #[allow(dead_code)]
+    /// The lifecycle action this prompt confirms — the seam the loop dispatches on
+    /// confirm (`create_new_secret_chat` / `close_secret_chat`), recorded as the
+    /// app's pending secret action (#121).
     #[must_use]
     pub fn lifecycle(&self) -> SecretLifecycle {
         self.lifecycle

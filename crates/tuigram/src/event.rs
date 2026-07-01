@@ -36,6 +36,9 @@ pub enum AppEvent {
     Messages,
     /// `updateFile`: a download or upload made progress.
     File,
+    /// `updateSecretChat`: a secret chat's lifecycle/key state advanced (#121) —
+    /// pending → ready → closed — so the secret-state projection re-reads it.
+    Secret,
     /// The live feed reported a dropped-update gap (a broadcast overflow): some
     /// change signals were missed, so the UI repaints to be safe. This is the
     /// stream-level error signal — the only failure the update feed itself raises.
@@ -112,6 +115,9 @@ fn classify_update(update: &Update) -> Option<AppEvent> {
         | Update::MessageInteractionInfo(_)
         | Update::DeleteMessages(_) => Some(AppEvent::Messages),
         Update::File(_) => Some(AppEvent::File),
+        // The E2E chat lifecycle: a state advance (pending/ready/closed) folds into
+        // the secret-chat store, which the secret-state projection reads back (#121).
+        Update::SecretChat(_) => Some(AppEvent::Secret),
         _ => None,
     }
 }
@@ -203,6 +209,23 @@ mod tests {
             })),
             Some(AppEvent::Auth)
         );
+    }
+
+    #[test]
+    fn a_secret_chat_update_signals_the_secret_projection() {
+        use tuigram_core::enums::SecretChatState;
+        use tuigram_core::types::{SecretChat, UpdateSecretChat};
+        let signal = classify(RouterEvent::Update(Update::SecretChat(UpdateSecretChat {
+            secret_chat: SecretChat {
+                id: 5,
+                user_id: 7,
+                state: SecretChatState::Ready,
+                is_outbound: true,
+                key_hash: "fingerprint".to_owned(),
+                layer: 144,
+            },
+        })));
+        assert_eq!(signal, Some(AppEvent::Secret));
     }
 
     #[test]

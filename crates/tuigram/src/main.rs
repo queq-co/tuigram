@@ -64,13 +64,13 @@ use tokio_stream::StreamExt;
 use tuigram_core::model::{ChatKind, ChatListKind, Message};
 use tuigram_core::{
     Client, DOWNLOAD_PRIORITY, EditRequests, FileRequests, FormattedText, ForwardRequests,
-    HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SendRequests,
-    StorageRequests, StorageSettings, load_archive_list, load_folder_list, load_main_list,
-    search_chat, search_global,
+    HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests,
+    SendRequests, StorageRequests, StorageSettings, load_archive_list, load_folder_list,
+    load_main_list, search_chat, search_global,
 };
 
 use crate::app::{Action, App};
-use crate::chat_list::project_lists;
+use crate::chat_list::{project_lists, project_secret_states};
 use crate::composer::Submission;
 use crate::event::{AppEvent, spawn_core_source};
 use crate::keymap::Focus;
@@ -273,6 +273,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         AppEvent::Chats => {
                             let lists = client.read(|s| project_lists(s.chats()));
                             app.project_chats(lists);
+                            // A new secret chat arrives as updateNewChat; re-project
+                            // its lifecycle state so the fresh row shows it (#121).
+                            reproject_secret_states(&mut app, client);
                         }
                         // A message change in some chat: refresh the open chat's
                         // history (a no-op projection if nothing it shows changed).
@@ -280,10 +283,14 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         // A file transfer advanced (#120): re-project so the open
                         // chat's download-progress lines reflect the newest `updateFile`.
                         AppEvent::File => project_conversation(&mut app, client, history.open),
+                        // A secret chat's lifecycle advanced (#121): re-project the
+                        // secret-state map so the row reflects pending → ready → closed.
+                        AppEvent::Secret => reproject_secret_states(&mut app, client),
                         // A dropped-update gap: re-project both panes to be safe.
                         AppEvent::Lagged => {
                             let lists = client.read(|s| project_lists(s.chats()));
                             app.project_chats(lists);
+                            reproject_secret_states(&mut app, client);
                             project_conversation(&mut app, client, history.open);
                         }
                         // Connection folds into the status bar; the rest repaint
@@ -345,6 +352,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // A confirmed attachment uploads into the open chat; its file streams back
         // through the store like a text send (#120).
         drive_media(&mut app, client, &history, &outbound_tx);
+        // A confirmed secret-chat lifecycle action hits Telegram; the resulting
+        // `updateSecretChat`/`updateNewChat` fold back and re-project (#121).
+        drive_secret(&mut app, client, &outbound_tx);
         // Pull down the open chat's incoming media, each file once, so the progress
         // lines and saved markers resolve as `updateFile` folds (#120).
         drive_downloads(client, &history, &mut downloading);
@@ -754,6 +764,54 @@ fn drive_media(
                 .await;
         }
     });
+}
+
+/// Dispatch a confirmed secret-chat lifecycle action to Telegram (#121). Confirming
+/// the secret-chat prompt records a pure [`SecretLifecycle`](crate::secret::SecretLifecycle)
+/// on `App`; here the loop drains it and calls [`SecretChatRequests`]' create or
+/// close per the action.
+///
+/// Fire-and-forget like the reaction/pin toggles: the authoritative state arrives as
+/// `updateSecretChat` (the lifecycle advance) and, for a create, `updateNewChat` (the
+/// new chat) — both folded by the router and reflected on the next projection, so this
+/// only issues the request. `create_new_secret_chat` also returns the new [`Chat`],
+/// but the fold is the source of truth, so the returned copy is dropped. Only a
+/// seam-level rejection reports back, as an error toast on `outbound_tx`.
+fn drive_secret(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Notice>) {
+    let Some(lifecycle) = app.take_secret() else {
+        return;
+    };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        use crate::secret::SecretLifecycle;
+        let bridge = client.bridge();
+        let result = match lifecycle {
+            SecretLifecycle::Start { user_id } => {
+                bridge.create_new_secret_chat(user_id).await.map(|_| ())
+            }
+            SecretLifecycle::Close { secret_chat_id } => {
+                bridge.close_secret_chat(secret_chat_id).await
+            }
+        };
+        if let Err(err) = result {
+            // A fixed TDLib error code (e.g. USER_NOT_FOUND), never key material or
+            // user input — safe to show, per the toast contract.
+            let _ = outbound_tx
+                .send(Notice::error("secret chat", Some(&err.message)))
+                .await;
+        }
+    });
+}
+
+/// Re-read the folded secret-chat states from the client and re-project them onto
+/// the chat list (#121). The projection needs the client, so it lives here rather
+/// than in the pure `App` — which only receives the owned pairs — the same split as
+/// [`project_lists`]. Joins each [`ChatKind::Secret`] chat to its
+/// [`SecretChatStore`](tuigram_core::SecretChatStore) record by `secret_chat_id`.
+fn reproject_secret_states(app: &mut App, client: &Arc<Client>) {
+    let states = client.read(|s| project_secret_states(s.chats(), s.secret_chats()));
+    app.project_secret_states(states);
 }
 
 /// Start downloading the open chat's incoming media (#120), each file at most once

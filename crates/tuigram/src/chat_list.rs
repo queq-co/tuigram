@@ -18,8 +18,8 @@
 
 use std::collections::HashMap;
 
-use tuigram_core::ChatStore;
-use tuigram_core::model::{Chat, ChatAction, ChatListKind, SecretChatState};
+use tuigram_core::model::{Chat, ChatAction, ChatKind, ChatListKind, SecretChatState};
+use tuigram_core::{ChatStore, SecretChatStore};
 
 /// Project the folded [`ChatStore`] into the view's switchable lists, in switch
 /// order: **Main**, **Archive**, then each user-defined **folder** (#113). Each
@@ -50,6 +50,30 @@ pub fn project_lists(chats: &ChatStore) -> Vec<ChatList> {
         });
     }
     lists
+}
+
+/// Project the folded secret-chat lifecycle states, keyed by **chat id** for the
+/// view (#121). A [`ChatKind::Secret`] chat carries a `secret_chat_id`; this joins
+/// each such chat to its folded [`SecretChat`](tuigram_core::model::SecretChat) in
+/// the [`SecretChatStore`] and pairs the chat id with the record's
+/// [`SecretChatState`], so the view can look a row's state up by the same chat id
+/// it renders. A secret chat whose `updateSecretChat` has not folded yet is
+/// skipped (it appears once its state lands). Reads only the lifecycle state, never
+/// any key material.
+#[must_use]
+pub fn project_secret_states(
+    chats: &ChatStore,
+    secrets: &SecretChatStore,
+) -> Vec<(i64, SecretChatState)> {
+    chats
+        .iter()
+        .filter_map(|chat| match chat.kind {
+            ChatKind::Secret { secret_chat_id, .. } => {
+                secrets.get(secret_chat_id).map(|sc| (chat.id, sc.state))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// One switchable list: its [kind](ChatListKind), the label shown in the pane
@@ -179,12 +203,22 @@ impl ChatListView {
     }
 
     /// Record (or replace) the secret-chat lifecycle state for chat `chat_id`. The
-    /// seam Phase 6 fills from the core
-    /// [`SecretChatStore`](tuigram_core::SecretChatStore) on each `updateSecretChat`;
-    /// until then only tests call it.
+    /// granular counterpart to [`project_secret_states`](Self::project_secret_states);
+    /// only tests call it now that the binary projects the whole map at once.
     #[allow(dead_code)]
     pub fn set_secret_state(&mut self, chat_id: i64, state: SecretChatState) {
         self.secret_states.insert(chat_id, state);
+    }
+
+    /// Replace the secret-chat lifecycle states wholesale from a fresh core
+    /// projection (#121): the loop reads each secret chat's folded
+    /// [`SecretChatState`] joined to its chat id (via the free
+    /// [`project_secret_states`]) and hands the owned pairs here. A full replace,
+    /// not a merge, so the view converges on the store rather than accreting stale
+    /// rows. Keyed by chat id, spanning every list. The per-chat-id map survives a
+    /// [`project`](Self::project) list swap, so this is the only path that clears it.
+    pub fn project_secret_states(&mut self, states: Vec<(i64, SecretChatState)>) {
+        self.secret_states = states.into_iter().collect();
     }
 
     /// Record (or clear) the chat action for chat `chat_id`: `Some` shows the
@@ -433,6 +467,21 @@ mod tests {
         // A lifecycle advance overwrites in place.
         view.set_secret_state(0, SecretChatState::Ready);
         assert_eq!(view.secret_state(0), Some(SecretChatState::Ready));
+    }
+
+    #[test]
+    fn projecting_secret_states_replaces_the_map_wholesale() {
+        let mut view = three_lists();
+        view.set_secret_state(0, SecretChatState::Pending);
+        view.set_secret_state(1, SecretChatState::Ready);
+        // A fresh projection replaces every prior entry — a chat absent from it
+        // (here 1) no longer carries a state; a survivor advances in place.
+        view.project_secret_states(vec![(0, SecretChatState::Closed)]);
+        assert_eq!(view.secret_state(0), Some(SecretChatState::Closed));
+        assert!(
+            view.secret_state(1).is_none(),
+            "dropped from the projection"
+        );
     }
 
     #[test]
