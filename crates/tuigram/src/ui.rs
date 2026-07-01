@@ -19,8 +19,8 @@ use ratatui::widgets::{
 };
 
 use tuigram_core::model::{
-    Chat, ChatAction, ChatKind, File, FileRef, FormattedText, Message, MessageContent,
-    ReactionKind, SecretChatState, Sender,
+    Chat, ChatAction, ChatKind, File, FormattedText, Message, MessageContent, ReactionKind,
+    SecretChatState, Sender,
 };
 
 use crate::chat_list::ChatListView;
@@ -434,31 +434,11 @@ fn message_lines(view: &ConversationView, message: &Message, selected: bool) -> 
     lines
 }
 
-/// The file a media message references, if any — the key into the download store
-/// for the progress indicator. Non-file content (text, location, poll, …) has none.
-fn content_file(content: &MessageContent) -> Option<FileRef> {
-    match content {
-        MessageContent::Photo(p) => Some(p.file),
-        MessageContent::Video(v) => Some(v.file),
-        MessageContent::Document(d) => Some(d.file),
-        MessageContent::Audio(a) => Some(a.file),
-        MessageContent::Voice(v) => Some(v.file),
-        MessageContent::Sticker(s) => Some(s.file),
-        MessageContent::Animation(a) => Some(a.file),
-        MessageContent::Text(_)
-        | MessageContent::Location(_)
-        | MessageContent::Venue(_)
-        | MessageContent::Contact(_)
-        | MessageContent::Poll(_)
-        | MessageContent::Unsupported(_) => None,
-    }
-}
-
 /// The download-progress line for a media message, driven by the file's transfer
 /// state: a dim percentage while a download is active, a saved marker once it is
 /// present, or `None` when the file is unknown or not being fetched.
 fn download_line(view: &ConversationView, content: &MessageContent) -> Option<Line<'static>> {
-    let file = view.download(content_file(content)?.id)?;
+    let file = view.download(content.file()?.id)?;
     let text = if file.is_downloading_active {
         format!("⬇ downloading {}%", percent(file))
     } else if file.is_present() {
@@ -1570,13 +1550,13 @@ mod tests {
             }),
         );
         let mut view = ConversationView::from_messages(vec![photo], HashSet::new());
-        view.set_download(File {
+        view.set_downloads(vec![File {
             id: 7,
             size: 100,
             downloaded_size: 45,
             is_downloading_active: true,
             ..File::default()
-        });
+        }]);
         let text = flatten(&render(&App::with_conversation(view), 80, 24));
         assert!(text.contains("[Photo]"), "media placeholder");
         assert!(

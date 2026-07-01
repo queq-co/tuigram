@@ -251,12 +251,16 @@ impl ConversationView {
         self.chat_action = action;
     }
 
-    /// Record (or replace) the download state of a file, keyed by its id. The seam
-    /// Phase 6 fills from the core [`FileStore`](tuigram_core::files::FileStore) on
-    /// each `updateFile`; until then only the render tests call it.
-    #[allow(dead_code)]
-    pub fn set_download(&mut self, file: File) {
-        self.downloads.insert(file.id, file);
+    /// Replace the download state of the open chat's media files, keyed by id (#120).
+    /// The loop projects this from the core
+    /// [`FileStore`](tuigram_core::files::FileStore) on each `updateFile` (and on a
+    /// history refresh), reading back the files the visible messages reference. A
+    /// wholesale replace is correct because the store carries the newest full record
+    /// for every file, so an advanced or completed transfer overwrites the last
+    /// snapshot and the progress line reflects it; a switch to a chat whose media has
+    /// not been folded yet clears to empty until its files arrive.
+    pub fn set_downloads(&mut self, files: Vec<File>) {
+        self.downloads = files.into_iter().map(|file| (file.id, file)).collect();
     }
 
     /// Scroll one message toward the newest, clamping at the last message. A no-op
@@ -547,18 +551,37 @@ mod tests {
     }
 
     #[test]
-    fn a_recorded_download_is_read_back_by_file_id() {
+    fn projected_downloads_are_read_back_by_file_id_and_replace_wholesale() {
         let mut view = ConversationView::default();
         assert!(view.download(42).is_none());
-        view.set_download(File {
-            id: 42,
-            size: 100,
-            downloaded_size: 45,
-            is_downloading_active: true,
-            ..File::default()
-        });
+        view.set_downloads(vec![
+            File {
+                id: 42,
+                size: 100,
+                downloaded_size: 45,
+                is_downloading_active: true,
+                ..File::default()
+            },
+            File {
+                id: 7,
+                size: 100,
+                downloaded_size: 100,
+                is_downloading_completed: true,
+                local_path: "/tmp/7".to_owned(),
+                ..File::default()
+            },
+        ]);
         let file = view.download(42).expect("recorded download");
         assert_eq!(file.downloaded_size, 45);
         assert!(file.is_downloading_active);
+        assert!(view.download(7).expect("second file").is_present());
+
+        // A fresh projection replaces the map wholesale: the old ids are gone.
+        view.set_downloads(vec![File {
+            id: 99,
+            ..File::default()
+        }]);
+        assert!(view.download(42).is_none(), "prior snapshot cleared");
+        assert!(view.download(99).is_some());
     }
 }

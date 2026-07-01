@@ -61,11 +61,11 @@ use crossterm::event::EventStream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::ChatListKind;
+use tuigram_core::model::{ChatListKind, Message};
 use tuigram_core::{
-    Client, EditRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST, PinRequests,
-    ReactionRequests, ReadRequests, SendRequests, load_archive_list, load_folder_list,
-    load_main_list, search_chat, search_global,
+    Client, DOWNLOAD_PRIORITY, EditRequests, FileRequests, FormattedText, ForwardRequests,
+    HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SendRequests,
+    load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
 };
 
 use crate::app::{Action, App};
@@ -195,6 +195,11 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // when a page is merged (a history page returns data directly, not as updates,
     // so it needs an explicit completion signal).
     let mut history = HistoryState::default();
+    // The media file ids whose download has been kicked off this run (#120), so each
+    // incoming attachment is requested at most once — `updateFile` then streams its
+    // progress and the projection reflects it, without the loop re-requesting on
+    // every re-projection.
+    let mut downloading: HashSet<i32> = HashSet::new();
     let (history_tx, mut history_rx) = mpsc::channel::<HistoryPage>(HISTORY_CHANNEL_DEPTH);
     // A spawned send/edit (#116) reports a seam-level rejection back here as a toast;
     // the loop surfaces it through the notification queue.
@@ -244,6 +249,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         // A message change in some chat: refresh the open chat's
                         // history (a no-op projection if nothing it shows changed).
                         AppEvent::Messages => project_conversation(&mut app, client, history.open),
+                        // A file transfer advanced (#120): re-project so the open
+                        // chat's download-progress lines reflect the newest `updateFile`.
+                        AppEvent::File => project_conversation(&mut app, client, history.open),
                         // A dropped-update gap: re-project both panes to be safe.
                         AppEvent::Lagged => {
                             let lists = client.read(|s| project_lists(s.chats()));
@@ -306,6 +314,12 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // the optimistic state the reducer already reflected (#119).
         drive_reaction(&mut app, client, &outbound_tx);
         drive_pin(&mut app, client, &outbound_tx);
+        // A confirmed attachment uploads into the open chat; its file streams back
+        // through the store like a text send (#120).
+        drive_media(&mut app, client, &history, &outbound_tx);
+        // Pull down the open chat's incoming media, each file once, so the progress
+        // lines and saved markers resolve as `updateFile` folds (#120).
+        drive_downloads(client, &history, &mut downloading);
     }
 
     Ok(())
@@ -676,22 +690,111 @@ fn drive_pin(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Not
     });
 }
 
+/// Dispatch a confirmed attachment to Telegram (#120). `App` builds the
+/// [`OutgoingMedia`] from the attach prompt and records it; here the loop drains it
+/// and calls [`SendRequests::send_media`], uploading the local file into the open
+/// chat.
+///
+/// Fire-and-forget like the text send (#116): TDLib returns an optimistic `Pending`
+/// message immediately, streams the upload as `updateFile` (folded by the file
+/// store, so the progress line moves), and settles the send via
+/// `updateMessageSendSucceeded`/`Failed` — all arriving back as updates the loop
+/// re-projects. The media is sent to the open chat (`history.open`), the same chat
+/// the composer targets; with no chat open there is nothing to attach to, so the
+/// drained intent is dropped. Only a seam-level rejection reports back, as an error
+/// toast on `outbound_tx`.
+fn drive_media(
+    app: &mut App,
+    client: &Arc<Client>,
+    history: &HistoryState,
+    outbound_tx: &mpsc::Sender<Notice>,
+) {
+    let Some(media) = app.take_media() else {
+        return;
+    };
+    let Some(chat_id) = history.open else { return };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        // A plain attachment, not a reply (`reply_to` None) — the attach prompt
+        // carries no reply target.
+        if let Err(err) = client.bridge().send_media(chat_id, None, media).await {
+            // The TDLib message is a fixed error code (e.g. CHAT_WRITE_FORBIDDEN),
+            // never the local path or caption — safe to show, per the toast contract.
+            let _ = outbound_tx
+                .send(Notice::error("send", Some(&err.message)))
+                .await;
+        }
+    });
+}
+
+/// Start downloading the open chat's incoming media (#120), each file at most once
+/// per run. Reads the file every message in the open chat's history references back
+/// from the store; a file that is neither present nor already transferring, and not
+/// requested yet this run, is downloaded at [`DOWNLOAD_PRIORITY`] and its id recorded
+/// in `downloading` so a later re-projection never re-requests it.
+///
+/// The download runs asynchronously: TDLib streams progress as `updateFile`, folded
+/// by the store and re-projected onto the conversation's progress line (via
+/// [`AppEvent::File`]), so this only starts the transfer and never awaits it. A file
+/// the store has not folded yet is skipped this pass and picked up once its first
+/// `updateFile` lands. The dedup is per-run, the download counterpart to the
+/// once-per-run list paging (`ensure_active_list_loaded`); a start rejected at the
+/// seam is not retried until the next run. With no chat open there is nothing to
+/// fetch.
+fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &mut HashSet<i32>) {
+    let Some(chat_id) = history.open else { return };
+    // The ids to start: files the history references that the store knows, are not
+    // yet present or active, and have not been requested this run. Photos with no
+    // sizes carry a 0 ref, which is not downloadable — skip it.
+    let to_start: Vec<i32> = client.read(|s| {
+        s.messages()
+            .history(chat_id)
+            .into_iter()
+            .filter_map(|m| m.content.file())
+            .filter(|file| file.id != 0 && !downloading.contains(&file.id))
+            .filter_map(|file| s.files().get(file.id))
+            .filter(|file| !file.is_present() && !file.is_downloading_active)
+            .map(|file| file.id)
+            .collect()
+    });
+    for file_id in to_start {
+        downloading.insert(file_id);
+        let client = Arc::clone(client);
+        tokio::spawn(async move {
+            let _ = client
+                .bridge()
+                .download_file(file_id, DOWNLOAD_PRIORITY)
+                .await;
+        });
+    }
+}
+
 /// Read the open chat's folded history and pinned ids back from the `Client` and
 /// project them onto the conversation pane (#114). The projection needs the client,
 /// so it lives here rather than in the pure `App`, which only receives the owned
 /// snapshot. A `None` open chat (the user is browsing the list) is a no-op.
 fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) {
     let Some(chat_id) = open else { return };
-    let (messages, pinned) = client.read(|s| {
-        let messages = s.messages().history(chat_id).into_iter().cloned().collect();
+    let (messages, pinned, files) = client.read(|s| {
+        let messages: Vec<Message> = s.messages().history(chat_id).into_iter().cloned().collect();
         let pinned = s
             .chats()
             .get(chat_id)
             .map(|chat| chat.pinned_message_ids.iter().copied().collect())
             .unwrap_or_default();
-        (messages, pinned)
+        // The download state of every file the history's media references, read back
+        // from the file store so the progress lines project alongside the messages
+        // (#120). A file the store has not folded yet is simply absent until it does.
+        let files = messages
+            .iter()
+            .filter_map(|m| m.content.file())
+            .filter_map(|file| s.files().get(file.id).cloned())
+            .collect();
+        (messages, pinned, files)
     });
     app.project_conversation(chat_id, messages, pinned);
+    app.project_downloads(files);
 }
 
 /// Fetch one history page for `chat_id` older than `anchor` ([`NEWEST`] for the
