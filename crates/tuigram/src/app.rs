@@ -13,7 +13,7 @@ use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
 use crate::conversation::ConversationView;
 use crate::event::AppEvent;
-use crate::forward::ForwardView;
+use crate::forward::{ForwardIntent, ForwardView};
 use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaDraft;
 use crate::reactions::ReactionPicker;
@@ -228,6 +228,11 @@ pub struct App {
     /// of that chat scrolls to the message if it is loaded, then clears this. Cleared
     /// on a switch to a different chat so a stale target never jumps a later view.
     pending_jump: Option<(i64, i64)>,
+    /// A confirmed forward awaiting dispatch to core (#118). Like `outbound`, `App`
+    /// records the intent and the loop drains it via
+    /// [`take_forward`](Self::take_forward), routing it to
+    /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages).
+    pending_forward: Option<ForwardIntent>,
 }
 
 impl App {
@@ -390,6 +395,14 @@ impl App {
     /// nothing was submitted since the last drain.
     pub fn take_search_query(&mut self) -> Option<String> {
         self.pending_search.take()
+    }
+
+    /// Take the pending forward, if any (#118). The loop drains this each tick and
+    /// dispatches it to
+    /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages);
+    /// `None` means no forward was confirmed since the last drain.
+    pub fn take_forward(&mut self) -> Option<ForwardIntent> {
+        self.pending_forward.take()
     }
 
     /// Replace the search overlay's hits with a fresh, projected result set (#117),
@@ -658,10 +671,13 @@ impl App {
             }
             Action::ForwardOpen => {
                 // Forward the selected hit. The picker reuses a snapshot of the
-                // chat list as its target list. No selected hit (empty results) is
-                // a no-op that stays on the results overlay.
-                if let Some(message_id) = self.search.selected_hit().map(|h| h.message_id) {
-                    self.forward = ForwardView::new(vec![message_id], self.chat_list.clone());
+                // chat list as its target list; the hit's chat is the source the
+                // forward carries. No selected hit (empty results) is a no-op that
+                // stays on the results overlay.
+                if let Some(hit) = self.search.selected_hit() {
+                    let (source, message_id) = (hit.chat_id, hit.message_id);
+                    self.forward =
+                        ForwardView::new(source, vec![message_id], self.chat_list.clone());
                     self.overlay = Overlay::Forward;
                     self.dirty = true;
                 }
@@ -675,8 +691,17 @@ impl App {
                 self.dirty = true;
             }
             Action::ForwardConfirm => {
-                // Phase 6 calls `Client::forward_messages` to the selected target;
-                // for now confirming just closes the picker back to browsing.
+                // Record the forward as a pure intent for the loop to send through
+                // `forward_messages` (#118), then close the picker back to browsing.
+                // An empty picker (no target chat) has nowhere to send, so it just
+                // closes without recording an intent.
+                if let Some(to_chat_id) = self.forward.selected_target().map(|c| c.id) {
+                    self.pending_forward = Some(ForwardIntent {
+                        from_chat_id: self.forward.source_chat_id(),
+                        message_ids: self.forward.message_ids().to_vec(),
+                        to_chat_id,
+                    });
+                }
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -1335,6 +1360,8 @@ mod tests {
         app.dispatch(Action::ForwardOpen);
         assert_eq!(app.overlay(), Overlay::Forward);
         assert_eq!(app.forward().message_ids(), &[20]);
+        // The hit's chat (Bob, id 2) is the source the forward carries.
+        assert_eq!(app.forward().source_chat_id(), 2);
         // The picker reuses the chat list as its target list.
         assert_eq!(
             app.forward().selected_target().map(|c| c.title.as_str()),
@@ -1343,8 +1370,8 @@ mod tests {
     }
 
     #[test]
-    fn forward_picks_a_target_then_confirms_back_to_browsing() {
-        let mut app = app_on_results();
+    fn forward_picks_a_target_then_confirms_records_the_intent() {
+        let mut app = app_on_results(); // selected hit: Alice's (chat 1, message 10)
         app.dispatch(Action::ForwardOpen);
         app.dispatch(Action::ForwardNext);
         assert_eq!(
@@ -1353,6 +1380,17 @@ mod tests {
         );
         app.dispatch(Action::ForwardConfirm);
         assert_eq!(app.overlay(), Overlay::None, "confirm closes the modal");
+        // The confirmed forward is recorded for the loop: message 10 from its source
+        // chat (1) into the picked target (Bob, 2).
+        assert_eq!(
+            app.take_forward(),
+            Some(ForwardIntent {
+                from_chat_id: 1,
+                message_ids: vec![10],
+                to_chat_id: 2,
+            })
+        );
+        assert_eq!(app.take_forward(), None, "the intent is drained once");
     }
 
     #[test]
