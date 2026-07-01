@@ -367,10 +367,16 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         " Notice ".to_owned()
     };
+    // The dismiss affordance (#139), on the bottom border: a toast also ages out on
+    // its own, but this tells the user how to clear one immediately.
+    let hint = " Ctrl-G to dismiss ";
 
-    // Width fits the message or the title, whichever is wider, plus borders —
-    // clamped to a readable maximum and to the content area.
-    let content_cols = (line_cols.max(title.chars().count()) + 2) as u16;
+    // Width fits the message, the title, or the hint — whichever is widest — plus
+    // borders, clamped to a readable maximum and to the content area.
+    let content_cols = (line_cols
+        .max(title.chars().count())
+        .max(hint.chars().count())
+        + 2) as u16;
     let width = content_cols
         .clamp(1, TOAST_MAX_WIDTH)
         .min(area.width.saturating_sub(2));
@@ -379,7 +385,6 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
     let inner = width.saturating_sub(2).max(1) as usize;
     let rows = line_cols.div_ceil(inner).max(1) as u16;
     let height = (rows + 2).min(area.height);
-    let body = Paragraph::new(line).wrap(ratatui::widgets::Wrap { trim: false });
 
     // Top-right, one cell in from the border so it does not sit on the corner.
     let x = area.x + area.width.saturating_sub(width + 1);
@@ -391,16 +396,22 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
         height,
     };
 
+    // Errors bold the message; the hint stays dim regardless, so each carries its own
+    // style rather than styling the whole widget.
     let emphasis = if notice.level() == NoticeLevel::Error {
         Style::new().add_modifier(Modifier::BOLD)
     } else {
         Style::new()
     };
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let block = Block::bordered()
+        .title(title)
+        .title_bottom(Line::styled(hint, dim).right_aligned());
+    let body = Paragraph::new(Line::styled(line, emphasis))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(block);
     frame.render_widget(Clear, rect);
-    frame.render_widget(
-        body.block(Block::bordered().title(title)).style(emphasis),
-        rect,
-    );
+    frame.render_widget(body, rect);
 }
 
 /// The lines for one message: a bold sender/timestamp header (with a selection
@@ -1758,6 +1769,16 @@ mod tests {
         let text = flatten(&render(&app, 80, 24));
         assert!(text.contains("Notice"), "toast box title");
         assert!(text.contains("download complete"), "toast message");
+    }
+
+    #[test]
+    fn a_toast_shows_how_to_dismiss_it() {
+        // The box carries the dismiss affordance (#139) so the user is never left
+        // wondering how to clear a notice.
+        let mut app = App::new();
+        app.notify(Notice::info("download complete"));
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Ctrl-G"), "dismiss hint on the toast");
     }
 
     #[test]

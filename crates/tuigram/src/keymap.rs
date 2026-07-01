@@ -357,10 +357,19 @@ const BINDINGS: &[Binding] = &[
 /// inserts that character.
 ///
 /// `Ctrl-C` quits from every overlay, so the app is never trapped in a modal.
+/// `Ctrl-G` dismisses the showing toast from everywhere too (#139): it is handled
+/// centrally, before the overlay match, rather than re-admitted per overlay like the
+/// `Ctrl-C` quit — a toast can surface while any overlay is open, so its dismiss must
+/// not depend on each resolver remembering to allow it.
 #[must_use]
 pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::Noop;
+    }
+    // The toast-dismiss chord is always available, even inside a capturing overlay;
+    // it is a Ctrl chord, so it never collides with an overlay's typed input.
+    if is_dismiss(key) {
+        return Action::NoticeDismiss;
     }
     match overlay {
         Overlay::None => resolve_panes(focus, key),
@@ -377,6 +386,12 @@ pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
 /// Whether the key is `Ctrl-C` — the always-available quit, even inside a modal.
 fn is_quit(key: &KeyEvent) -> bool {
     Trigger::Ctrl(KeyCode::Char('c')).matches(key)
+}
+
+/// Whether the key is `Ctrl-G` — the always-available toast dismiss (#139), even
+/// inside a capturing overlay.
+fn is_dismiss(key: &KeyEvent) -> bool {
+    Trigger::Ctrl(KeyCode::Char('g')).matches(key)
 }
 
 /// Normal browsing: walk the keymap under `focus`, then fall through to composer
@@ -647,6 +662,27 @@ mod tests {
             assert_eq!(
                 resolve(focus, Overlay::None, &ctrl('g')),
                 Action::NoticeDismiss
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_g_dismisses_a_toast_from_inside_every_overlay() {
+        // A toast can surface while any overlay is open, so its dismiss must reach
+        // through the capture — unlike other globals, which an overlay swallows (#139).
+        for overlay in [
+            Overlay::Help,
+            Overlay::SearchInput,
+            Overlay::SearchResults,
+            Overlay::Forward,
+            Overlay::Reaction,
+            Overlay::SendMedia,
+            Overlay::SecretChat,
+        ] {
+            assert_eq!(
+                resolve(Focus::History, overlay, &ctrl('g')),
+                Action::NoticeDismiss,
+                "Ctrl-G must dismiss from {overlay:?}"
             );
         }
     }

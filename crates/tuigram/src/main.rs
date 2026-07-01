@@ -83,6 +83,12 @@ use crate::terminal::{TerminalGuard, install_panic_hook};
 /// latency, so the UI stays smooth while core is mid-request.
 const FRAME: Duration = Duration::from_millis(33);
 
+/// How often a showing toast is aged (#139). A `Notice`'s lifetime is counted in
+/// these ~1s heartbeats, so this is the clock that expires toasts. Independent of
+/// the faster [`FRAME`] render cadence: a toast should tick down on a human-readable
+/// second, not once per repaint.
+const NOTICE_TICK: Duration = Duration::from_secs(1);
+
 /// How often the download-cache retention sweep runs (#120). Retention is not
 /// time-critical — expiring a file minutes late is harmless — so a slow cadence
 /// keeps the maintenance out of the way; each pass re-reads the loaded chats, so
@@ -194,6 +200,10 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     let mut app = App::new();
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(FRAME);
+    // Ages a showing toast once a second (#139), independent of the render tick, so
+    // notices actually time out; a still-counting toast is repainted by the render
+    // tick meanwhile.
+    let mut notice_tick = tokio::time::interval(NOTICE_TICK);
     let mut core_rx = spawn_core_source(client);
     // Download-cache retention policy (#120), read once from settings.toml; the
     // periodic sweep applies it. Absent/malformed settings default to keep-forever,
@@ -245,6 +255,8 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             },
             // Render tick: mark dirty so clocks/animations repaint on cadence.
             _ = tick.tick() => app.dispatch(Action::Render),
+            // Notice tick (#139): age the showing toast so it eventually times out.
+            _ = notice_tick.tick() => app.tick_notices(),
             // Retention sweep (#120): expire old downloaded media per the settings.
             // Purely a background side effect — no UI state changes here.
             _ = sweep_tick.tick() => drive_storage_sweep(client, &storage_settings),

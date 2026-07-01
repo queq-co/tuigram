@@ -508,11 +508,21 @@ impl App {
     }
 
     /// Enqueue a transient toast — a failed action (#116) or a one-off core event.
-    /// The heartbeat tick ages it out and [`Action::NoticeDismiss`] drops it on
-    /// demand.
+    /// The notice tick ([`tick_notices`](Self::tick_notices)) ages it out and
+    /// [`Action::NoticeDismiss`] drops it on demand.
     pub fn notify(&mut self, notice: crate::status::Notice) {
         self.notifications.push(notice);
         self.dirty = true;
+    }
+
+    /// Age the showing toast by one notice-clock tick (#139), dropping it when its
+    /// lifetime runs out and revealing any next. Driven by the loop's ~1s notice
+    /// interval, separate from the faster render tick. Marks the app dirty only when
+    /// a toast actually left, since a still-counting toast looks unchanged.
+    pub fn tick_notices(&mut self) {
+        if self.notifications.tick() {
+            self.dirty = true;
+        }
     }
 
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
@@ -2166,6 +2176,29 @@ mod tests {
             app.notifications().current().unwrap().line(),
             "✗ send failed (FLOOD_WAIT)"
         );
+    }
+
+    #[test]
+    fn tick_notices_ages_out_the_toast_and_repaints_only_when_it_leaves() {
+        // The notice clock (#139) drives the toast's lifetime; the app repaints only
+        // on the tick that actually drops it, since a still-counting toast is unchanged.
+        let mut app = App::new();
+        app.notify(Notice::info("download complete"));
+        // Age it to the brink of expiry without dropping it — no repaint owed.
+        let mut ticks = 0;
+        loop {
+            app.clear_dirty();
+            app.tick_notices();
+            if app.notifications().current().is_none() {
+                break;
+            }
+            assert!(!app.is_dirty(), "a still-counting toast owes no repaint");
+            ticks += 1;
+            assert!(ticks < 100, "toast should have expired by now");
+        }
+        // The expiring tick dropped it and asked for a repaint.
+        assert!(app.is_dirty(), "the expiring tick repaints");
+        assert!(ticks > 0, "the toast survived at least one tick");
     }
 
     #[test]

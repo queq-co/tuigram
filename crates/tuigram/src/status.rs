@@ -80,9 +80,15 @@ impl NoticeLevel {
     }
 }
 
-/// The default lifetime of a toast, in heartbeats (~1s each): long enough to read
-/// a short line, short enough not to linger.
+/// The lifetime of an info/success toast, in heartbeats (~1s each): long enough to
+/// read a short line, short enough not to linger.
 const DEFAULT_TTL: u32 = 5;
+
+/// The lifetime of an error toast, in heartbeats (~1s each): longer than
+/// [`DEFAULT_TTL`] because a failure is something the user may need to read and
+/// act on, so it should not vanish as quickly as a routine event. It still ages
+/// out on its own and Ctrl-G dismisses it early, per the non-capturing contract.
+const ERROR_TTL: u32 = 12;
 
 /// One transient toast: a severity, a message, and the remaining heartbeats before
 /// it auto-dismisses.
@@ -94,9 +100,7 @@ pub struct Notice {
 }
 
 // The toast constructors are the Phase-6 building API: core calls them (through
-// [`App::notify`]) when an action fails or a one-off event lands. Until that
-// wiring exists they are reached only from the tests, so they are dead in the
-// binary — annotated like `notify` itself.
+// [`App::notify`]) when an action fails or a one-off event lands.
 impl Notice {
     /// An informational toast (a one-off event like "download complete").
     #[allow(dead_code)]
@@ -116,7 +120,6 @@ impl Notice {
     /// (e.g. `error("send", Some("FLOOD_WAIT"))` → "send failed (FLOOD_WAIT)").
     /// Built only from a fixed action phrase and a core code — never the user's
     /// typed input, the same rule the login flow follows.
-    #[allow(dead_code)]
     #[must_use]
     pub fn error(action: &str, code: Option<&str>) -> Self {
         let text = match code {
@@ -126,13 +129,14 @@ impl Notice {
         Self::new(NoticeLevel::Error, text)
     }
 
-    #[allow(dead_code)]
+    /// Build a notice, giving errors the longer [`ERROR_TTL`] so a failure lingers
+    /// long enough to read while routine info/success toasts clear on [`DEFAULT_TTL`].
     fn new(level: NoticeLevel, text: String) -> Self {
-        Self {
-            level,
-            text,
-            ttl: DEFAULT_TTL,
-        }
+        let ttl = match level {
+            NoticeLevel::Error => ERROR_TTL,
+            NoticeLevel::Info | NoticeLevel::Success => DEFAULT_TTL,
+        };
+        Self { level, text, ttl }
     }
 
     /// This toast's severity, for the render emphasis.
@@ -183,11 +187,10 @@ impl Notifications {
     /// whether a toast was removed — the only change the render path must repaint
     /// for, since a still-counting toast looks the same.
     ///
-    /// The clock that drove this was the Phase-5 heartbeat, removed with the fake
-    /// source in #110; the real wall-clock clock returns alongside the toast
-    /// producers in a later Phase 6 issue (no toast is enqueued until then, so the
-    /// queue is empty and unaged in the binary meanwhile).
-    #[allow(dead_code)]
+    /// Driven by the loop's wall-clock notice interval (#139): the Phase-5 heartbeat
+    /// that first drove this was removed with the fake source in #110, and the toast
+    /// producers came back (#116, #120) without it, so toasts never aged out until
+    /// the interval was restored here.
     pub fn tick(&mut self) -> bool {
         if let Some(front) = self.queue.front_mut() {
             front.ttl = front.ttl.saturating_sub(1);
@@ -266,6 +269,31 @@ mod tests {
         assert!(notes.current().is_none());
         // Ticking an empty queue is a no-op.
         assert!(!notes.tick());
+    }
+
+    // Errors must outlast routine toasts (ERROR_TTL > DEFAULT_TTL), checked at
+    // compile time so the constants can't drift the wrong way.
+    const _: () = assert!(ERROR_TTL > DEFAULT_TTL);
+
+    #[test]
+    fn an_error_toast_outlives_an_info_toast() {
+        // Errors carry the longer ERROR_TTL so a failure lingers long enough to
+        // read; info/success clear on the shorter DEFAULT_TTL.
+        let mut notes = Notifications::default();
+        notes.push(Notice::error("send", Some("FLOOD_WAIT")));
+        // It survives every tick an info toast would have expired on.
+        for _ in 0..DEFAULT_TTL {
+            notes.tick();
+        }
+        assert!(
+            notes.current().is_some(),
+            "error still showing past DEFAULT_TTL"
+        );
+        // And clears once its own longer lifetime runs out.
+        for _ in DEFAULT_TTL..ERROR_TTL {
+            notes.tick();
+        }
+        assert!(notes.current().is_none(), "error clears on ERROR_TTL");
     }
 
     #[test]
