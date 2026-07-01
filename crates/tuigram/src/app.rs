@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use crossterm::event::Event;
-use tuigram_core::model::Message;
+use tuigram_core::model::{File, Message, OutgoingMedia};
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
@@ -268,6 +268,13 @@ pub struct App {
     /// [`take_pin`](Self::take_pin), routing it to
     /// [`PinRequests`](tuigram_core::PinRequests)' pin/unpin.
     pending_pin: Option<PinIntent>,
+    /// A confirmed send-media attachment awaiting dispatch to core (#120). `App`
+    /// stays pure and never touches the `Client`, so confirming the attach prompt
+    /// builds the [`OutgoingMedia`] and lands it here; the loop drains it via
+    /// [`take_media`](Self::take_media) and routes it to
+    /// [`SendRequests::send_media`](tuigram_core::SendRequests::send_media), the
+    /// upload streaming back through the file store exactly like the send path (#116).
+    pending_media: Option<OutgoingMedia>,
 }
 
 impl App {
@@ -459,6 +466,26 @@ impl App {
     /// selected message; `None` means no pin was toggled since the last drain.
     pub fn take_pin(&mut self) -> Option<PinIntent> {
         self.pending_pin.take()
+    }
+
+    /// Take the pending send-media attachment, if any (#120). The loop drains this
+    /// each tick and dispatches it to
+    /// [`SendRequests::send_media`](tuigram_core::SendRequests::send_media) for the
+    /// open chat; `None` means nothing was confirmed since the last drain.
+    pub fn take_media(&mut self) -> Option<OutgoingMedia> {
+        self.pending_media.take()
+    }
+
+    /// Re-project the open chat's media download state from the core
+    /// [`FileStore`](tuigram_core::files::FileStore) (#120). The loop reads the files
+    /// backing the open chat's messages back from the `Client` and hands the owned
+    /// snapshot here, so `App` stays pure — the same split as
+    /// [`project_conversation`](Self::project_conversation). Replaces the view's
+    /// download state wholesale, so a completed or advanced transfer overwrites the
+    /// prior snapshot and the progress line reflects the newest `updateFile`.
+    pub fn project_downloads(&mut self, files: Vec<File>) {
+        self.conversation.set_downloads(files);
+        self.dirty = true;
     }
 
     /// Open the forward target picker for `message_id` from `source_chat_id`, shared
@@ -944,10 +971,12 @@ impl App {
                 self.dirty = true;
             }
             Action::AttachConfirm => {
-                // Phase 6 builds the `OutgoingMedia` from the prompt and calls
-                // `send_media`; for now confirming with a path just closes the
-                // prompt, and an empty path is a no-op that keeps it open.
-                if self.media.is_sendable() {
+                // Build the `OutgoingMedia` the prompt describes and record it for the
+                // loop to send (#120); the upload then streams back through the file
+                // store, exactly like a text send (#116). An empty path yields no
+                // media, a no-op that keeps the prompt open.
+                if let Some(media) = self.media.to_outgoing() {
+                    self.pending_media = Some(media);
                     self.overlay = Overlay::None;
                     self.dirty = true;
                 }
@@ -1919,12 +1948,64 @@ mod tests {
             Overlay::SendMedia,
             "no path, nothing to send"
         );
+        assert!(
+            app.take_media().is_none(),
+            "an empty prompt records no send"
+        );
         // A path makes it sendable; confirm then closes.
         for c in "/tmp/a.png".chars() {
             app.dispatch(Action::AttachInput(c));
         }
         app.dispatch(Action::AttachConfirm);
         assert_eq!(app.overlay(), Overlay::None);
+    }
+
+    #[test]
+    fn confirming_an_attach_records_the_media_for_the_loop() {
+        use tuigram_core::model::OutgoingMedia;
+
+        let mut app = app_with_history();
+        app.dispatch(Action::AttachOpen);
+        for c in "/tmp/clip.mp4".chars() {
+            app.dispatch(Action::AttachInput(c));
+        }
+        app.dispatch(Action::AttachToggleField);
+        for c in "watch".chars() {
+            app.dispatch(Action::AttachInput(c));
+        }
+        app.dispatch(Action::AttachConfirm);
+        assert_eq!(app.overlay(), Overlay::None, "the prompt closed");
+
+        // The intent carries the extension-inferred variant, path, and caption, and
+        // drains exactly once (a second drain is empty).
+        match app.take_media() {
+            Some(OutgoingMedia::Video { path, caption }) => {
+                assert_eq!(path, "/tmp/clip.mp4");
+                assert_eq!(caption.text, "watch");
+            }
+            other => panic!("expected a video attachment, got {other:?}"),
+        }
+        assert!(app.take_media().is_none(), "drained once");
+    }
+
+    #[test]
+    fn projecting_downloads_fills_the_conversation_progress_state() {
+        use tuigram_core::model::File;
+
+        let mut app = app_with_history();
+        app.project_downloads(vec![File {
+            id: 42,
+            size: 100,
+            downloaded_size: 40,
+            is_downloading_active: true,
+            ..File::default()
+        }]);
+        let file = app
+            .conversation()
+            .download(42)
+            .expect("projected download state");
+        assert_eq!(file.downloaded_size, 40);
+        assert!(file.is_downloading_active);
     }
 
     #[test]

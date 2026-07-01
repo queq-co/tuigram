@@ -61,11 +61,12 @@ use crossterm::event::EventStream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::ChatListKind;
+use tuigram_core::model::{ChatKind, ChatListKind, Message};
 use tuigram_core::{
-    Client, EditRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST, PinRequests,
-    ReactionRequests, ReadRequests, SendRequests, load_archive_list, load_folder_list,
-    load_main_list, search_chat, search_global,
+    Client, DOWNLOAD_PRIORITY, EditRequests, FileRequests, FormattedText, ForwardRequests,
+    HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SendRequests,
+    StorageRequests, StorageSettings, load_archive_list, load_folder_list, load_main_list,
+    search_chat, search_global,
 };
 
 use crate::app::{Action, App};
@@ -81,6 +82,13 @@ use crate::terminal::{TerminalGuard, install_panic_hook};
 /// Render cadence cap (~30 FPS). Bounds repaint rate independently of network
 /// latency, so the UI stays smooth while core is mid-request.
 const FRAME: Duration = Duration::from_millis(33);
+
+/// How often the download-cache retention sweep runs (#120). Retention is not
+/// time-critical — expiring a file minutes late is harmless — so a slow cadence
+/// keeps the maintenance out of the way; each pass re-reads the loaded chats, so
+/// coverage widens as the user browses. The first tick fires at startup, when few
+/// chats are loaded, so the first effective sweep is roughly one interval in.
+const STORAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
 /// How many chats to request per `loadChats` page when filling a list (#113).
 /// The core pager loops a list to exhaustion at this granularity, so this only
@@ -187,6 +195,11 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(FRAME);
     let mut core_rx = spawn_core_source(client);
+    // Download-cache retention policy (#120), read once from settings.toml; the
+    // periodic sweep applies it. Absent/malformed settings default to keep-forever,
+    // so retention is off unless the user opts in.
+    let storage_settings = StorageSettings::load();
+    let mut sweep_tick = tokio::time::interval(STORAGE_SWEEP_INTERVAL);
     // The lists whose `loadChats` paging has been kicked off, so each is loaded
     // at most once per run. A handful of entries (Main, Archive, a few folders),
     // so a `Vec` lookup beats pulling `Hash` onto the core enum.
@@ -195,6 +208,11 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // when a page is merged (a history page returns data directly, not as updates,
     // so it needs an explicit completion signal).
     let mut history = HistoryState::default();
+    // The media file ids whose download has been kicked off this run (#120), so each
+    // incoming attachment is requested at most once — `updateFile` then streams its
+    // progress and the projection reflects it, without the loop re-requesting on
+    // every re-projection.
+    let mut downloading: HashSet<i32> = HashSet::new();
     let (history_tx, mut history_rx) = mpsc::channel::<HistoryPage>(HISTORY_CHANNEL_DEPTH);
     // A spawned send/edit (#116) reports a seam-level rejection back here as a toast;
     // the loop surfaces it through the notification queue.
@@ -227,6 +245,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             },
             // Render tick: mark dirty so clocks/animations repaint on cadence.
             _ = tick.tick() => app.dispatch(Action::Render),
+            // Retention sweep (#120): expire old downloaded media per the settings.
+            // Purely a background side effect — no UI state changes here.
+            _ = sweep_tick.tick() => drive_storage_sweep(client, &storage_settings),
             // Live core events. `None` => the source ended (the bridge closed its
             // broadcast on shutdown); keep running so a late teardown can't wedge
             // the loop — the quit path drives the exit.
@@ -244,6 +265,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         // A message change in some chat: refresh the open chat's
                         // history (a no-op projection if nothing it shows changed).
                         AppEvent::Messages => project_conversation(&mut app, client, history.open),
+                        // A file transfer advanced (#120): re-project so the open
+                        // chat's download-progress lines reflect the newest `updateFile`.
+                        AppEvent::File => project_conversation(&mut app, client, history.open),
                         // A dropped-update gap: re-project both panes to be safe.
                         AppEvent::Lagged => {
                             let lists = client.read(|s| project_lists(s.chats()));
@@ -306,6 +330,12 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // the optimistic state the reducer already reflected (#119).
         drive_reaction(&mut app, client, &outbound_tx);
         drive_pin(&mut app, client, &outbound_tx);
+        // A confirmed attachment uploads into the open chat; its file streams back
+        // through the store like a text send (#120).
+        drive_media(&mut app, client, &history, &outbound_tx);
+        // Pull down the open chat's incoming media, each file once, so the progress
+        // lines and saved markers resolve as `updateFile` folds (#120).
+        drive_downloads(client, &history, &mut downloading);
     }
 
     Ok(())
@@ -676,22 +706,183 @@ fn drive_pin(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Not
     });
 }
 
+/// Dispatch a confirmed attachment to Telegram (#120). `App` builds the
+/// [`OutgoingMedia`] from the attach prompt and records it; here the loop drains it
+/// and calls [`SendRequests::send_media`], uploading the local file into the open
+/// chat.
+///
+/// Fire-and-forget like the text send (#116): TDLib returns an optimistic `Pending`
+/// message immediately, streams the upload as `updateFile` (folded by the file
+/// store, so the progress line moves), and settles the send via
+/// `updateMessageSendSucceeded`/`Failed` — all arriving back as updates the loop
+/// re-projects. The media is sent to the open chat (`history.open`), the same chat
+/// the composer targets; with no chat open there is nothing to attach to, so the
+/// drained intent is dropped. Only a seam-level rejection reports back, as an error
+/// toast on `outbound_tx`.
+fn drive_media(
+    app: &mut App,
+    client: &Arc<Client>,
+    history: &HistoryState,
+    outbound_tx: &mpsc::Sender<Notice>,
+) {
+    let Some(media) = app.take_media() else {
+        return;
+    };
+    let Some(chat_id) = history.open else { return };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        // A plain attachment, not a reply (`reply_to` None) — the attach prompt
+        // carries no reply target.
+        if let Err(err) = client.bridge().send_media(chat_id, None, media).await {
+            // The TDLib message is a fixed error code (e.g. CHAT_WRITE_FORBIDDEN),
+            // never the local path or caption — safe to show, per the toast contract.
+            let _ = outbound_tx
+                .send(Notice::error("send", Some(&err.message)))
+                .await;
+        }
+    });
+}
+
+/// Start downloading the open chat's incoming media (#120), each file at most once
+/// per run. Reads the file every message in the open chat's history references back
+/// from the store; a file that is neither present nor already transferring, and not
+/// requested yet this run, is downloaded at [`DOWNLOAD_PRIORITY`] and its id recorded
+/// in `downloading` so a later re-projection never re-requests it.
+///
+/// The download runs asynchronously: TDLib streams progress as `updateFile`, folded
+/// by the store and re-projected onto the conversation's progress line (via
+/// [`AppEvent::File`]), so this only starts the transfer and never awaits it. A file
+/// the store has not folded yet is skipped this pass and picked up once its first
+/// `updateFile` lands. The dedup is per-run, the download counterpart to the
+/// once-per-run list paging (`ensure_active_list_loaded`); a start rejected at the
+/// seam is not retried until the next run. With no chat open there is nothing to
+/// fetch.
+fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &mut HashSet<i32>) {
+    let Some(chat_id) = history.open else { return };
+    // The ids to start: files the history references that the store knows, are not
+    // yet present or active, and have not been requested this run. Photos with no
+    // sizes carry a 0 ref, which is not downloadable — skip it.
+    let to_start: Vec<i32> = client.read(|s| {
+        s.messages()
+            .history(chat_id)
+            .into_iter()
+            .filter_map(|m| m.content.file())
+            .filter(|file| file.id != 0 && !downloading.contains(&file.id))
+            .filter_map(|file| s.files().get(file.id))
+            .filter(|file| !file.is_present() && !file.is_downloading_active)
+            .map(|file| file.id)
+            .collect()
+    });
+    for file_id in to_start {
+        downloading.insert(file_id);
+        let client = Arc::clone(client);
+        tokio::spawn(async move {
+            let _ = client
+                .bridge()
+                .download_file(file_id, DOWNLOAD_PRIORITY)
+                .await;
+        });
+    }
+}
+
+/// Loaded chat ids split by retention category (#120): one-to-one/secret chats,
+/// groups (basic + super), and broadcast channels — the grouping the official apps'
+/// per-kind "Keep Media" TTLs use.
+#[derive(Default)]
+struct RetentionGroups {
+    private: Vec<i64>,
+    groups: Vec<i64>,
+    channels: Vec<i64>,
+}
+
+/// Split chats into [`RetentionGroups`] by [`ChatKind`]. Pure over the chats it is
+/// given (the driver feeds it the store's loaded chats), so the mapping is unit-
+/// testable without a `Client`: private and secret chats group together, basic groups
+/// and supergroups as "groups", and channels on their own.
+fn categorize_chats<'a>(
+    chats: impl Iterator<Item = &'a tuigram_core::model::Chat>,
+) -> RetentionGroups {
+    let mut out = RetentionGroups::default();
+    for chat in chats {
+        match chat.kind {
+            ChatKind::Private { .. } | ChatKind::Secret { .. } => out.private.push(chat.id),
+            ChatKind::BasicGroup { .. } | ChatKind::Supergroup { .. } => out.groups.push(chat.id),
+            ChatKind::Channel { .. } => out.channels.push(chat.id),
+        }
+    }
+    out
+}
+
+/// Run the download-cache retention sweep (#120): expire downloaded media not
+/// accessed within each chat kind's configured TTL. `App` is uninvolved — this is
+/// background maintenance with no UI state.
+///
+/// Chats are grouped by retention category — one-to-one/secret chats, groups
+/// (basic + super), and channels — from whatever the chat store currently holds, and
+/// each category with a finite TTL and at least one loaded chat gets one
+/// `optimizeStorage` scoped to its chat ids. An **empty** category is skipped, never
+/// swept with an empty chat list: `optimizeStorage` treats that as *all* chats, which
+/// would misapply one kind's TTL globally. Kinds kept forever are skipped outright.
+///
+/// Coverage tracks what is loaded: files from chats the user has not opened this
+/// session are not reached until those chats page in. Each spawned sweep is
+/// fire-and-forget — a rejection is dropped and the next interval retries.
+fn drive_storage_sweep(client: &Arc<Client>, settings: &StorageSettings) {
+    // Nothing configured: no sweep, no chat read.
+    if !settings.sweeps_anything() {
+        return;
+    }
+    // Partition the loaded chats' ids by retention category in a single store read.
+    let RetentionGroups {
+        private,
+        groups,
+        channels,
+    } = client.read(|s| categorize_chats(s.chats().iter()));
+
+    for (keep, chat_ids) in [
+        (settings.keep_private, private),
+        (settings.keep_groups, groups),
+        (settings.keep_channels, channels),
+    ] {
+        // Only sweep a kind with a finite TTL that actually has loaded chats — an
+        // empty list would sweep everything, so it is skipped, not passed through.
+        if let Some(ttl) = keep.to_ttl_seconds()
+            && !chat_ids.is_empty()
+        {
+            let client = Arc::clone(client);
+            tokio::spawn(async move {
+                let _ = client.bridge().sweep_chat_media(ttl, chat_ids).await;
+            });
+        }
+    }
+}
+
 /// Read the open chat's folded history and pinned ids back from the `Client` and
 /// project them onto the conversation pane (#114). The projection needs the client,
 /// so it lives here rather than in the pure `App`, which only receives the owned
 /// snapshot. A `None` open chat (the user is browsing the list) is a no-op.
 fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) {
     let Some(chat_id) = open else { return };
-    let (messages, pinned) = client.read(|s| {
-        let messages = s.messages().history(chat_id).into_iter().cloned().collect();
+    let (messages, pinned, files) = client.read(|s| {
+        let messages: Vec<Message> = s.messages().history(chat_id).into_iter().cloned().collect();
         let pinned = s
             .chats()
             .get(chat_id)
             .map(|chat| chat.pinned_message_ids.iter().copied().collect())
             .unwrap_or_default();
-        (messages, pinned)
+        // The download state of every file the history's media references, read back
+        // from the file store so the progress lines project alongside the messages
+        // (#120). A file the store has not folded yet is simply absent until it does.
+        let files = messages
+            .iter()
+            .filter_map(|m| m.content.file())
+            .filter_map(|file| s.files().get(file.id).cloned())
+            .collect();
+        (messages, pinned, files)
     });
     app.project_conversation(chat_id, messages, pinned);
+    app.project_downloads(files);
 }
 
 /// Fetch one history page for `chat_id` older than `anchor` ([`NEWEST`] for the
@@ -752,4 +943,50 @@ fn ensure_active_list_loaded(app: &App, client: &Arc<Client>, requested: &mut Ve
             ChatListKind::Folder(id) => load_folder_list(bridge, id, CHAT_PAGE).await,
         };
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::chat_list::sample_chat;
+    use tuigram_core::model::{Chat, ChatKind};
+
+    fn chat_of_kind(id: i64, kind: ChatKind) -> Chat {
+        let mut chat = sample_chat(id, "c", 0);
+        chat.kind = kind;
+        chat
+    }
+
+    #[test]
+    fn categorize_chats_groups_each_kind_and_pairs_private_with_secret() {
+        let chats = [
+            chat_of_kind(1, ChatKind::Private { user_id: 1 }),
+            chat_of_kind(
+                2,
+                ChatKind::Secret {
+                    secret_chat_id: 9,
+                    user_id: 2,
+                },
+            ),
+            chat_of_kind(3, ChatKind::BasicGroup { basic_group_id: 3 }),
+            chat_of_kind(4, ChatKind::Supergroup { supergroup_id: 4 }),
+            chat_of_kind(5, ChatKind::Channel { supergroup_id: 5 }),
+        ];
+        let mut groups = categorize_chats(chats.iter());
+        // Order within a category follows iteration; sort for a stable assertion.
+        groups.private.sort_unstable();
+        groups.groups.sort_unstable();
+        groups.channels.sort_unstable();
+        assert_eq!(groups.private, vec![1, 2], "private + secret together");
+        assert_eq!(groups.groups, vec![3, 4], "basic + super as groups");
+        assert_eq!(groups.channels, vec![5]);
+    }
+
+    #[test]
+    fn categorize_chats_on_no_chats_yields_empty_categories() {
+        let groups = categorize_chats(std::iter::empty());
+        assert!(groups.private.is_empty());
+        assert!(groups.groups.is_empty());
+        assert!(groups.channels.is_empty());
+    }
 }
