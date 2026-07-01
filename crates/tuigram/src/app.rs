@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use crossterm::event::Event;
-use tuigram_core::model::{File, Message, OutgoingMedia};
+use tuigram_core::model::{File, Message, OutgoingMedia, SecretChatState};
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
@@ -171,9 +171,9 @@ pub enum Action {
     /// new secret chat with a private chat's user, or close an open one. A no-op
     /// when the selection offers no lifecycle action (a group or channel).
     SecretOpen,
-    /// Confirm the secret-chat lifecycle action and close the prompt. Phase 6 calls
-    /// the core seam (`create_new_secret_chat` / `close_secret_chat`); for now it
-    /// just closes.
+    /// Confirm the secret-chat lifecycle action and close the prompt. Records the
+    /// chosen action for the loop to dispatch on the core seam
+    /// (`create_new_secret_chat` / `close_secret_chat`) (#121).
     SecretConfirm,
     /// Cancel the secret-chat prompt without acting.
     SecretCancel,
@@ -275,6 +275,13 @@ pub struct App {
     /// [`SendRequests::send_media`](tuigram_core::SendRequests::send_media), the
     /// upload streaming back through the file store exactly like the send path (#116).
     pending_media: Option<OutgoingMedia>,
+    /// A confirmed secret-chat lifecycle action awaiting dispatch to core (#121).
+    /// Confirming the secret-chat prompt records the chosen [`SecretLifecycle`]
+    /// here (never any key material); the loop drains it via
+    /// [`take_secret`](Self::take_secret) and routes it to
+    /// [`SecretChatRequests`](tuigram_core::SecretChatRequests)' create/close. The
+    /// resulting `updateSecretChat`/`updateNewChat` fold back and re-project.
+    pending_secret: Option<SecretLifecycle>,
 }
 
 impl App {
@@ -476,6 +483,25 @@ impl App {
         self.pending_media.take()
     }
 
+    /// Take the pending secret-chat lifecycle action, if any (#121). The loop drains
+    /// this each tick and dispatches it to
+    /// [`SecretChatRequests`](tuigram_core::SecretChatRequests)' create/close; `None`
+    /// means no secret-chat prompt was confirmed since the last drain.
+    pub fn take_secret(&mut self) -> Option<SecretLifecycle> {
+        self.pending_secret.take()
+    }
+
+    /// Re-project the secret-chat lifecycle states from the core
+    /// [`SecretChatStore`](tuigram_core::SecretChatStore) (#121). The loop reads each
+    /// secret chat's folded state joined to its chat id back from the `Client` and
+    /// hands the owned pairs here, so `App` stays pure — the same split as
+    /// [`project_chats`](Self::project_chats). Replaces the view's secret-state map
+    /// wholesale, so a lifecycle advance (pending → ready → closed) is reflected.
+    pub fn project_secret_states(&mut self, states: Vec<(i64, SecretChatState)>) {
+        self.chat_list.project_secret_states(states);
+        self.dirty = true;
+    }
+
     /// Re-project the open chat's media download state from the core
     /// [`FileStore`](tuigram_core::files::FileStore) (#120). The loop reads the files
     /// backing the open chat's messages back from the `Client` and hands the owned
@@ -600,6 +626,7 @@ impl App {
             | AppEvent::Chats
             | AppEvent::Messages
             | AppEvent::File
+            | AppEvent::Secret
             | AppEvent::Lagged => Action::Render,
         }
     }
@@ -1011,11 +1038,14 @@ impl App {
                 }
             }
             Action::SecretConfirm => {
-                // Phase 6 dispatches the core seam for `self.secret`'s lifecycle
-                // (`create_new_secret_chat` / `close_secret_chat`) and lets the
-                // resulting `updateSecretChat` / `updateNewChat` fold in; for now
-                // confirming just closes the prompt back to browsing.
-                self.secret = None;
+                // Record the confirmed lifecycle action for the loop to dispatch on
+                // the core seam (`create_new_secret_chat` / `close_secret_chat`); the
+                // resulting `updateSecretChat` / `updateNewChat` fold back and
+                // re-project (#121). Reads only the prompt's lifecycle, never any key
+                // material. A confirm with no prompt open is an inert close.
+                if let Some(prompt) = self.secret.take() {
+                    self.pending_secret = Some(prompt.lifecycle());
+                }
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -2100,13 +2130,20 @@ mod tests {
     }
 
     #[test]
-    fn confirming_the_secret_prompt_closes_it() {
+    fn confirming_the_secret_prompt_records_the_action_for_the_loop() {
         use tuigram_core::model::ChatKind;
         let mut app = app_with_one_chat(ChatKind::Private { user_id: 7 }, None);
         app.dispatch(Action::SecretOpen);
         app.dispatch(Action::SecretConfirm);
         assert_eq!(app.overlay(), Overlay::None, "confirm closes the modal");
         assert!(app.secret().is_none(), "prompt state cleared");
+        // The confirmed lifecycle is queued for the loop to dispatch on the seam,
+        // then drained exactly once.
+        assert_eq!(
+            app.take_secret(),
+            Some(SecretLifecycle::Start { user_id: 7 })
+        );
+        assert!(app.take_secret().is_none(), "drained once");
     }
 
     #[test]
@@ -2117,6 +2154,25 @@ mod tests {
         app.dispatch(Action::SecretCancel);
         assert_eq!(app.overlay(), Overlay::None);
         assert!(app.secret().is_none());
+        assert!(app.take_secret().is_none(), "cancel dispatches nothing");
+    }
+
+    #[test]
+    fn projecting_secret_states_lands_them_on_the_chat_list() {
+        use tuigram_core::model::{ChatKind, SecretChatState};
+        let mut app = app_with_one_chat(
+            ChatKind::Secret {
+                secret_chat_id: 9,
+                user_id: 7,
+            },
+            None,
+        );
+        assert!(app.chat_list().secret_state(5).is_none());
+        app.project_secret_states(vec![(5, SecretChatState::Ready)]);
+        assert_eq!(
+            app.chat_list().secret_state(5),
+            Some(SecretChatState::Ready)
+        );
     }
 
     #[test]
