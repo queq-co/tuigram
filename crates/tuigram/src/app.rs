@@ -11,12 +11,12 @@ use tuigram_core::model::Message;
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
-use crate::conversation::ConversationView;
+use crate::conversation::{ConversationView, PinIntent};
 use crate::event::AppEvent;
 use crate::forward::{ForwardIntent, ForwardView};
 use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaDraft;
-use crate::reactions::ReactionPicker;
+use crate::reactions::{ReactionIntent, ReactionPicker};
 use crate::search::SearchView;
 use crate::secret::{SecretChatPrompt, SecretLifecycle};
 use crate::status::{ConnectionState, Notifications};
@@ -249,6 +249,16 @@ pub struct App {
     /// [`take_forward`](Self::take_forward), routing it to
     /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages).
     pending_forward: Option<ForwardIntent>,
+    /// A confirmed reaction toggle awaiting dispatch to core (#119). `App` reflects
+    /// the toggle optimistically and records the intent; the loop drains it via
+    /// [`take_reaction`](Self::take_reaction), routing it to
+    /// [`ReactionRequests`](tuigram_core::ReactionRequests)' add/remove.
+    pending_reaction: Option<ReactionIntent>,
+    /// A confirmed pin toggle awaiting dispatch to core (#119). `App` flips the
+    /// pinned set optimistically and records the intent; the loop drains it via
+    /// [`take_pin`](Self::take_pin), routing it to
+    /// [`PinRequests`](tuigram_core::PinRequests)' pin/unpin.
+    pending_pin: Option<PinIntent>,
 }
 
 impl App {
@@ -425,6 +435,21 @@ impl App {
     /// `None` means no forward was confirmed since the last drain.
     pub fn take_forward(&mut self) -> Option<ForwardIntent> {
         self.pending_forward.take()
+    }
+
+    /// Take the pending reaction toggle, if any (#119). The loop drains this each
+    /// tick and dispatches it to
+    /// [`ReactionRequests`](tuigram_core::ReactionRequests)' add/remove on the
+    /// selected message; `None` means no reaction was confirmed since the last drain.
+    pub fn take_reaction(&mut self) -> Option<ReactionIntent> {
+        self.pending_reaction.take()
+    }
+
+    /// Take the pending pin toggle, if any (#119). The loop drains this each tick and
+    /// dispatches it to [`PinRequests`](tuigram_core::PinRequests)' pin/unpin on the
+    /// selected message; `None` means no pin was toggled since the last drain.
+    pub fn take_pin(&mut self) -> Option<PinIntent> {
+        self.pending_pin.take()
     }
 
     /// Open the forward target picker for `message_id` from `source_chat_id`, shared
@@ -767,11 +792,22 @@ impl App {
                 self.dirty = true;
             }
             Action::PinToggle => {
-                // Pin/unpin the selected message. Phase 6 also calls core's
-                // pin/unpin; for now the local flip drives the 📌 indicator. A no-op
-                // on an empty history (no selected message).
-                if let Some(id) = self.conversation.selected_message().map(|m| m.id) {
+                // Pin/unpin the selected message: flip the 📌 indicator optimistically
+                // and record the intent for the loop to send through core's pin/unpin
+                // (#119). The pre-toggle pinned state decides pin vs unpin. A no-op on
+                // an empty history (no selected message).
+                if let Some((chat_id, id)) = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.chat_id, m.id))
+                {
+                    let pin = !self.conversation.is_pinned(id);
                     self.conversation.toggle_pin(id);
+                    self.pending_pin = Some(PinIntent {
+                        chat_id,
+                        message_id: id,
+                        pin,
+                    });
                     self.dirty = true;
                 }
             }
@@ -792,12 +828,25 @@ impl App {
                 self.dirty = true;
             }
             Action::ReactionConfirm => {
-                // Toggle the picked emoji on the selected message and close. Phase 6
-                // dispatches the core add/remove and folds the real counts; here the
-                // optimistic flip updates the `{emoji×n*}` chips directly.
-                if let Some(id) = self.conversation.selected_message().map(|m| m.id) {
-                    self.conversation
-                        .toggle_reaction(id, self.reaction.selected_emoji());
+                // Toggle the picked emoji on the selected message and close. The
+                // optimistic flip updates the `{emoji×n*}` chips directly; the intent
+                // it records drives the core add/remove (#119), whose real counts fold
+                // in later. Whether we already had that reaction (pre-toggle) decides
+                // add vs remove.
+                if let Some((chat_id, id)) = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.chat_id, m.id))
+                {
+                    let emoji = self.reaction.selected_emoji();
+                    let add = !self.conversation.has_own_reaction(id, emoji);
+                    self.conversation.toggle_reaction(id, emoji);
+                    self.pending_reaction = Some(ReactionIntent {
+                        chat_id,
+                        message_id: id,
+                        emoji: emoji.to_owned(),
+                        add,
+                    });
                 }
                 self.overlay = Overlay::None;
                 self.dirty = true;
@@ -1569,6 +1618,7 @@ mod tests {
 
     // --- media, reactions & pins (#85) ---
 
+    use crate::reactions::ReactionIntent;
     use tuigram_core::model::ReactionKind;
 
     /// An app whose history holds two text messages, the first (oldest, at the top)
@@ -1593,15 +1643,35 @@ mod tests {
     }
 
     #[test]
-    fn pin_toggles_the_selected_message_and_dirties() {
+    fn pin_toggles_the_selected_message_and_records_the_intent() {
+        use crate::conversation::PinIntent;
         let mut app = app_with_history();
         let id = app.conversation().selected_message().unwrap().id;
         app.clear_dirty();
         app.dispatch(Action::PinToggle);
-        assert!(app.conversation().is_pinned(id), "pinned");
+        assert!(app.conversation().is_pinned(id), "pinned optimistically");
         assert!(app.is_dirty());
+        // The pin (not unpin) is recorded for the loop to send to core.
+        assert_eq!(
+            app.take_pin(),
+            Some(PinIntent {
+                chat_id: 1,
+                message_id: id,
+                pin: true,
+            })
+        );
+        assert_eq!(app.take_pin(), None, "the intent is drained once");
+        // Toggling again unpins, and records the matching unpin.
         app.dispatch(Action::PinToggle);
         assert!(!app.conversation().is_pinned(id), "unpinned again");
+        assert_eq!(
+            app.take_pin(),
+            Some(PinIntent {
+                chat_id: 1,
+                message_id: id,
+                pin: false,
+            })
+        );
     }
 
     #[test]
@@ -1610,6 +1680,7 @@ mod tests {
         app.clear_dirty();
         app.dispatch(Action::PinToggle);
         assert!(!app.is_dirty(), "no selected message, nothing changes");
+        assert_eq!(app.take_pin(), None, "no intent recorded");
     }
 
     #[test]
@@ -1628,6 +1699,45 @@ mod tests {
         assert_eq!(reactions.len(), 1);
         assert!(reactions[0].is_chosen, "our reaction is recorded");
         assert_eq!(reactions[0].kind, ReactionKind::Emoji(chosen.to_owned()));
+        // The add (a fresh reaction) is recorded for the loop to send to core.
+        assert_eq!(
+            app.take_reaction(),
+            Some(ReactionIntent {
+                chat_id: 1,
+                message_id: id,
+                emoji: chosen.to_owned(),
+                add: true,
+            })
+        );
+        assert_eq!(app.take_reaction(), None, "the intent is drained once");
+    }
+
+    #[test]
+    fn reacting_with_the_same_emoji_again_records_a_removal() {
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        // React once (add), then again with the same emoji (remove).
+        app.dispatch(Action::ReactionOpen);
+        let chosen = app.reaction().selected_emoji();
+        app.dispatch(Action::ReactionConfirm);
+        assert!(matches!(app.take_reaction(), Some(i) if i.add));
+        app.dispatch(Action::ReactionOpen);
+        app.dispatch(Action::ReactionConfirm);
+        // The optimistic bucket is gone, and the recorded intent is a removal.
+        let message = app.conversation().messages().iter().find(|m| m.id == id);
+        assert!(
+            message.unwrap().reactions.is_empty(),
+            "our reaction removed"
+        );
+        assert_eq!(
+            app.take_reaction(),
+            Some(ReactionIntent {
+                chat_id: 1,
+                message_id: id,
+                emoji: chosen.to_owned(),
+                add: false,
+            })
+        );
     }
 
     #[test]
@@ -1654,6 +1764,7 @@ mod tests {
                 .all(|m| m.reactions.is_empty()),
             "cancel adds no reaction"
         );
+        assert_eq!(app.take_reaction(), None, "cancel records no intent");
     }
 
     #[test]

@@ -17,6 +17,32 @@
 /// available-reactions list, which is a Phase 6 refinement.
 const PALETTE: &[&str] = &["👍", "👎", "❤️", "🔥", "🎉", "😁", "😢", "🙏"];
 
+/// A confirmed reaction toggle, recorded by `App` as a pure intent for the loop to
+/// dispatch (#119) — the message and emoji, and whether the toggle **added** our
+/// reaction or **removed** it. `App` never touches the `Client`, so
+/// [`ReactionConfirm`](crate::app::Action::ReactionConfirm) reflects the toggle
+/// optimistically and records this; the loop drains it into
+/// [`ReactionRequests::add_message_reaction`] / `remove_message_reaction`, the same
+/// intent-then-drain split forwarding (#118) uses. The real
+/// `updateMessageInteractionInfo` then folds the authoritative counts back over the
+/// optimistic ones.
+///
+/// [`ReactionRequests::add_message_reaction`]: tuigram_core::ReactionRequests::add_message_reaction
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReactionIntent {
+    /// The chat holding the reacted-to message — `add`/`remove_message_reaction`'s
+    /// chat.
+    pub chat_id: i64,
+    /// The message being reacted to, by id.
+    pub message_id: i64,
+    /// The standard emoji reaction being toggled (e.g. `"👍"`).
+    pub emoji: String,
+    /// Whether the toggle added our reaction (`true` → `add_message_reaction`) or
+    /// removed it (`false` → `remove_message_reaction`), decided from the message's
+    /// pre-toggle state.
+    pub add: bool,
+}
+
 /// The reaction overlay's state: the emoji palette and the selected one. The
 /// palette is fixed, so this is just a clamped cursor over [`PALETTE`].
 #[derive(Debug, Clone, Default)]

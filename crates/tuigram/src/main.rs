@@ -63,8 +63,9 @@ use tokio_stream::StreamExt;
 
 use tuigram_core::model::ChatListKind;
 use tuigram_core::{
-    Client, EditRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST, ReadRequests,
-    SendRequests, load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
+    Client, EditRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST, PinRequests,
+    ReactionRequests, ReadRequests, SendRequests, load_archive_list, load_folder_list,
+    load_main_list, search_chat, search_global,
 };
 
 use crate::app::{Action, App};
@@ -301,6 +302,10 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         drive_search(&mut app, client, &history, &search_tx, &outbound_tx);
         // A confirmed forward copies its messages into the picked target chat (#118).
         drive_forward(&mut app, client, &outbound_tx);
+        // A confirmed reaction/pin toggle hits Telegram; the real update reconciles
+        // the optimistic state the reducer already reflected (#119).
+        drive_reaction(&mut app, client, &outbound_tx);
+        drive_pin(&mut app, client, &outbound_tx);
     }
 
     Ok(())
@@ -596,6 +601,76 @@ fn drive_forward(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender
             // never user content — safe to show, per the toast contract.
             let _ = outbound_tx
                 .send(Notice::error("forward", Some(&err.message)))
+                .await;
+        }
+    });
+}
+
+/// Dispatch a confirmed reaction toggle to Telegram (#119). `App` reflects the
+/// toggle optimistically and records a pure [`ReactionIntent`](crate::reactions::ReactionIntent);
+/// here the loop drains it and calls [`ReactionRequests`]' add or remove per the
+/// intent's `add` flag.
+///
+/// The call is advisory and fire-and-forget: the reaction is acknowledged to the
+/// server and the authoritative counts arrive as `updateMessageInteractionInfo`,
+/// which the router folds and the next projection reconciles over the optimistic
+/// chips. Only a seam-level rejection reports back, as an error toast on
+/// `outbound_tx`.
+fn drive_reaction(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Notice>) {
+    let Some(intent) = app.take_reaction() else {
+        return;
+    };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        let bridge = client.bridge();
+        let result = if intent.add {
+            bridge
+                .add_message_reaction(intent.chat_id, intent.message_id, intent.emoji)
+                .await
+        } else {
+            bridge
+                .remove_message_reaction(intent.chat_id, intent.message_id, intent.emoji)
+                .await
+        };
+        if let Err(err) = result {
+            let _ = outbound_tx
+                .send(Notice::error("reaction", Some(&err.message)))
+                .await;
+        }
+    });
+}
+
+/// Dispatch a confirmed pin toggle to Telegram (#119). `App` flips the chat's pinned
+/// set optimistically and records a pure [`PinIntent`](crate::conversation::PinIntent);
+/// here the loop drains it and calls [`PinRequests`]' pin or unpin per the intent's
+/// `pin` flag.
+///
+/// A plain pin: not silent and shared with the chat (`disable_notification` and
+/// `only_for_self` both false). Fire-and-forget like the reaction path — the real
+/// `updateMessageIsPinned` folds the chat's pinned set, which the next projection
+/// reconciles over the optimistic 📌. Only a seam-level rejection reports back, as an
+/// error toast on `outbound_tx`.
+fn drive_pin(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Notice>) {
+    let Some(intent) = app.take_pin() else {
+        return;
+    };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        let bridge = client.bridge();
+        let result = if intent.pin {
+            bridge
+                .pin_chat_message(intent.chat_id, intent.message_id, false, false)
+                .await
+        } else {
+            bridge
+                .unpin_chat_message(intent.chat_id, intent.message_id)
+                .await
+        };
+        if let Err(err) = result {
+            let _ = outbound_tx
+                .send(Notice::error("pin", Some(&err.message)))
                 .await;
         }
     });
