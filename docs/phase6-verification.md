@@ -72,7 +72,7 @@ Record each real run here (append, don't overwrite):
 
 - **Date:** 2026-07-02
 - **Account / environment:** personal account, residential network, macOS
-- **TDLib / crate version:** TDLib 1.8.61 (via `tdlib-rs =1.4.0`); crate `tuigram_core` 0.0.0
+- **TDLib / crate version:** TDLib 1.8.61 (via `tdlib-rs =1.4.0`); crate `tuigram_core` 0.0.0 — the build under test; month-based CalVer (`2026.7.0`) was adopted immediately after this run
 - **Summary:** Full lifecycle exercised end-to-end against a live account; all 16 paths PASS, no gaps attributed to the tested functionality.
 
 ## Gaps found
