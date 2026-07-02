@@ -4,9 +4,11 @@
 //! Distinct from [`credentials`](crate::credentials): credentials are secrets the
 //! onboarding flow writes (mode `600`), whereas settings are plain preferences the
 //! user hand-edits. They live in sibling files under the same `tuigram` config dir
-//! so both resolve identically, but this module owns no secrets and never writes —
-//! it only reads, and a missing or malformed file falls back to safe defaults rather
-//! than failing startup.
+//! so both resolve identically. This module owns no secrets, and its only write is a
+//! **default template on first run** ([`StorageSettings::ensure_default_file`]) so the
+//! file exists to edit — an existing file is never overwritten. Loads are pure reads,
+//! and a missing or malformed file falls back to safe defaults rather than failing
+//! startup.
 //!
 //! ## Retention ([`StorageSettings`])
 //!
@@ -29,8 +31,10 @@
 //! max_cache     = "2GB"       # global size backstop across every chat
 //! ```
 //!
-//! An annotated template ships as `settings.example.toml` at the repo root — copy it
-//! to `~/.config/tuigram/settings.toml` to opt in.
+//! On first run tuigram writes a default `settings.toml` (all keys at their defaults)
+//! so there is a real file to edit in place; an annotated `settings.example.toml` also
+//! ships at the repo root as a fuller reference. Editing either — by hand, or through
+//! the app — changes retention.
 //!
 //! ## Two complementary policies
 //!
@@ -45,7 +49,8 @@
 //! bounding the total. Both default off, so retention stays strictly opt-in.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -315,6 +320,90 @@ impl StorageSettings {
             }
         }
     }
+
+    /// Render this policy as the text of a `settings.toml` — an annotated `[storage]`
+    /// table with these values filled in. The single source of truth for the file's
+    /// on-disk form: [`ensure_default_file`](Self::ensure_default_file) writes it on
+    /// first run, and it round-trips (the output [`load`](Self::load)s back to `self`),
+    /// so the same renderer can rewrite the file after an edit without losing shape.
+    #[must_use]
+    pub fn render(&self) -> String {
+        // The comment block mirrors settings.example.toml's grammar so a hand-editor
+        // needs no other reference; the values are this policy's, aligned on the keys.
+        format!(
+            "# tuigram settings — download-cache retention. Safe to hand-edit.\n\
+             #\n\
+             # Plain preferences, not secrets (credentials live in config.toml). Every\n\
+             # key is optional and falls back to its default; the defaults below keep\n\
+             # everything, so retention is opt-in. tuigram writes this file once with the\n\
+             # defaults and never overwrites your edits.\n\
+             #\n\
+             # keep_* : \"forever\" (default), or a duration — \"3d\", \"1w\", \"1m\", or\n\
+             #          a bare day count like \"14\". Deletes media not accessed within it.\n\
+             # max_cache : \"unbounded\" (default), or a total-cache size ceiling across\n\
+             #             every chat — \"512MB\", \"2GB\", or a byte count. Binary units.\n\
+             \n\
+             [storage]\n\
+             keep_private  = \"{}\"\n\
+             keep_groups   = \"{}\"\n\
+             keep_channels = \"{}\"\n\
+             max_cache     = \"{}\"\n",
+            self.keep_private, self.keep_groups, self.keep_channels, self.max_cache
+        )
+    }
+
+    /// First run: write a default `settings.toml` to the user's config path so the file
+    /// exists to edit, if it is not there already. Best-effort maintenance — an
+    /// unresolvable config dir or an unwritable location is logged and ignored (the app
+    /// still runs on defaults), and an **existing** file is left exactly as-is.
+    pub fn ensure_default_file() {
+        let Some(path) = settings_path() else {
+            return;
+        };
+        if let Err(err) = init_default_at(&path) {
+            eprintln!("tuigram: could not write {}: {err}", path.display());
+        }
+    }
+}
+
+/// Write the default template to `path` unless a settings file is already there.
+/// Returns whether it wrote. Split from [`StorageSettings::ensure_default_file`] so the
+/// first-run behaviour is testable against an explicit path with no `HOME`.
+fn init_default_at(path: &Path) -> io::Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    write_settings_file(path, &StorageSettings::default().render())?;
+    Ok(true)
+}
+
+/// Write `contents` to `path`, creating the parent dir. Unlike credentials' owner-only
+/// `600`, settings are non-secret preferences, so the file is the usual world-readable
+/// `644`. Always truncates — callers decide whether to overwrite before calling.
+#[cfg(unix)]
+fn write_settings_file(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_settings_file(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, contents)
 }
 
 /// The whole settings file. Only `[storage]` today; a table keeps room for future
@@ -417,6 +506,65 @@ mod tests {
         let file: SettingsFile = toml::from_str(&text).expect("example must parse");
         assert_eq!(file.storage, StorageSettings::default());
         assert!(!file.storage.sweeps_anything());
+    }
+
+    #[test]
+    fn render_round_trips_through_load() {
+        // The rendered file must parse back to the exact policy it came from — both the
+        // default and a fully non-default one — so first-run and later rewrites are
+        // lossless. Round-trip is by meaning: a week reads back as its day-equivalent.
+        for original in [
+            StorageSettings::default(),
+            StorageSettings {
+                keep_private: KeepMedia::Days(3),
+                keep_groups: KeepMedia::Days(7),
+                keep_channels: KeepMedia::Forever,
+                max_cache: CacheCap::Bytes(2 * BYTES_PER_GB),
+            },
+        ] {
+            let parsed: SettingsFile =
+                toml::from_str(&original.render()).expect("rendered settings must parse");
+            assert_eq!(parsed.storage, original);
+        }
+    }
+
+    #[test]
+    fn init_default_writes_the_default_when_absent_and_creates_the_dir() {
+        // First run: no file yet, so a default one is written under a freshly created
+        // config dir and parses back to the default policy.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tuigram").join("settings.toml");
+        assert!(init_default_at(&path).unwrap(), "should report it wrote");
+        assert!(path.exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        let file: SettingsFile = toml::from_str(&text).unwrap();
+        assert_eq!(file.storage, StorageSettings::default());
+    }
+
+    #[test]
+    fn init_default_never_overwrites_an_existing_file() {
+        // A settings file already there — even a hand-edited or malformed one — is left
+        // byte-for-byte untouched, and the call reports it did not write.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let existing = "[storage]\nkeep_channels = \"3d\"\n# my notes\n";
+        std::fs::write(&path, existing).unwrap();
+        assert!(
+            !init_default_at(&path).unwrap(),
+            "should not write over a file"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_written_settings_file_is_world_readable_644() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        write_settings_file(&path, "[storage]\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "settings are non-secret preferences, not 600");
     }
 
     #[test]

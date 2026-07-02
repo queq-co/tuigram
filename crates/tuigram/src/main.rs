@@ -207,7 +207,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     let mut core_rx = spawn_core_source(client);
     // Download-cache retention policy (#120), read once from settings.toml; the
     // periodic sweep applies it. Absent/malformed settings default to keep-forever,
-    // so retention is off unless the user opts in.
+    // so retention is off unless the user opts in. On first run write a default file so
+    // there is something to edit (#145) — best-effort, and never over an existing file.
+    StorageSettings::ensure_default_file();
     let storage_settings = StorageSettings::load();
     let mut sweep_tick = tokio::time::interval(STORAGE_SWEEP_INTERVAL);
     // The lists whose `loadChats` paging has been kicked off, so each is loaded
