@@ -11,6 +11,7 @@
 //! Errors surface a fixed action phrase and an optional core error *code* — never
 //! the user's typed input, the same rule the login flow follows.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 /// The core link's connection lifecycle, mirrored from TDLib's `connectionState`.
@@ -129,6 +130,19 @@ impl Notice {
         Self::new(NoticeLevel::Error, text)
     }
 
+    /// Build an error toast for a failed core request (#122): the fixed `action`
+    /// phrase plus the raw TDLib error `message`, folded through
+    /// [`normalize_error`] into a short readable code. This is the single entry
+    /// point every Phase-6 send path funnels through, so a flood-wait, a
+    /// permission denial, or a dropped link all read the same way regardless of
+    /// which request failed. Like [`error`](Self::error) it shows only the action
+    /// and a normalized code — never the user's input.
+    #[must_use]
+    pub fn from_core_error(action: &str, message: &str) -> Self {
+        let code = normalize_error(message);
+        Self::error(action, (!code.is_empty()).then_some(code.as_ref()))
+    }
+
     /// Build a notice, giving errors the longer [`ERROR_TTL`] so a failure lingers
     /// long enough to read while routine info/success toasts clear on [`DEFAULT_TTL`].
     fn new(level: NoticeLevel, text: String) -> Self {
@@ -149,6 +163,41 @@ impl Notice {
     #[must_use]
     pub fn line(&self) -> String {
         format!("{} {}", self.level.marker(), self.text)
+    }
+}
+
+/// Fold a raw TDLib error message into a short, readable code for an error toast
+/// (#122).
+///
+/// TDLib names a rejection with a fixed code or phrase — `FLOOD_WAIT_42`,
+/// `CHAT_WRITE_FORBIDDEN`, `USER_PRIVACY_RESTRICTED` — never the user's input, so
+/// the raw string is always safe to show; it just doesn't read well in a toast.
+/// This collapses the common families (rate limits, permission/privacy denials,
+/// transport failures) each onto one plain phrase, matching case-insensitively so
+/// a family's variants (`FLOOD_WAIT`, `SLOWMODE_WAIT`; the several `*_FORBIDDEN`s)
+/// all normalize together. Anything unrecognized keeps its original message — still
+/// a safe fixed code — so no failure is ever swallowed into a silent toast. An
+/// empty message (TDLib gave only a numeric code) yields an empty code, which
+/// [`Notice::from_core_error`] renders as a bare "… failed".
+///
+/// Ordering matters where families overlap: `USER_PRIVACY_RESTRICTED` is caught by
+/// the privacy arm before the permission arm's broader `RESTRICTED`.
+#[must_use]
+pub fn normalize_error(message: &str) -> Cow<'_, str> {
+    let upper = message.to_ascii_uppercase();
+    if upper.contains("FLOOD_WAIT") || upper.contains("SLOWMODE_WAIT") {
+        Cow::Borrowed("rate limited")
+    } else if upper.contains("PRIVACY") || upper.contains("BLOCKED") {
+        Cow::Borrowed("privacy")
+    } else if upper.contains("FORBIDDEN")
+        || upper.contains("RESTRICTED")
+        || upper.contains("ADMIN_REQUIRED")
+    {
+        Cow::Borrowed("not allowed")
+    } else if upper.contains("CONNECT") || upper.contains("NETWORK") || upper.contains("TIMEOUT") {
+        Cow::Borrowed("network")
+    } else {
+        Cow::Borrowed(message)
     }
 }
 
@@ -241,6 +290,49 @@ mod tests {
         // No code (an unclassified failure) still reads cleanly.
         let bare = Notice::error("download", None);
         assert_eq!(bare.line(), "✗ download failed");
+    }
+
+    #[test]
+    fn normalize_error_folds_the_common_tdlib_families() {
+        // Rate limits: the flood/slowmode waits (with their trailing seconds) both
+        // read as one phrase.
+        assert_eq!(normalize_error("FLOOD_WAIT_42"), "rate limited");
+        assert_eq!(normalize_error("SLOWMODE_WAIT_10"), "rate limited");
+        // Privacy/blocked, checked before the broader permission arm so
+        // USER_PRIVACY_RESTRICTED reads as privacy, not "not allowed".
+        assert_eq!(normalize_error("USER_PRIVACY_RESTRICTED"), "privacy");
+        assert_eq!(normalize_error("USER_IS_BLOCKED"), "privacy");
+        // Permission denials, across the several *_FORBIDDEN / admin variants.
+        assert_eq!(normalize_error("CHAT_WRITE_FORBIDDEN"), "not allowed");
+        assert_eq!(normalize_error("CHAT_ADMIN_REQUIRED"), "not allowed");
+        assert_eq!(normalize_error("CHAT_FORWARDS_RESTRICTED"), "not allowed");
+        // Transport failures.
+        assert_eq!(normalize_error("Connection closed"), "network");
+    }
+
+    #[test]
+    fn normalize_error_keeps_an_unrecognized_code_verbatim() {
+        // An unmodelled but still-safe TDLib code passes through unchanged rather
+        // than being swallowed, so the toast always says something.
+        assert_eq!(normalize_error("CHAT_NOT_FOUND"), "CHAT_NOT_FOUND");
+        // An empty message (only a numeric code came back) yields an empty code.
+        assert_eq!(normalize_error(""), "");
+    }
+
+    #[test]
+    fn from_core_error_normalizes_and_reads_uniformly() {
+        // The single send-path entry point: a raw TDLib message becomes a readable
+        // toast, the same shape for every failed action.
+        let flood = Notice::from_core_error("send", "FLOOD_WAIT_42");
+        assert_eq!(flood.level(), NoticeLevel::Error);
+        assert_eq!(flood.line(), "✗ send failed (rate limited)");
+
+        let forbidden = Notice::from_core_error("pin", "CHAT_WRITE_FORBIDDEN");
+        assert_eq!(forbidden.line(), "✗ pin failed (not allowed)");
+
+        // A code-only failure (blank message) drops to a bare "… failed".
+        let bare = Notice::from_core_error("reaction", "");
+        assert_eq!(bare.line(), "✗ reaction failed");
     }
 
     #[test]

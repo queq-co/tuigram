@@ -539,9 +539,10 @@ fn drive_outbound(
         };
         if let Err(err) = result {
             // The TDLib message is a fixed error code (e.g. CHAT_WRITE_FORBIDDEN),
-            // never the user's typed text — safe to show, per the toast contract.
+            // never the user's typed text — safe to show; `from_core_error`
+            // normalizes it to a readable phrase (#122).
             let _ = outbound_tx
-                .send(Notice::error(action, Some(&err.message)))
+                .send(Notice::from_core_error(action, &err.message))
                 .await;
         }
     });
@@ -607,10 +608,10 @@ fn drive_search(
                 let _ = search_tx.send(hits).await;
             }
             // The TDLib message is a fixed error code, never the user's query — safe
-            // to show, per the toast contract.
+            // to show; `from_core_error` normalizes it to a readable phrase (#122).
             Err(err) => {
                 let _ = outbound_tx
-                    .send(Notice::error("search", Some(&err.message)))
+                    .send(Notice::from_core_error("search", &err.message))
                     .await;
             }
         }
@@ -650,9 +651,10 @@ fn drive_forward(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender
             .await;
         if let Err(err) = result {
             // The TDLib message is a fixed error code (e.g. CHAT_FORWARDS_RESTRICTED),
-            // never user content — safe to show, per the toast contract.
+            // never user content — safe to show; `from_core_error` normalizes it to a
+            // readable phrase (#122).
             let _ = outbound_tx
-                .send(Notice::error("forward", Some(&err.message)))
+                .send(Notice::from_core_error("forward", &err.message))
                 .await;
         }
     });
@@ -686,8 +688,9 @@ fn drive_reaction(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sende
                 .await
         };
         if let Err(err) = result {
+            // A fixed TDLib error code, normalized to a readable phrase (#122).
             let _ = outbound_tx
-                .send(Notice::error("reaction", Some(&err.message)))
+                .send(Notice::from_core_error("reaction", &err.message))
                 .await;
         }
     });
@@ -721,8 +724,9 @@ fn drive_pin(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Not
                 .await
         };
         if let Err(err) = result {
+            // A fixed TDLib error code, normalized to a readable phrase (#122).
             let _ = outbound_tx
-                .send(Notice::error("pin", Some(&err.message)))
+                .send(Notice::from_core_error("pin", &err.message))
                 .await;
         }
     });
@@ -758,9 +762,10 @@ fn drive_media(
         // carries no reply target.
         if let Err(err) = client.bridge().send_media(chat_id, None, media).await {
             // The TDLib message is a fixed error code (e.g. CHAT_WRITE_FORBIDDEN),
-            // never the local path or caption — safe to show, per the toast contract.
+            // never the local path or caption — safe to show; `from_core_error`
+            // normalizes it to a readable phrase (#122).
             let _ = outbound_tx
-                .send(Notice::error("send", Some(&err.message)))
+                .send(Notice::from_core_error("send", &err.message))
                 .await;
         }
     });
@@ -796,9 +801,10 @@ fn drive_secret(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<
         };
         if let Err(err) = result {
             // A fixed TDLib error code (e.g. USER_NOT_FOUND), never key material or
-            // user input — safe to show, per the toast contract.
+            // user input — safe to show; `from_core_error` normalizes it to a
+            // readable phrase (#122).
             let _ = outbound_tx
-                .send(Notice::error("secret chat", Some(&err.message)))
+                .send(Notice::from_core_error("secret chat", &err.message))
                 .await;
         }
     });
