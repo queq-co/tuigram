@@ -70,13 +70,18 @@ A mechanical sequence that touches every row with the least account churn:
 
 Record each real run here (append, don't overwrite):
 
-- **Date:** _(unrun)_
-- **Account / environment:** _(unrun — real account, residential network)_
-- **TDLib / crate version:** _(unrun — `application_version` = `tuigram_core::version()`)_
-- **Summary:** _(unrun)_
+- **Date:** 2026-07-02
+- **Account / environment:** personal account, residential network, macOS
+- **TDLib / crate version:** TDLib 1.8.61 (via `tdlib-rs =1.4.0`); crate `tuigram_core` 0.0.0
+- **Summary:** Full lifecycle exercised end-to-end against a live account; all 16 paths PASS, no gaps attributed to the tested functionality.
 
 ## Gaps found
 
 File each gap as its own GitHub issue and link it here — don't paper over it.
 
-- _(none recorded yet — populated during the run)_
+- **No verification gaps.** All 16 paths PASS; nothing attributable to the tested
+  functionality itself.
+- _Harness quality-of-life (not a verification gap):_ REPL command-history
+  navigation (↑/↓) and command autocompletion surfaced as future improvements to
+  the manual REPL — tracked in
+  [#152](https://github.com/queq-co/tuigram/issues/152).
