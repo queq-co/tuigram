@@ -35,22 +35,22 @@ Fill the **Result** column as each path is exercised: `PASS`, `FAIL (#nnn)`, or
 
 | # | Path | REPL command(s) | What to observe | Result | Observed |
 |---|------|-----------------|-----------------|--------|----------|
-| 1 | Real login | *(startup flow)* | Phone → code → 2FA completes; reaches `Ready`; session persists so the next run resumes without re-auth | ⬜ | |
-| 2 | Connection state transitions | `status`, then pull the network | `updateConnectionState` moves Connecting → Updating → Ready; `status` reflects each; recovery after a drop | ⬜ | |
-| 3 | Chat list load | `chats`, `archive`, `folders`, `folder <id>` | Main list, Archive, and folders populate with real chats | ⬜ | |
-| 4 | Open + history | `open <chat>`, `history <chat>` | Recent messages load and render; `open` also marks read (see #6) | ⬜ | |
-| 5 | Send / reply / edit / delete | `send <chat> <text>`, `reply <chat> <msg> <text>`, `edit <chat> <msg> <text>`, `delete <chat> <msg> [all]` | Message appears on the real account; reply threads; edit updates in place; delete removes it | ⬜ | |
-| 6 | Mark-as-read | `read <chat>` (and via `open`) | Unread count clears on the real account; read state folds back | ⬜ | |
-| 7 | Search | `search <query>` (account-wide), `search <chat> <query>` (scoped) | Real hits return; scoped vs. global differ; loaded history untouched afterward | ⬜ | |
-| 8 | React / unreact | `react <chat> <msg> <emoji>`, `unreact <chat> <msg> <emoji>` | Reaction appears/disappears on the real message | ⬜ | |
-| 9 | Pin / unpin | `pin <chat> <msg>`, `unpin <chat> <msg>` | Message pins/unpins chat-wide | ⬜ | |
-| 10 | Forward | `forward <from> <ids> <to>` | Comma-separated ids arrive in the target chat | ⬜ | |
-| 11 | Media download | `download <chat> <msg>`, `file <file_id>` | Media downloads; local path reported; `file` shows transfer state | ⬜ | |
-| 12 | Media send | `sendmedia <chat> photo\|video\|document <path> [cap]` | File arrives on the real account with the caption | ⬜ | |
-| 13 | Typing action | `typing <chat>` | Recipient sees the typing indicator | ⬜ | |
-| 14 | Secret chats | `secret-new <user_id>`, `secrets`, `secret-close <secret_id>` (open/send reuse chat-id commands) | Secret chat negotiates to Ready; send/receive works; close tears it down | ⬜ | |
-| 15 | Dropped-update recovery | provoke a gap, `status`, `resync` | `status` reports STALE with a dropped count; `resync` re-queries and clears it | ⬜ | |
-| 16 | Logout | `logout` | Session invalidated + local DB wiped; the next run starts at a fresh login | ⬜ | |
+| 1 | Real login | *(startup flow)* | Phone → code → 2FA completes; reaches `Ready`; session persists so the next run resumes without re-auth | `PASS` | All tests successful; session is persisted. |
+| 2 | Connection state transitions | `status`, then pull the network | `updateConnectionState` moves Connecting → Updating → Ready; `status` reflects each; recovery after a drop | `PASS` | Status is correctly reflected |
+| 3 | Chat list load | `chats`, `archive`, `folders`, `folder <id>` | Main list, Archive, and folders populate with real chats | `PASS` | Commands work as expected. |
+| 4 | Open + history | `open <chat>`, `history <chat>` | Recent messages load and render; `open` also marks read (see #6) | `PASS` | Commands work as expected. |
+| 5 | Send / reply / edit / delete | `send <chat> <text>`, `reply <chat> <msg> <text>`, `edit <chat> <msg> <text>`, `delete <chat> <msg> [all]` | Message appears on the real account; reply threads; edit updates in place; delete removes it | `PASS` | Commands work as expected. |
+| 6 | Mark-as-read | `read <chat>` (and via `open`) | Unread count clears on the real account; read state folds back | `PASS` | Commands work as expected. |
+| 7 | Search | `search <query>` (account-wide), `search <chat> <query>` (scoped) | Real hits return; scoped vs. global differ; loaded history untouched afterward | `PASS` | Commands work as expected. |
+| 8 | React / unreact | `react <chat> <msg> <emoji>`, `unreact <chat> <msg> <emoji>` | Reaction appears/disappears on the real message | `PASS` | Commands work as expected. |
+| 9 | Pin / unpin | `pin <chat> <msg>`, `unpin <chat> <msg>` | Message pins/unpins chat-wide | `PASS` | Commands work as expected. |
+| 10 | Forward | `forward <from> <ids> <to>` | Comma-separated ids arrive in the target chat | `PASS` | Commands work as expected. |
+| 11 | Media download | `download <chat> <msg>`, `file <file_id>` | Media downloads; local path reported; `file` shows transfer state | `PASS` | Commands work as expected. |
+| 12 | Media send | `sendmedia <chat> photo\|video\|document <path> [cap]` | File arrives on the real account with the caption | `PASS` | Commands work as expected. |
+| 13 | Typing action | `typing <chat>` | Recipient sees the typing indicator | `PASS` | Commands work as expected. |
+| 14 | Secret chats | `secret-new <user_id>`, `secrets`, `secret-close <secret_id>` (open/send reuse chat-id commands) | Secret chat negotiates to Ready; send/receive works; close tears it down | `PASS` | Commands work as expected. |
+| 15 | Dropped-update recovery | provoke a gap, `status`, `resync` | `status` reports STALE with a dropped count; `resync` re-queries and clears it | `PASS` | Commands work as expected. |
+| 16 | Logout | `logout` | Session invalidated + local DB wiped; the next run starts at a fresh login | `PASS` | Commands work as expected. |
 
 ## Suggested run order
 
