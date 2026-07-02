@@ -11,7 +11,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -30,6 +30,7 @@ use crate::composer::ComposerMode;
 use crate::conversation::ConversationView;
 use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaField;
+use crate::settingsform::SettingsField;
 use crate::status::NoticeLevel;
 
 /// Chat-list pane width, as a percentage of the terminal; the conversation pane
@@ -86,6 +87,7 @@ pub fn ui(frame: &mut Frame, app: &App) {
         Overlay::Reaction => render_reaction(frame, frame.area(), app),
         Overlay::SendMedia => render_send_media(frame, frame.area(), app),
         Overlay::SecretChat => render_secret_chat(frame, frame.area(), app),
+        Overlay::Settings => render_settings(frame, frame.area(), app),
     }
 
     // A transient toast floats over the content too, but — unlike a modal overlay
@@ -342,6 +344,7 @@ fn mode_label(app: &App) -> &'static str {
         Overlay::Reaction => "react",
         Overlay::SendMedia => "attach",
         Overlay::SecretChat => "secret chat",
+        Overlay::Settings => "settings",
     }
 }
 
@@ -940,6 +943,66 @@ fn render_send_media(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// The retention settings editor (#146): a centred modal with the three per-kind
+/// TTL fields over the global cache-cap field, pre-filled with the live values. The
+/// focused field shows the caret; a rejected confirm surfaces its reason on a red
+/// line above the key hint, so an invalid value is corrected in place rather than
+/// saved.
+fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let settings = app.settings();
+    let field_line = |field: SettingsField| {
+        settings_field_line(
+            field.label(),
+            settings.value(field),
+            settings.field() == field,
+            settings.cursor(),
+        )
+    };
+    let mut lines = vec![
+        field_line(SettingsField::KeepPrivate),
+        field_line(SettingsField::KeepGroups),
+        field_line(SettingsField::KeepChannels),
+        field_line(SettingsField::MaxCache),
+        Line::from(""),
+    ];
+    if let Some(error) = settings.error() {
+        lines.push(Line::from(Span::styled(
+            error.to_owned(),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    lines.push(hint_line(
+        "Tab next field · Enter save · Esc cancel · forever/3d/1w · 2GB/unbounded",
+    ));
+
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Cache retention ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// One labelled field of the settings editor: a padded label then the value — the
+/// focused field with a caret (via [`input_line`]), the rest their plain text. Every
+/// field is pre-filled, so there is no placeholder branch.
+fn settings_field_line(label: &str, text: &str, focused: bool, cursor: usize) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{label:<10}"),
+        Style::new().add_modifier(Modifier::BOLD),
+    )];
+    if focused {
+        spans.extend(input_line(text, cursor).spans);
+    } else {
+        spans.push(Span::raw(text.to_owned()));
+    }
+    Line::from(spans)
+}
+
 /// The secret-chat lifecycle confirm overlay (#87): a centred modal posing the
 /// start/close question for the selected chat, over a key hint. Confirming runs the
 /// core seam (Phase 6); the prompt reads only the chat's kind and lifecycle state,
@@ -1103,6 +1166,51 @@ mod tests {
             "documents focus switching"
         );
         assert!(text.contains("scroll"), "the footer hints the scroll keys");
+    }
+
+    #[test]
+    fn the_settings_overlay_shows_the_prefilled_fields_and_hint() {
+        use tuigram_core::{CacheCap, KeepMedia, StorageSettings};
+        let mut app = App::new();
+        app.set_storage_settings(StorageSettings {
+            keep_private: KeepMedia::Forever,
+            keep_groups: KeepMedia::Days(7),
+            keep_channels: KeepMedia::Days(3),
+            max_cache: CacheCap::Bytes(2 * 1024 * 1024 * 1024),
+        });
+        app.dispatch(crate::app::Action::SettingsOpen);
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Cache retention"), "overlay title");
+        assert!(text.contains("channels"), "a field label");
+        assert!(
+            text.contains("2GB"),
+            "the live max-cache value is pre-filled"
+        );
+        assert!(text.contains("Enter save"), "the key hint");
+    }
+
+    #[test]
+    fn the_settings_overlay_surfaces_a_rejected_value_in_place() {
+        let mut app = App::new();
+        app.dispatch(crate::app::Action::SettingsOpen);
+        // Replace the private field with an unparseable value, then confirm.
+        for _ in 0.."forever".len() {
+            app.dispatch(crate::app::Action::SettingsBackspace);
+        }
+        for c in "nope".chars() {
+            app.dispatch(crate::app::Action::SettingsInput(c));
+        }
+        app.dispatch(crate::app::Action::SettingsConfirm);
+        assert_eq!(
+            app.overlay(),
+            Overlay::Settings,
+            "still open after rejection"
+        );
+        let text = flatten(&render(&app, 80, 24));
+        assert!(
+            text.contains("private:"),
+            "the reason names the offending field"
+        );
     }
 
     #[test]

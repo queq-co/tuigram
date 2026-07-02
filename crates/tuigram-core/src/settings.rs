@@ -364,6 +364,23 @@ impl StorageSettings {
             eprintln!("tuigram: could not write {}: {err}", path.display());
         }
     }
+
+    /// Persist this policy to `~/.config/tuigram/settings.toml`, replacing any existing
+    /// file with its [`render`](Self::render)ed form (annotations and all). This is the
+    /// deliberate save behind the in-app editor (#146): unlike
+    /// [`ensure_default_file`](Self::ensure_default_file), it **does** overwrite, so the
+    /// on-disk file matches what the running session applies. The error (no config dir,
+    /// an unwritable location) is returned rather than logged, so the caller can toast
+    /// it while still applying the edit in memory.
+    pub fn save(&self) -> io::Result<()> {
+        let path = settings_path().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no config directory (set HOME or XDG_CONFIG_HOME)",
+            )
+        })?;
+        write_settings_file(&path, &self.render())
+    }
 }
 
 /// Write the default template to `path` unless a settings file is already there.
@@ -554,6 +571,26 @@ mod tests {
             "should not write over a file"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), existing);
+    }
+
+    #[test]
+    fn a_saved_edit_overwrites_the_prior_file_through_render() {
+        // The in-app editor's save (#146) replaces the file wholesale with the edited
+        // policy's rendered form — comments and all — over whatever was there, and it
+        // reads back to exactly the edit. (`save` itself resolves the config path and
+        // delegates here; this exercises the overwrite-and-round-trip that matters.)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        write_settings_file(&path, &StorageSettings::default().render()).unwrap();
+        let edited = StorageSettings {
+            keep_private: KeepMedia::Forever,
+            keep_groups: KeepMedia::Days(7),
+            keep_channels: KeepMedia::Days(3),
+            max_cache: CacheCap::Bytes(2 * BYTES_PER_GB),
+        };
+        write_settings_file(&path, &edited.render()).unwrap();
+        let file: SettingsFile = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file.storage, edited);
     }
 
     #[cfg(unix)]

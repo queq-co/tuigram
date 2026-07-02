@@ -2,9 +2,11 @@
 #
 #   cp settings.example.toml ~/.config/tuigram/settings.toml
 #
-# This file is plain, hand-edited preferences — NOT secrets. Credentials
-# (api_id / api_hash) live separately in ~/.config/tuigram/config.toml, which
-# the login flow writes for you; tuigram never writes this settings file.
+# This file is plain preferences — NOT secrets. Credentials (api_id / api_hash)
+# live separately in ~/.config/tuigram/config.toml, which the login flow writes
+# for you. tuigram writes a default settings.toml on first run (it never
+# overwrites your edits), and the in-app editor (press "," while browsing) can
+# rewrite it — but hand-editing this file works just as well.
 #
 # Every key is optional. A missing file, a missing table, or a missing key
 # falls back to the safe default noted below, and a malformed value is ignored

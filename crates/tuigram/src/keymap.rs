@@ -74,6 +74,9 @@ pub enum Overlay {
     SendMedia,
     /// The secret-chat lifecycle confirm: start or close a secret chat (#87).
     SecretChat,
+    /// The retention settings editor (#146): edit the four download-cache knobs,
+    /// applied live and written back to `settings.toml` on confirm.
+    Settings,
 }
 
 /// The focus context a binding applies in. `Global` always applies; `Nav` applies
@@ -334,6 +337,13 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         context: Context::Nav,
+        trigger: Trigger::Plain(&[KeyCode::Char(',')]),
+        action: Action::SettingsOpen,
+        keys: ",",
+        description: "cache-retention settings",
+    },
+    Binding {
+        context: Context::Nav,
         trigger: Trigger::Plain(&[KeyCode::Char('q')]),
         action: Action::Quit,
         keys: "q",
@@ -380,6 +390,7 @@ pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
         Overlay::Reaction => resolve_reaction(key),
         Overlay::SendMedia => resolve_send_media(key),
         Overlay::SecretChat => resolve_secret_chat(key),
+        Overlay::Settings => resolve_settings(key),
     }
 }
 
@@ -515,6 +526,30 @@ fn resolve_send_media(key: &KeyEvent) -> Action {
         KeyCode::End => Action::AttachEnd,
         _ => match printable(key) {
             Some(c) => Action::AttachInput(c),
+            None => Action::Noop,
+        },
+    }
+}
+
+/// The retention settings editor (#146): typing edits the focused knob, Tab moves
+/// between the four fields, Enter validates and saves (a bad value is rejected in
+/// place, keeping the overlay open), Esc cancels. Mirrors the send-media prompt's
+/// multi-field editing.
+fn resolve_settings(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::SettingsCancel,
+        KeyCode::Enter => Action::SettingsConfirm,
+        KeyCode::Tab => Action::SettingsToggleField,
+        KeyCode::Backspace => Action::SettingsBackspace,
+        KeyCode::Left => Action::SettingsLeft,
+        KeyCode::Right => Action::SettingsRight,
+        KeyCode::Home => Action::SettingsHome,
+        KeyCode::End => Action::SettingsEnd,
+        _ => match printable(key) {
+            Some(c) => Action::SettingsInput(c),
             None => Action::Noop,
         },
     }
@@ -678,6 +713,7 @@ mod tests {
             Overlay::Reaction,
             Overlay::SendMedia,
             Overlay::SecretChat,
+            Overlay::Settings,
         ] {
             assert_eq!(
                 resolve(Focus::History, overlay, &ctrl('g')),
@@ -695,6 +731,41 @@ mod tests {
         assert_eq!(
             resolved(Focus::Composer, KeyCode::Char('q')),
             Action::ComposerInput('q')
+        );
+    }
+
+    #[test]
+    fn comma_opens_settings_in_nav_panes_but_types_in_the_composer() {
+        // The settings binding lives in Nav, so it opens from the browsing panes but
+        // never steals the comma key from a message being composed (#146).
+        assert_eq!(
+            resolved(Focus::ChatList, KeyCode::Char(',')),
+            Action::SettingsOpen
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char(',')),
+            Action::SettingsOpen
+        );
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char(',')),
+            Action::ComposerInput(',')
+        );
+    }
+
+    #[test]
+    fn the_settings_overlay_captures_editing_keys() {
+        // While open, the editor captures typing, Tab field-switch, confirm/cancel —
+        // resolved against the overlay, not the pane behind it (#146).
+        let at = |code| resolve(Focus::History, Overlay::Settings, &key(code));
+        assert_eq!(at(KeyCode::Esc), Action::SettingsCancel);
+        assert_eq!(at(KeyCode::Enter), Action::SettingsConfirm);
+        assert_eq!(at(KeyCode::Tab), Action::SettingsToggleField);
+        assert_eq!(at(KeyCode::Backspace), Action::SettingsBackspace);
+        assert_eq!(at(KeyCode::Char('3')), Action::SettingsInput('3'));
+        // Ctrl-C still escapes the modal.
+        assert_eq!(
+            resolve(Focus::History, Overlay::Settings, &ctrl('c')),
+            Action::Quit
         );
     }
 

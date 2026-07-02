@@ -29,7 +29,7 @@ deliberately thin in Phase 5 so Phase 6 only has to feed it.
 | The focus model + the one bindings table | [`keymap.rs`](../crates/tuigram/src/keymap.rs) |
 | The `AppEvent` seam + the temporary fake source | [`event.rs`](../crates/tuigram/src/event.rs) |
 | The terminal guard (raw mode, alt screen, restore) | [`terminal.rs`](../crates/tuigram/src/terminal.rs) |
-| Per-pane / per-overlay view-models | `chat_list`, `conversation`, `composer`, `search`, `forward`, `reactions`, `mediaform`, `secret`, `login`, `status`, `textinput` |
+| Per-pane / per-overlay view-models | `chat_list`, `conversation`, `composer`, `search`, `forward`, `reactions`, `mediaform`, `secret`, `settingsform`, `login`, `status`, `textinput` |
 
 ## The central event loop
 
@@ -118,8 +118,8 @@ is always obvious. The **status bar** (added in #88) shows the connection state
 and current chat/mode on the left and the always-available `? help · q quit`
 hint on the right.
 
-A **modal overlay** (help, search, forward, reaction, send-media, secret-chat)
-floats above the panes and **captures input** while open. A **transient toast**
+A **modal overlay** (help, search, forward, reaction, send-media, secret-chat,
+settings) floats above the panes and **captures input** while open. A **transient toast**
 also floats above the content but deliberately does **not** capture input, so a
 notification never blocks the loop. Both are drawn after the panes; the toast
 sits outside the overlay match for exactly that reason.
