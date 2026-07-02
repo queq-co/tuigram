@@ -29,6 +29,9 @@
 //! max_cache     = "2GB"       # global size backstop across every chat
 //! ```
 //!
+//! An annotated template ships as `settings.example.toml` at the repo root — copy it
+//! to `~/.config/tuigram/settings.toml` to opt in.
+//!
 //! ## Two complementary policies
 //!
 //! The per-kind TTLs are applied through `optimizeStorage` **scoped** to chat ids, and
@@ -402,6 +405,18 @@ mod tests {
         assert_eq!(file.storage.keep_private, KeepMedia::Forever);
         assert_eq!(file.storage.max_cache, CacheCap::Bytes(2 * BYTES_PER_GB));
         assert!(file.storage.sweeps_anything());
+    }
+
+    #[test]
+    fn the_shipped_example_parses_to_the_all_default_policy() {
+        // `settings.example.toml` at the repo root is the user-facing template; keep it
+        // in lockstep with the parser. Every key it shows is the default, so a fresh
+        // copy is a valid no-op config (all-forever, unbounded, sweeps nothing).
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../settings.example.toml");
+        let text = std::fs::read_to_string(path).expect("settings.example.toml must exist");
+        let file: SettingsFile = toml::from_str(&text).expect("example must parse");
+        assert_eq!(file.storage, StorageSettings::default());
+        assert!(!file.storage.sweeps_anything());
     }
 
     #[test]
