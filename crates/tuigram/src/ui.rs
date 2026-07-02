@@ -11,7 +11,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -19,8 +19,8 @@ use ratatui::widgets::{
 };
 
 use tuigram_core::model::{
-    Chat, ChatAction, ChatKind, File, FileRef, FormattedText, Message, MessageContent,
-    ReactionKind, SecretChatState, Sender,
+    Chat, ChatAction, ChatKind, File, FormattedText, Message, MessageContent, ReactionKind,
+    SecretChatState, Sender,
 };
 
 use crate::chat_list::ChatListView;
@@ -30,6 +30,7 @@ use crate::composer::ComposerMode;
 use crate::conversation::ConversationView;
 use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaField;
+use crate::settingsform::SettingsField;
 use crate::status::NoticeLevel;
 
 /// Chat-list pane width, as a percentage of the terminal; the conversation pane
@@ -79,13 +80,14 @@ pub fn ui(frame: &mut Frame, app: &App) {
     // A modal overlay floats above the panes, capturing input while open.
     match app.overlay() {
         Overlay::None => {}
-        Overlay::Help => render_help(frame, frame.area()),
+        Overlay::Help => render_help(frame, frame.area(), app),
         Overlay::SearchInput => render_search_input(frame, frame.area(), app),
         Overlay::SearchResults => render_search_results(frame, frame.area(), app),
         Overlay::Forward => render_forward(frame, frame.area(), app),
         Overlay::Reaction => render_reaction(frame, frame.area(), app),
         Overlay::SendMedia => render_send_media(frame, frame.area(), app),
         Overlay::SecretChat => render_secret_chat(frame, frame.area(), app),
+        Overlay::Settings => render_settings(frame, frame.area(), app),
     }
 
     // A transient toast floats over the content too, but — unlike a modal overlay
@@ -268,15 +270,12 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The pre-data conversation pane: a welcome banner that doubles as the liveness
-/// view, echoing the core heartbeat count until real history (Phase 6) replaces
-/// it. The quit/help hint now lives in the status bar (#88), so the banner only
-/// carries the welcome and the heartbeat proof.
+/// The pre-data conversation pane: a welcome banner shown until real history
+/// (a later Phase 6 issue) replaces it. The heartbeat counter it used to echo is
+/// gone with the fake source (#110); the connection state now lives in the status
+/// bar (#88), so the banner only carries the welcome.
 fn render_conversation_placeholder(frame: &mut Frame, area: Rect, app: &App) {
-    let body = format!(
-        "tuigram — Phase 5 TUI skeleton\n\ncore heartbeats: {}",
-        app.beats()
-    );
+    let body = "tuigram — Phase 5 TUI skeleton\n\nselect a chat to begin";
     let block = pane_block(" tuigram ".to_owned(), app.focus() == Focus::History)
         .title_alignment(Alignment::Center);
     let widget = Paragraph::new(body)
@@ -345,6 +344,7 @@ fn mode_label(app: &App) -> &'static str {
         Overlay::Reaction => "react",
         Overlay::SendMedia => "attach",
         Overlay::SecretChat => "secret chat",
+        Overlay::Settings => "settings",
     }
 }
 
@@ -370,10 +370,16 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         " Notice ".to_owned()
     };
+    // The dismiss affordance (#139), on the bottom border: a toast also ages out on
+    // its own, but this tells the user how to clear one immediately.
+    let hint = " Ctrl-G to dismiss ";
 
-    // Width fits the message or the title, whichever is wider, plus borders —
-    // clamped to a readable maximum and to the content area.
-    let content_cols = (line_cols.max(title.chars().count()) + 2) as u16;
+    // Width fits the message, the title, or the hint — whichever is widest — plus
+    // borders, clamped to a readable maximum and to the content area.
+    let content_cols = (line_cols
+        .max(title.chars().count())
+        .max(hint.chars().count())
+        + 2) as u16;
     let width = content_cols
         .clamp(1, TOAST_MAX_WIDTH)
         .min(area.width.saturating_sub(2));
@@ -382,7 +388,6 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
     let inner = width.saturating_sub(2).max(1) as usize;
     let rows = line_cols.div_ceil(inner).max(1) as u16;
     let height = (rows + 2).min(area.height);
-    let body = Paragraph::new(line).wrap(ratatui::widgets::Wrap { trim: false });
 
     // Top-right, one cell in from the border so it does not sit on the corner.
     let x = area.x + area.width.saturating_sub(width + 1);
@@ -394,16 +399,22 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
         height,
     };
 
+    // Errors bold the message; the hint stays dim regardless, so each carries its own
+    // style rather than styling the whole widget.
     let emphasis = if notice.level() == NoticeLevel::Error {
         Style::new().add_modifier(Modifier::BOLD)
     } else {
         Style::new()
     };
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let block = Block::bordered()
+        .title(title)
+        .title_bottom(Line::styled(hint, dim).right_aligned());
+    let body = Paragraph::new(Line::styled(line, emphasis))
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(block);
     frame.render_widget(Clear, rect);
-    frame.render_widget(
-        body.block(Block::bordered().title(title)).style(emphasis),
-        rect,
-    );
+    frame.render_widget(body, rect);
 }
 
 /// The lines for one message: a bold sender/timestamp header (with a selection
@@ -437,31 +448,11 @@ fn message_lines(view: &ConversationView, message: &Message, selected: bool) -> 
     lines
 }
 
-/// The file a media message references, if any — the key into the download store
-/// for the progress indicator. Non-file content (text, location, poll, …) has none.
-fn content_file(content: &MessageContent) -> Option<FileRef> {
-    match content {
-        MessageContent::Photo(p) => Some(p.file),
-        MessageContent::Video(v) => Some(v.file),
-        MessageContent::Document(d) => Some(d.file),
-        MessageContent::Audio(a) => Some(a.file),
-        MessageContent::Voice(v) => Some(v.file),
-        MessageContent::Sticker(s) => Some(s.file),
-        MessageContent::Animation(a) => Some(a.file),
-        MessageContent::Text(_)
-        | MessageContent::Location(_)
-        | MessageContent::Venue(_)
-        | MessageContent::Contact(_)
-        | MessageContent::Poll(_)
-        | MessageContent::Unsupported(_) => None,
-    }
-}
-
 /// The download-progress line for a media message, driven by the file's transfer
 /// state: a dim percentage while a download is active, a saved marker once it is
 /// present, or `None` when the file is unknown or not being fetched.
 fn download_line(view: &ConversationView, content: &MessageContent) -> Option<Line<'static>> {
-    let file = view.download(content_file(content)?.id)?;
+    let file = view.download(content.file()?.id)?;
     let text = if file.is_downloading_active {
         format!("⬇ downloading {}%", percent(file))
     } else if file.is_present() {
@@ -659,20 +650,38 @@ pub(crate) fn input_line(text: &str, cursor: usize) -> Line<'static> {
 }
 
 /// The help overlay: a centred, bordered popup listing the active key bindings,
-/// generated from the keymap so it always matches what the keys actually do.
-fn render_help(frame: &mut Frame, area: Rect) {
+/// generated from the keymap so it always matches what the keys actually do. On a
+/// terminal too short to show every binding the body scrolls (`app.help_scroll`),
+/// with a fixed hint row along the bottom; the border and hint stay put while the
+/// bindings slide under them.
+fn render_help(frame: &mut Frame, area: Rect, app: &App) {
     let lines = help_lines();
     let content_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let popup = centered_rect(content_width + 4, lines.len() as u16 + 2, area);
+    // Border (2) + the hint row (1) frame the scrollable body; `centered_rect` clamps
+    // the height to the terminal, so a tall cheatsheet becomes a scroll viewport.
+    let popup = centered_rect(content_width + 4, lines.len() as u16 + 3, area);
     // `Clear` wipes the panes underneath so the overlay reads as a modal.
     frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(" Help ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [body_area, hint_area] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+
+    // `scroll` offsets the body; ratatui clips it to `body_area`, so the offset picks
+    // the first visible binding line. The offset is already clamped to the last line
+    // by the reducer.
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::bordered()
-                .title(" Help ")
-                .title_alignment(Alignment::Center),
-        ),
-        popup,
+        Paragraph::new(lines).scroll((app.help_scroll(), 0)),
+        body_area,
+    );
+    frame.render_widget(
+        Paragraph::new(hint_line("j / k scroll · ? / q / Esc close")),
+        hint_area,
     );
 }
 
@@ -786,7 +795,7 @@ fn render_search_results(frame: &mut Frame, area: Rect, app: &App) {
         title,
         items,
         search.selected(),
-        "j / k move · f forward · Esc close",
+        "j / k move · Enter open · f forward · Esc close",
     );
 }
 
@@ -813,21 +822,87 @@ fn render_forward(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// The reaction picker (#85): a centred modal listing the emoji palette with the
-/// selected one marked. Confirming toggles it on the selected message.
+/// selected one marked (palette mode), or the custom-emoji entry line (custom mode,
+/// #119). Confirming toggles the effective emoji on the selected message.
 fn render_reaction(frame: &mut Frame, area: Rect, app: &App) {
     let picker = app.reaction();
+    match picker.custom_input() {
+        Some(buffer) => render_reaction_custom(frame, area, buffer),
+        None => render_reaction_palette(frame, area, picker),
+    }
+}
+
+/// Palette mode: the emoji list with the selected one marked, over a dim affordance
+/// for the custom-emoji line and the key hint.
+fn render_reaction_palette(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &crate::reactions::ReactionPicker,
+) {
     let items: Vec<ListItem> = picker
         .palette()
         .iter()
         .map(|emoji| ListItem::new((*emoji).to_owned()))
         .collect();
-    render_list_modal(
-        frame,
-        area,
-        " React ".to_owned(),
-        items,
-        picker.selected(),
-        "j / k move · Enter toggle · Esc cancel",
+
+    // Border (2) + the palette rows + the custom affordance (1) + the hint row (1).
+    let height = items.len() as u16 + 4;
+    let popup = centered_rect(OVERLAY_WIDTH, height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::bordered()
+        .title(" React ")
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let [list_area, custom_area, hint_area] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+
+    let list = List::new(items)
+        .highlight_symbol(SELECTED_SYMBOL)
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut state = ListState::default().with_selected(Some(picker.selected()));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    frame.render_widget(
+        Paragraph::new(hint_line("c  type a custom emoji")),
+        custom_area,
+    );
+    frame.render_widget(
+        Paragraph::new(hint_line("j / k move · Enter react · Esc cancel")),
+        hint_area,
+    );
+}
+
+/// Custom mode: the editable custom-emoji line (with the caret) over the key hint.
+/// The buffer takes whatever the OS emoji picker or a paste emits, so the caret sits
+/// at its end.
+fn render_reaction_custom(frame: &mut Frame, area: Rect, buffer: &str) {
+    let cursor = buffer.chars().count();
+    let mut spans = vec![Span::styled(
+        "custom ",
+        Style::new().add_modifier(Modifier::DIM),
+    )];
+    spans.extend(input_line(buffer, cursor).spans);
+    let lines = vec![
+        Line::from(spans),
+        Line::from(""),
+        hint_line("type or paste an emoji · Enter react · Esc back"),
+    ];
+
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" React ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
     );
 }
 
@@ -866,6 +941,66 @@ fn render_send_media(frame: &mut Frame, area: Rect, app: &App) {
         ),
         popup,
     );
+}
+
+/// The retention settings editor (#146): a centred modal with the three per-kind
+/// TTL fields over the global cache-cap field, pre-filled with the live values. The
+/// focused field shows the caret; a rejected confirm surfaces its reason on a red
+/// line above the key hint, so an invalid value is corrected in place rather than
+/// saved.
+fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
+    let settings = app.settings();
+    let field_line = |field: SettingsField| {
+        settings_field_line(
+            field.label(),
+            settings.value(field),
+            settings.field() == field,
+            settings.cursor(),
+        )
+    };
+    let mut lines = vec![
+        field_line(SettingsField::KeepPrivate),
+        field_line(SettingsField::KeepGroups),
+        field_line(SettingsField::KeepChannels),
+        field_line(SettingsField::MaxCache),
+        Line::from(""),
+    ];
+    if let Some(error) = settings.error() {
+        lines.push(Line::from(Span::styled(
+            error.to_owned(),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    lines.push(hint_line(
+        "Tab next field · Enter save · Esc cancel · forever/3d/1w · 2GB/unbounded",
+    ));
+
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Cache retention ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// One labelled field of the settings editor: a padded label then the value — the
+/// focused field with a caret (via [`input_line`]), the rest their plain text. Every
+/// field is pre-filled, so there is no placeholder branch.
+fn settings_field_line(label: &str, text: &str, focused: bool, cursor: usize) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("{label:<10}"),
+        Style::new().add_modifier(Modifier::BOLD),
+    )];
+    if focused {
+        spans.extend(input_line(text, cursor).spans);
+    } else {
+        spans.push(Span::raw(text.to_owned()));
+    }
+    Line::from(spans)
 }
 
 /// The secret-chat lifecycle confirm overlay (#87): a centred modal posing the
@@ -1030,14 +1165,88 @@ mod tests {
             text.contains("focus next pane"),
             "documents focus switching"
         );
+        assert!(text.contains("scroll"), "the footer hints the scroll keys");
     }
 
     #[test]
-    fn shows_heartbeat_count() {
+    fn the_settings_overlay_shows_the_prefilled_fields_and_hint() {
+        use tuigram_core::{CacheCap, KeepMedia, StorageSettings};
         let mut app = App::new();
-        app.dispatch(crate::app::Action::Beat);
-        app.dispatch(crate::app::Action::Beat);
-        assert!(flatten(&render(&app, 80, 24)).contains("heartbeats: 2"));
+        app.set_storage_settings(StorageSettings {
+            keep_private: KeepMedia::Forever,
+            keep_groups: KeepMedia::Days(7),
+            keep_channels: KeepMedia::Days(3),
+            max_cache: CacheCap::Bytes(2 * 1024 * 1024 * 1024),
+        });
+        app.dispatch(crate::app::Action::SettingsOpen);
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Cache retention"), "overlay title");
+        assert!(text.contains("channels"), "a field label");
+        assert!(
+            text.contains("2GB"),
+            "the live max-cache value is pre-filled"
+        );
+        assert!(text.contains("Enter save"), "the key hint");
+    }
+
+    #[test]
+    fn the_settings_overlay_surfaces_a_rejected_value_in_place() {
+        let mut app = App::new();
+        app.dispatch(crate::app::Action::SettingsOpen);
+        // Replace the private field with an unparseable value, then confirm.
+        for _ in 0.."forever".len() {
+            app.dispatch(crate::app::Action::SettingsBackspace);
+        }
+        for c in "nope".chars() {
+            app.dispatch(crate::app::Action::SettingsInput(c));
+        }
+        app.dispatch(crate::app::Action::SettingsConfirm);
+        assert_eq!(
+            app.overlay(),
+            Overlay::Settings,
+            "still open after rejection"
+        );
+        let text = flatten(&render(&app, 80, 24));
+        assert!(
+            text.contains("private:"),
+            "the reason names the offending field"
+        );
+    }
+
+    #[test]
+    fn help_line_count_matches_the_rendered_body() {
+        // The scroll clamp keys off `keymap::help_line_count`; it must track the lines
+        // `help_lines` actually produces, or a scroll could stop short or overrun.
+        assert_eq!(keymap::help_line_count(), help_lines().len());
+    }
+
+    #[test]
+    fn a_short_terminal_scrolls_the_help_body() {
+        let mut app = App::new();
+        app.dispatch(crate::app::Action::ToggleHelp);
+        // A terminal too short to show the whole cheatsheet: the first section shows
+        // at the top, the last does not.
+        let top = flatten(&render(&app, 80, 10));
+        assert!(top.contains("Global"), "the first section is at the top");
+        assert!(
+            !top.contains("Chat list & history"),
+            "the last section is off-screen"
+        );
+        // Scroll down enough to move the first section out of the viewport; the
+        // overlay stays open (scrolling never closes it) and the footer hint is fixed.
+        for _ in 0..7 {
+            app.dispatch(crate::app::Action::HelpScrollDown);
+        }
+        assert!(app.help_visible(), "scrolling keeps the overlay open");
+        let scrolled = flatten(&render(&app, 80, 10));
+        assert!(
+            !scrolled.contains("Global"),
+            "the first section scrolled out of view"
+        );
+        assert!(
+            scrolled.contains("scroll"),
+            "the footer hint stays put while the body scrolls"
+        );
     }
 
     #[test]
@@ -1351,11 +1560,15 @@ mod tests {
     fn app_on_results() -> App {
         let mut app = app_with_lists(); // Main: Alice/Bob/Carol, Archive: Old Friend
         app.dispatch(Action::SearchOpen);
+        for c in "kenobi".chars() {
+            app.dispatch(Action::SearchInput(c));
+        }
+        app.dispatch(Action::SearchSubmit);
+        // The hits arrive from the core search once it completes; inject them here.
         app.inject_search_results(vec![
             SearchHit::new(1, 10, "Alice: hello there"),
             SearchHit::new(2, 20, "Bob: general kenobi"),
         ]);
-        app.dispatch(Action::SearchSubmit);
         app
     }
 
@@ -1399,6 +1612,7 @@ mod tests {
     fn the_results_overlay_reports_no_matches_when_empty() {
         let mut app = App::new();
         app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchInput('q')); // a query whose search returns nothing
         app.dispatch(Action::SearchSubmit); // no hits injected
         let text = flatten(&render(&app, 80, 24));
         assert!(text.contains("Results"), "results overlay title");
@@ -1455,13 +1669,13 @@ mod tests {
             }),
         );
         let mut view = ConversationView::from_messages(vec![photo], HashSet::new());
-        view.set_download(File {
+        view.set_downloads(vec![File {
             id: 7,
             size: 100,
             downloaded_size: 45,
             is_downloading_active: true,
             ..File::default()
-        });
+        }]);
         let text = flatten(&render(&App::with_conversation(view), 80, 24));
         assert!(text.contains("[Photo]"), "media placeholder");
         assert!(
@@ -1478,12 +1692,32 @@ mod tests {
         let text = flatten(&buffer);
         assert!(text.contains("React"), "reaction overlay title");
         assert!(text.contains('👍'), "an emoji from the palette");
-        assert!(text.contains("Enter toggle"), "key hint");
+        assert!(text.contains("Enter react"), "key hint");
+        assert!(text.contains("custom emoji"), "the custom-entry affordance");
         // The first palette entry is selected.
         assert!(
             row_containing(&buffer, "👍").contains('▶'),
             "first emoji selected"
         );
+    }
+
+    #[test]
+    fn the_reaction_picker_shows_the_custom_entry_line() {
+        let mut app = app_with_history(vec![text_message(1, "nice")]);
+        app.dispatch(Action::ReactionOpen);
+        // Enter the custom line and type an emoji.
+        app.dispatch(Action::ReactionKey('c'));
+        app.dispatch(Action::ReactionKey('🥳'));
+        let buffer = render(&app, 80, 24);
+        let text = flatten(&buffer);
+        assert!(text.contains("custom"), "the custom-entry label");
+        assert!(text.contains('🥳'), "the typed emoji");
+        assert!(
+            text.contains("Esc back"),
+            "custom-mode hint returns to palette"
+        );
+        // The palette list is not shown while typing a custom emoji.
+        assert!(!text.contains("j / k move"), "palette hint is gone");
     }
 
     #[test]
@@ -1643,6 +1877,16 @@ mod tests {
         let text = flatten(&render(&app, 80, 24));
         assert!(text.contains("Notice"), "toast box title");
         assert!(text.contains("download complete"), "toast message");
+    }
+
+    #[test]
+    fn a_toast_shows_how_to_dismiss_it() {
+        // The box carries the dismiss affordance (#139) so the user is never left
+        // wondering how to clear a notice.
+        let mut app = App::new();
+        app.notify(Notice::info("download complete"));
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("Ctrl-G"), "dismiss hint on the toast");
     }
 
     #[test]

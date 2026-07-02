@@ -4,18 +4,23 @@
 //! marks the frame dirty, and the loop repaints from the new state. Nothing here
 //! touches the terminal or awaits — it stays a pure, unit-testable reducer.
 
-use crossterm::event::Event;
+use std::collections::HashSet;
 
-use crate::chat_list::ChatListView;
-use crate::composer::Composer;
-use crate::conversation::ConversationView;
+use crossterm::event::Event;
+use tuigram_core::StorageSettings;
+use tuigram_core::model::{File, Message, OutgoingMedia, SecretChatState};
+
+use crate::chat_list::{ChatList, ChatListView};
+use crate::composer::{Composer, Submission};
+use crate::conversation::{ConversationView, PinIntent};
 use crate::event::AppEvent;
-use crate::forward::ForwardView;
+use crate::forward::{ForwardIntent, ForwardView};
 use crate::keymap::{self, Focus, Overlay};
 use crate::mediaform::MediaDraft;
-use crate::reactions::ReactionPicker;
+use crate::reactions::{ReactionIntent, ReactionPicker};
 use crate::search::SearchView;
 use crate::secret::{SecretChatPrompt, SecretLifecycle};
+use crate::settingsform::SettingsDraft;
 use crate::status::{ConnectionState, Notifications};
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
@@ -26,9 +31,13 @@ pub enum Action {
     /// Nothing to do (e.g. an unbound key).
     Noop,
     /// Mark the frame dirty so the loop repaints, with no other state change.
+    /// The catch-all for a core signal whose data the panes do not project yet
+    /// (chats/messages/files/auth): repaint and let the projection read it back.
     Render,
-    /// A heartbeat from core — placeholder until Phase 6 wires the real `Client`.
-    Beat,
+    /// Fold the core link's connection state into the status bar — the reduction
+    /// of an [`AppEvent::Connection`](crate::event::AppEvent::Connection) from the
+    /// live `updateConnectionState` feed.
+    SetConnection(ConnectionState),
     /// Move input focus to the next pane (chat list → history → composer → …).
     FocusNext,
     /// Move input focus to the previous pane, wrapping.
@@ -38,6 +47,10 @@ pub enum Action {
     SetFocus(Focus),
     /// Show or hide the help overlay.
     ToggleHelp,
+    /// Scroll the help overlay one line toward the end (`j` / ↓).
+    HelpScrollDown,
+    /// Scroll the help overlay one line toward the start (`k` / ↑).
+    HelpScrollUp,
     /// Move the chat-list selection down one row.
     SelectNext,
     /// Move the chat-list selection up one row.
@@ -92,16 +105,23 @@ pub enum Action {
     ResultNext,
     /// Move the search-results selection up one hit.
     ResultPrev,
+    /// Open the selected search hit (#117): jump to its chat and, when the message
+    /// is in the loaded history, scroll to it.
+    ResultOpen,
     /// Start forwarding the selected search hit: open the target picker.
     ForwardOpen,
+    /// Start forwarding the selected conversation message (`f` in the history pane,
+    /// as in the official client): open the target picker sourced from the open chat.
+    ForwardMessage,
     /// Move the forward target-picker selection down one chat.
     ForwardNext,
     /// Move the forward target-picker selection up one chat.
     ForwardPrev,
-    /// Confirm the forward to the selected target. Phase 6 sends through core; for
-    /// now it just closes the picker.
+    /// Confirm the forward to the selected target (#118): record the send and close
+    /// the picker back to browsing.
     ForwardConfirm,
-    /// Cancel the forward and return to the search results.
+    /// Cancel the forward, returning to wherever it was started from (the search
+    /// results, or the conversation).
     ForwardCancel,
     /// Pin or unpin the selected history message. Phase 6 also calls core; for now
     /// it flips the local pinned state behind the 📌 indicator.
@@ -109,14 +129,23 @@ pub enum Action {
     /// Open the reaction picker on the selected history message (a no-op with no
     /// selected message).
     ReactionOpen,
-    /// Move the reaction-picker selection to the next emoji.
+    /// Move the reaction-picker selection to the next emoji (palette mode).
     ReactionNext,
-    /// Move the reaction-picker selection to the previous emoji.
+    /// Move the reaction-picker selection to the previous emoji (palette mode).
     ReactionPrev,
-    /// Toggle the picked emoji on the selected message and close the picker. Phase
-    /// 6 dispatches the core add/remove; for now it reflects optimistically.
+    /// A character typed in the reaction overlay. In palette mode it is a shortcut
+    /// (`j`/`k` move, `c` opens the custom-emoji line); in custom mode it is appended
+    /// to the custom-emoji buffer. The reducer disambiguates by the picker's mode.
+    ReactionKey(char),
+    /// Delete the last character of the custom-emoji buffer (Backspace); a no-op in
+    /// palette mode.
+    ReactionBackspace,
+    /// Toggle the picked emoji — the highlighted palette one, or the typed custom one
+    /// — on the selected message and close the picker, recording the core add/remove
+    /// as a pending intent (#119).
     ReactionConfirm,
-    /// Close the reaction picker without changing anything.
+    /// Dismiss the reaction overlay: in custom mode this returns to the palette; in
+    /// palette mode it closes the overlay.
     ReactionCancel,
     /// Open the send-media prompt on a fresh, empty path/caption.
     AttachOpen,
@@ -144,12 +173,35 @@ pub enum Action {
     /// new secret chat with a private chat's user, or close an open one. A no-op
     /// when the selection offers no lifecycle action (a group or channel).
     SecretOpen,
-    /// Confirm the secret-chat lifecycle action and close the prompt. Phase 6 calls
-    /// the core seam (`create_new_secret_chat` / `close_secret_chat`); for now it
-    /// just closes.
+    /// Confirm the secret-chat lifecycle action and close the prompt. Records the
+    /// chosen action for the loop to dispatch on the core seam
+    /// (`create_new_secret_chat` / `close_secret_chat`) (#121).
     SecretConfirm,
     /// Cancel the secret-chat prompt without acting.
     SecretCancel,
+    /// Open the retention settings editor (#146), pre-filled with the policy in
+    /// effect.
+    SettingsOpen,
+    /// Insert a typed character into the focused settings field.
+    SettingsInput(char),
+    /// Delete the character before the focused settings field's cursor.
+    SettingsBackspace,
+    /// Move the focused settings field's cursor one character left.
+    SettingsLeft,
+    /// Move the focused settings field's cursor one character right.
+    SettingsRight,
+    /// Move the focused settings field's cursor to the start of the line.
+    SettingsHome,
+    /// Move the focused settings field's cursor to the end of the line.
+    SettingsEnd,
+    /// Move settings editing to the next field (Tab).
+    SettingsToggleField,
+    /// Validate and confirm the settings edit. A valid edit updates the in-memory
+    /// policy and records it for the loop to persist and apply live (#146); an
+    /// invalid value is rejected in place, keeping the overlay open.
+    SettingsConfirm,
+    /// Cancel the settings editor without saving.
+    SettingsCancel,
     /// Dismiss the current transient toast immediately (#88), revealing the next
     /// queued one. A no-op when nothing is showing.
     NoticeDismiss,
@@ -165,9 +217,6 @@ pub struct App {
     should_quit: bool,
     /// Set when visible state changed since the last paint; cleared after `draw`.
     dirty: bool,
-    /// Count of core heartbeats applied — proof the mpsc arm is live until the
-    /// real update stream replaces the fake source in Phase 6.
-    beats: u64,
     /// The left pane's chat-list view: the lists, the active one, and the
     /// selection. Empty until Phase 6 projects the core store into it.
     chat_list: ChatListView,
@@ -182,11 +231,19 @@ pub struct App {
     /// The modal overlay drawn over the panes, if any. While set it captures input
     /// (key resolution routes to it instead of `focus`).
     overlay: Overlay,
+    /// The help overlay's scroll offset — the index of the topmost help line drawn,
+    /// so the cheatsheet can be read on a terminal too short to show it all. Reset to
+    /// the top each time help opens; clamped against [`keymap::help_line_count`].
+    help_scroll: u16,
     /// The search overlay's state: the query line and the hit list it renders from.
     search: SearchView,
     /// The forward overlay's state: the messages being forwarded and the target
     /// picker. Inert until a forward is started.
     forward: ForwardView,
+    /// Where a cancelled forward returns to — the overlay that was active when the
+    /// forward was started, so `Esc` lands back on the search results (forward from a
+    /// hit) or the conversation (forward from the history pane, `Overlay::None`).
+    forward_return: Overlay,
     /// The reaction picker's state: the emoji palette and the selection. Reset each
     /// time the picker opens.
     reaction: ReactionPicker,
@@ -196,12 +253,75 @@ pub struct App {
     /// The secret-chat lifecycle confirm's state (#87): the start/close action for
     /// the selected chat. `Some` only while the [`Overlay::SecretChat`] is open.
     secret: Option<SecretChatPrompt>,
+    /// The download-cache retention policy currently in effect (#146). Seeded from
+    /// `settings.toml` at startup ([`set_storage_settings`](Self::set_storage_settings)),
+    /// it pre-fills the settings editor and is updated in place when an edit is
+    /// confirmed, so reopening the editor shows the live values. `App` never touches
+    /// the file — the loop persists and applies the confirmed change.
+    storage: StorageSettings,
+    /// The settings editor's state (#146): the four retention inputs being edited.
+    /// Reset from [`storage`](Self::storage) each time the editor opens.
+    settings: SettingsDraft,
     /// The core link's connection state (#88), shown in the status bar. Defaults to
     /// `Connecting`; Phase 6 folds `updateConnectionState` into it.
     connection: ConnectionState,
     /// The transient-toast queue (#88): one-off events and error codes that float
     /// over the panes without capturing input and age out on the heartbeat.
     notifications: Notifications,
+    /// Set when the user scrolled up while already at the oldest loaded message, a
+    /// request the loop services by paging older history (#114). The loop reads and
+    /// clears it each tick via [`take_wants_older_history`](Self::take_wants_older_history).
+    wants_older_history: bool,
+    /// A submitted composer buffer awaiting dispatch to core (#116). `App` is pure
+    /// and never touches the `Client`, so a submit lands here and the loop drains it
+    /// via [`take_outbound`](Self::take_outbound), routing it to the send/edit seam.
+    outbound: Option<Submission>,
+    /// A submitted search query awaiting dispatch to core (#117). Like `outbound`,
+    /// `App` records the intent and the loop drains it via
+    /// [`take_search_query`](Self::take_search_query), runs the search (in-chat or
+    /// global by context), and feeds the hits back through
+    /// [`set_search_results`](Self::set_search_results).
+    pending_search: Option<String>,
+    /// A `(chat_id, message_id)` the user opened from a search hit and wants the
+    /// conversation to land on (#117). The loop opens the chat; the next projection
+    /// of that chat scrolls to the message if it is loaded, then clears this. Cleared
+    /// on a switch to a different chat so a stale target never jumps a later view.
+    pending_jump: Option<(i64, i64)>,
+    /// A confirmed forward awaiting dispatch to core (#118). Like `outbound`, `App`
+    /// records the intent and the loop drains it via
+    /// [`take_forward`](Self::take_forward), routing it to
+    /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages).
+    pending_forward: Option<ForwardIntent>,
+    /// A confirmed reaction toggle awaiting dispatch to core (#119). `App` reflects
+    /// the toggle optimistically and records the intent; the loop drains it via
+    /// [`take_reaction`](Self::take_reaction), routing it to
+    /// [`ReactionRequests`](tuigram_core::ReactionRequests)' add/remove.
+    pending_reaction: Option<ReactionIntent>,
+    /// A confirmed pin toggle awaiting dispatch to core (#119). `App` flips the
+    /// pinned set optimistically and records the intent; the loop drains it via
+    /// [`take_pin`](Self::take_pin), routing it to
+    /// [`PinRequests`](tuigram_core::PinRequests)' pin/unpin.
+    pending_pin: Option<PinIntent>,
+    /// A confirmed send-media attachment awaiting dispatch to core (#120). `App`
+    /// stays pure and never touches the `Client`, so confirming the attach prompt
+    /// builds the [`OutgoingMedia`] and lands it here; the loop drains it via
+    /// [`take_media`](Self::take_media) and routes it to
+    /// [`SendRequests::send_media`](tuigram_core::SendRequests::send_media), the
+    /// upload streaming back through the file store exactly like the send path (#116).
+    pending_media: Option<OutgoingMedia>,
+    /// A confirmed secret-chat lifecycle action awaiting dispatch to core (#121).
+    /// Confirming the secret-chat prompt records the chosen [`SecretLifecycle`]
+    /// here (never any key material); the loop drains it via
+    /// [`take_secret`](Self::take_secret) and routes it to
+    /// [`SecretChatRequests`](tuigram_core::SecretChatRequests)' create/close. The
+    /// resulting `updateSecretChat`/`updateNewChat` fold back and re-project.
+    pending_secret: Option<SecretLifecycle>,
+    /// A confirmed retention edit awaiting the loop (#146). Confirming the settings
+    /// editor updates the in-memory [`storage`](Self::storage) and lands the new
+    /// policy here; the loop drains it via [`take_settings`](Self::take_settings),
+    /// swaps its live retention (the next sweep honours it), and persists it to
+    /// `settings.toml`.
+    pending_settings: Option<StorageSettings>,
 }
 
 impl App {
@@ -219,10 +339,6 @@ impl App {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
-    }
-
-    pub fn beats(&self) -> u64 {
-        self.beats
     }
 
     /// The chat-list view the left pane renders from.
@@ -258,6 +374,12 @@ impl App {
         self.overlay == Overlay::Help
     }
 
+    /// The help overlay's scroll offset — the topmost help line to draw. Read by the
+    /// render to window the cheatsheet on a short terminal.
+    pub fn help_scroll(&self) -> u16 {
+        self.help_scroll
+    }
+
     /// The search overlay's state, for rendering the query line and results.
     pub fn search(&self) -> &SearchView {
         &self.search
@@ -284,6 +406,19 @@ impl App {
         self.secret.as_ref()
     }
 
+    /// The settings editor's state, for rendering the retention fields (#146).
+    pub fn settings(&self) -> &SettingsDraft {
+        &self.settings
+    }
+
+    /// Seed the in-effect retention policy from `settings.toml` at startup (#146), so
+    /// the editor opens pre-filled with the live values. The loop calls this once
+    /// after loading settings; `App` keeps it only to fill and reflect the editor,
+    /// never to touch the file.
+    pub fn set_storage_settings(&mut self, settings: StorageSettings) {
+        self.storage = settings;
+    }
+
     /// The core link's connection state, for the status bar's left field.
     pub fn connection(&self) -> ConnectionState {
         self.connection
@@ -294,10 +429,9 @@ impl App {
         &self.notifications
     }
 
-    /// Set the connection state — Phase 6 calls this on a TDLib
-    /// `updateConnectionState`. Unused in the binary until that wiring lands; the
-    /// status-bar render and the reducer tests drive it for now.
-    #[allow(dead_code)]
+    /// Fold a connection-state change into the status bar — driven by
+    /// [`Action::SetConnection`], the reduction of the live
+    /// `updateConnectionState` feed (#110). Repaints only on an actual change.
     pub fn set_connection(&mut self, state: ConnectionState) {
         if self.connection != state {
             self.connection = state;
@@ -305,13 +439,176 @@ impl App {
         }
     }
 
-    /// Enqueue a transient toast — Phase 6 calls this for a failed action or a
-    /// one-off core event. Unused in the binary until core feeds it; the heartbeat
-    /// tick ages it out and [`Action::NoticeDismiss`] drops it on demand.
-    #[allow(dead_code)]
+    /// Re-project the chat-list pane from the core [`ChatStore`](tuigram_core::ChatStore)
+    /// (#113). The loop reads the folded lists back from the `Client` on a chat
+    /// signal and hands the owned projection here, so `App` stays pure — it never
+    /// touches the `Client`, the same split as the carried-state connection fold.
+    /// The cursor is preserved across the swap (see [`ChatListView::project`]), so
+    /// a live chat update repaints the list without moving the selection.
+    pub fn project_chats(&mut self, lists: Vec<ChatList>) {
+        self.chat_list.project(lists);
+        self.dirty = true;
+    }
+
+    /// Re-project the conversation pane from the core
+    /// [`MessageStore`](tuigram_core::messages::MessageStore) (#114). The loop reads
+    /// the open `chat_id`'s history and pinned ids back from the `Client` on a
+    /// message signal (or a freshly-merged history page) and hands the owned
+    /// snapshot here, so `App` stays pure — the same split as
+    /// [`project_chats`](Self::project_chats). [`ConversationView::project`] keeps
+    /// the selected message under the cursor when refreshing the same chat, and
+    /// starts fresh at the top when a different chat is opened.
+    pub fn project_conversation(
+        &mut self,
+        chat_id: i64,
+        messages: Vec<Message>,
+        pinned: HashSet<i64>,
+    ) {
+        self.conversation.project(chat_id, messages, pinned);
+        // Honor a pending search-hit jump (#117): once this chat's history holds the
+        // target message, scroll to it and clear the jump. A jump for a different chat
+        // is stale (the user opened elsewhere) — drop it so it never moves a later
+        // view. A jump for this chat whose message is not loaded yet stays pending, so
+        // the landing page (which projects right after open) can still land on it.
+        if let Some((jump_chat, message_id)) = self.pending_jump {
+            // Apply the jump only for its own chat, and only once the message is
+            // loaded; clear it when applied, or when it is stale (a different chat is
+            // now open). A same-chat target whose message is not loaded yet stays
+            // pending for the landing page.
+            let applied = jump_chat == chat_id && self.conversation.select_message(message_id);
+            if applied || jump_chat != chat_id {
+                self.pending_jump = None;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Take the pending "page older history" request (#114), clearing it. The loop
+    /// calls this each tick: a `true` means the user pressed up at the very top of
+    /// the loaded history, so the loop fetches the next older page for the open chat.
+    pub fn take_wants_older_history(&mut self) -> bool {
+        std::mem::take(&mut self.wants_older_history)
+    }
+
+    /// Take the pending composer submission, if any (#116). The loop drains this
+    /// each tick and dispatches it to the send/edit seam; `None` means nothing was
+    /// submitted since the last drain.
+    pub fn take_outbound(&mut self) -> Option<Submission> {
+        self.outbound.take()
+    }
+
+    /// Take the pending search query, if any (#117). The loop drains this each tick,
+    /// runs the search (in-chat or global by context), and feeds the projected hits
+    /// back through [`set_search_results`](Self::set_search_results); `None` means
+    /// nothing was submitted since the last drain.
+    pub fn take_search_query(&mut self) -> Option<String> {
+        self.pending_search.take()
+    }
+
+    /// Take the pending forward, if any (#118). The loop drains this each tick and
+    /// dispatches it to
+    /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages);
+    /// `None` means no forward was confirmed since the last drain.
+    pub fn take_forward(&mut self) -> Option<ForwardIntent> {
+        self.pending_forward.take()
+    }
+
+    /// Take the pending reaction toggle, if any (#119). The loop drains this each
+    /// tick and dispatches it to
+    /// [`ReactionRequests`](tuigram_core::ReactionRequests)' add/remove on the
+    /// selected message; `None` means no reaction was confirmed since the last drain.
+    pub fn take_reaction(&mut self) -> Option<ReactionIntent> {
+        self.pending_reaction.take()
+    }
+
+    /// Take the pending pin toggle, if any (#119). The loop drains this each tick and
+    /// dispatches it to [`PinRequests`](tuigram_core::PinRequests)' pin/unpin on the
+    /// selected message; `None` means no pin was toggled since the last drain.
+    pub fn take_pin(&mut self) -> Option<PinIntent> {
+        self.pending_pin.take()
+    }
+
+    /// Take the pending send-media attachment, if any (#120). The loop drains this
+    /// each tick and dispatches it to
+    /// [`SendRequests::send_media`](tuigram_core::SendRequests::send_media) for the
+    /// open chat; `None` means nothing was confirmed since the last drain.
+    pub fn take_media(&mut self) -> Option<OutgoingMedia> {
+        self.pending_media.take()
+    }
+
+    /// Take the pending secret-chat lifecycle action, if any (#121). The loop drains
+    /// this each tick and dispatches it to
+    /// [`SecretChatRequests`](tuigram_core::SecretChatRequests)' create/close; `None`
+    /// means no secret-chat prompt was confirmed since the last drain.
+    pub fn take_secret(&mut self) -> Option<SecretLifecycle> {
+        self.pending_secret.take()
+    }
+
+    /// Take the pending retention edit, if any (#146). The loop drains this each tick,
+    /// swaps its live sweep policy to the new value, and writes it to `settings.toml`;
+    /// `None` means no settings edit was confirmed since the last drain.
+    pub fn take_settings(&mut self) -> Option<StorageSettings> {
+        self.pending_settings.take()
+    }
+
+    /// Re-project the secret-chat lifecycle states from the core
+    /// [`SecretChatStore`](tuigram_core::SecretChatStore) (#121). The loop reads each
+    /// secret chat's folded state joined to its chat id back from the `Client` and
+    /// hands the owned pairs here, so `App` stays pure — the same split as
+    /// [`project_chats`](Self::project_chats). Replaces the view's secret-state map
+    /// wholesale, so a lifecycle advance (pending → ready → closed) is reflected.
+    pub fn project_secret_states(&mut self, states: Vec<(i64, SecretChatState)>) {
+        self.chat_list.project_secret_states(states);
+        self.dirty = true;
+    }
+
+    /// Re-project the open chat's media download state from the core
+    /// [`FileStore`](tuigram_core::files::FileStore) (#120). The loop reads the files
+    /// backing the open chat's messages back from the `Client` and hands the owned
+    /// snapshot here, so `App` stays pure — the same split as
+    /// [`project_conversation`](Self::project_conversation). Replaces the view's
+    /// download state wholesale, so a completed or advanced transfer overwrites the
+    /// prior snapshot and the progress line reflects the newest `updateFile`.
+    pub fn project_downloads(&mut self, files: Vec<File>) {
+        self.conversation.set_downloads(files);
+        self.dirty = true;
+    }
+
+    /// Open the forward target picker for `message_id` from `source_chat_id`, shared
+    /// by the two entry points (a search hit, `ForwardOpen`; the selected history
+    /// message, `ForwardMessage`). The picker reuses a snapshot of the chat list as
+    /// its targets, and the current overlay is remembered as the cancel-return target.
+    fn open_forward(&mut self, source_chat_id: i64, message_id: i64) {
+        self.forward_return = self.overlay;
+        self.forward = ForwardView::new(source_chat_id, vec![message_id], self.chat_list.clone());
+        self.overlay = Overlay::Forward;
+        self.dirty = true;
+    }
+
+    /// Replace the search overlay's hits with a fresh, projected result set (#117),
+    /// resetting the selection to the top. The loop calls this when a spawned search
+    /// completes.
+    pub fn set_search_results(&mut self, hits: Vec<crate::search::SearchHit>) {
+        self.search.set_results(hits);
+        self.dirty = true;
+    }
+
+    /// Enqueue a transient toast — a failed action (#116) or a one-off core event.
+    /// The notice tick ([`tick_notices`](Self::tick_notices)) ages it out and
+    /// [`Action::NoticeDismiss`] drops it on demand.
     pub fn notify(&mut self, notice: crate::status::Notice) {
         self.notifications.push(notice);
         self.dirty = true;
+    }
+
+    /// Age the showing toast by one notice-clock tick (#139), dropping it when its
+    /// lifetime runs out and revealing any next. Driven by the loop's ~1s notice
+    /// interval, separate from the faster render tick. Marks the app dirty only when
+    /// a toast actually left, since a still-counting toast looks unchanged.
+    pub fn tick_notices(&mut self) {
+        if self.notifications.tick() {
+            self.dirty = true;
+        }
     }
 
     /// A fresh app showing `chat_list`, marked dirty so the first frame paints.
@@ -344,11 +641,13 @@ impl App {
         }
     }
 
-    /// Inject a search result set, standing in for the Phase 6 core search. The
-    /// seam the reducer and render tests use to drive the results/forward overlays.
+    /// Inject a search result set, the test seam standing in for a completed core
+    /// search (#117). Delegates to [`set_search_results`](Self::set_search_results),
+    /// the same path the loop uses, so the reducer and render tests drive the
+    /// results/forward overlays exactly as the live search does.
     #[cfg(test)]
     pub fn inject_search_results(&mut self, results: Vec<crate::search::SearchHit>) {
-        self.search.set_results(results);
+        self.set_search_results(results);
     }
 
     /// Called by the loop after a successful `terminal.draw`.
@@ -371,10 +670,24 @@ impl App {
         }
     }
 
-    /// Map a core [`AppEvent`] to an [`Action`].
+    /// Map a core [`AppEvent`] to an [`Action`]. Pure: the live source already
+    /// classified the update, so this only chooses the reduction.
+    ///
+    /// Connection changes fold into the status bar. Chat and message signals don't
+    /// pass through here — the loop reads the folded list/history back from the
+    /// `Client` and calls [`project_chats`](Self::project_chats) (#113) /
+    /// [`project_conversation`](Self::project_conversation) (#114) directly, since
+    /// the projection needs the `Client` and `App` stays pure. Every remaining
+    /// signal (files/auth) is a repaint nudge until its own projection lands.
     pub fn on_app_event(&self, event: AppEvent) -> Action {
         match event {
-            AppEvent::Beat => Action::Beat,
+            AppEvent::Connection(state) => Action::SetConnection(state),
+            AppEvent::Auth
+            | AppEvent::Chats
+            | AppEvent::Messages
+            | AppEvent::File
+            | AppEvent::Secret
+            | AppEvent::Lagged => Action::Render,
         }
     }
 
@@ -384,13 +697,7 @@ impl App {
         match action {
             Action::Noop => {}
             Action::Render => self.dirty = true,
-            Action::Beat => {
-                // The heartbeat doubles as the toast clock: each beat ages the
-                // current toast, popping it when it expires (#88).
-                self.beats += 1;
-                self.notifications.tick();
-                self.dirty = true;
-            }
+            Action::SetConnection(state) => self.set_connection(state),
             Action::FocusNext => {
                 self.focus = self.focus.next();
                 self.dirty = true;
@@ -405,12 +712,25 @@ impl App {
             }
             Action::ToggleHelp => {
                 // Toggles between no overlay and the help cheatsheet; the keymap
-                // only emits this from browsing or while help is already open.
+                // only emits this from browsing or while help is already open. A
+                // fresh open starts at the top of the cheatsheet.
                 self.overlay = if self.overlay == Overlay::Help {
                     Overlay::None
                 } else {
+                    self.help_scroll = 0;
                     Overlay::Help
                 };
+                self.dirty = true;
+            }
+            Action::HelpScrollDown => {
+                // Clamp at the last help line so a scroll never runs off the end; the
+                // render further clips to the popup's height.
+                let max = keymap::help_line_count().saturating_sub(1) as u16;
+                self.help_scroll = (self.help_scroll + 1).min(max);
+                self.dirty = true;
+            }
+            Action::HelpScrollUp => {
+                self.help_scroll = self.help_scroll.saturating_sub(1);
                 self.dirty = true;
             }
             Action::SelectNext => {
@@ -434,6 +754,11 @@ impl App {
                 self.dirty = true;
             }
             Action::ScrollUp => {
+                // A scroll-up that can't move (already at the oldest loaded message)
+                // is the request to page older history; the loop services it (#114).
+                if self.conversation.offset() == 0 && !self.conversation.is_empty() {
+                    self.wants_older_history = true;
+                }
                 self.conversation.scroll_up();
                 self.dirty = true;
             }
@@ -462,10 +787,13 @@ impl App {
                 self.dirty = true;
             }
             Action::ComposerSubmit => {
-                // Phase 6 routes the submitted text to core (a new message, reply,
-                // or edit per the composer's mode); for now it is consumed. An empty
-                // buffer returns `None` — the send is a no-op that does not repaint.
-                if self.composer.submit().is_some() {
+                // Route the submitted buffer to core (#116): a new message, a reply,
+                // or an edit per the composer's mode. `App` is pure, so it records the
+                // resolved submission as an outbound intent the loop drains and
+                // dispatches to the send/edit seam; an empty buffer returns `None`, a
+                // no-op that does not repaint.
+                if let Some(submission) = self.composer.submit() {
+                    self.outbound = Some(submission);
                     self.dirty = true;
                 }
             }
@@ -504,11 +832,18 @@ impl App {
                 self.dirty = true;
             }
             Action::SearchSubmit => {
-                // Phase 6 runs the query against core and folds the hits in through
-                // `set_results`; for now we just switch to the (injected-or-empty)
-                // results list so the overlay flow is exercised headlessly.
-                self.overlay = Overlay::SearchResults;
-                self.dirty = true;
+                // Record the query as a pure intent the loop drains and runs against
+                // core (#117), then switch to the results overlay. `App` is pure, so
+                // the hits arrive later via `set_search_results`; clear any stale hits
+                // now so the overlay is empty until they land. A blank query is a
+                // no-op that stays on the input line.
+                let query = self.search.query().trim().to_owned();
+                if !query.is_empty() {
+                    self.pending_search = Some(query);
+                    self.search.set_results(Vec::new());
+                    self.overlay = Overlay::SearchResults;
+                    self.dirty = true;
+                }
             }
             Action::SearchCancel => {
                 self.overlay = Overlay::None;
@@ -522,14 +857,42 @@ impl App {
                 self.search.select_prev();
                 self.dirty = true;
             }
+            Action::ResultOpen => {
+                // Jump to the selected hit (#117): select its chat in the list, focus
+                // the history so the loop opens and pages it, and record the target so
+                // the next projection of that chat scrolls to the message if it is
+                // loaded. A hit whose chat is not in the active list (a global hit in a
+                // folder/archive) still closes the overlay and focuses the history; the
+                // chat just stays whatever was selected. No selected hit is a no-op.
+                if let Some(hit) = self.search.selected_hit() {
+                    let (chat_id, message_id) = (hit.chat_id, hit.message_id);
+                    self.pending_jump = Some((chat_id, message_id));
+                    self.chat_list.select_chat(chat_id);
+                    self.focus = Focus::History;
+                    self.overlay = Overlay::None;
+                    self.dirty = true;
+                }
+            }
             Action::ForwardOpen => {
                 // Forward the selected hit. The picker reuses a snapshot of the
-                // chat list as its target list. No selected hit (empty results) is
-                // a no-op that stays on the results overlay.
-                if let Some(message_id) = self.search.selected_hit().map(|h| h.message_id) {
-                    self.forward = ForwardView::new(vec![message_id], self.chat_list.clone());
-                    self.overlay = Overlay::Forward;
-                    self.dirty = true;
+                // chat list as its target list; the hit's chat is the source the
+                // forward carries. No selected hit (empty results) is a no-op that
+                // stays on the results overlay.
+                if let Some(hit) = self.search.selected_hit() {
+                    let (source, message_id) = (hit.chat_id, hit.message_id);
+                    self.open_forward(source, message_id);
+                }
+            }
+            Action::ForwardMessage => {
+                // Forward the selected conversation message (`f` in the history pane).
+                // The message carries its own chat, which is the open chat and the
+                // forward's source. No selected message (empty history) is a no-op.
+                if let Some((source, message_id)) = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.chat_id, m.id))
+                {
+                    self.open_forward(source, message_id);
                 }
             }
             Action::ForwardNext => {
@@ -541,22 +904,43 @@ impl App {
                 self.dirty = true;
             }
             Action::ForwardConfirm => {
-                // Phase 6 calls `Client::forward_messages` to the selected target;
-                // for now confirming just closes the picker back to browsing.
+                // Record the forward as a pure intent for the loop to send through
+                // `forward_messages` (#118), then close the picker back to browsing.
+                // An empty picker (no target chat) has nowhere to send, so it just
+                // closes without recording an intent.
+                if let Some(to_chat_id) = self.forward.selected_target().map(|c| c.id) {
+                    self.pending_forward = Some(ForwardIntent {
+                        from_chat_id: self.forward.source_chat_id(),
+                        message_ids: self.forward.message_ids().to_vec(),
+                        to_chat_id,
+                    });
+                }
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
             Action::ForwardCancel => {
-                // Back to the results the forward was started from.
-                self.overlay = Overlay::SearchResults;
+                // Back to wherever the forward was started from — the search results
+                // (forward from a hit) or the conversation (forward from history).
+                self.overlay = self.forward_return;
                 self.dirty = true;
             }
             Action::PinToggle => {
-                // Pin/unpin the selected message. Phase 6 also calls core's
-                // pin/unpin; for now the local flip drives the 📌 indicator. A no-op
-                // on an empty history (no selected message).
-                if let Some(id) = self.conversation.selected_message().map(|m| m.id) {
+                // Pin/unpin the selected message: flip the 📌 indicator optimistically
+                // and record the intent for the loop to send through core's pin/unpin
+                // (#119). The pre-toggle pinned state decides pin vs unpin. A no-op on
+                // an empty history (no selected message).
+                if let Some((chat_id, id)) = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.chat_id, m.id))
+                {
+                    let pin = !self.conversation.is_pinned(id);
                     self.conversation.toggle_pin(id);
+                    self.pending_pin = Some(PinIntent {
+                        chat_id,
+                        message_id: id,
+                        pin,
+                    });
                     self.dirty = true;
                 }
             }
@@ -569,26 +953,84 @@ impl App {
                 }
             }
             Action::ReactionNext => {
-                self.reaction.select_next();
-                self.dirty = true;
+                // Arrow-key nav walks the palette; ignored while typing a custom emoji.
+                if !self.reaction.is_custom() {
+                    self.reaction.select_next();
+                    self.dirty = true;
+                }
             }
             Action::ReactionPrev => {
-                self.reaction.select_prev();
-                self.dirty = true;
+                if !self.reaction.is_custom() {
+                    self.reaction.select_prev();
+                    self.dirty = true;
+                }
+            }
+            Action::ReactionKey(c) => {
+                // Custom mode: every character is buffer input (a terminal has no emoji
+                // key, so we take whatever the OS picker or a paste emits). Palette
+                // mode: `j`/`k` move and `c` opens the custom line; any other letter is
+                // ignored (reactions are emoji, not latin text).
+                if self.reaction.is_custom() {
+                    self.reaction.push(c);
+                    self.dirty = true;
+                } else {
+                    let handled = match c {
+                        'j' => {
+                            self.reaction.select_next();
+                            true
+                        }
+                        'k' => {
+                            self.reaction.select_prev();
+                            true
+                        }
+                        'c' => {
+                            self.reaction.enter_custom();
+                            true
+                        }
+                        _ => false,
+                    };
+                    self.dirty |= handled;
+                }
+            }
+            Action::ReactionBackspace => {
+                if self.reaction.is_custom() {
+                    self.reaction.backspace();
+                    self.dirty = true;
+                }
             }
             Action::ReactionConfirm => {
-                // Toggle the picked emoji on the selected message and close. Phase 6
-                // dispatches the core add/remove and folds the real counts; here the
-                // optimistic flip updates the `{emoji×n*}` chips directly.
-                if let Some(id) = self.conversation.selected_message().map(|m| m.id) {
-                    self.conversation
-                        .toggle_reaction(id, self.reaction.selected_emoji());
+                // React with the effective emoji — the typed custom one, or the
+                // highlighted palette one — then close. The optimistic flip updates the
+                // `{emoji×n*}` chips directly; the intent it records drives the core
+                // add/remove (#119), whose real counts fold in later. Whether we already
+                // had that reaction (pre-toggle) decides add vs remove. An empty custom
+                // line has nothing to send, so it just closes.
+                if let Some(emoji) = self.reaction.confirmed_emoji()
+                    && let Some((chat_id, id)) = self
+                        .conversation
+                        .selected_message()
+                        .map(|m| (m.chat_id, m.id))
+                {
+                    let add = !self.conversation.has_own_reaction(id, &emoji);
+                    self.conversation.toggle_reaction(id, &emoji);
+                    self.pending_reaction = Some(ReactionIntent {
+                        chat_id,
+                        message_id: id,
+                        emoji,
+                        add,
+                    });
                 }
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
             Action::ReactionCancel => {
-                self.overlay = Overlay::None;
+                // Esc backs out of the custom line to the palette first; a second Esc
+                // (now in palette mode) closes the overlay.
+                if self.reaction.is_custom() {
+                    self.reaction.exit_custom();
+                } else {
+                    self.overlay = Overlay::None;
+                }
                 self.dirty = true;
             }
             Action::AttachOpen => {
@@ -626,10 +1068,12 @@ impl App {
                 self.dirty = true;
             }
             Action::AttachConfirm => {
-                // Phase 6 builds the `OutgoingMedia` from the prompt and calls
-                // `send_media`; for now confirming with a path just closes the
-                // prompt, and an empty path is a no-op that keeps it open.
-                if self.media.is_sendable() {
+                // Build the `OutgoingMedia` the prompt describes and record it for the
+                // loop to send (#120); the upload then streams back through the file
+                // store, exactly like a text send (#116). An empty path yields no
+                // media, a no-op that keeps the prompt open.
+                if let Some(media) = self.media.to_outgoing() {
+                    self.pending_media = Some(media);
                     self.overlay = Overlay::None;
                     self.dirty = true;
                 }
@@ -654,16 +1098,70 @@ impl App {
                 }
             }
             Action::SecretConfirm => {
-                // Phase 6 dispatches the core seam for `self.secret`'s lifecycle
-                // (`create_new_secret_chat` / `close_secret_chat`) and lets the
-                // resulting `updateSecretChat` / `updateNewChat` fold in; for now
-                // confirming just closes the prompt back to browsing.
-                self.secret = None;
+                // Record the confirmed lifecycle action for the loop to dispatch on
+                // the core seam (`create_new_secret_chat` / `close_secret_chat`); the
+                // resulting `updateSecretChat` / `updateNewChat` fold back and
+                // re-project (#121). Reads only the prompt's lifecycle, never any key
+                // material. A confirm with no prompt open is an inert close.
+                if let Some(prompt) = self.secret.take() {
+                    self.pending_secret = Some(prompt.lifecycle());
+                }
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
             Action::SecretCancel => {
                 self.secret = None;
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::SettingsOpen => {
+                // Open the editor pre-filled with the policy in effect, so the fields
+                // show the live values a Tab-and-type edits (#146).
+                self.settings = SettingsDraft::from_settings(self.storage);
+                self.overlay = Overlay::Settings;
+                self.dirty = true;
+            }
+            Action::SettingsInput(c) => {
+                self.settings.insert(c);
+                self.dirty = true;
+            }
+            Action::SettingsBackspace => {
+                self.settings.backspace();
+                self.dirty = true;
+            }
+            Action::SettingsLeft => {
+                self.settings.move_left();
+                self.dirty = true;
+            }
+            Action::SettingsRight => {
+                self.settings.move_right();
+                self.dirty = true;
+            }
+            Action::SettingsHome => {
+                self.settings.move_home();
+                self.dirty = true;
+            }
+            Action::SettingsEnd => {
+                self.settings.move_end();
+                self.dirty = true;
+            }
+            Action::SettingsToggleField => {
+                self.settings.toggle_field();
+                self.dirty = true;
+            }
+            Action::SettingsConfirm => {
+                // Validate the four fields through core's parsers. A valid edit
+                // updates the in-memory policy (so a reopen shows the new values) and
+                // lands it for the loop to apply live and persist (#146); an invalid
+                // value keeps the overlay open with the reason shown in place.
+                if let Some(updated) = self.settings.confirm() {
+                    self.storage = updated;
+                    self.pending_settings = Some(updated);
+                    self.overlay = Overlay::None;
+                }
+                self.dirty = true;
+            }
+            Action::SettingsCancel => {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -739,13 +1237,33 @@ mod tests {
     }
 
     #[test]
-    fn beat_counts_and_dirties() {
+    fn a_connection_event_folds_into_the_status_bar() {
         let mut app = App::new();
+        assert_eq!(app.connection(), ConnectionState::Connecting);
+        // The live source classifies updateConnectionState into Connection(state);
+        // on_app_event reduces it to SetConnection, dispatch folds it.
+        let action = app.on_app_event(AppEvent::Connection(ConnectionState::Ready));
+        assert_eq!(action, Action::SetConnection(ConnectionState::Ready));
         app.clear_dirty();
-        let action = app.on_app_event(AppEvent::Beat);
         app.dispatch(action);
-        assert_eq!(app.beats(), 1);
+        assert_eq!(app.connection(), ConnectionState::Ready);
         assert!(app.is_dirty());
+    }
+
+    #[test]
+    fn data_signals_map_to_a_repaint() {
+        // Until the panes project the folded state, every non-connection signal is
+        // a repaint nudge — each variant maps, so the mpsc arm is exercised whole.
+        let app = App::new();
+        for event in [
+            AppEvent::Auth,
+            AppEvent::Chats,
+            AppEvent::Messages,
+            AppEvent::File,
+            AppEvent::Lagged,
+        ] {
+            assert_eq!(app.on_app_event(event), Action::Render);
+        }
     }
 
     #[test]
@@ -755,7 +1273,6 @@ mod tests {
         app.dispatch(Action::Noop);
         assert!(!app.is_dirty());
         assert!(!app.should_quit());
-        assert_eq!(app.beats(), 0);
     }
 
     #[test]
@@ -801,18 +1318,42 @@ mod tests {
     }
 
     #[test]
-    fn toggle_help_shows_then_hides_the_overlay_and_a_key_dismisses_it() {
+    fn toggle_help_shows_then_hides_the_overlay_and_a_stray_key_is_ignored() {
         let mut app = App::new();
         assert!(!app.help_visible());
         app.dispatch(Action::ToggleHelp);
         assert!(app.help_visible());
-        // While open the overlay is modal: any key resolves to a dismiss.
+        // While open the overlay is modal and explicitly closed: a stray key no
+        // longer dismisses it, so a half-read page survives an accidental press.
         assert_eq!(
             app.on_terminal_event(key(KeyCode::Char('x'), KeyModifiers::NONE)),
-            Action::ToggleHelp
+            Action::Noop
         );
+        assert!(app.help_visible(), "a stray key does not close help");
         app.dispatch(Action::ToggleHelp);
         assert!(!app.help_visible());
+    }
+
+    #[test]
+    fn help_scrolls_within_bounds_and_resets_on_reopen() {
+        let mut app = App::new();
+        app.dispatch(Action::ToggleHelp);
+        assert_eq!(app.help_scroll(), 0);
+        // Scrolling up at the top is a clamped no-op.
+        app.dispatch(Action::HelpScrollUp);
+        assert_eq!(app.help_scroll(), 0);
+        app.dispatch(Action::HelpScrollDown);
+        assert_eq!(app.help_scroll(), 1);
+        // It never runs past the last help line, however many downs arrive.
+        let max = (keymap::help_line_count() - 1) as u16;
+        for _ in 0..keymap::help_line_count() + 5 {
+            app.dispatch(Action::HelpScrollDown);
+        }
+        assert_eq!(app.help_scroll(), max, "clamped at the last line");
+        // Closing and reopening starts back at the top.
+        app.dispatch(Action::ToggleHelp);
+        app.dispatch(Action::ToggleHelp);
+        assert_eq!(app.help_scroll(), 0, "reopen resets to the top");
     }
 
     #[test]
@@ -858,7 +1399,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_then_submitting_routes_through_the_composer_and_dirties() {
+    fn typing_then_submitting_records_an_outbound_intent_and_dirties() {
         let mut app = App::new();
         app.dispatch(Action::ComposerInput('h'));
         app.dispatch(Action::ComposerInput('i'));
@@ -868,6 +1409,14 @@ mod tests {
         app.dispatch(Action::ComposerSubmit);
         assert!(app.composer().is_empty(), "buffer consumed on send");
         assert!(app.is_dirty());
+        // The submit becomes an intent the loop drains and routes to the seam (#116).
+        assert_eq!(
+            app.take_outbound(),
+            Some(Submission::Send {
+                text: "hi".to_owned()
+            })
+        );
+        assert_eq!(app.take_outbound(), None, "drained once");
     }
 
     #[test]
@@ -877,6 +1426,7 @@ mod tests {
         app.dispatch(Action::ComposerSubmit);
         assert!(app.composer().is_empty());
         assert!(!app.is_dirty(), "an empty send changes nothing");
+        assert_eq!(app.take_outbound(), None, "nothing to dispatch");
     }
 
     #[test]
@@ -897,6 +1447,99 @@ mod tests {
         assert!(app.is_dirty());
     }
 
+    #[test]
+    fn projecting_chats_refreshes_the_pane_and_dirties() {
+        use crate::chat_list::{ChatList, sample_chat};
+        use tuigram_core::model::ChatListKind;
+
+        // Stands in for the loop's read-back from the core ChatStore on a chat
+        // signal: an owned projection handed to the pure App.
+        let mut app = App::new();
+        app.clear_dirty();
+        app.project_chats(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "Alice", 3), sample_chat(2, "Bob", 0)],
+        }]);
+        assert!(app.is_dirty());
+        assert_eq!(app.chat_list().active_chats().len(), 2);
+        assert_eq!(
+            app.chat_list().selected_chat().map(|c| c.title.as_str()),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn projecting_a_conversation_fills_the_history_and_dirties() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let text = |id: i64| {
+            sample_message(
+                id,
+                MessageContent::Text(FormattedText {
+                    text: format!("m{id}"),
+                    entities: Vec::new(),
+                }),
+            )
+        };
+        // Stands in for the loop's read-back of the open chat's MessageStore.
+        let mut app = App::new();
+        app.clear_dirty();
+        app.project_conversation(10, vec![text(1), text(2)], HashSet::new());
+        assert!(app.is_dirty());
+        assert_eq!(app.conversation().len(), 2);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    #[test]
+    fn scrolling_up_at_the_top_requests_older_history_once() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let messages = (1..=2)
+            .map(|i| {
+                sample_message(
+                    i,
+                    MessageContent::Text(FormattedText {
+                        text: format!("m{i}"),
+                        entities: Vec::new(),
+                    }),
+                )
+            })
+            .collect();
+        let mut app =
+            App::with_conversation(ConversationView::from_messages(messages, HashSet::new()));
+        // Move down so we are no longer at the top: a scroll-up there just moves.
+        app.dispatch(Action::ScrollDown);
+        app.dispatch(Action::ScrollUp);
+        assert!(
+            !app.take_wants_older_history(),
+            "a normal scroll-up pages nothing"
+        );
+
+        // Now at the top (offset 0): a further scroll-up is the paging request.
+        app.dispatch(Action::ScrollUp);
+        assert!(
+            app.take_wants_older_history(),
+            "up at the top requests older history"
+        );
+        assert!(
+            !app.take_wants_older_history(),
+            "the request is cleared once taken"
+        );
+    }
+
+    #[test]
+    fn scrolling_up_on_an_empty_history_requests_nothing() {
+        let mut app = App::new();
+        app.dispatch(Action::ScrollUp);
+        assert!(
+            !app.take_wants_older_history(),
+            "no history, nothing to page"
+        );
+    }
+
     // --- search & forward overlays (#84) ---
 
     use crate::search::SearchHit;
@@ -914,12 +1557,16 @@ mod tests {
         }]);
         let mut app = App::with_chat_list(view);
         app.dispatch(Action::SearchOpen);
-        // Hits arrive (Phase 6: from the core search) before we land on results.
+        for c in "kenobi".chars() {
+            app.dispatch(Action::SearchInput(c));
+        }
+        app.dispatch(Action::SearchSubmit);
+        // The hits arrive from the core search (the loop's `set_search_results`) once
+        // it completes; inject them to stand in for that delivery.
         app.inject_search_results(vec![
             SearchHit::new(1, 10, "Alice: hello"),
             SearchHit::new(2, 20, "Bob: kenobi"),
         ]);
-        app.dispatch(Action::SearchSubmit);
         app
     }
 
@@ -958,12 +1605,126 @@ mod tests {
     }
 
     #[test]
+    fn submitting_an_empty_query_stays_on_the_input_with_no_intent() {
+        let mut app = App::new();
+        app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchSubmit);
+        assert_eq!(
+            app.overlay(),
+            Overlay::SearchInput,
+            "blank query does not search"
+        );
+        assert_eq!(app.take_search_query(), None, "nothing to dispatch");
+    }
+
+    #[test]
+    fn submitting_a_query_records_the_intent_clears_stale_hits_and_drains_once() {
+        // The helper already submitted "kenobi" and (via inject) holds two hits.
+        let mut app = app_on_results();
+        assert_eq!(app.search().results().len(), 2);
+
+        // A fresh search: the query becomes a pending intent and the stale hits clear
+        // until the loop feeds the new ones back.
+        app.dispatch(Action::SearchOpen);
+        for c in "vader".chars() {
+            app.dispatch(Action::SearchInput(c));
+        }
+        app.dispatch(Action::SearchSubmit);
+        assert_eq!(app.overlay(), Overlay::SearchResults);
+        assert!(
+            app.search().results().is_empty(),
+            "stale hits cleared until new ones land"
+        );
+        assert_eq!(app.take_search_query().as_deref(), Some("vader"));
+        assert_eq!(app.take_search_query(), None, "the intent is drained once");
+    }
+
+    #[test]
+    fn set_search_results_fills_the_overlay() {
+        let mut app = App::new();
+        app.set_search_results(vec![SearchHit::new(1, 5, "a hit")]);
+        assert_eq!(app.search().results().len(), 1);
+        assert_eq!(app.search().selected(), 0);
+    }
+
+    #[test]
+    fn opening_a_hit_jumps_to_its_chat_and_focuses_the_history() {
+        let mut app = app_on_results(); // chats Alice(1)/Bob(2); hits (1,10),(2,20)
+        app.dispatch(Action::ResultNext); // select Bob's hit (chat 2, message 20)
+        app.dispatch(Action::ResultOpen);
+        assert_eq!(app.overlay(), Overlay::None, "overlay closed on jump");
+        assert_eq!(
+            app.focus(),
+            Focus::History,
+            "history focused so the loop opens it"
+        );
+        assert_eq!(
+            app.chat_list().selected_chat().map(|c| c.id),
+            Some(2),
+            "the hit's chat is selected"
+        );
+    }
+
+    /// A run of text messages with the given ids, for the jump projection tests.
+    fn text_history(ids: &[i64]) -> Vec<Message> {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+        ids.iter()
+            .map(|&id| {
+                sample_message(
+                    id,
+                    MessageContent::Text(FormattedText {
+                        text: format!("m{id}"),
+                        entities: Vec::new(),
+                    }),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_jump_waits_for_the_message_then_scrolls_to_it_when_it_loads() {
+        let mut app = app_on_results();
+        app.dispatch(Action::ResultOpen); // first hit: chat 1, message 10
+
+        // The first projection of chat 1 does not carry message 10 yet: no jump.
+        app.project_conversation(1, text_history(&[1, 2]), HashSet::new());
+        assert_ne!(
+            app.conversation().selected_message().map(|m| m.id),
+            Some(10),
+            "message not loaded, nothing to scroll to"
+        );
+
+        // The page carrying message 10 lands: the jump applies and clears.
+        app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
+        assert_eq!(
+            app.conversation().selected_message().map(|m| m.id),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn a_jump_is_dropped_when_a_different_chat_is_opened_first() {
+        let mut app = app_on_results();
+        app.dispatch(Action::ResultOpen); // hit for chat 1, message 10
+
+        // The user opens chat 2 before chat 1's history arrives: the stale jump drops.
+        app.project_conversation(2, text_history(&[7, 8]), HashSet::new());
+        // Chat 1's history (with message 10) arrives later, but the jump is gone, so
+        // the view lands fresh at the top (message 9) rather than chasing message 10.
+        app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(9));
+    }
+
+    #[test]
     fn forwarding_a_hit_opens_the_target_picker_with_that_message() {
         let mut app = app_on_results();
         app.dispatch(Action::ResultNext); // select Bob's hit (message 20)
         app.dispatch(Action::ForwardOpen);
         assert_eq!(app.overlay(), Overlay::Forward);
         assert_eq!(app.forward().message_ids(), &[20]);
+        // The hit's chat (Bob, id 2) is the source the forward carries.
+        assert_eq!(app.forward().source_chat_id(), 2);
         // The picker reuses the chat list as its target list.
         assert_eq!(
             app.forward().selected_target().map(|c| c.title.as_str()),
@@ -972,8 +1733,8 @@ mod tests {
     }
 
     #[test]
-    fn forward_picks_a_target_then_confirms_back_to_browsing() {
-        let mut app = app_on_results();
+    fn forward_picks_a_target_then_confirms_records_the_intent() {
+        let mut app = app_on_results(); // selected hit: Alice's (chat 1, message 10)
         app.dispatch(Action::ForwardOpen);
         app.dispatch(Action::ForwardNext);
         assert_eq!(
@@ -982,6 +1743,17 @@ mod tests {
         );
         app.dispatch(Action::ForwardConfirm);
         assert_eq!(app.overlay(), Overlay::None, "confirm closes the modal");
+        // The confirmed forward is recorded for the loop: message 10 from its source
+        // chat (1) into the picked target (Bob, 2).
+        assert_eq!(
+            app.take_forward(),
+            Some(ForwardIntent {
+                from_chat_id: 1,
+                message_ids: vec![10],
+                to_chat_id: 2,
+            })
+        );
+        assert_eq!(app.take_forward(), None, "the intent is drained once");
     }
 
     #[test]
@@ -996,12 +1768,74 @@ mod tests {
     fn forwarding_with_no_hits_is_a_noop() {
         let mut app = App::new();
         app.dispatch(Action::SearchOpen);
+        app.dispatch(Action::SearchInput('q')); // a query, but the search returns nothing
         app.dispatch(Action::SearchSubmit); // empty results
         app.dispatch(Action::ForwardOpen);
         assert_eq!(
             app.overlay(),
             Overlay::SearchResults,
             "no hit to forward, stays put"
+        );
+    }
+
+    /// An app with a two-chat list and an open conversation (chat 1) — the state a
+    /// forward is started from in the history pane (`f`).
+    fn app_on_conversation() -> App {
+        use crate::chat_list::{ChatList, ChatListView, sample_chat};
+        use std::collections::HashSet;
+        use tuigram_core::model::ChatListKind;
+
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
+        }]);
+        let mut app = App::with_chat_list(view);
+        app.project_conversation(1, text_history(&[10, 11]), HashSet::new());
+        app
+    }
+
+    #[test]
+    fn forwarding_the_selected_history_message_opens_the_picker_from_the_open_chat() {
+        let mut app = app_on_conversation();
+        // The message the history pane has selected (sample_message pins chat_id to 1).
+        let selected = app.conversation().selected_message().map(|m| m.id).unwrap();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(app.overlay(), Overlay::Forward);
+        assert_eq!(app.forward().message_ids(), &[selected]);
+        assert_eq!(
+            app.forward().source_chat_id(),
+            1,
+            "sourced from the open chat"
+        );
+        // The picker reuses the chat list as its target list.
+        assert_eq!(
+            app.forward().selected_target().map(|c| c.title.as_str()),
+            Some("Alice")
+        );
+    }
+
+    #[test]
+    fn cancelling_a_history_forward_returns_to_the_conversation() {
+        let mut app = app_on_conversation();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(app.overlay(), Overlay::Forward);
+        app.dispatch(Action::ForwardCancel);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "cancel lands back on the conversation, not the search results"
+        );
+    }
+
+    #[test]
+    fn forwarding_from_an_empty_history_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::ForwardMessage);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "no selected message, nothing to forward"
         );
     }
 
@@ -1018,6 +1852,7 @@ mod tests {
 
     // --- media, reactions & pins (#85) ---
 
+    use crate::reactions::ReactionIntent;
     use tuigram_core::model::ReactionKind;
 
     /// An app whose history holds two text messages, the first (oldest, at the top)
@@ -1042,15 +1877,35 @@ mod tests {
     }
 
     #[test]
-    fn pin_toggles_the_selected_message_and_dirties() {
+    fn pin_toggles_the_selected_message_and_records_the_intent() {
+        use crate::conversation::PinIntent;
         let mut app = app_with_history();
         let id = app.conversation().selected_message().unwrap().id;
         app.clear_dirty();
         app.dispatch(Action::PinToggle);
-        assert!(app.conversation().is_pinned(id), "pinned");
+        assert!(app.conversation().is_pinned(id), "pinned optimistically");
         assert!(app.is_dirty());
+        // The pin (not unpin) is recorded for the loop to send to core.
+        assert_eq!(
+            app.take_pin(),
+            Some(PinIntent {
+                chat_id: 1,
+                message_id: id,
+                pin: true,
+            })
+        );
+        assert_eq!(app.take_pin(), None, "the intent is drained once");
+        // Toggling again unpins, and records the matching unpin.
         app.dispatch(Action::PinToggle);
         assert!(!app.conversation().is_pinned(id), "unpinned again");
+        assert_eq!(
+            app.take_pin(),
+            Some(PinIntent {
+                chat_id: 1,
+                message_id: id,
+                pin: false,
+            })
+        );
     }
 
     #[test]
@@ -1059,6 +1914,7 @@ mod tests {
         app.clear_dirty();
         app.dispatch(Action::PinToggle);
         assert!(!app.is_dirty(), "no selected message, nothing changes");
+        assert_eq!(app.take_pin(), None, "no intent recorded");
     }
 
     #[test]
@@ -1077,6 +1933,45 @@ mod tests {
         assert_eq!(reactions.len(), 1);
         assert!(reactions[0].is_chosen, "our reaction is recorded");
         assert_eq!(reactions[0].kind, ReactionKind::Emoji(chosen.to_owned()));
+        // The add (a fresh reaction) is recorded for the loop to send to core.
+        assert_eq!(
+            app.take_reaction(),
+            Some(ReactionIntent {
+                chat_id: 1,
+                message_id: id,
+                emoji: chosen.to_owned(),
+                add: true,
+            })
+        );
+        assert_eq!(app.take_reaction(), None, "the intent is drained once");
+    }
+
+    #[test]
+    fn reacting_with_the_same_emoji_again_records_a_removal() {
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        // React once (add), then again with the same emoji (remove).
+        app.dispatch(Action::ReactionOpen);
+        let chosen = app.reaction().selected_emoji();
+        app.dispatch(Action::ReactionConfirm);
+        assert!(matches!(app.take_reaction(), Some(i) if i.add));
+        app.dispatch(Action::ReactionOpen);
+        app.dispatch(Action::ReactionConfirm);
+        // The optimistic bucket is gone, and the recorded intent is a removal.
+        let message = app.conversation().messages().iter().find(|m| m.id == id);
+        assert!(
+            message.unwrap().reactions.is_empty(),
+            "our reaction removed"
+        );
+        assert_eq!(
+            app.take_reaction(),
+            Some(ReactionIntent {
+                chat_id: 1,
+                message_id: id,
+                emoji: chosen.to_owned(),
+                add: false,
+            })
+        );
     }
 
     #[test]
@@ -1103,6 +1998,79 @@ mod tests {
                 .all(|m| m.reactions.is_empty()),
             "cancel adds no reaction"
         );
+        assert_eq!(app.take_reaction(), None, "cancel records no intent");
+    }
+
+    #[test]
+    fn typing_a_custom_emoji_reacts_with_it() {
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        app.dispatch(Action::ReactionOpen);
+        // `c` opens the custom line; then type a multi-scalar emoji.
+        app.dispatch(Action::ReactionKey('c'));
+        assert!(app.reaction().is_custom(), "custom line active");
+        for c in "🥳".chars() {
+            app.dispatch(Action::ReactionKey(c));
+        }
+        app.dispatch(Action::ReactionConfirm);
+        assert_eq!(app.overlay(), Overlay::None, "confirm closes the picker");
+        // The custom emoji lands on the message and is sent to core as an add.
+        let reactions = &app
+            .conversation()
+            .messages()
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap()
+            .reactions;
+        assert_eq!(reactions[0].kind, ReactionKind::Emoji("🥳".to_owned()));
+        assert_eq!(
+            app.take_reaction(),
+            Some(ReactionIntent {
+                chat_id: 1,
+                message_id: id,
+                emoji: "🥳".to_owned(),
+                add: true,
+            })
+        );
+    }
+
+    #[test]
+    fn custom_line_keys_type_instead_of_navigating_and_esc_returns_to_the_palette() {
+        let mut app = app_with_history();
+        app.dispatch(Action::ReactionOpen);
+        app.dispatch(Action::ReactionKey('c'));
+        // In custom mode, `j`/`k` are literal input, not palette navigation.
+        app.dispatch(Action::ReactionKey('j'));
+        app.dispatch(Action::ReactionKey('k'));
+        assert_eq!(app.reaction().custom_input(), Some("jk"));
+        assert_eq!(app.reaction().selected(), 0, "palette cursor did not move");
+        // Backspace edits the buffer.
+        app.dispatch(Action::ReactionBackspace);
+        assert_eq!(app.reaction().custom_input(), Some("j"));
+        // Esc backs out to the palette (overlay stays open); a second Esc closes it.
+        app.dispatch(Action::ReactionCancel);
+        assert!(!app.reaction().is_custom(), "back in palette mode");
+        assert_eq!(app.overlay(), Overlay::Reaction, "overlay still open");
+        app.dispatch(Action::ReactionCancel);
+        assert_eq!(app.overlay(), Overlay::None, "second Esc closes it");
+    }
+
+    #[test]
+    fn confirming_an_empty_custom_line_reacts_with_nothing() {
+        let mut app = app_with_history();
+        app.dispatch(Action::ReactionOpen);
+        app.dispatch(Action::ReactionKey('c'));
+        // Enter with nothing typed: close the overlay, but record no reaction.
+        app.dispatch(Action::ReactionConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(
+            app.conversation()
+                .messages()
+                .iter()
+                .all(|m| m.reactions.is_empty()),
+            "empty custom line adds no reaction"
+        );
+        assert_eq!(app.take_reaction(), None, "no intent recorded");
     }
 
     #[test]
@@ -1131,12 +2099,64 @@ mod tests {
             Overlay::SendMedia,
             "no path, nothing to send"
         );
+        assert!(
+            app.take_media().is_none(),
+            "an empty prompt records no send"
+        );
         // A path makes it sendable; confirm then closes.
         for c in "/tmp/a.png".chars() {
             app.dispatch(Action::AttachInput(c));
         }
         app.dispatch(Action::AttachConfirm);
         assert_eq!(app.overlay(), Overlay::None);
+    }
+
+    #[test]
+    fn confirming_an_attach_records_the_media_for_the_loop() {
+        use tuigram_core::model::OutgoingMedia;
+
+        let mut app = app_with_history();
+        app.dispatch(Action::AttachOpen);
+        for c in "/tmp/clip.mp4".chars() {
+            app.dispatch(Action::AttachInput(c));
+        }
+        app.dispatch(Action::AttachToggleField);
+        for c in "watch".chars() {
+            app.dispatch(Action::AttachInput(c));
+        }
+        app.dispatch(Action::AttachConfirm);
+        assert_eq!(app.overlay(), Overlay::None, "the prompt closed");
+
+        // The intent carries the extension-inferred variant, path, and caption, and
+        // drains exactly once (a second drain is empty).
+        match app.take_media() {
+            Some(OutgoingMedia::Video { path, caption }) => {
+                assert_eq!(path, "/tmp/clip.mp4");
+                assert_eq!(caption.text, "watch");
+            }
+            other => panic!("expected a video attachment, got {other:?}"),
+        }
+        assert!(app.take_media().is_none(), "drained once");
+    }
+
+    #[test]
+    fn projecting_downloads_fills_the_conversation_progress_state() {
+        use tuigram_core::model::File;
+
+        let mut app = app_with_history();
+        app.project_downloads(vec![File {
+            id: 42,
+            size: 100,
+            downloaded_size: 40,
+            is_downloading_active: true,
+            ..File::default()
+        }]);
+        let file = app
+            .conversation()
+            .download(42)
+            .expect("projected download state");
+        assert_eq!(file.downloaded_size, 40);
+        assert!(file.is_downloading_active);
     }
 
     #[test]
@@ -1147,6 +2167,110 @@ mod tests {
         app.dispatch(Action::AttachCancel);
         app.dispatch(Action::AttachOpen);
         assert_eq!(app.media().path(), "", "reopened prompt starts empty");
+    }
+
+    // --- settings editor (#146) ---
+
+    use crate::settingsform::SettingsField;
+    use tuigram_core::{CacheCap, KeepMedia, StorageSettings};
+
+    /// Backspace over the focused field's current text, so a test can retype it.
+    fn clear_field(app: &mut App) {
+        for _ in 0..app.settings().value(app.settings().field()).chars().count() {
+            app.dispatch(Action::SettingsBackspace);
+        }
+    }
+
+    #[test]
+    fn opening_settings_prefills_from_the_live_policy() {
+        let mut app = App::new();
+        app.set_storage_settings(StorageSettings {
+            keep_private: KeepMedia::Forever,
+            keep_groups: KeepMedia::Days(7),
+            keep_channels: KeepMedia::Days(3),
+            max_cache: CacheCap::Bytes(2 * 1024 * 1024 * 1024),
+        });
+        app.dispatch(Action::SettingsOpen);
+        assert_eq!(app.overlay(), Overlay::Settings);
+        assert_eq!(app.settings().value(SettingsField::KeepGroups), "7d");
+        assert_eq!(app.settings().value(SettingsField::MaxCache), "2GB");
+    }
+
+    #[test]
+    fn confirming_a_valid_edit_applies_it_live_and_hands_it_to_the_loop() {
+        let mut app = App::new();
+        app.dispatch(Action::SettingsOpen);
+        // Edit channels forever -> 3d and the cache unbounded -> 2GB.
+        app.dispatch(Action::SettingsToggleField); // groups
+        app.dispatch(Action::SettingsToggleField); // channels
+        clear_field(&mut app);
+        for c in "3d".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsToggleField); // max cache
+        clear_field(&mut app);
+        for c in "2GB".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsConfirm);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "a valid edit closes the editor"
+        );
+
+        // The loop drains the new policy exactly once.
+        let updated = app
+            .take_settings()
+            .expect("a confirmed edit is handed back");
+        assert_eq!(updated.keep_channels, KeepMedia::Days(3));
+        assert_eq!(updated.max_cache, CacheCap::Bytes(2 * 1024 * 1024 * 1024));
+        assert!(app.take_settings().is_none(), "drained once");
+
+        // Reopening shows the applied values, proving the in-memory policy updated.
+        app.dispatch(Action::SettingsOpen);
+        assert_eq!(app.settings().value(SettingsField::KeepChannels), "3d");
+    }
+
+    #[test]
+    fn an_invalid_edit_keeps_the_editor_open_and_records_nothing() {
+        let mut app = App::new();
+        app.dispatch(Action::SettingsOpen);
+        clear_field(&mut app); // private field: "forever" -> ""
+        for c in "2TB".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsToggleField); // move off before confirming
+        app.dispatch(Action::SettingsConfirm);
+        assert_eq!(
+            app.overlay(),
+            Overlay::Settings,
+            "an invalid value keeps the editor open"
+        );
+        assert!(
+            app.take_settings().is_none(),
+            "an invalid edit is never handed to the loop"
+        );
+        assert!(
+            app.settings().error().is_some(),
+            "the reason is shown in place"
+        );
+    }
+
+    #[test]
+    fn cancelling_settings_discards_the_edit() {
+        let mut app = App::new();
+        app.dispatch(Action::SettingsOpen);
+        clear_field(&mut app);
+        for c in "3d".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.take_settings().is_none(), "a cancel records nothing");
+        // The live policy is untouched — reopening shows the original default.
+        app.dispatch(Action::SettingsOpen);
+        assert_eq!(app.settings().value(SettingsField::KeepPrivate), "forever");
     }
 
     // --- secret chats & chat-action indicators (#87) ---
@@ -1221,13 +2345,20 @@ mod tests {
     }
 
     #[test]
-    fn confirming_the_secret_prompt_closes_it() {
+    fn confirming_the_secret_prompt_records_the_action_for_the_loop() {
         use tuigram_core::model::ChatKind;
         let mut app = app_with_one_chat(ChatKind::Private { user_id: 7 }, None);
         app.dispatch(Action::SecretOpen);
         app.dispatch(Action::SecretConfirm);
         assert_eq!(app.overlay(), Overlay::None, "confirm closes the modal");
         assert!(app.secret().is_none(), "prompt state cleared");
+        // The confirmed lifecycle is queued for the loop to dispatch on the seam,
+        // then drained exactly once.
+        assert_eq!(
+            app.take_secret(),
+            Some(SecretLifecycle::Start { user_id: 7 })
+        );
+        assert!(app.take_secret().is_none(), "drained once");
     }
 
     #[test]
@@ -1238,6 +2369,25 @@ mod tests {
         app.dispatch(Action::SecretCancel);
         assert_eq!(app.overlay(), Overlay::None);
         assert!(app.secret().is_none());
+        assert!(app.take_secret().is_none(), "cancel dispatches nothing");
+    }
+
+    #[test]
+    fn projecting_secret_states_lands_them_on_the_chat_list() {
+        use tuigram_core::model::{ChatKind, SecretChatState};
+        let mut app = app_with_one_chat(
+            ChatKind::Secret {
+                secret_chat_id: 9,
+                user_id: 7,
+            },
+            None,
+        );
+        assert!(app.chat_list().secret_state(5).is_none());
+        app.project_secret_states(vec![(5, SecretChatState::Ready)]);
+        assert_eq!(
+            app.chat_list().secret_state(5),
+            Some(SecretChatState::Ready)
+        );
     }
 
     #[test]
@@ -1300,17 +2450,26 @@ mod tests {
     }
 
     #[test]
-    fn the_heartbeat_ages_a_toast_out() {
+    fn tick_notices_ages_out_the_toast_and_repaints_only_when_it_leaves() {
+        // The notice clock (#139) drives the toast's lifetime; the app repaints only
+        // on the tick that actually drops it, since a still-counting toast is unchanged.
         let mut app = App::new();
         app.notify(Notice::info("download complete"));
-        // Beat is the toast clock: enough beats expire it.
-        for _ in 0..10 {
-            app.dispatch(Action::Beat);
+        // Age it to the brink of expiry without dropping it — no repaint owed.
+        let mut ticks = 0;
+        loop {
+            app.clear_dirty();
+            app.tick_notices();
+            if app.notifications().current().is_none() {
+                break;
+            }
+            assert!(!app.is_dirty(), "a still-counting toast owes no repaint");
+            ticks += 1;
+            assert!(ticks < 100, "toast should have expired by now");
         }
-        assert!(
-            app.notifications().current().is_none(),
-            "the toast timed out"
-        );
+        // The expiring tick dropped it and asked for a repaint.
+        assert!(app.is_dirty(), "the expiring tick repaints");
+        assert!(ticks > 0, "the toast survived at least one tick");
     }
 
     #[test]

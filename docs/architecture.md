@@ -5,8 +5,10 @@
 > them, and Phase 4 extends that client (media, archive/folders, search/forward,
 > reactions/pins, chat actions, secret chats, full login) without revisiting it.
 > Phase 5 adds the Ratatui front-end as a spine over fixtures (see below;
-> [tui.md](tui.md) holds the detail). Later phases extend rather than revisit
-> these decisions.
+> [tui.md](tui.md) holds the detail), and Phase 6 feeds that spine the real
+> `Client` — live updates in, actions out — without changing its shape
+> ([wiring.md](wiring.md) holds the detail). Later phases extend rather than
+> revisit these decisions.
 
 ## Goals
 
@@ -155,3 +157,40 @@ walkthrough; the shaping decisions are:
   `fn(&mut Frame, &App)` rendered into an in-memory `Buffer`; tests assert on
   whole-buffer text and per-row layout, alongside the headless core's plain unit
   tests — no terminal in CI, the same discipline as the core.
+
+## Resolved decisions (Phase 6 — wire Telegram ↔ TUI)
+
+Phase 6 feeds the Phase 5 spine the real [`Client`](headless-client.md): login,
+live updates, and every action routed to a real request seam. It makes no new core
+decisions — it realises the seam Phase 5 left open, and the loop's shape is
+unchanged. [wiring.md](wiring.md) holds the full walkthrough; the shaping decisions
+are:
+
+- **The fake source becomes the real one; the loop is untouched.** Phase 5 fed the
+  loop's mpsc arm from a heartbeat; Phase 6 feeds it from
+  [`spawn_core_source`](../crates/tuigram/src/event.rs), which subscribes to the
+  client's update feed, classifies each event, and forwards it onto the *same*
+  channel. The three-phase client standup (bootstrap on the plain terminal →
+  in-TUI login → `Client::start` only on `Ready`) lives in
+  [`main.rs`](../crates/tuigram/src/main.rs); TDLib is closed cleanly on every exit
+  path so its database is never left mid-write.
+- **`AppEvent` is a redraw signal, not the data.** Each variant means "this domain
+  may have changed, repaint"; the projection reads the current folded state back
+  from the `Client` (`Connection` is the one exception, carrying its already-
+  projected state). `classify` mirrors the core router's own routing and drops
+  unmodelled updates at the source, so the loop only wakes for redraw-worthy
+  signals. A second, independent lagged-aware subscription means a broadcast gap
+  here is harmless — the router folded the authoritative state regardless, so
+  `Lagged` just re-projects.
+- **Projections read the store; `App` stays pure.** Reading folded state needs the
+  `Client`, so the `project_*` calls live in the loop and hand `App` an **owned**
+  snapshot (`Vec<Message>`, projected lists) — `App` never holds a `Client`, so the
+  reducer and every pane stay unit-testable without a live core.
+- **Actions are pure intents, drained to fire-and-forget seams.** A keypress
+  records an intent on `App`; the loop drains it and routes it to the matching
+  per-domain request seam off an `Arc<Client>` clone, never awaiting in the loop.
+  The request's return value never feeds the UI — the authoritative result arrives
+  as an update the router folds and the loop re-projects, the same path an
+  unsolicited change takes. Only a seam-level rejection reports back, as an error
+  toast carrying a fixed TDLib error code, never user content. Reaction/pin toggles
+  apply optimistically and reconcile on the real update.

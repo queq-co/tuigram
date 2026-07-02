@@ -17,6 +17,7 @@ pub mod model;
 pub mod router;
 pub mod secret_chats;
 pub mod session;
+pub mod settings;
 pub mod users;
 
 pub use actions::{ChatActionRequests, ChatActionStore};
@@ -30,7 +31,9 @@ pub use connection::{ConnectionState, ConnectionStore};
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };
-pub use files::{DOWNLOAD_PRIORITY, FileRequests, FileStore};
+pub use files::{
+    DOWNLOAD_PRIORITY, FileRequests, FileStore, SWEEP_IMMUNITY_DELAY, StorageRequests,
+};
 pub use messages::{
     DeleteRequests, EditRequests, ForwardRequests, HistoryRequests, MessageRequests, MessageStore,
     NEWEST, PinRequests, ReactionRequests, ReadRequests, SearchPage, SearchRequests, SearchResults,
@@ -46,6 +49,7 @@ pub use model::{
 pub use router::{Router, UpdateSink};
 pub use secret_chats::{SecretChatRequests, SecretChatStore};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
+pub use settings::{CacheCap, KeepMedia, StorageSettings};
 pub use users::{UserRequests, UserStore};
 
 /// TDLib's typed request API and data model, re-exported so callers depend on

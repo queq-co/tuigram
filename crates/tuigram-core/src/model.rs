@@ -1501,6 +1501,32 @@ impl MessageContent {
             TdMessageContent::MessageUnsupported => Self::Unsupported("messageUnsupported"),
         }
     }
+
+    /// The downloadable file this content references, if any — the key into the
+    /// [`FileStore`](crate::files::FileStore) for a download or progress bar. The
+    /// media variants (photo, video, document, audio, voice, sticker, animation)
+    /// each carry one file; every other variant (text, location, poll, …) has none.
+    ///
+    /// The single source of truth for "which file backs this message", shared by the
+    /// download driver (#120) and the UI's progress line so the two never drift.
+    #[must_use]
+    pub fn file(&self) -> Option<FileRef> {
+        match self {
+            Self::Photo(p) => Some(p.file),
+            Self::Video(v) => Some(v.file),
+            Self::Document(d) => Some(d.file),
+            Self::Audio(a) => Some(a.file),
+            Self::Voice(v) => Some(v.file),
+            Self::Sticker(s) => Some(s.file),
+            Self::Animation(a) => Some(a.file),
+            Self::Text(_)
+            | Self::Location(_)
+            | Self::Venue(_)
+            | Self::Contact(_)
+            | Self::Poll(_)
+            | Self::Unsupported(_) => None,
+        }
+    }
 }
 
 /// A file-backed message to send, from a local path — the write-side counterpart
@@ -3220,5 +3246,38 @@ mod tests {
                 is_chosen: true,
             }]
         );
+    }
+
+    #[test]
+    fn message_content_exposes_the_backing_file_only_for_media() {
+        let caption = FormattedText {
+            text: String::new(),
+            entities: vec![],
+        };
+        // Each media variant surfaces its own file id; a document is representative.
+        let photo = MessageContent::Photo(Photo {
+            caption: caption.clone(),
+            file: FileRef::new(7),
+            width: 0,
+            height: 0,
+        });
+        assert_eq!(photo.file(), Some(FileRef::new(7)));
+        let document = MessageContent::Document(Document {
+            caption,
+            file: FileRef::new(9),
+            file_name: "x".to_owned(),
+            mime_type: String::new(),
+        });
+        assert_eq!(document.file(), Some(FileRef::new(9)));
+        // Non-file content has none.
+        assert_eq!(
+            MessageContent::Text(FormattedText {
+                text: "hi".to_owned(),
+                entities: vec![],
+            })
+            .file(),
+            None
+        );
+        assert_eq!(MessageContent::Unsupported("messageDice").file(), None);
     }
 }

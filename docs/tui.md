@@ -29,7 +29,7 @@ deliberately thin in Phase 5 so Phase 6 only has to feed it.
 | The focus model + the one bindings table | [`keymap.rs`](../crates/tuigram/src/keymap.rs) |
 | The `AppEvent` seam + the temporary fake source | [`event.rs`](../crates/tuigram/src/event.rs) |
 | The terminal guard (raw mode, alt screen, restore) | [`terminal.rs`](../crates/tuigram/src/terminal.rs) |
-| Per-pane / per-overlay view-models | `chat_list`, `conversation`, `composer`, `search`, `forward`, `reactions`, `mediaform`, `secret`, `login`, `status`, `textinput` |
+| Per-pane / per-overlay view-models | `chat_list`, `conversation`, `composer`, `search`, `forward`, `reactions`, `mediaform`, `secret`, `settingsform`, `login`, `status`, `textinput` |
 
 ## The central event loop
 
@@ -118,8 +118,8 @@ is always obvious. The **status bar** (added in #88) shows the connection state
 and current chat/mode on the left and the always-available `? help · q quit`
 hint on the right.
 
-A **modal overlay** (help, search, forward, reaction, send-media, secret-chat)
-floats above the panes and **captures input** while open. A **transient toast**
+A **modal overlay** (help, search, forward, reaction, send-media, secret-chat,
+settings) floats above the panes and **captures input** while open. A **transient toast**
 also floats above the content but deliberately does **not** capture input, so a
 notification never blocks the loop. Both are drawn after the panes; the toast
 sits outside the overlay match for exactly that reason.
@@ -160,6 +160,11 @@ the Phase-6 ingest seams (e.g. `set_connection`, `notify`) — they're just fed
 from fixtures for now, marked `#[allow(dead_code)]` where only the Phase-6 path
 reaches them.
 
+This is exactly what Phase 6 did, and the seam held: `spawn_core_source` replaced
+`spawn_fake_source` on the same mpsc arm, `AppEvent` grew its real variants, and
+the panes are now projected from the folded `Client` store — all without changing
+the loop above. [wiring.md](wiring.md) is that swap, as built.
+
 ## Testing: `TestBackend` snapshots, no TTY
 
 `TestBackend` renders `ui()` into an in-memory `Buffer` with no terminal, so UI
@@ -189,7 +194,9 @@ eventually drives.
   feed is Phase 6 (the fake-source boundary above).
 - **Real lifecycle exercise.** The spine is proven headlessly; the connected
   paths (a real login, a real send, real `updateConnectionState`) are exercised
-  via the REPL against live TDLib in Phase 6, not asserted in CI here.
+  via the REPL against live TDLib in Phase 6, not asserted in CI here — see
+  [phase6-verification.md](phase6-verification.md) for the checklist and recorded
+  outcomes.
 
 ## Trying it
 

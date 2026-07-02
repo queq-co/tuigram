@@ -18,7 +18,8 @@
 use crate::textinput::TextInput;
 
 /// What the composer is currently acting on. The mode drives the pane's indicator
-/// and, in Phase 6, whether a submit sends a new message, a reply, or an edit.
+/// and, on submit, whether the buffer becomes a new message, a reply, or an edit
+/// (#116).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ComposerMode {
     /// Writing a new message in the open chat.
@@ -28,20 +29,44 @@ pub enum ComposerMode {
     /// (built by the caller from the message), shown in the pane indicator so the
     /// user sees what they are replying to.
     Reply {
-        /// The message being replied to. Carried for the Phase 6 send (the reply's
-        /// `reply_to`); the indicator renders only the `preview`, so the binary
-        /// does not read it yet.
-        #[allow(dead_code)]
+        /// The message being replied to — the reply's `reply_to` on submit (#116).
         message_id: i64,
         preview: String,
     },
     /// Editing a message already sent. The buffer is pre-filled with its current
     /// text; submitting replaces it.
     Edit {
-        /// The message being edited, for the Phase 6 edit call; the indicator does
-        /// not render it, so it is unread in the binary for now.
-        #[allow(dead_code)]
+        /// The message being edited — the edit target on submit (#116).
         message_id: i64,
+    },
+}
+
+/// A submitted composer buffer and what core should do with it (#116). [`submit`]
+/// resolves the [mode](ComposerMode) into one of these so the loop can route it to
+/// the matching seam without re-reading the composer's state; the text is always
+/// non-empty (an empty submit is a no-op).
+///
+/// [`submit`]: Composer::submit
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Submission {
+    /// Send `text` as a new message in the open chat.
+    Send {
+        /// The message body.
+        text: String,
+    },
+    /// Send `text` as a reply to `reply_to` in the open chat.
+    Reply {
+        /// The message being replied to.
+        reply_to: i64,
+        /// The reply body.
+        text: String,
+    },
+    /// Replace message `message_id`'s text with `text`.
+    Edit {
+        /// The message being edited.
+        message_id: i64,
+        /// The replacement text.
+        text: String,
     },
 }
 
@@ -144,20 +169,29 @@ impl Composer {
         self.mode = ComposerMode::Compose;
     }
 
-    /// Submit the buffer. Returns the text and resets to an empty compose state
-    /// when there is something to send; an empty or whitespace-only buffer is a
-    /// no-op that returns `None` (and leaves the mode untouched).
+    /// Submit the buffer. Resolves the current [mode](Self::mode) into a
+    /// [`Submission`] (a new message, a reply, or an edit), clears the buffer, and
+    /// resets to plain compose. An empty or whitespace-only buffer is a no-op that
+    /// returns `None` and leaves the mode untouched.
     ///
-    /// Phase 6 routes the returned text to core — a new message, a reply, or an
-    /// edit per the [mode](Self::mode) at the call site; Phase 5 simply consumes it.
+    /// The loop routes the returned [`Submission`] to the send/edit seam (#116).
     #[must_use]
-    pub fn submit(&mut self) -> Option<String> {
+    pub fn submit(&mut self) -> Option<Submission> {
         if self.input.text().trim().is_empty() {
             return None;
         }
         let text = self.input.take();
-        self.mode = ComposerMode::Compose;
-        Some(text)
+        // `take` resets the mode to its `Compose` default, leaving the composer
+        // ready for the next message regardless of what it was just acting on.
+        let submission = match std::mem::take(&mut self.mode) {
+            ComposerMode::Compose => Submission::Send { text },
+            ComposerMode::Reply { message_id, .. } => Submission::Reply {
+                reply_to: message_id,
+                text,
+            },
+            ComposerMode::Edit { message_id } => Submission::Edit { message_id, text },
+        };
+        Some(submission)
     }
 }
 
@@ -245,14 +279,43 @@ mod tests {
     }
 
     #[test]
-    fn submit_returns_the_text_and_resets_to_empty_compose() {
+    fn submit_resolves_the_mode_and_resets_to_empty_compose() {
+        // A plain compose submits as a new message.
         let mut composer = typed("hello");
-        composer.reply_to(7, "User 7: hi".to_owned());
-        let sent = composer.submit();
-        assert_eq!(sent.as_deref(), Some("hello"));
+        assert_eq!(
+            composer.submit(),
+            Some(Submission::Send {
+                text: "hello".to_owned()
+            })
+        );
         assert!(composer.is_empty());
         assert_eq!(composer.cursor(), 0);
         assert_eq!(composer.mode(), &ComposerMode::Compose);
+
+        // Reply mode carries its target through as the reply's `reply_to`.
+        let mut replying = typed("sure");
+        replying.reply_to(7, "User 7: hi".to_owned());
+        assert_eq!(
+            replying.submit(),
+            Some(Submission::Reply {
+                reply_to: 7,
+                text: "sure".to_owned()
+            })
+        );
+        assert_eq!(replying.mode(), &ComposerMode::Compose);
+
+        // Edit mode carries the message being edited.
+        let mut editing = Composer::default();
+        editing.edit(99, "old".to_owned());
+        editing.insert('!');
+        assert_eq!(
+            editing.submit(),
+            Some(Submission::Edit {
+                message_id: 99,
+                text: "old!".to_owned()
+            })
+        );
+        assert_eq!(editing.mode(), &ComposerMode::Compose);
     }
 
     #[test]

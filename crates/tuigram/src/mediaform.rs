@@ -125,12 +125,11 @@ impl MediaDraft {
 
     /// Build the [`OutgoingMedia`] the prompt describes, its variant inferred from
     /// the path's extension (image ⇒ photo, video ⇒ video, audio ⇒ audio, else
-    /// document), or `None` when no path is set. Phase 6 hands the result to
-    /// [`send_media`](tuigram_core::SendRequests::send_media); only the reducer
-    /// tests build it today, so it is unused in the non-test binary for now.
+    /// document), or `None` when no path is set. The attach-confirm reducer (#120)
+    /// hands the result to the loop, which sends it via
+    /// [`send_media`](tuigram_core::SendRequests::send_media).
     ///
     /// [`send_media`]: tuigram_core::SendRequests::send_media
-    #[allow(dead_code)]
     #[must_use]
     pub fn to_outgoing(&self) -> Option<OutgoingMedia> {
         if !self.is_sendable() {

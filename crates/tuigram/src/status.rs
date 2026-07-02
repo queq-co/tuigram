@@ -11,14 +11,15 @@
 //! Errors surface a fixed action phrase and an optional core error *code* — never
 //! the user's typed input, the same rule the login flow follows.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
 /// The core link's connection lifecycle, mirrored from TDLib's `connectionState`.
-/// A total set, so a status read is always classified; the real
-/// `updateConnectionState` folds into it in Phase 6. Some variants are only
-/// constructed by that Phase-6 fold (and the tests) for now, so the whole set is
-/// kept regardless of current construction.
-#[allow(dead_code)]
+/// A total set, so a status read is always classified. The real
+/// `updateConnectionState` folds into it live (#112): the core source projects
+/// every TDLib connection state onto a variant here
+/// ([`project_connection`](crate::event)), so each one is constructed in the
+/// binary, not just the tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
     /// No network reachable; waiting for one.
@@ -80,9 +81,15 @@ impl NoticeLevel {
     }
 }
 
-/// The default lifetime of a toast, in heartbeats (~1s each): long enough to read
-/// a short line, short enough not to linger.
+/// The lifetime of an info/success toast, in heartbeats (~1s each): long enough to
+/// read a short line, short enough not to linger.
 const DEFAULT_TTL: u32 = 5;
+
+/// The lifetime of an error toast, in heartbeats (~1s each): longer than
+/// [`DEFAULT_TTL`] because a failure is something the user may need to read and
+/// act on, so it should not vanish as quickly as a routine event. It still ages
+/// out on its own and Ctrl-G dismisses it early, per the non-capturing contract.
+const ERROR_TTL: u32 = 12;
 
 /// One transient toast: a severity, a message, and the remaining heartbeats before
 /// it auto-dismisses.
@@ -94,9 +101,7 @@ pub struct Notice {
 }
 
 // The toast constructors are the Phase-6 building API: core calls them (through
-// [`App::notify`]) when an action fails or a one-off event lands. Until that
-// wiring exists they are reached only from the tests, so they are dead in the
-// binary — annotated like `notify` itself.
+// [`App::notify`]) when an action fails or a one-off event lands.
 impl Notice {
     /// An informational toast (a one-off event like "download complete").
     #[allow(dead_code)]
@@ -116,7 +121,6 @@ impl Notice {
     /// (e.g. `error("send", Some("FLOOD_WAIT"))` → "send failed (FLOOD_WAIT)").
     /// Built only from a fixed action phrase and a core code — never the user's
     /// typed input, the same rule the login flow follows.
-    #[allow(dead_code)]
     #[must_use]
     pub fn error(action: &str, code: Option<&str>) -> Self {
         let text = match code {
@@ -126,13 +130,27 @@ impl Notice {
         Self::new(NoticeLevel::Error, text)
     }
 
-    #[allow(dead_code)]
+    /// Build an error toast for a failed core request (#122): the fixed `action`
+    /// phrase plus the raw TDLib error `message`, folded through
+    /// [`normalize_error`] into a short readable code. This is the single entry
+    /// point every Phase-6 send path funnels through, so a flood-wait, a
+    /// permission denial, or a dropped link all read the same way regardless of
+    /// which request failed. Like [`error`](Self::error) it shows only the action
+    /// and a normalized code — never the user's input.
+    #[must_use]
+    pub fn from_core_error(action: &str, message: &str) -> Self {
+        let code = normalize_error(message);
+        Self::error(action, (!code.is_empty()).then_some(code.as_ref()))
+    }
+
+    /// Build a notice, giving errors the longer [`ERROR_TTL`] so a failure lingers
+    /// long enough to read while routine info/success toasts clear on [`DEFAULT_TTL`].
     fn new(level: NoticeLevel, text: String) -> Self {
-        Self {
-            level,
-            text,
-            ttl: DEFAULT_TTL,
-        }
+        let ttl = match level {
+            NoticeLevel::Error => ERROR_TTL,
+            NoticeLevel::Info | NoticeLevel::Success => DEFAULT_TTL,
+        };
+        Self { level, text, ttl }
     }
 
     /// This toast's severity, for the render emphasis.
@@ -145,6 +163,41 @@ impl Notice {
     #[must_use]
     pub fn line(&self) -> String {
         format!("{} {}", self.level.marker(), self.text)
+    }
+}
+
+/// Fold a raw TDLib error message into a short, readable code for an error toast
+/// (#122).
+///
+/// TDLib names a rejection with a fixed code or phrase — `FLOOD_WAIT_42`,
+/// `CHAT_WRITE_FORBIDDEN`, `USER_PRIVACY_RESTRICTED` — never the user's input, so
+/// the raw string is always safe to show; it just doesn't read well in a toast.
+/// This collapses the common families (rate limits, permission/privacy denials,
+/// transport failures) each onto one plain phrase, matching case-insensitively so
+/// a family's variants (`FLOOD_WAIT`, `SLOWMODE_WAIT`; the several `*_FORBIDDEN`s)
+/// all normalize together. Anything unrecognized keeps its original message — still
+/// a safe fixed code — so no failure is ever swallowed into a silent toast. An
+/// empty message (TDLib gave only a numeric code) yields an empty code, which
+/// [`Notice::from_core_error`] renders as a bare "… failed".
+///
+/// Ordering matters where families overlap: `USER_PRIVACY_RESTRICTED` is caught by
+/// the privacy arm before the permission arm's broader `RESTRICTED`.
+#[must_use]
+pub fn normalize_error(message: &str) -> Cow<'_, str> {
+    let upper = message.to_ascii_uppercase();
+    if upper.contains("FLOOD_WAIT") || upper.contains("SLOWMODE_WAIT") {
+        Cow::Borrowed("rate limited")
+    } else if upper.contains("PRIVACY") || upper.contains("BLOCKED") {
+        Cow::Borrowed("privacy")
+    } else if upper.contains("FORBIDDEN")
+        || upper.contains("RESTRICTED")
+        || upper.contains("ADMIN_REQUIRED")
+    {
+        Cow::Borrowed("not allowed")
+    } else if upper.contains("CONNECT") || upper.contains("NETWORK") || upper.contains("TIMEOUT") {
+        Cow::Borrowed("network")
+    } else {
+        Cow::Borrowed(message)
     }
 }
 
@@ -179,9 +232,14 @@ impl Notifications {
         self.queue.pop_front();
     }
 
-    /// Age the current toast by one heartbeat, dropping it when it expires.
-    /// Returns whether a toast was removed — the only change the render path must
-    /// repaint for, since a still-counting toast looks the same.
+    /// Age the current toast by one tick, dropping it when it expires. Returns
+    /// whether a toast was removed — the only change the render path must repaint
+    /// for, since a still-counting toast looks the same.
+    ///
+    /// Driven by the loop's wall-clock notice interval (#139): the Phase-5 heartbeat
+    /// that first drove this was removed with the fake source in #110, and the toast
+    /// producers came back (#116, #120) without it, so toasts never aged out until
+    /// the interval was restored here.
     pub fn tick(&mut self) -> bool {
         if let Some(front) = self.queue.front_mut() {
             front.ttl = front.ttl.saturating_sub(1);
@@ -235,6 +293,49 @@ mod tests {
     }
 
     #[test]
+    fn normalize_error_folds_the_common_tdlib_families() {
+        // Rate limits: the flood/slowmode waits (with their trailing seconds) both
+        // read as one phrase.
+        assert_eq!(normalize_error("FLOOD_WAIT_42"), "rate limited");
+        assert_eq!(normalize_error("SLOWMODE_WAIT_10"), "rate limited");
+        // Privacy/blocked, checked before the broader permission arm so
+        // USER_PRIVACY_RESTRICTED reads as privacy, not "not allowed".
+        assert_eq!(normalize_error("USER_PRIVACY_RESTRICTED"), "privacy");
+        assert_eq!(normalize_error("USER_IS_BLOCKED"), "privacy");
+        // Permission denials, across the several *_FORBIDDEN / admin variants.
+        assert_eq!(normalize_error("CHAT_WRITE_FORBIDDEN"), "not allowed");
+        assert_eq!(normalize_error("CHAT_ADMIN_REQUIRED"), "not allowed");
+        assert_eq!(normalize_error("CHAT_FORWARDS_RESTRICTED"), "not allowed");
+        // Transport failures.
+        assert_eq!(normalize_error("Connection closed"), "network");
+    }
+
+    #[test]
+    fn normalize_error_keeps_an_unrecognized_code_verbatim() {
+        // An unmodelled but still-safe TDLib code passes through unchanged rather
+        // than being swallowed, so the toast always says something.
+        assert_eq!(normalize_error("CHAT_NOT_FOUND"), "CHAT_NOT_FOUND");
+        // An empty message (only a numeric code came back) yields an empty code.
+        assert_eq!(normalize_error(""), "");
+    }
+
+    #[test]
+    fn from_core_error_normalizes_and_reads_uniformly() {
+        // The single send-path entry point: a raw TDLib message becomes a readable
+        // toast, the same shape for every failed action.
+        let flood = Notice::from_core_error("send", "FLOOD_WAIT_42");
+        assert_eq!(flood.level(), NoticeLevel::Error);
+        assert_eq!(flood.line(), "✗ send failed (rate limited)");
+
+        let forbidden = Notice::from_core_error("pin", "CHAT_WRITE_FORBIDDEN");
+        assert_eq!(forbidden.line(), "✗ pin failed (not allowed)");
+
+        // A code-only failure (blank message) drops to a bare "… failed".
+        let bare = Notice::from_core_error("reaction", "");
+        assert_eq!(bare.line(), "✗ reaction failed");
+    }
+
+    #[test]
     fn the_queue_shows_one_toast_and_counts_the_rest() {
         let mut notes = Notifications::default();
         assert!(notes.current().is_none());
@@ -260,6 +361,31 @@ mod tests {
         assert!(notes.current().is_none());
         // Ticking an empty queue is a no-op.
         assert!(!notes.tick());
+    }
+
+    // Errors must outlast routine toasts (ERROR_TTL > DEFAULT_TTL), checked at
+    // compile time so the constants can't drift the wrong way.
+    const _: () = assert!(ERROR_TTL > DEFAULT_TTL);
+
+    #[test]
+    fn an_error_toast_outlives_an_info_toast() {
+        // Errors carry the longer ERROR_TTL so a failure lingers long enough to
+        // read; info/success clear on the shorter DEFAULT_TTL.
+        let mut notes = Notifications::default();
+        notes.push(Notice::error("send", Some("FLOOD_WAIT")));
+        // It survives every tick an info toast would have expired on.
+        for _ in 0..DEFAULT_TTL {
+            notes.tick();
+        }
+        assert!(
+            notes.current().is_some(),
+            "error still showing past DEFAULT_TTL"
+        );
+        // And clears once its own longer lifetime runs out.
+        for _ in DEFAULT_TTL..ERROR_TTL {
+            notes.tick();
+        }
+        assert!(notes.current().is_none(), "error clears on ERROR_TTL");
     }
 
     #[test]

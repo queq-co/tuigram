@@ -60,7 +60,7 @@ pub enum Overlay {
     /// No overlay: normal three-pane browsing, resolved against [`Focus`].
     #[default]
     None,
-    /// The help cheatsheet (#83): modal, any key dismisses it.
+    /// The help cheatsheet (#83): modal and scrollable, closed only by `?`/`q`/`Esc`.
     Help,
     /// The search query line: typing builds the query, Enter runs it.
     SearchInput,
@@ -74,6 +74,9 @@ pub enum Overlay {
     SendMedia,
     /// The secret-chat lifecycle confirm: start or close a secret chat (#87).
     SecretChat,
+    /// The retention settings editor (#146): edit the four download-cache knobs,
+    /// applied live and written back to `settings.toml` on confirm.
+    Settings,
 }
 
 /// The focus context a binding applies in. `Global` always applies; `Nav` applies
@@ -262,6 +265,13 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('f')]),
+        action: Action::ForwardMessage,
+        keys: "f",
+        description: "forward the selected message",
+    },
+    Binding {
+        context: Context::History,
         trigger: Trigger::Plain(&[KeyCode::Char('a')]),
         action: Action::AttachOpen,
         keys: "a",
@@ -327,6 +337,13 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         context: Context::Nav,
+        trigger: Trigger::Plain(&[KeyCode::Char(',')]),
+        action: Action::SettingsOpen,
+        keys: ",",
+        description: "cache-retention settings",
+    },
+    Binding {
+        context: Context::Nav,
         trigger: Trigger::Plain(&[KeyCode::Char('q')]),
         action: Action::Quit,
         keys: "q",
@@ -350,10 +367,19 @@ const BINDINGS: &[Binding] = &[
 /// inserts that character.
 ///
 /// `Ctrl-C` quits from every overlay, so the app is never trapped in a modal.
+/// `Ctrl-G` dismisses the showing toast from everywhere too (#139): it is handled
+/// centrally, before the overlay match, rather than re-admitted per overlay like the
+/// `Ctrl-C` quit — a toast can surface while any overlay is open, so its dismiss must
+/// not depend on each resolver remembering to allow it.
 #[must_use]
 pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
     if key.kind == KeyEventKind::Release {
         return Action::Noop;
+    }
+    // The toast-dismiss chord is always available, even inside a capturing overlay;
+    // it is a Ctrl chord, so it never collides with an overlay's typed input.
+    if is_dismiss(key) {
+        return Action::NoticeDismiss;
     }
     match overlay {
         Overlay::None => resolve_panes(focus, key),
@@ -364,12 +390,19 @@ pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
         Overlay::Reaction => resolve_reaction(key),
         Overlay::SendMedia => resolve_send_media(key),
         Overlay::SecretChat => resolve_secret_chat(key),
+        Overlay::Settings => resolve_settings(key),
     }
 }
 
 /// Whether the key is `Ctrl-C` — the always-available quit, even inside a modal.
 fn is_quit(key: &KeyEvent) -> bool {
     Trigger::Ctrl(KeyCode::Char('c')).matches(key)
+}
+
+/// Whether the key is `Ctrl-G` — the always-available toast dismiss (#139), even
+/// inside a capturing overlay.
+fn is_dismiss(key: &KeyEvent) -> bool {
+    Trigger::Ctrl(KeyCode::Char('g')).matches(key)
 }
 
 /// Normal browsing: walk the keymap under `focus`, then fall through to composer
@@ -388,12 +421,19 @@ fn resolve_panes(focus: Focus, key: &KeyEvent) -> Action {
     Action::Noop
 }
 
-/// The help overlay (#83): modal, any key dismisses it (Ctrl-C still quits).
+/// The help overlay (#83): scrollable and explicitly closed. `j`/`k` (and the
+/// arrows) scroll the cheatsheet, which can run taller than a short terminal; `?`,
+/// `q`, and `Esc` close it, and `Ctrl-C` still quits. Every other key is ignored, so
+/// a stray press no longer dismisses a half-read page.
 fn resolve_help(key: &KeyEvent) -> Action {
     if is_quit(key) {
-        Action::Quit
-    } else {
-        Action::ToggleHelp
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => Action::ToggleHelp,
+        KeyCode::Char('j') | KeyCode::Down => Action::HelpScrollDown,
+        KeyCode::Char('k') | KeyCode::Up => Action::HelpScrollUp,
+        _ => Action::Noop,
     }
 }
 
@@ -417,7 +457,8 @@ fn resolve_search_input(key: &KeyEvent) -> Action {
     }
 }
 
-/// The search results list: navigate hits, forward the selected one, or close.
+/// The search results list: navigate hits, open the selected one, forward it, or
+/// close.
 fn resolve_search_results(key: &KeyEvent) -> Action {
     if is_quit(key) {
         return Action::Quit;
@@ -426,6 +467,7 @@ fn resolve_search_results(key: &KeyEvent) -> Action {
         KeyCode::Esc => Action::SearchCancel,
         KeyCode::Char('j') | KeyCode::Down => Action::ResultNext,
         KeyCode::Char('k') | KeyCode::Up => Action::ResultPrev,
+        KeyCode::Enter => Action::ResultOpen,
         KeyCode::Char('f') => Action::ForwardOpen,
         _ => Action::Noop,
     }
@@ -445,18 +487,25 @@ fn resolve_forward(key: &KeyEvent) -> Action {
     }
 }
 
-/// The reaction picker: navigate the emoji palette, Enter toggles the chosen
-/// reaction on the selected message, Esc cancels.
+/// The reaction picker: arrow keys navigate the palette, Enter toggles the chosen
+/// reaction on the selected message, Esc cancels. Character keys become
+/// [`Action::ReactionKey`] and Backspace [`Action::ReactionBackspace`] — the reducer
+/// interprets them by the picker's mode (a palette shortcut like `j`/`k`/`c`, or
+/// input for the custom-emoji line), so the keymap stays a pure function of the key.
 fn resolve_reaction(key: &KeyEvent) -> Action {
     if is_quit(key) {
         return Action::Quit;
     }
     match key.code {
         KeyCode::Esc => Action::ReactionCancel,
-        KeyCode::Char('j') | KeyCode::Down => Action::ReactionNext,
-        KeyCode::Char('k') | KeyCode::Up => Action::ReactionPrev,
         KeyCode::Enter => Action::ReactionConfirm,
-        _ => Action::Noop,
+        KeyCode::Backspace => Action::ReactionBackspace,
+        KeyCode::Down => Action::ReactionNext,
+        KeyCode::Up => Action::ReactionPrev,
+        _ => match printable(key) {
+            Some(c) => Action::ReactionKey(c),
+            None => Action::Noop,
+        },
     }
 }
 
@@ -477,6 +526,30 @@ fn resolve_send_media(key: &KeyEvent) -> Action {
         KeyCode::End => Action::AttachEnd,
         _ => match printable(key) {
             Some(c) => Action::AttachInput(c),
+            None => Action::Noop,
+        },
+    }
+}
+
+/// The retention settings editor (#146): typing edits the focused knob, Tab moves
+/// between the four fields, Enter validates and saves (a bad value is rejected in
+/// place, keeping the overlay open), Esc cancels. Mirrors the send-media prompt's
+/// multi-field editing.
+fn resolve_settings(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::SettingsCancel,
+        KeyCode::Enter => Action::SettingsConfirm,
+        KeyCode::Tab => Action::SettingsToggleField,
+        KeyCode::Backspace => Action::SettingsBackspace,
+        KeyCode::Left => Action::SettingsLeft,
+        KeyCode::Right => Action::SettingsRight,
+        KeyCode::Home => Action::SettingsHome,
+        KeyCode::End => Action::SettingsEnd,
+        _ => match printable(key) {
+            Some(c) => Action::SettingsInput(c),
             None => Action::Noop,
         },
     }
@@ -559,6 +632,19 @@ pub fn help_sections() -> Vec<HelpSection> {
         .collect()
 }
 
+/// The number of lines the help overlay renders, mirroring the layout `render_help`
+/// builds from [`help_sections`]: a heading plus one line per entry for each section,
+/// with a blank separator between sections. The help scroll offset clamps against
+/// this so a scroll can never run past the last line.
+#[must_use]
+pub fn help_line_count() -> usize {
+    help_sections()
+        .iter()
+        .enumerate()
+        .map(|(i, section)| usize::from(i > 0) + 1 + section.entries.len())
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +702,28 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_g_dismisses_a_toast_from_inside_every_overlay() {
+        // A toast can surface while any overlay is open, so its dismiss must reach
+        // through the capture — unlike other globals, which an overlay swallows (#139).
+        for overlay in [
+            Overlay::Help,
+            Overlay::SearchInput,
+            Overlay::SearchResults,
+            Overlay::Forward,
+            Overlay::Reaction,
+            Overlay::SendMedia,
+            Overlay::SecretChat,
+            Overlay::Settings,
+        ] {
+            assert_eq!(
+                resolve(Focus::History, overlay, &ctrl('g')),
+                Action::NoticeDismiss,
+                "Ctrl-G must dismiss from {overlay:?}"
+            );
+        }
+    }
+
+    #[test]
     fn q_quits_in_nav_panes_but_types_in_the_composer() {
         assert_eq!(resolved(Focus::ChatList, KeyCode::Char('q')), Action::Quit);
         assert_eq!(resolved(Focus::History, KeyCode::Char('q')), Action::Quit);
@@ -623,6 +731,41 @@ mod tests {
         assert_eq!(
             resolved(Focus::Composer, KeyCode::Char('q')),
             Action::ComposerInput('q')
+        );
+    }
+
+    #[test]
+    fn comma_opens_settings_in_nav_panes_but_types_in_the_composer() {
+        // The settings binding lives in Nav, so it opens from the browsing panes but
+        // never steals the comma key from a message being composed (#146).
+        assert_eq!(
+            resolved(Focus::ChatList, KeyCode::Char(',')),
+            Action::SettingsOpen
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char(',')),
+            Action::SettingsOpen
+        );
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char(',')),
+            Action::ComposerInput(',')
+        );
+    }
+
+    #[test]
+    fn the_settings_overlay_captures_editing_keys() {
+        // While open, the editor captures typing, Tab field-switch, confirm/cancel —
+        // resolved against the overlay, not the pane behind it (#146).
+        let at = |code| resolve(Focus::History, Overlay::Settings, &key(code));
+        assert_eq!(at(KeyCode::Esc), Action::SettingsCancel);
+        assert_eq!(at(KeyCode::Enter), Action::SettingsConfirm);
+        assert_eq!(at(KeyCode::Tab), Action::SettingsToggleField);
+        assert_eq!(at(KeyCode::Backspace), Action::SettingsBackspace);
+        assert_eq!(at(KeyCode::Char('3')), Action::SettingsInput('3'));
+        // Ctrl-C still escapes the modal.
+        assert_eq!(
+            resolve(Focus::History, Overlay::Settings, &ctrl('c')),
+            Action::Quit
         );
     }
 
@@ -667,12 +810,28 @@ mod tests {
     }
 
     #[test]
-    fn an_open_help_overlay_is_modal() {
-        // Any key closes it, except Ctrl-C which still quits. Focus is irrelevant
-        // while a modal captures input.
+    fn an_open_help_overlay_scrolls_and_closes_explicitly() {
+        // Focus is irrelevant while a modal captures input. `j`/`k` (and the arrows)
+        // scroll rather than dismiss; only `?`/`q`/`Esc` close it, and Ctrl-C quits.
+        assert_eq!(
+            resolve(Focus::ChatList, Overlay::Help, &key(KeyCode::Char('j'))),
+            Action::HelpScrollDown
+        );
+        assert_eq!(
+            resolve(Focus::ChatList, Overlay::Help, &key(KeyCode::Up)),
+            Action::HelpScrollUp
+        );
+        for close in [KeyCode::Char('?'), KeyCode::Char('q'), KeyCode::Esc] {
+            assert_eq!(
+                resolve(Focus::ChatList, Overlay::Help, &key(close)),
+                Action::ToggleHelp,
+                "{close:?} closes the help overlay"
+            );
+        }
+        // A stray key no longer dismisses a half-read page.
         assert_eq!(
             resolve(Focus::ChatList, Overlay::Help, &key(KeyCode::Char('x'))),
-            Action::ToggleHelp
+            Action::Noop
         );
         assert_eq!(
             resolve(Focus::Composer, Overlay::Help, &ctrl('c')),
@@ -713,6 +872,7 @@ mod tests {
         let at = |code| resolve(Focus::ChatList, Overlay::SearchResults, &key(code));
         assert_eq!(at(KeyCode::Char('j')), Action::ResultNext);
         assert_eq!(at(KeyCode::Up), Action::ResultPrev);
+        assert_eq!(at(KeyCode::Enter), Action::ResultOpen);
         assert_eq!(at(KeyCode::Char('f')), Action::ForwardOpen);
         assert_eq!(at(KeyCode::Esc), Action::SearchCancel);
     }
@@ -728,7 +888,7 @@ mod tests {
 
     #[test]
     fn history_keys_act_on_the_selected_message() {
-        // r / p / a operate on the selected message in the history pane.
+        // r / p / f / a operate on the selected message in the history pane.
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('r')),
             Action::ReactionOpen
@@ -736,6 +896,10 @@ mod tests {
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('p')),
             Action::PinToggle
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('f')),
+            Action::ForwardMessage
         );
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('a')),
@@ -751,10 +915,16 @@ mod tests {
     }
 
     #[test]
-    fn the_reaction_overlay_navigates_the_palette_and_confirms() {
+    fn the_reaction_overlay_routes_keys_for_the_reducer_to_interpret() {
         let at = |code| resolve(Focus::History, Overlay::Reaction, &key(code));
-        assert_eq!(at(KeyCode::Char('j')), Action::ReactionNext);
+        // Arrows navigate the palette outright; character keys are routed generically
+        // (the reducer decides palette shortcut vs custom-emoji input by mode).
+        assert_eq!(at(KeyCode::Down), Action::ReactionNext);
         assert_eq!(at(KeyCode::Up), Action::ReactionPrev);
+        assert_eq!(at(KeyCode::Char('j')), Action::ReactionKey('j'));
+        assert_eq!(at(KeyCode::Char('c')), Action::ReactionKey('c'));
+        assert_eq!(at(KeyCode::Char('🔥')), Action::ReactionKey('🔥'));
+        assert_eq!(at(KeyCode::Backspace), Action::ReactionBackspace);
         assert_eq!(at(KeyCode::Enter), Action::ReactionConfirm);
         assert_eq!(at(KeyCode::Esc), Action::ReactionCancel);
     }
