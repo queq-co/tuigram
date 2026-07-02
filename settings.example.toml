@@ -1,0 +1,34 @@
+# tuigram settings — copy to ~/.config/tuigram/settings.toml and edit.
+#
+#   cp settings.example.toml ~/.config/tuigram/settings.toml
+#
+# This file is plain, hand-edited preferences — NOT secrets. Credentials
+# (api_id / api_hash) live separately in ~/.config/tuigram/config.toml, which
+# the login flow writes for you; tuigram never writes this settings file.
+#
+# Every key is optional. A missing file, a missing table, or a missing key
+# falls back to the safe default noted below, and a malformed value is ignored
+# with a warning rather than blocking startup. The defaults keep everything, so
+# retention is strictly opt-in — an unconfigured install deletes nothing.
+
+# Download-cache retention. Downloaded media (photos, videos, documents)
+# accumulates in TDLib's cache with no bound; these knobs cap it.
+[storage]
+
+# Per-kind time-to-live: delete media not *accessed* within this window, so
+# opening a file resets its clock. Grouped as the official apps group their
+# "Keep Media" controls. Each is "forever" (never delete — the default) or a
+# duration: a day/week/month count with a d/w/m suffix ("3d", "1w", "1m"), or a
+# bare number of days ("14"). A month is a flat 30 days.
+keep_private  = "forever"   # one-to-one chats (and secret chats)
+keep_groups   = "forever"   # basic groups + supergroups
+keep_channels = "forever"   # broadcast channels
+
+# Global size backstop across *every* chat, independent of the per-kind TTLs
+# above. The per-kind sweeps only reach chats you've opened this session, so
+# this ceiling bounds the total cache regardless of which chats have loaded;
+# TDLib evicts least-recently-used files first to stay under it. Either
+# "unbounded" (no cap — the default) or a size: "512MB", "2GB" (the bare letter
+# K/M/G also works), or a plain byte count ("1073741824" / "1073741824B").
+# Units are binary (1GB = 1024 MB).
+max_cache = "unbounded"

@@ -894,43 +894,66 @@ fn categorize_chats<'a>(
 /// accessed within each chat kind's configured TTL. `App` is uninvolved — this is
 /// background maintenance with no UI state.
 ///
-/// Chats are grouped by retention category — one-to-one/secret chats, groups
-/// (basic + super), and channels — from whatever the chat store currently holds, and
-/// each category with a finite TTL and at least one loaded chat gets one
-/// `optimizeStorage` scoped to its chat ids. An **empty** category is skipped, never
-/// swept with an empty chat list: `optimizeStorage` treats that as *all* chats, which
-/// would misapply one kind's TTL globally. Kinds kept forever are skipped outright.
+/// Two complementary policies run here. The **per-kind TTL** sweeps group the loaded
+/// chats by retention category — one-to-one/secret chats, groups (basic + super), and
+/// channels — from whatever the chat store currently holds, and each category with a
+/// finite TTL and at least one loaded chat gets one `optimizeStorage` scoped to its
+/// chat ids. An **empty** category is skipped, never swept with an empty chat list:
+/// `optimizeStorage` treats that as *all* chats, which would misapply one kind's TTL
+/// globally. Kinds kept forever are skipped outright.
 ///
-/// Coverage tracks what is loaded: files from chats the user has not opened this
-/// session are not reached until those chats page in. Each spawned sweep is
-/// fire-and-forget — a rejection is dropped and the next interval retries.
+/// The TTL sweeps' coverage tracks what is loaded: files from chats the user has not
+/// opened this session are not reached until those chats page in. So a **global size
+/// backstop** (#138) runs alongside them when `max_cache` is set — one *unscoped*
+/// `optimizeStorage` with a byte ceiling over every chat, bounding the total cache
+/// regardless of which chats have loaded. Each spawned sweep is fire-and-forget — a
+/// rejection is dropped and the next interval retries.
 fn drive_storage_sweep(client: &Arc<Client>, settings: &StorageSettings) {
     // Nothing configured: no sweep, no chat read.
     if !settings.sweeps_anything() {
         return;
     }
-    // Partition the loaded chats' ids by retention category in a single store read.
-    let RetentionGroups {
-        private,
-        groups,
-        channels,
-    } = client.read(|s| categorize_chats(s.chats().iter()));
+    // Per-kind TTL sweeps: only touch the store when at least one kind has a finite
+    // TTL — a cache-cap-only config sweeps globally below without reading any chats.
+    let per_kind = [
+        settings.keep_private,
+        settings.keep_groups,
+        settings.keep_channels,
+    ];
+    if per_kind.iter().any(|k| k.to_ttl_seconds().is_some()) {
+        // Partition the loaded chats' ids by retention category in a single store read.
+        let RetentionGroups {
+            private,
+            groups,
+            channels,
+        } = client.read(|s| categorize_chats(s.chats().iter()));
 
-    for (keep, chat_ids) in [
-        (settings.keep_private, private),
-        (settings.keep_groups, groups),
-        (settings.keep_channels, channels),
-    ] {
-        // Only sweep a kind with a finite TTL that actually has loaded chats — an
-        // empty list would sweep everything, so it is skipped, not passed through.
-        if let Some(ttl) = keep.to_ttl_seconds()
-            && !chat_ids.is_empty()
-        {
-            let client = Arc::clone(client);
-            tokio::spawn(async move {
-                let _ = client.bridge().sweep_chat_media(ttl, chat_ids).await;
-            });
+        for (keep, chat_ids) in [
+            (settings.keep_private, private),
+            (settings.keep_groups, groups),
+            (settings.keep_channels, channels),
+        ] {
+            // Only sweep a kind with a finite TTL that actually has loaded chats — an
+            // empty list would sweep everything, so it is skipped, not passed through.
+            if let Some(ttl) = keep.to_ttl_seconds()
+                && !chat_ids.is_empty()
+            {
+                let client = Arc::clone(client);
+                tokio::spawn(async move {
+                    let _ = client.bridge().sweep_chat_media(ttl, chat_ids).await;
+                });
+            }
         }
+    }
+
+    // Global size backstop: an unscoped byte ceiling over every chat, so media from
+    // chats never opened this session is still bounded (#138). Independent of the
+    // per-kind TTLs and needs no chat read — TDLib evicts least-recently-used first.
+    if let Some(max_bytes) = settings.max_cache.to_size_bytes() {
+        let client = Arc::clone(client);
+        tokio::spawn(async move {
+            let _ = client.bridge().sweep_cache_to_size(max_bytes).await;
+        });
     }
 }
 

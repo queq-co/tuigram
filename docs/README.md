@@ -18,6 +18,9 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
   event loop (nothing awaited in the draw path), `App`-as-single-source-of-truth
   + the `Action` reducer, the three-pane layout + status bar, the focus-aware
   keymap, the fake-source ↔ Phase 6 boundary, and `TestBackend` snapshot testing.
+- [../settings.example.toml](../settings.example.toml) — annotated template for
+  `~/.config/tuigram/settings.toml`: download-cache retention (per-kind TTLs and the
+  global size backstop). Optional; copy it into place to opt in.
 - [branch-model.md](branch-model.md) — how we use `develop` → PR → `main`.
 - Research (Phase 1):
   - [research/ratatui.md](research/ratatui.md) — how Ratatui works and how we'll use it.
