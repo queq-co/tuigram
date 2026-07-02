@@ -160,6 +160,11 @@ the Phase-6 ingest seams (e.g. `set_connection`, `notify`) — they're just fed
 from fixtures for now, marked `#[allow(dead_code)]` where only the Phase-6 path
 reaches them.
 
+This is exactly what Phase 6 did, and the seam held: `spawn_core_source` replaced
+`spawn_fake_source` on the same mpsc arm, `AppEvent` grew its real variants, and
+the panes are now projected from the folded `Client` store — all without changing
+the loop above. [wiring.md](wiring.md) is that swap, as built.
+
 ## Testing: `TestBackend` snapshots, no TTY
 
 `TestBackend` renders `ui()` into an in-memory `Buffer` with no terminal, so UI

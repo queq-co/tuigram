@@ -18,6 +18,10 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
   event loop (nothing awaited in the draw path), `App`-as-single-source-of-truth
   + the `Action` reducer, the three-pane layout + status bar, the focus-aware
   keymap, the fake-source ↔ Phase 6 boundary, and `TestBackend` snapshot testing.
+- [wiring.md](wiring.md) — Phase 6, as built: standing up the real `Client` (bootstrap
+  → in-TUI login → `Client::start`), the update stream → `AppEvent` → project-folded-
+  state → pane path, and how each keypress routes to a per-domain request seam
+  fire-and-forget — all without changing the Phase 5 loop's shape.
 - [phase6-verification.md](phase6-verification.md) — the Phase 6 milestone gate: the
   real-TDLib lifecycle verification checklist run via the REPL (login, connection,
   send/read/react/pin/forward/search/media/secret, resync, logout), its recorded
@@ -42,4 +46,4 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
 | 3 | Core client features (headless) | List chats/messages, send, reply — **done** |
 | 4 | Extended client features (headless) | Media, archive/folders, search/forward, reactions/pins, chat actions, secret chats, full login — **done** |
 | 5 | TUI | Ratatui interface — event loop, panes, keymap, overlays, status/toasts (fixtures) — **done** |
-| 6 | Wire Telegram ↔ TUI (MVP) | Render & interact over real data |
+| 6 | Wire Telegram ↔ TUI (MVP) | Render & interact over real data — **done** |
