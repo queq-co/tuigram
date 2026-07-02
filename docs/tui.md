@@ -189,7 +189,9 @@ eventually drives.
   feed is Phase 6 (the fake-source boundary above).
 - **Real lifecycle exercise.** The spine is proven headlessly; the connected
   paths (a real login, a real send, real `updateConnectionState`) are exercised
-  via the REPL against live TDLib in Phase 6, not asserted in CI here.
+  via the REPL against live TDLib in Phase 6, not asserted in CI here — see
+  [phase6-verification.md](phase6-verification.md) for the checklist and recorded
+  outcomes.
 
 ## Trying it
 

@@ -18,6 +18,10 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
   event loop (nothing awaited in the draw path), `App`-as-single-source-of-truth
   + the `Action` reducer, the three-pane layout + status bar, the focus-aware
   keymap, the fake-source ↔ Phase 6 boundary, and `TestBackend` snapshot testing.
+- [phase6-verification.md](phase6-verification.md) — the Phase 6 milestone gate: the
+  real-TDLib lifecycle verification checklist run via the REPL (login, connection,
+  send/read/react/pin/forward/search/media/secret, resync, logout), its recorded
+  outcomes, and any gaps filed.
 - [../settings.example.toml](../settings.example.toml) — annotated template for
   `~/.config/tuigram/settings.toml`: download-cache retention (per-kind TTLs and the
   global size backstop). Optional; copy it into place to opt in.
