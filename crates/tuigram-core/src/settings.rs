@@ -17,22 +17,29 @@
 //! measured since a file was last *accessed* — so viewing a file resets its clock.
 //!
 //! Configured by hand in `~/.config/tuigram/settings.toml`; every key is optional and
-//! defaults to `"forever"` (keep, never delete). Values are `"forever"` or a duration
-//! — `"3d"`, `"1w"`, `"2w"`, `"1m"`, or a bare day count like `"14"`:
+//! defaults to keeping everything. The per-kind values are `"forever"` or a duration
+//! — `"3d"`, `"1w"`, `"2w"`, `"1m"`, or a bare day count like `"14"` — and `max_cache`
+//! is a global byte ceiling (`"unbounded"`, or a size like `"512MB"`/`"2GB"`):
 //!
 //! ```toml
 //! [storage]
 //! keep_private  = "forever"   # one-to-one (and secret) chats
 //! keep_groups   = "1w"        # basic groups + supergroups
 //! keep_channels = "3d"        # broadcast channels
+//! max_cache     = "2GB"       # global size backstop across every chat
 //! ```
 //!
-//! **Coverage caveat:** `optimizeStorage` scopes deletion to the chat ids it is
-//! given, and tuigram pages chats lazily, so a sweep only reaches chats already
-//! loaded into the store. Files from chats the user has not opened this session are
-//! not expired until those chats load; the periodic sweep re-reads the store each
-//! pass, so coverage grows as the user browses. Broadening this (a global size
-//! backstop, or a full chat enumeration before a sweep) is a follow-up.
+//! ## Two complementary policies
+//!
+//! The per-kind TTLs are applied through `optimizeStorage` **scoped** to chat ids, and
+//! tuigram pages chats lazily, so a TTL sweep only reaches chats already loaded into
+//! the store; the periodic sweep re-reads the store each pass, so coverage grows as
+//! the user browses. To bound the cache regardless of which chats are loaded,
+//! [`max_cache`](StorageSettings::max_cache) runs one **unscoped** `optimizeStorage`
+//! with a byte cap (and no TTL) over every chat — a safety net that catches media from
+//! chats never opened this session (#138). TDLib evicts least-recently-used files
+//! first, so a generous ceiling rarely touches actively-used media while still
+//! bounding the total. Both default off, so retention stays strictly opt-in.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -133,6 +140,118 @@ impl<'de> Deserialize<'de> for KeepMedia {
     }
 }
 
+/// The bytes in a kilobyte/megabyte/gigabyte — binary units, the sizes users expect
+/// of a disk cache (`"1GB"` ≈ what the OS reports for a 1 GiB file).
+const BYTES_PER_KB: u64 = 1024;
+const BYTES_PER_MB: u64 = 1024 * BYTES_PER_KB;
+const BYTES_PER_GB: u64 = 1024 * BYTES_PER_MB;
+
+/// A global ceiling on the total downloaded-media cache: unbounded (grow freely), or a
+/// size in bytes above which the least-recently-used files are swept.
+///
+/// Parsed from and written back as a short string — `"unbounded"`, or a count with a
+/// `KB`/`MB`/`GB` suffix (`"512MB"`, `"2GB"`; the bare letter `K`/`M`/`G` also works)
+/// or a plain byte count (`"1048576"` or `"1048576B"`). It round-trips by *meaning*:
+/// a value that divides evenly serialises in the largest whole unit, so `"2048MB"`
+/// comes back as `"2GB"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheCap {
+    /// No size limit — the cache grows freely, the safe default so an unconfigured
+    /// install deletes nothing.
+    #[default]
+    Unbounded,
+    /// Cap the cache at this many bytes. Always ≥ 1 (a zero cap, which would wipe
+    /// media the instant it is fetched, is rejected at parse time).
+    Bytes(u64),
+}
+
+impl CacheCap {
+    /// The `optimizeStorage` size limit in bytes, or `None` when the cache is
+    /// unbounded (the driver then skips the global backstop rather than passing an
+    /// unlimited cap). Saturates rather than overflowing on absurd byte counts.
+    #[must_use]
+    pub fn to_size_bytes(self) -> Option<i64> {
+        match self {
+            Self::Unbounded => None,
+            Self::Bytes(bytes) => Some(i64::try_from(bytes).unwrap_or(i64::MAX)),
+        }
+    }
+}
+
+impl FromStr for CacheCap {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let value = raw.trim().to_ascii_lowercase();
+        if value == "unbounded" {
+            return Ok(Self::Unbounded);
+        }
+        // Strip an optional unit suffix (longest first so "gb" wins over "g"/"b"),
+        // leaving the digits and the multiplier that turns them into bytes.
+        let units = [
+            ("gb", BYTES_PER_GB),
+            ("mb", BYTES_PER_MB),
+            ("kb", BYTES_PER_KB),
+            ("g", BYTES_PER_GB),
+            ("m", BYTES_PER_MB),
+            ("k", BYTES_PER_KB),
+            ("b", 1),
+        ];
+        let (digits, multiplier) = units
+            .into_iter()
+            .find_map(|(suffix, mult)| value.strip_suffix(suffix).map(|rest| (rest, mult)))
+            .unwrap_or((value.as_str(), 1));
+        let count: u64 = digits.trim().parse().map_err(|_| {
+            format!("expected \"unbounded\" or a size like \"512MB\"/\"2GB\", got {raw:?}")
+        })?;
+        let bytes = count
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("cache size {raw:?} is too large"))?;
+        if bytes == 0 {
+            return Err(format!(
+                "cache size must be at least one byte (or \"unbounded\"), got {raw:?}"
+            ));
+        }
+        Ok(Self::Bytes(bytes))
+    }
+}
+
+impl fmt::Display for CacheCap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unbounded => f.write_str("unbounded"),
+            // Render in the largest unit that divides evenly, so the value round-trips
+            // by meaning; fall back to a bare byte count when nothing divides cleanly.
+            Self::Bytes(bytes) => {
+                let bytes = *bytes;
+                for (unit, size) in [
+                    ("GB", BYTES_PER_GB),
+                    ("MB", BYTES_PER_MB),
+                    ("KB", BYTES_PER_KB),
+                ] {
+                    if bytes % size == 0 {
+                        return write!(f, "{}{unit}", bytes / size);
+                    }
+                }
+                write!(f, "{bytes}B")
+            }
+        }
+    }
+}
+
+impl Serialize for CacheCap {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CacheCap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
 /// The download-cache retention policy: one [`KeepMedia`] per chat kind. Grouped as
 /// the official apps group them — one-to-one chats, groups, and broadcast channels —
 /// so each can expire on its own schedule. All [`KeepMedia::Forever`] by default, so
@@ -146,16 +265,22 @@ pub struct StorageSettings {
     pub keep_groups: KeepMedia,
     /// Retention for broadcast channels.
     pub keep_channels: KeepMedia,
+    /// Global size ceiling across every chat — the backstop that bounds the cache
+    /// regardless of which chats have paged in (#138). Independent of the per-kind
+    /// TTLs above.
+    pub max_cache: CacheCap,
 }
 
 impl StorageSettings {
-    /// Whether any kind has a finite retention — if not, the sweep has nothing to do
-    /// and the driver can skip scheduling it.
+    /// Whether anything needs sweeping — any kind with a finite retention, or a finite
+    /// cache ceiling. If not, the sweep has nothing to do and the driver can skip
+    /// scheduling it.
     #[must_use]
     pub fn sweeps_anything(&self) -> bool {
         [self.keep_private, self.keep_groups, self.keep_channels]
             .into_iter()
             .any(|k| k.to_ttl_seconds().is_some())
+            || self.max_cache.to_size_bytes().is_some()
     }
 
     /// Load the retention policy from `~/.config/tuigram/settings.toml`'s `[storage]`
@@ -265,7 +390,85 @@ mod tests {
         assert_eq!(settings.keep_private, KeepMedia::Forever);
         assert_eq!(settings.keep_groups, KeepMedia::Forever);
         assert_eq!(settings.keep_channels, KeepMedia::Forever);
+        assert_eq!(settings.max_cache, CacheCap::Unbounded);
         assert!(!settings.sweeps_anything());
+    }
+
+    #[test]
+    fn a_cache_cap_alone_makes_something_sweep() {
+        // Every kind kept forever, but a byte ceiling is set — the driver must still
+        // schedule the sweep so the global backstop runs (#138).
+        let file: SettingsFile = toml::from_str("[storage]\nmax_cache = \"2GB\"\n").unwrap();
+        assert_eq!(file.storage.keep_private, KeepMedia::Forever);
+        assert_eq!(file.storage.max_cache, CacheCap::Bytes(2 * BYTES_PER_GB));
+        assert!(file.storage.sweeps_anything());
+    }
+
+    #[test]
+    fn parses_unbounded_case_insensitively() {
+        assert_eq!(
+            "unbounded".parse::<CacheCap>().unwrap(),
+            CacheCap::Unbounded
+        );
+        assert_eq!(
+            "  Unbounded ".parse::<CacheCap>().unwrap(),
+            CacheCap::Unbounded
+        );
+        assert_eq!(CacheCap::Unbounded.to_size_bytes(), None);
+    }
+
+    #[test]
+    fn parses_size_units_and_bare_bytes() {
+        assert_eq!(
+            "512mb".parse::<CacheCap>().unwrap(),
+            CacheCap::Bytes(512 * BYTES_PER_MB)
+        );
+        assert_eq!(
+            "2GB".parse::<CacheCap>().unwrap(),
+            CacheCap::Bytes(2 * BYTES_PER_GB)
+        );
+        assert_eq!(
+            "4k".parse::<CacheCap>().unwrap(),
+            CacheCap::Bytes(4 * BYTES_PER_KB)
+        );
+        assert_eq!(
+            "1048576".parse::<CacheCap>().unwrap(),
+            CacheCap::Bytes(1_048_576)
+        );
+        assert_eq!("2048b".parse::<CacheCap>().unwrap(), CacheCap::Bytes(2048));
+        assert_eq!(
+            CacheCap::Bytes(2 * BYTES_PER_GB).to_size_bytes(),
+            Some(2 * BYTES_PER_GB as i64)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_and_garbage_sizes() {
+        assert!(
+            "0GB".parse::<CacheCap>().is_err(),
+            "zero would wipe on fetch"
+        );
+        assert!("0".parse::<CacheCap>().is_err());
+        assert!("".parse::<CacheCap>().is_err());
+        assert!("lots".parse::<CacheCap>().is_err());
+        assert!("2TB".parse::<CacheCap>().is_err(), "terabytes unsupported");
+    }
+
+    #[test]
+    fn cache_cap_round_trips_in_the_largest_whole_unit() {
+        // 2 GiB prints as "2GB", not "2048MB"; a size with no clean unit falls back to
+        // bytes — either way it parses back to the same value.
+        assert_eq!(CacheCap::Bytes(2 * BYTES_PER_GB).to_string(), "2GB");
+        assert_eq!(CacheCap::Bytes(512 * BYTES_PER_MB).to_string(), "512MB");
+        assert_eq!(CacheCap::Bytes(1500).to_string(), "1500B");
+        for original in [
+            CacheCap::Unbounded,
+            CacheCap::Bytes(3 * BYTES_PER_GB),
+            CacheCap::Bytes(1500),
+        ] {
+            let text = original.to_string();
+            assert_eq!(text.parse::<CacheCap>().unwrap(), original);
+        }
     }
 
     #[test]

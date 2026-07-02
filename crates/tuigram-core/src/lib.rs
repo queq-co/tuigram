@@ -49,7 +49,7 @@ pub use model::{
 pub use router::{Router, UpdateSink};
 pub use secret_chats::{SecretChatRequests, SecretChatStore};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
-pub use settings::{KeepMedia, StorageSettings};
+pub use settings::{CacheCap, KeepMedia, StorageSettings};
 pub use users::{UserRequests, UserStore};
 
 /// TDLib's typed request API and data model, re-exported so callers depend on

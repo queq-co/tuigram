@@ -111,13 +111,16 @@ impl FileRequests for Bridge {
 /// to expire old downloaded media (#120), segregated from [`FileRequests`] so a
 /// retention driver depends only on the sweep, not on downloads.
 ///
-/// The one operation is a **scoped** sweep: delete files, older than a TTL, that
-/// belong to a given set of chats. The scoping is deliberate — it is how per-kind
-/// retention (private/groups/channels, each with its own TTL) is expressed, running
-/// one sweep per kind over that kind's chats. A sweep over *all* files would ignore
-/// the per-kind policy, so this seam never offers an unscoped variant.
+/// Two complementary sweeps, matching the two retention policies:
+/// - [`sweep_chat_media`](Self::sweep_chat_media): a **scoped** TTL sweep over a given
+///   set of chats. The scoping is how per-kind retention (private/groups/channels,
+///   each with its own TTL) is expressed — one sweep per kind over that kind's chats.
+/// - [`sweep_cache_to_size`](Self::sweep_cache_to_size): an **unscoped** size sweep
+///   over every chat. A byte ceiling is global by nature, and being unscoped is
+///   exactly the point — it bounds media from chats the scoped sweep never reaches
+///   this session (#138).
 ///
-/// [`Bridge`] implements it over a live `tdjson` client; tests implement it with a
+/// [`Bridge`] implements them over a live `tdjson` client; tests implement them with a
 /// mock, exactly as [`FileRequests`] is exercised.
 // Internal seam: every consumer is in-crate and generic over `C: StorageRequests`,
 // so the missing `Send` bound this lint wants is not a concern here.
@@ -133,6 +136,17 @@ pub trait StorageRequests {
     /// them here. The freed-space statistics TDLib returns are discarded; the sweep
     /// is fire-and-forget maintenance.
     async fn sweep_chat_media(&self, ttl: i32, chat_ids: Vec<i64>) -> Result<(), TdError>;
+
+    /// Delete downloaded files across *all* chats until the total cached media is at
+    /// most `max_bytes`, keeping anything used within [`SWEEP_IMMUNITY_DELAY`].
+    ///
+    /// Maps to `optimizeStorage` with a size cap and no TTL or count bound, over an
+    /// empty `chat_ids` — the "every chat" behaviour is deliberate here: this is the
+    /// global backstop that bounds media in chats [`sweep_chat_media`](Self::sweep_chat_media)
+    /// never scopes over this session. TDLib evicts least-recently-used files first to
+    /// reach the ceiling. The freed-space statistics it returns are discarded; the
+    /// sweep is fire-and-forget maintenance.
+    async fn sweep_cache_to_size(&self, max_bytes: i64) -> Result<(), TdError>;
 }
 
 impl StorageRequests for Bridge {
@@ -147,6 +161,26 @@ impl StorageRequests for Bridge {
             SWEEP_IMMUNITY_DELAY,
             Vec::new(),
             chat_ids,
+            Vec::new(),
+            false,
+            0,
+            self.id(),
+        )
+        .await
+        .map(|_stats| ())
+    }
+
+    async fn sweep_cache_to_size(&self, max_bytes: i64) -> Result<(), TdError> {
+        // size <max_bytes>: the total cache ceiling. ttl -1 / count -1: no time or
+        // count bound — size is the only limit. chat_ids []: every chat (the global
+        // backstop). immunity protects just-used files; the report is discarded.
+        tdlib_rs::functions::optimize_storage(
+            max_bytes,
+            -1,
+            -1,
+            SWEEP_IMMUNITY_DELAY,
+            Vec::new(),
+            Vec::new(),
             Vec::new(),
             false,
             0,
@@ -404,15 +438,21 @@ mod tests {
         assert_eq!(spy.got.get(), Some(7));
     }
 
-    /// A spy `StorageRequests` recording the ttl and chats it was asked to sweep.
+    /// A spy `StorageRequests` recording what each sweep was asked to do.
     #[derive(Default)]
     struct StorageSpy {
         swept: RefCell<Option<(i32, Vec<i64>)>>,
+        capped: RefCell<Option<i64>>,
     }
 
     impl StorageRequests for StorageSpy {
         async fn sweep_chat_media(&self, ttl: i32, chat_ids: Vec<i64>) -> Result<(), TdError> {
             *self.swept.borrow_mut() = Some((ttl, chat_ids));
+            Ok(())
+        }
+
+        async fn sweep_cache_to_size(&self, max_bytes: i64) -> Result<(), TdError> {
+            *self.capped.borrow_mut() = Some(max_bytes);
             Ok(())
         }
     }
@@ -426,5 +466,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(spy.swept.into_inner(), Some((3 * 86_400, vec![10, 11])));
+    }
+
+    #[tokio::test]
+    async fn size_backstop_drives_the_seam_with_the_byte_cap() {
+        let spy = StorageSpy::default();
+        // A 2 GiB ceiling reaches the seam as its byte count, unscoped by chat.
+        spy.sweep_cache_to_size(2 * 1024 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(spy.capped.into_inner(), Some(2 * 1024 * 1024 * 1024));
     }
 }
