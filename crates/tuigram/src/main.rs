@@ -46,6 +46,7 @@ mod mediaform;
 mod reactions;
 mod search;
 mod secret;
+mod settingsform;
 mod status;
 mod terminal;
 mod textinput;
@@ -210,7 +211,11 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // so retention is off unless the user opts in. On first run write a default file so
     // there is something to edit (#145) — best-effort, and never over an existing file.
     StorageSettings::ensure_default_file();
-    let storage_settings = StorageSettings::load();
+    // Mutable so the in-app editor (#146) can swap the live policy without a restart;
+    // the next sweep tick honours whatever it holds. Seed `App` with it too, so the
+    // editor opens pre-filled with the values in effect.
+    let mut storage_settings = StorageSettings::load();
+    app.set_storage_settings(storage_settings);
     let mut sweep_tick = tokio::time::interval(STORAGE_SWEEP_INTERVAL);
     // The lists whose `loadChats` paging has been kicked off, so each is loaded
     // at most once per run. A handful of entries (Main, Archive, a few folders),
@@ -357,6 +362,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // A confirmed secret-chat lifecycle action hits Telegram; the resulting
         // `updateSecretChat`/`updateNewChat` fold back and re-project (#121).
         drive_secret(&mut app, client, &outbound_tx);
+        // A confirmed retention edit swaps the live sweep policy and writes it back to
+        // settings.toml, taking effect on the next sweep with no restart (#146).
+        drive_settings(&mut app, &mut storage_settings);
         // Pull down the open chat's incoming media, each file once, so the progress
         // lines and saved markers resolve as `updateFile` folds (#120).
         drive_downloads(client, &history, &mut downloading);
@@ -810,6 +818,30 @@ fn drive_secret(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<
                 .await;
         }
     });
+}
+
+/// Apply a confirmed retention edit from the in-app editor (#146). The editor
+/// validates the four knobs on `App` and lands the resulting
+/// [`StorageSettings`](tuigram_core::StorageSettings); here the loop drains it,
+/// **swaps the live sweep policy first** so the session reflects the change on the
+/// next sweep tick regardless of the disk write, then persists it to
+/// `settings.toml`.
+///
+/// The write is deliberately synchronous — it is a single small file, negligible
+/// beside the loop's other per-tick work — so a completed edit is durable before the
+/// loop moves on. A save failure (an unwritable config dir) surfaces as an error
+/// toast but never blocks the in-memory apply, matching the acceptance criteria: the
+/// running session honours the edit even when it could not be written back.
+fn drive_settings(app: &mut App, storage_settings: &mut StorageSettings) {
+    let Some(updated) = app.take_settings() else {
+        return;
+    };
+    *storage_settings = updated;
+    if updated.save().is_err() {
+        // The error is a local I/O failure (no config dir, permissions) — a fixed
+        // phrase, never the user's typed values, the same rule the send paths follow.
+        app.notify(Notice::error("settings save", None));
+    }
 }
 
 /// Re-read the folded secret-chat states from the client and re-project them onto

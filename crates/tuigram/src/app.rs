@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use crossterm::event::Event;
+use tuigram_core::StorageSettings;
 use tuigram_core::model::{File, Message, OutgoingMedia, SecretChatState};
 
 use crate::chat_list::{ChatList, ChatListView};
@@ -19,6 +20,7 @@ use crate::mediaform::MediaDraft;
 use crate::reactions::{ReactionIntent, ReactionPicker};
 use crate::search::SearchView;
 use crate::secret::{SecretChatPrompt, SecretLifecycle};
+use crate::settingsform::SettingsDraft;
 use crate::status::{ConnectionState, Notifications};
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
@@ -177,6 +179,29 @@ pub enum Action {
     SecretConfirm,
     /// Cancel the secret-chat prompt without acting.
     SecretCancel,
+    /// Open the retention settings editor (#146), pre-filled with the policy in
+    /// effect.
+    SettingsOpen,
+    /// Insert a typed character into the focused settings field.
+    SettingsInput(char),
+    /// Delete the character before the focused settings field's cursor.
+    SettingsBackspace,
+    /// Move the focused settings field's cursor one character left.
+    SettingsLeft,
+    /// Move the focused settings field's cursor one character right.
+    SettingsRight,
+    /// Move the focused settings field's cursor to the start of the line.
+    SettingsHome,
+    /// Move the focused settings field's cursor to the end of the line.
+    SettingsEnd,
+    /// Move settings editing to the next field (Tab).
+    SettingsToggleField,
+    /// Validate and confirm the settings edit. A valid edit updates the in-memory
+    /// policy and records it for the loop to persist and apply live (#146); an
+    /// invalid value is rejected in place, keeping the overlay open.
+    SettingsConfirm,
+    /// Cancel the settings editor without saving.
+    SettingsCancel,
     /// Dismiss the current transient toast immediately (#88), revealing the next
     /// queued one. A no-op when nothing is showing.
     NoticeDismiss,
@@ -228,6 +253,15 @@ pub struct App {
     /// The secret-chat lifecycle confirm's state (#87): the start/close action for
     /// the selected chat. `Some` only while the [`Overlay::SecretChat`] is open.
     secret: Option<SecretChatPrompt>,
+    /// The download-cache retention policy currently in effect (#146). Seeded from
+    /// `settings.toml` at startup ([`set_storage_settings`](Self::set_storage_settings)),
+    /// it pre-fills the settings editor and is updated in place when an edit is
+    /// confirmed, so reopening the editor shows the live values. `App` never touches
+    /// the file — the loop persists and applies the confirmed change.
+    storage: StorageSettings,
+    /// The settings editor's state (#146): the four retention inputs being edited.
+    /// Reset from [`storage`](Self::storage) each time the editor opens.
+    settings: SettingsDraft,
     /// The core link's connection state (#88), shown in the status bar. Defaults to
     /// `Connecting`; Phase 6 folds `updateConnectionState` into it.
     connection: ConnectionState,
@@ -282,6 +316,12 @@ pub struct App {
     /// [`SecretChatRequests`](tuigram_core::SecretChatRequests)' create/close. The
     /// resulting `updateSecretChat`/`updateNewChat` fold back and re-project.
     pending_secret: Option<SecretLifecycle>,
+    /// A confirmed retention edit awaiting the loop (#146). Confirming the settings
+    /// editor updates the in-memory [`storage`](Self::storage) and lands the new
+    /// policy here; the loop drains it via [`take_settings`](Self::take_settings),
+    /// swaps its live retention (the next sweep honours it), and persists it to
+    /// `settings.toml`.
+    pending_settings: Option<StorageSettings>,
 }
 
 impl App {
@@ -364,6 +404,19 @@ impl App {
     /// (`None` when it is not open).
     pub fn secret(&self) -> Option<&SecretChatPrompt> {
         self.secret.as_ref()
+    }
+
+    /// The settings editor's state, for rendering the retention fields (#146).
+    pub fn settings(&self) -> &SettingsDraft {
+        &self.settings
+    }
+
+    /// Seed the in-effect retention policy from `settings.toml` at startup (#146), so
+    /// the editor opens pre-filled with the live values. The loop calls this once
+    /// after loading settings; `App` keeps it only to fill and reflect the editor,
+    /// never to touch the file.
+    pub fn set_storage_settings(&mut self, settings: StorageSettings) {
+        self.storage = settings;
     }
 
     /// The core link's connection state, for the status bar's left field.
@@ -489,6 +542,13 @@ impl App {
     /// means no secret-chat prompt was confirmed since the last drain.
     pub fn take_secret(&mut self) -> Option<SecretLifecycle> {
         self.pending_secret.take()
+    }
+
+    /// Take the pending retention edit, if any (#146). The loop drains this each tick,
+    /// swaps its live sweep policy to the new value, and writes it to `settings.toml`;
+    /// `None` means no settings edit was confirmed since the last drain.
+    pub fn take_settings(&mut self) -> Option<StorageSettings> {
+        self.pending_settings.take()
     }
 
     /// Re-project the secret-chat lifecycle states from the core
@@ -1051,6 +1111,57 @@ impl App {
             }
             Action::SecretCancel => {
                 self.secret = None;
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::SettingsOpen => {
+                // Open the editor pre-filled with the policy in effect, so the fields
+                // show the live values a Tab-and-type edits (#146).
+                self.settings = SettingsDraft::from_settings(self.storage);
+                self.overlay = Overlay::Settings;
+                self.dirty = true;
+            }
+            Action::SettingsInput(c) => {
+                self.settings.insert(c);
+                self.dirty = true;
+            }
+            Action::SettingsBackspace => {
+                self.settings.backspace();
+                self.dirty = true;
+            }
+            Action::SettingsLeft => {
+                self.settings.move_left();
+                self.dirty = true;
+            }
+            Action::SettingsRight => {
+                self.settings.move_right();
+                self.dirty = true;
+            }
+            Action::SettingsHome => {
+                self.settings.move_home();
+                self.dirty = true;
+            }
+            Action::SettingsEnd => {
+                self.settings.move_end();
+                self.dirty = true;
+            }
+            Action::SettingsToggleField => {
+                self.settings.toggle_field();
+                self.dirty = true;
+            }
+            Action::SettingsConfirm => {
+                // Validate the four fields through core's parsers. A valid edit
+                // updates the in-memory policy (so a reopen shows the new values) and
+                // lands it for the loop to apply live and persist (#146); an invalid
+                // value keeps the overlay open with the reason shown in place.
+                if let Some(updated) = self.settings.confirm() {
+                    self.storage = updated;
+                    self.pending_settings = Some(updated);
+                    self.overlay = Overlay::None;
+                }
+                self.dirty = true;
+            }
+            Action::SettingsCancel => {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -2056,6 +2167,110 @@ mod tests {
         app.dispatch(Action::AttachCancel);
         app.dispatch(Action::AttachOpen);
         assert_eq!(app.media().path(), "", "reopened prompt starts empty");
+    }
+
+    // --- settings editor (#146) ---
+
+    use crate::settingsform::SettingsField;
+    use tuigram_core::{CacheCap, KeepMedia, StorageSettings};
+
+    /// Backspace over the focused field's current text, so a test can retype it.
+    fn clear_field(app: &mut App) {
+        for _ in 0..app.settings().value(app.settings().field()).chars().count() {
+            app.dispatch(Action::SettingsBackspace);
+        }
+    }
+
+    #[test]
+    fn opening_settings_prefills_from_the_live_policy() {
+        let mut app = App::new();
+        app.set_storage_settings(StorageSettings {
+            keep_private: KeepMedia::Forever,
+            keep_groups: KeepMedia::Days(7),
+            keep_channels: KeepMedia::Days(3),
+            max_cache: CacheCap::Bytes(2 * 1024 * 1024 * 1024),
+        });
+        app.dispatch(Action::SettingsOpen);
+        assert_eq!(app.overlay(), Overlay::Settings);
+        assert_eq!(app.settings().value(SettingsField::KeepGroups), "7d");
+        assert_eq!(app.settings().value(SettingsField::MaxCache), "2GB");
+    }
+
+    #[test]
+    fn confirming_a_valid_edit_applies_it_live_and_hands_it_to_the_loop() {
+        let mut app = App::new();
+        app.dispatch(Action::SettingsOpen);
+        // Edit channels forever -> 3d and the cache unbounded -> 2GB.
+        app.dispatch(Action::SettingsToggleField); // groups
+        app.dispatch(Action::SettingsToggleField); // channels
+        clear_field(&mut app);
+        for c in "3d".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsToggleField); // max cache
+        clear_field(&mut app);
+        for c in "2GB".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsConfirm);
+        assert_eq!(
+            app.overlay(),
+            Overlay::None,
+            "a valid edit closes the editor"
+        );
+
+        // The loop drains the new policy exactly once.
+        let updated = app
+            .take_settings()
+            .expect("a confirmed edit is handed back");
+        assert_eq!(updated.keep_channels, KeepMedia::Days(3));
+        assert_eq!(updated.max_cache, CacheCap::Bytes(2 * 1024 * 1024 * 1024));
+        assert!(app.take_settings().is_none(), "drained once");
+
+        // Reopening shows the applied values, proving the in-memory policy updated.
+        app.dispatch(Action::SettingsOpen);
+        assert_eq!(app.settings().value(SettingsField::KeepChannels), "3d");
+    }
+
+    #[test]
+    fn an_invalid_edit_keeps_the_editor_open_and_records_nothing() {
+        let mut app = App::new();
+        app.dispatch(Action::SettingsOpen);
+        clear_field(&mut app); // private field: "forever" -> ""
+        for c in "2TB".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsToggleField); // move off before confirming
+        app.dispatch(Action::SettingsConfirm);
+        assert_eq!(
+            app.overlay(),
+            Overlay::Settings,
+            "an invalid value keeps the editor open"
+        );
+        assert!(
+            app.take_settings().is_none(),
+            "an invalid edit is never handed to the loop"
+        );
+        assert!(
+            app.settings().error().is_some(),
+            "the reason is shown in place"
+        );
+    }
+
+    #[test]
+    fn cancelling_settings_discards_the_edit() {
+        let mut app = App::new();
+        app.dispatch(Action::SettingsOpen);
+        clear_field(&mut app);
+        for c in "3d".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.take_settings().is_none(), "a cancel records nothing");
+        // The live policy is untouched — reopening shows the original default.
+        app.dispatch(Action::SettingsOpen);
+        assert_eq!(app.settings().value(SettingsField::KeepPrivate), "forever");
     }
 
     // --- secret chats & chat-action indicators (#87) ---
