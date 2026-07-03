@@ -1042,7 +1042,17 @@ async fn drive_logout(app: &mut App, client: &Arc<Client>) {
         return;
     }
     match client.bridge().log_out().await {
-        Ok(()) => app.dispatch(Action::Quit),
+        Ok(()) => {
+            // `logOut` is asynchronous: the request is acknowledged here, but TDLib
+            // then destroys all local data and drives authorization Ready → Closing →
+            // Closed. Wait for Closed *before* quitting so that destruction fully
+            // completes — quitting early lets the outer teardown's `close` race the
+            // in-flight logout and strand a half-cleared session, which the next run
+            // opens straight into Closed (no login UI, silent exit). Bounded (~5s), so
+            // a stuck teardown never wedges the exit.
+            bootstrap::wait_until_closed(client.bridge()).await;
+            app.dispatch(Action::Quit);
+        }
         // A fixed TDLib error code, never user content — safe to show (#122).
         Err(err) => app.notify(Notice::from_core_error("logout", &err.message)),
     }

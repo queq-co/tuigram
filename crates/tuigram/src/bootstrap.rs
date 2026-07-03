@@ -100,11 +100,12 @@ pub async fn shutdown(bridge: &Bridge) {
     wait_until_closed(bridge).await;
 }
 
-/// Wait for TDLib to reach `Closed` — the signal that `close` has finished
-/// flushing and closing the local database. Bounded (~5s) so a stuck teardown
-/// cannot hang exit; a query that errors (the client is already gone) counts as
-/// closed.
-async fn wait_until_closed(bridge: &Bridge) {
+/// Wait for TDLib to reach `Closed` — the signal that `close` (or an in-flight
+/// `logOut`, #195) has finished flushing and closing the local database. Bounded
+/// (~5s) so a stuck teardown cannot hang exit; a query that errors (the client is
+/// already gone) counts as closed. Shared with the logout path, which must let the
+/// logout's local-data destruction fully complete before the process exits.
+pub(crate) async fn wait_until_closed(bridge: &Bridge) {
     for _ in 0..50 {
         match bridge.authorization_state().await {
             Ok(AuthorizationState::Closed) | Err(_) => return,
