@@ -92,6 +92,8 @@ pub fn ui(frame: &mut Frame, app: &App) -> usize {
         Overlay::SendMedia => render_send_media(frame, frame.area(), app),
         Overlay::SecretChat => render_secret_chat(frame, frame.area(), app),
         Overlay::Settings => render_settings(frame, frame.area(), app),
+        Overlay::DeleteConfirm => render_delete_confirm(frame, frame.area(), app),
+        Overlay::LogoutConfirm => render_logout_confirm(frame, frame.area(), app),
     }
 
     // A transient toast floats over the content too, but — unlike a modal overlay
@@ -376,6 +378,8 @@ fn mode_label(app: &App) -> &'static str {
         Overlay::SendMedia => "attach",
         Overlay::SecretChat => "secret chat",
         Overlay::Settings => "settings",
+        Overlay::DeleteConfirm => "delete",
+        Overlay::LogoutConfirm => "logout",
     }
 }
 
@@ -1040,6 +1044,65 @@ fn render_secret_chat(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(lines).block(
             Block::bordered()
                 .title(" Secret chat ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// The delete-message confirm (#195): the target message's preview and the scope
+/// the confirm will use, gating the destructive delete behind an explicit step.
+/// "For everyone" is offered only for our own messages — the only ones Telegram can
+/// revoke — so a message from someone else shows just the "for me" delete.
+fn render_delete_confirm(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(prompt) = app.delete() else {
+        return;
+    };
+    let scope = if prompt.revoke() {
+        "for everyone"
+    } else {
+        "for me"
+    };
+    let mut lines = vec![
+        Line::from(format!("Delete this message {scope}?")),
+        Line::from(""),
+        Line::from(prompt.preview().to_owned()),
+        Line::from(""),
+    ];
+    lines.push(if prompt.can_revoke() {
+        hint_line("Enter delete · Tab toggle scope · Esc cancel")
+    } else {
+        hint_line("Enter delete · Esc cancel")
+    });
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Delete message ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// The logout confirm (#195): a deliberately spare, destructive-action confirm —
+/// logging out clears the local session, so it is gated behind an explicit Enter.
+fn render_logout_confirm(frame: &mut Frame, area: Rect, _app: &App) {
+    let lines = vec![
+        Line::from("Log out of this account?"),
+        Line::from(""),
+        Line::from("This clears the local session on this device."),
+        Line::from("The next launch will sign in fresh."),
+        Line::from(""),
+        hint_line("Enter log out · Esc cancel"),
+    ];
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" Log out ")
                 .title_alignment(Alignment::Center),
         ),
         popup,

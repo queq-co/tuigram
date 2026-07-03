@@ -64,10 +64,10 @@ use tokio_stream::StreamExt;
 
 use tuigram_core::model::{ChatKind, ChatListKind, Message, Sender, UserKind};
 use tuigram_core::{
-    Client, DOWNLOAD_PRIORITY, EditRequests, FileRequests, FormattedText, ForwardRequests,
-    HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests,
-    SendRequests, StorageRequests, StorageSettings, load_archive_list, load_folder_list,
-    load_main_list, search_chat, search_global,
+    AuthRequests, Client, DOWNLOAD_PRIORITY, DeleteRequests, EditRequests, FileRequests,
+    FormattedText, ForwardRequests, HistoryRequests, NEWEST, PinRequests, ReactionRequests,
+    ReadRequests, SecretChatRequests, SendRequests, StorageRequests, StorageSettings,
+    load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
 };
 
 use crate::app::{Action, App};
@@ -375,6 +375,17 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // Pull down the open chat's incoming media, each file once, so the progress
         // lines and saved markers resolve as `updateFile` folds (#120).
         drive_downloads(client, &history, &mut downloading);
+        // A confirmed delete removes the message for us or everyone; the real
+        // `updateDeleteMessages` folds and re-projects the history (#195).
+        drive_delete(&mut app, client, &outbound_tx);
+        // A save request reveals the media's local path (already downloaded) or
+        // starts its download (#195).
+        drive_save(&mut app, client);
+        // A resync re-queries the chat list after a dropped-update gap (#195).
+        drive_resync(&mut app, client, &outbound_tx);
+        // A confirmed logout ends the session and quits; awaited (not spawned)
+        // since the whole session is going away and the exit waits on it (#195).
+        drive_logout(&mut app, client).await;
     }
 
     Ok(())
@@ -929,6 +940,111 @@ fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &m
                 .download_file(file_id, DOWNLOAD_PRIORITY)
                 .await;
         });
+    }
+}
+
+/// Dispatch a confirmed delete to Telegram (#195). `App` records the target and
+/// scope as a pure [`DeleteIntent`](crate::conversation::DeleteIntent) from the
+/// delete confirm; here the loop drains it and calls
+/// [`DeleteRequests::delete`](tuigram_core::DeleteRequests).
+///
+/// Fire-and-forget like the send/forward paths: there is no optimistic local
+/// removal — TDLib streams `updateDeleteMessages`, folded by the message store and
+/// re-projected onto the open chat's history, so the message vanishes through the
+/// normal pipeline. Only a seam-level rejection reports back, as an error toast on
+/// `outbound_tx`.
+fn drive_delete(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Notice>) {
+    let Some(intent) = app.take_delete() else {
+        return;
+    };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = client
+            .bridge()
+            .delete(intent.chat_id, intent.message_ids, intent.revoke)
+            .await
+        {
+            // A fixed TDLib error code (e.g. MESSAGE_DELETE_FORBIDDEN), never user
+            // content — safe to show; `from_core_error` normalizes it (#122).
+            let _ = outbound_tx
+                .send(Notice::from_core_error("delete", &err.message))
+                .await;
+        }
+    });
+}
+
+/// Service a save/download request for a message's media (#195). `App` records the
+/// file id from the selected message; here the loop reads the file store back:
+/// a file already on disk (the auto-download of incoming media, #120, usually has
+/// it) is **revealed** by toasting its local path, so the user knows where to open
+/// it; a file not yet present starts the download and says so, its progress then
+/// tracked by the conversation's download line — a second `S` once complete reveals
+/// the path.
+fn drive_save(app: &mut App, client: &Arc<Client>) {
+    let Some(file_id) = app.take_save() else {
+        return;
+    };
+    let present_path = client.read(|state| {
+        state
+            .files()
+            .get(file_id)
+            .filter(|file| file.is_present())
+            .map(|file| file.local_path.clone())
+    });
+    match present_path {
+        Some(path) if !path.is_empty() => app.notify(Notice::success(format!("Saved to {path}"))),
+        _ => {
+            let client = Arc::clone(client);
+            tokio::spawn(async move {
+                let _ = client
+                    .bridge()
+                    .download_file(file_id, DOWNLOAD_PRIORITY)
+                    .await;
+            });
+            app.notify(Notice::info(
+                "Downloading… progress shows in the conversation; press S again when it completes.",
+            ));
+        }
+    }
+}
+
+/// Re-query the chat list after a dropped-update gap (#195). `App` records the
+/// request (`Ctrl-R`); here the loop drains it and calls [`Client::resync`], the
+/// same recovery the status bar's "run resync" hint points at. Spawned off an
+/// `Arc<Client>` clone so the round-trip never blocks the loop; the recovered list
+/// folds back and re-projects on its own. A seam-level failure reports as a toast.
+fn drive_resync(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Notice>) {
+    if !app.take_resync() {
+        return;
+    }
+    app.notify(Notice::info("Resyncing the chat list…"));
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = client.resync().await {
+            let _ = outbound_tx
+                .send(Notice::from_core_error("resync", &err.message))
+                .await;
+        }
+    });
+}
+
+/// Log out and exit on a confirmed logout (#195). Unlike the fire-and-forget seams
+/// this is **awaited** in the loop: logout is terminal — the whole session is going
+/// away — so on success the app quits (the outer teardown in `main` then waits for
+/// TDLib to reach `Closed` and flushes the database, exactly as on any exit),
+/// wiping the local session so the next launch starts at a fresh login. A rejected
+/// logout stays in the app and surfaces why, rather than stranding a half-torn-down
+/// session.
+async fn drive_logout(app: &mut App, client: &Arc<Client>) {
+    if !app.take_logout() {
+        return;
+    }
+    match client.bridge().log_out().await {
+        Ok(()) => app.dispatch(Action::Quit),
+        // A fixed TDLib error code, never user content — safe to show (#122).
+        Err(err) => app.notify(Notice::from_core_error("logout", &err.message)),
     }
 }
 

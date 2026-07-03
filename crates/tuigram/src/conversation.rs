@@ -41,6 +41,94 @@ pub struct PinIntent {
     pub pin: bool,
 }
 
+/// The delete-confirm overlay's state (#195): the message a `d` in the history
+/// targets and the scope the confirm will use. Deleting is destructive, so it is
+/// gated behind an explicit confirm — this holds what is being deleted and whether
+/// the pending confirm revokes it **for everyone** or removes it **only for us**.
+/// [`toggle_revoke`](Self::toggle_revoke) flips the scope; [`into_intent`](Self::into_intent)
+/// resolves it into the pure [`DeleteIntent`] the loop dispatches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletePrompt {
+    chat_id: i64,
+    message_id: i64,
+    /// Whether the target is our own message — only then can Telegram delete it for
+    /// everyone, so the "for everyone" scope is offered only when this holds.
+    own: bool,
+    /// The current scope: `true` deletes for everyone (revoke), `false` only for us.
+    revoke: bool,
+    /// A short label of the message, shown in the confirm so the user sees what
+    /// they are about to delete.
+    preview: String,
+}
+
+impl DeletePrompt {
+    /// A confirm for deleting `message_id` in `chat_id`. Defaults to the safe
+    /// scope — delete **only for us** — so a reflexive Enter never revokes a
+    /// message for the whole chat; the user opts into "for everyone" with the
+    /// scope toggle, and only when it is their own message.
+    #[must_use]
+    pub fn new(chat_id: i64, message_id: i64, own: bool, preview: String) -> Self {
+        Self {
+            chat_id,
+            message_id,
+            own,
+            revoke: false,
+            preview,
+        }
+    }
+
+    /// Flip the delete scope between "for me" and "for everyone". A no-op for a
+    /// message that is not ours, which can only ever be deleted for us.
+    pub fn toggle_revoke(&mut self) {
+        if self.own {
+            self.revoke = !self.revoke;
+        }
+    }
+
+    /// Whether the current scope is "for everyone" (revoke).
+    #[must_use]
+    pub fn revoke(&self) -> bool {
+        self.revoke
+    }
+
+    /// Whether "for everyone" is an available scope (the message is our own).
+    #[must_use]
+    pub fn can_revoke(&self) -> bool {
+        self.own
+    }
+
+    /// The message preview shown in the confirm.
+    #[must_use]
+    pub fn preview(&self) -> &str {
+        &self.preview
+    }
+
+    /// Resolve the confirmed prompt into the pure [`DeleteIntent`] the loop drains.
+    #[must_use]
+    pub fn into_intent(self) -> DeleteIntent {
+        DeleteIntent {
+            chat_id: self.chat_id,
+            message_ids: vec![self.message_id],
+            revoke: self.revoke,
+        }
+    }
+}
+
+/// A confirmed delete, recorded by `App` as a pure intent for the loop to dispatch
+/// (#195). Unlike the pin/reaction toggles there is no optimistic local change —
+/// the authoritative `updateDeleteMessages` folds and re-projects the history, so
+/// the loop only issues [`DeleteRequests::delete`](tuigram_core::messages::DeleteRequests)
+/// and lets the removal arrive through the normal pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteIntent {
+    /// The chat holding the message(s) — `delete`'s chat.
+    pub chat_id: i64,
+    /// The messages to delete, by id.
+    pub message_ids: Vec<i64>,
+    /// `true` deletes for everyone (revoke), `false` only for us.
+    pub revoke: bool,
+}
+
 /// The history pane's state: the open chat's messages (oldest first), which of
 /// them are pinned, the scroll offset, and the download state of any media files
 /// the visible messages reference. Empty until Phase 6 projects the core message
