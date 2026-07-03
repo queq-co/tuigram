@@ -23,7 +23,9 @@ path = "src/main.rs"
 # now always present (the TUI itself runs on tokio), so this is a build-gate
 # marker only. Run it with:
 #   cargo run -p tuigram --example repl --features login-harness
-login-harness = []
+# Pulls in rustyline (readline editing + command completion, #156–#157) solely
+# for the example; a default `cargo build --workspace` never compiles it.
+login-harness = ["dep:rustyline"]
 
 [[example]]
 name = "repl"
@@ -45,3 +47,7 @@ crossterm = { workspace = true }
 # QR encoder for the login QR screen (#86): renders the device-confirmation link
 # as a scannable code in the terminal.
 qrcodegen = { workspace = true }
+# Readline editing + command-name tab completion for the headless REPL example
+# only (#156–#157). Optional and pulled in solely by the `login-harness` feature
+# (`dep:rustyline` above), so a default `cargo build --workspace` never compiles it.
+rustyline = { workspace = true, optional = true }
