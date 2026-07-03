@@ -63,6 +63,10 @@ pub enum Action {
     ScrollDown,
     /// Scroll the conversation history one message toward the oldest.
     ScrollUp,
+    /// Jump the conversation history to the bottom-anchored newest message (`G` /
+    /// `End`), the way a chat client's "go to bottom" does (#158). Also re-arms
+    /// auto-follow, since it lands the view back on the newest anchor (#159).
+    JumpToNewest,
     /// Insert a typed character into the composer at the cursor — the keymap's
     /// printable-input fall-through when the composer is focused.
     ComposerInput(char),
@@ -574,6 +578,18 @@ impl App {
         self.dirty = true;
     }
 
+    /// Record the conversation pane's inner height measured by the last render (#158),
+    /// so the view can bottom-anchor an open / `G` and follow the tail against the real
+    /// number of visible rows. The loop calls this after each `draw`. Marks the frame
+    /// dirty only when the recorded height re-anchored the cursor (a first measurement
+    /// or a resize while following), so the corrected frame repaints without the draw
+    /// loop spinning when the height is unchanged.
+    pub fn set_conversation_viewport(&mut self, height: usize) {
+        if self.conversation.set_viewport_height(height) {
+            self.dirty = true;
+        }
+    }
+
     /// Open the forward target picker for `message_id` from `source_chat_id`, shared
     /// by the two entry points (a search hit, `ForwardOpen`; the selected history
     /// message, `ForwardMessage`). The picker reuses a snapshot of the chat list as
@@ -760,6 +776,10 @@ impl App {
                     self.wants_older_history = true;
                 }
                 self.conversation.scroll_up();
+                self.dirty = true;
+            }
+            Action::JumpToNewest => {
+                self.conversation.jump_to_newest();
                 self.dirty = true;
             }
             Action::ComposerInput(c) => {
@@ -1485,11 +1505,48 @@ mod tests {
         };
         // Stands in for the loop's read-back of the open chat's MessageStore.
         let mut app = App::new();
+        // A tall viewport (the loop records it after each render) so the whole
+        // two-message history fits: the open bottom-anchors, which for a history that
+        // fits is the top — message 1 at the top of the pane (#158).
+        app.set_conversation_viewport(40);
         app.clear_dirty();
         app.project_conversation(10, vec![text(1), text(2)], HashSet::new());
         assert!(app.is_dirty());
         assert_eq!(app.conversation().len(), 2);
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    #[test]
+    fn jump_to_newest_bottom_anchors_the_history_and_dirties() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let text = |id: i64| {
+            sample_message(
+                id,
+                MessageContent::Text(FormattedText {
+                    text: format!("m{id}"),
+                    entities: Vec::new(),
+                }),
+            )
+        };
+        // Five 3-row messages in a two-message viewport: opening bottom-anchors, so
+        // scrolling up and pressing G returns to the newest anchor (#158).
+        let mut app = App::new();
+        app.set_conversation_viewport(6);
+        app.project_conversation(10, (1..=5).map(text).collect(), HashSet::new());
+        let anchor = app.conversation().offset();
+        assert!(anchor > 0, "a long history opens away from the top");
+
+        app.dispatch(Action::ScrollUp);
+        app.clear_dirty();
+        app.dispatch(Action::JumpToNewest);
+        assert_eq!(
+            app.conversation().offset(),
+            anchor,
+            "G returns to the newest"
+        );
+        assert!(app.is_dirty());
     }
 
     #[test]
@@ -1706,12 +1763,16 @@ mod tests {
     #[test]
     fn a_jump_is_dropped_when_a_different_chat_is_opened_first() {
         let mut app = app_on_results();
+        // A viewport tall enough to hold the short history, so bottom-anchoring puts
+        // the oldest loaded message at the top of the pane (#158).
+        app.set_conversation_viewport(40);
         app.dispatch(Action::ResultOpen); // hit for chat 1, message 10
 
         // The user opens chat 2 before chat 1's history arrives: the stale jump drops.
         app.project_conversation(2, text_history(&[7, 8]), HashSet::new());
         // Chat 1's history (with message 10) arrives later, but the jump is gone, so
-        // the view lands fresh at the top (message 9) rather than chasing message 10.
+        // the view opens bottom-anchored (message 9 at the pane top, the whole history
+        // fitting) rather than chasing message 10.
         app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(9));
     }

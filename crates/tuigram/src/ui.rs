@@ -53,8 +53,12 @@ const COMPOSER_PLACEHOLDER: &str = "type a message…";
 /// Marker prefixed to the focused pane's border title.
 const FOCUS_MARKER: &str = "●";
 
-/// Render the whole UI for one frame from the current `App` state.
-pub fn ui(frame: &mut Frame, app: &App) {
+/// Render the whole UI for one frame from the current `App` state, returning the
+/// history pane's inner height (rows) so the loop can record it on the conversation
+/// view (#158) — the number of visible message rows the bottom-anchoring walk sums
+/// against. The renderer stays a pure snapshot; the loop owns feeding the height
+/// back through [`App::set_conversation_viewport`](crate::app::App::set_conversation_viewport).
+pub fn ui(frame: &mut Frame, app: &App) -> usize {
     // Outer split: the three panes over a one-row status bar pinned to the bottom.
     let [content_area, status_area] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)])
@@ -95,6 +99,10 @@ pub fn ui(frame: &mut Frame, app: &App) {
     if app.notifications().current().is_some() {
         render_toast(frame, content_area, app);
     }
+
+    // The history pane's inner height (excluding the block's top and bottom borders)
+    // — the row budget the bottom-anchoring walk (#158) fits messages into.
+    history_area.height.saturating_sub(2) as usize
 }
 
 /// A pane's bordered block, with the focus highlight applied when `focused`: a
@@ -1115,7 +1123,11 @@ mod tests {
     /// `Buffer` at a fixed size. Every later `ui:` issue asserts against this.
     fn render(app: &App, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| ui(frame, app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui(frame, app);
+            })
+            .unwrap();
         terminal.backend().buffer().clone()
     }
 
@@ -1739,6 +1751,61 @@ mod tests {
             text.contains("downloading 45%"),
             "download progress indicator"
         );
+    }
+
+    #[test]
+    fn message_height_matches_the_rendered_line_count() {
+        // The bottom-anchoring walk (#158) sums `ConversationView::message_height`;
+        // this guards it against drifting from what `message_lines` actually renders —
+        // the two are a single source split across the view model and the renderer.
+        use tuigram_core::model::{FileRef, Photo, ReactionKind};
+
+        let mut reacted = text_message(4, "nice");
+        reacted.reactions = vec![Reaction {
+            kind: ReactionKind::Emoji("👍".to_owned()),
+            count: 2,
+            is_chosen: true,
+        }];
+        let photo = sample_message(
+            3,
+            MessageContent::Photo(Photo {
+                caption: FormattedText {
+                    text: "a caption\non two lines".to_owned(),
+                    entities: Vec::new(),
+                },
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let messages = vec![
+            text_message(1, "single line"),
+            text_message(2, "line one\nline two\nline three"),
+            photo,
+            reacted,
+        ];
+        // One pin (height-neutral) and an active download that adds a progress line.
+        let mut view = ConversationView::from_messages(messages, HashSet::from([1]));
+        view.set_downloads(vec![File {
+            id: 7,
+            size: 100,
+            downloaded_size: 40,
+            is_downloading_active: true,
+            ..File::default()
+        }]);
+
+        for message in view.messages() {
+            // The pane never wraps, so height is width-independent; the selection
+            // marker only prefixes the header and never changes the row count.
+            for selected in [false, true] {
+                assert_eq!(
+                    message_lines(&view, message, selected).len(),
+                    view.message_height(message),
+                    "height drifts from the renderer for message {}",
+                    message.id
+                );
+            }
+        }
     }
 
     #[test]

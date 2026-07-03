@@ -244,8 +244,16 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
 
     while !app.should_quit() {
         if app.is_dirty() {
-            guard.terminal_mut().draw(|frame| ui::ui(frame, &app))?;
+            // The draw reports the history pane's inner height; record it on the view
+            // so an open/`G`/tail-follow can bottom-anchor against the real number of
+            // visible rows (#158). A first measurement or a resize while following
+            // re-anchors and re-dirties, so the corrected frame paints next iteration.
+            let mut convo_viewport = 0;
+            guard
+                .terminal_mut()
+                .draw(|frame| convo_viewport = ui::ui(frame, &app))?;
             app.clear_dirty();
+            app.set_conversation_viewport(convo_viewport);
         }
 
         tokio::select! {
