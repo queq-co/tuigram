@@ -55,7 +55,7 @@ use tuigram_core::{
     Login, Message, MessageContent, NEWEST, Onboarding, OutgoingMedia, PinRequests, Reaction,
     ReactionKind, ReactionRequests, ReadRequests, SecretChatRequests, SecretChatState,
     SendRequests, SendState, Sender, SessionStorage, TgClient, UpdateStream, load_archive_list,
-    load_folder_list, load_main_list,
+    load_folder_list, load_main_list, scrub_line, scrub_prose,
 };
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
@@ -390,6 +390,7 @@ async fn run_repl(client: &Client) -> Fallible {
                 Err(_) => println!("usage: secret-close <secret_chat_id>"),
             },
             "status" => show_status(client),
+            "probe" => run_probe(rest),
             "resync" => resync(client).await,
             "logout" => {
                 if logout(client).await == Flow::Done {
@@ -1237,6 +1238,109 @@ fn parse_sendmedia(rest: &str) -> Result<(i64, OutgoingMedia), String> {
 }
 
 /// The command reference, shown on entry and on `help`.
+/// A built-in terminal-injection payload for the `probe` command: a human label
+/// and the raw hostile bytes exactly as a contact could embed them in a message.
+struct Payload {
+    /// What the payload attempts, for the operator's benefit.
+    label: &'static str,
+    /// The raw attacker bytes — real ESC/BEL/bidi, not their printable spellings.
+    raw: &'static str,
+    /// Whether this stands in for a single-line identifier (file name, title),
+    /// which the boundary scrubs with [`scrub_line`], versus a prose body
+    /// ([`scrub_prose`]). Mirrors the field-shape split in `from_tdlib`.
+    line: bool,
+}
+
+/// The payloads `probe` exercises: the escape-injection vectors #174 defends
+/// against, carried as literals so the operator never has to type a raw ESC
+/// (which most terminals and editors swallow) to reproduce the attack.
+const PROBE_PAYLOADS: &[Payload] = &[
+    Payload {
+        label: "OSC set-window-title",
+        raw: "before \x1b]0;PWNED\x07 after",
+        line: false,
+    },
+    Payload {
+        label: "OSC 8 hyperlink cloak",
+        raw: "\x1b]8;;https://evil.example\x1b\\click me\x1b]8;;\x1b\\",
+        line: false,
+    },
+    Payload {
+        label: "DECRQSS status query",
+        raw: "\x1bP$qm\x1b\\",
+        line: false,
+    },
+    Payload {
+        label: "SGR colour bleed",
+        raw: "\x1b[31mred-forever",
+        line: false,
+    },
+    Payload {
+        label: "Trojan-Source file name",
+        raw: "report_e\u{202e}xe.txt",
+        line: true,
+    },
+];
+
+/// Demonstrate the terminal-injection defence (#174) with no network round-trip
+/// and no second account. The default run pushes each built-in payload through
+/// the same public sanitizer the `from_tdlib` trust boundary uses and prints the
+/// neutralized result, so you can confirm on a real terminal that nothing reacts.
+/// `probe raw` instead emits the *unscrubbed* bytes so you can watch the attack
+/// fire — proof the threat is real — then restores the window title.
+fn run_probe(rest: &str) {
+    if rest.trim() == "raw" {
+        probe_raw();
+    } else {
+        probe_safe();
+    }
+}
+
+/// Scrub each payload at the boundary and report whether any control byte
+/// survived — the property #174 guarantees.
+fn probe_safe() {
+    println!(
+        "Terminal-injection probe — each payload scrubbed at the from_tdlib boundary (#174):\n"
+    );
+    let mut all_inert = true;
+    for p in PROBE_PAYLOADS {
+        let scrubbed = if p.line {
+            scrub_line(p.raw)
+        } else {
+            scrub_prose(p.raw)
+        };
+        // `\n` is legitimate in scrubbed prose; any other control byte is a leak.
+        let inert = !scrubbed.chars().any(|c| c.is_control() && c != '\n');
+        all_inert &= inert;
+        let verdict = if inert { "inert" } else { "LEAK" };
+        println!("  {:<24} [{verdict}] {scrubbed}", p.label);
+    }
+    if all_inert {
+        println!(
+            "\nAll payloads inert. Your terminal title is unchanged and every escape shows as `\u{fffd}`."
+        );
+    } else {
+        println!("\nA payload LEAKED a control byte — #174 has regressed.");
+    }
+    println!("Run `probe raw` to see the same payloads fire on an unprotected terminal.");
+}
+
+/// Emit the payloads unscrubbed so the operator can watch a real terminal react —
+/// then undo the window title so the REPL does not leave `PWNED` behind.
+fn probe_raw() {
+    println!(
+        "DANGER: writing raw payloads to your terminal — expect the window title to change.\n"
+    );
+    for p in PROBE_PAYLOADS {
+        // The hostile bytes verbatim, exactly as an unsanitized render would emit.
+        println!("  {}:\n    {}", p.label, p.raw);
+    }
+    // Courtesy reset: put the window title back so the demonstration is reversible.
+    print!("\x1b]0;tuigram repl\x07");
+    let _ = io::stdout().flush();
+    println!("\n(window title restored). This is what #174 neutralizes on the real message path.");
+}
+
 fn print_help() {
     println!(
         "Commands:\n\
@@ -1265,6 +1369,7 @@ fn print_help() {
          \x20 secrets                            list known secret chats + state\n\
          \x20 secret-close <secret_id>           close a secret chat\n\
          \x20 status                             show connection/sync status + any dropped-update gap\n\
+         \x20 probe [raw]                         terminal-injection self-test (#174); `raw` fires the unscrubbed attack\n\
          \x20 resync                             re-query the chat list after a dropped-update gap\n\
          \x20 logout                             end the session and exit (next run logs in fresh)\n\
          \x20 help                               show this help\n\
