@@ -1440,7 +1440,11 @@ mod tests {
     fn open_chat_replaces_the_empty_state_with_history() {
         // The empty-state copy appears only with no chat open: an open chat's
         // history takes the pane, and the placeholder CTA is gone.
-        let text = flatten(&render(&app_with_history(vec![text_message(1, "hi")]), 80, 24));
+        let text = flatten(&render(
+            &app_with_history(vec![text_message(1, "hi")]),
+            80,
+            24,
+        ));
         assert!(text.contains("hi"), "history body shown");
         assert!(
             !text.contains("Select a chat and press Enter"),
