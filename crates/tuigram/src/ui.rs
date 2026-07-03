@@ -1134,6 +1134,31 @@ mod tests {
         assert!(text.contains("quit"), "quit hint");
     }
 
+    /// End-to-end inertness: text that has passed through the core sanitizer
+    /// (as it will, arriving via `from_tdlib`) renders with no control byte
+    /// reaching a cell, and with a visible replacement marker where the escape
+    /// was. This is the render half of the escape-injection defense (#174); the
+    /// core `sanitize` and `model` tests cover the projection half.
+    #[test]
+    fn a_hostile_message_renders_inert() {
+        let hostile = "hello\u{1b}]0;pwned\u{07}\u{1b}[2Jworld";
+        let content = MessageContent::Text(FormattedText {
+            text: tuigram_core::scrub_prose(hostile),
+            entities: Vec::new(),
+        });
+        let rendered: String = content_lines(&content)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            !rendered.chars().any(|c| c.is_control() && c != '\n'),
+            "no control byte reaches a cell: {rendered:?}"
+        );
+        assert!(rendered.contains('\u{fffd}'), "tampering is marked");
+        assert!(rendered.contains("hello") && rendered.contains("world"));
+    }
+
     #[test]
     fn the_focused_pane_carries_the_focus_marker() {
         use crate::keymap::Focus;

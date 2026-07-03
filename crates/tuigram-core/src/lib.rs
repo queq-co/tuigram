@@ -15,6 +15,7 @@ pub mod files;
 pub mod messages;
 pub mod model;
 pub mod router;
+pub mod sanitize;
 pub mod secret_chats;
 pub mod session;
 pub mod settings;
@@ -47,6 +48,7 @@ pub use model::{
     UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
+pub use sanitize::{scrub_line, scrub_prose};
 pub use secret_chats::{SecretChatRequests, SecretChatStore};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
 pub use settings::{CacheCap, KeepMedia, StorageSettings};
