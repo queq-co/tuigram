@@ -48,6 +48,14 @@ tempfile = { version = "3" }
 # link is drawn as a scannable code. Nayuki's reference implementation — pure
 # Rust, zero dependencies, deterministic output (so the render is snapshot-testable).
 qrcodegen = { version = "1.8" }
+# Readline-style line editing for the headless REPL harness only (#156–#157):
+# in-session up/down history and command-name tab completion. `default-features
+# = false` drops the file-history + directory helpers, so `DefaultHistory` is the
+# in-memory `MemHistory` — command lines (which carry message text and file paths)
+# are never written to disk, matching the encrypted-at-rest posture (#8). Harness
+# only: pulled in via `dep:rustyline` behind `login-harness`, never in the product
+# binary's dependency graph.
+rustyline = { version = "18", default-features = false }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.
