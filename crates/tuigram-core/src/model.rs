@@ -286,14 +286,20 @@ impl User {
     pub fn from_tdlib(user: &TdUser) -> Self {
         Self {
             id: user.id,
-            first_name: user.first_name.clone(),
-            last_name: user.last_name.clone(),
+            first_name: crate::sanitize::scrub_line(&user.first_name),
+            last_name: crate::sanitize::scrub_line(&user.last_name),
             usernames: user
                 .usernames
                 .as_ref()
-                .map(|u| u.active_usernames.clone())
+                .map(|u| {
+                    u.active_usernames
+                        .iter()
+                        .map(|name| crate::sanitize::scrub_line(name))
+                        .collect()
+                })
                 .unwrap_or_default(),
-            phone_number: Some(user.phone_number.clone()).filter(|p| !p.is_empty()),
+            phone_number: Some(crate::sanitize::scrub_line(&user.phone_number))
+                .filter(|p| !p.is_empty()),
             is_contact: user.is_contact,
             kind: UserKind::from_tdlib(&user.r#type),
             status: Presence::from_tdlib(&user.status),
@@ -744,8 +750,12 @@ impl FormattedText {
     /// Project TDLib's `FormattedText`.
     #[must_use]
     pub fn from_tdlib(text: &TdFormattedText) -> Self {
+        // Trust boundary: message bodies and captions are attacker-controlled and
+        // end up in terminal cells, so neutralize control sequences here — once,
+        // where every text/caption/poll projection funnels through. Replacing
+        // controls one-for-one keeps the entities' UTF-16 offsets aligned.
         Self {
-            text: text.text.clone(),
+            text: crate::sanitize::scrub_prose(&text.text),
             entities: text.entities.iter().map(TextEntity::from_tdlib).collect(),
         }
     }
@@ -932,8 +942,8 @@ impl Video {
             width: m.video.width,
             height: m.video.height,
             duration: m.video.duration,
-            file_name: m.video.file_name.clone(),
-            mime_type: m.video.mime_type.clone(),
+            file_name: crate::sanitize::scrub_line(&m.video.file_name),
+            mime_type: crate::sanitize::scrub_line(&m.video.mime_type),
         }
     }
 }
@@ -958,8 +968,8 @@ impl Document {
         Self {
             caption: FormattedText::from_tdlib(&m.caption),
             file: FileRef::new(m.document.document.id),
-            file_name: m.document.file_name.clone(),
-            mime_type: m.document.mime_type.clone(),
+            file_name: crate::sanitize::scrub_line(&m.document.file_name),
+            mime_type: crate::sanitize::scrub_line(&m.document.mime_type),
         }
     }
 }
@@ -991,10 +1001,10 @@ impl Audio {
             caption: FormattedText::from_tdlib(&m.caption),
             file: FileRef::new(m.audio.audio.id),
             duration: m.audio.duration,
-            title: m.audio.title.clone(),
-            performer: m.audio.performer.clone(),
-            file_name: m.audio.file_name.clone(),
-            mime_type: m.audio.mime_type.clone(),
+            title: crate::sanitize::scrub_line(&m.audio.title),
+            performer: crate::sanitize::scrub_line(&m.audio.performer),
+            file_name: crate::sanitize::scrub_line(&m.audio.file_name),
+            mime_type: crate::sanitize::scrub_line(&m.audio.mime_type),
         }
     }
 }
@@ -1020,7 +1030,7 @@ impl Voice {
             caption: FormattedText::from_tdlib(&m.caption),
             file: FileRef::new(m.voice_note.voice.id),
             duration: m.voice_note.duration,
-            mime_type: m.voice_note.mime_type.clone(),
+            mime_type: crate::sanitize::scrub_line(&m.voice_note.mime_type),
         }
     }
 }
@@ -1047,7 +1057,7 @@ impl Sticker {
             file: FileRef::new(m.sticker.sticker.id),
             width: m.sticker.width,
             height: m.sticker.height,
-            emoji: m.sticker.emoji.clone(),
+            emoji: crate::sanitize::scrub_line(&m.sticker.emoji),
         }
     }
 }
@@ -1081,8 +1091,8 @@ impl Animation {
             width: m.animation.width,
             height: m.animation.height,
             duration: m.animation.duration,
-            file_name: m.animation.file_name.clone(),
-            mime_type: m.animation.mime_type.clone(),
+            file_name: crate::sanitize::scrub_line(&m.animation.file_name),
+            mime_type: crate::sanitize::scrub_line(&m.animation.mime_type),
         }
     }
 }
@@ -1134,8 +1144,8 @@ impl Venue {
     pub fn from_tdlib(v: &TdVenue) -> Self {
         Self {
             location: Location::from_tdlib(&v.location),
-            title: v.title.clone(),
-            address: v.address.clone(),
+            title: crate::sanitize::scrub_line(&v.title),
+            address: crate::sanitize::scrub_line(&v.address),
         }
     }
 }
@@ -1159,9 +1169,9 @@ impl Contact {
     #[must_use]
     pub fn from_tdlib(c: &TdContact) -> Self {
         Self {
-            first_name: c.first_name.clone(),
-            last_name: c.last_name.clone(),
-            phone_number: c.phone_number.clone(),
+            first_name: crate::sanitize::scrub_line(&c.first_name),
+            last_name: crate::sanitize::scrub_line(&c.last_name),
+            phone_number: crate::sanitize::scrub_line(&c.phone_number),
             user_id: c.user_id,
         }
     }
@@ -1704,7 +1714,7 @@ impl ReactionKind {
     #[must_use]
     pub fn from_tdlib(kind: &TdReactionType) -> Self {
         match kind {
-            TdReactionType::Emoji(e) => Self::Emoji(e.emoji.clone()),
+            TdReactionType::Emoji(e) => Self::Emoji(crate::sanitize::scrub_line(&e.emoji)),
             TdReactionType::CustomEmoji(c) => Self::CustomEmoji(c.custom_emoji_id),
             TdReactionType::Paid => Self::Paid,
         }
@@ -1926,7 +1936,7 @@ impl Chat {
     pub fn from_tdlib(chat: &TdChat) -> Self {
         Self {
             id: chat.id,
-            title: chat.title.clone(),
+            title: crate::sanitize::scrub_line(&chat.title),
             kind: ChatKind::from_tdlib(&chat.r#type),
             last_message: chat.last_message.as_ref().map(Message::from_tdlib),
             unread_count: chat.unread_count,
@@ -2286,6 +2296,43 @@ mod tests {
                 mime_type: "application/pdf".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn text_projection_scrubs_terminal_escapes_at_the_boundary() {
+        // The seam is wired: a body with an ESC-introduced control sequence is
+        // neutralized by the projection, so the store never holds hostile bytes.
+        let content = td_text("hi\u{1b}]0;pwned\u{07}there", vec![]);
+        let MessageContent::Text(text) = MessageContent::from_tdlib(&content) else {
+            panic!("text content");
+        };
+        assert!(
+            !text.text.chars().any(|c| c.is_control() && c != '\n'),
+            "no control byte stored: {:?}",
+            text.text
+        );
+        assert_eq!(text.text, "hi\u{fffd}]0;pwned\u{fffd}there");
+    }
+
+    #[test]
+    fn document_projection_scrubs_bidi_spoofed_file_name() {
+        // A Trojan-Source file name (an override that flips `exe`/`txt`) is
+        // neutralized on projection so the stored name reads honestly.
+        let content = TdMessageContent::MessageDocument(TdMessageDocument {
+            document: tdlib_rs::types::Document {
+                file_name: "report_e\u{202e}xe.txt".to_owned(),
+                mime_type: "application/pdf".to_owned(),
+                minithumbnail: None,
+                thumbnail: None,
+                document: td_file(3),
+            },
+            caption: TdFormattedTextT::default(),
+        });
+        let MessageContent::Document(doc) = MessageContent::from_tdlib(&content) else {
+            panic!("document content");
+        };
+        assert!(!doc.file_name.contains('\u{202e}'), "override removed");
+        assert_eq!(doc.file_name, "report_e\u{fffd}xe.txt");
     }
 
     #[test]
