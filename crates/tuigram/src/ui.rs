@@ -20,7 +20,7 @@ use ratatui::widgets::{
 
 use tuigram_core::model::{
     Chat, ChatAction, ChatKind, File, FormattedText, Message, MessageContent, ReactionKind,
-    SecretChatState, Sender,
+    SecretChatState,
 };
 
 use crate::chat_list::ChatListView;
@@ -443,7 +443,7 @@ fn message_lines(view: &ConversationView, message: &Message, selected: bool) -> 
     if view.is_pinned(message.id) {
         header.push_str("📌 ");
     }
-    header.push_str(&sender_label(message));
+    header.push_str(&view.sender_label(message));
     header.push_str("  ");
     header.push_str(&hour_minute(message.date));
 
@@ -488,19 +488,6 @@ fn percent(file: &File) -> i64 {
         return 0;
     }
     (file.downloaded_size * 100 / total).clamp(0, 100)
-}
-
-/// The header's name for a message: "You" for our own messages, else the sender's
-/// id. Resolving ids to display names needs the user/chat store, which Phase 6
-/// wires; until then the id keeps the header unambiguous.
-fn sender_label(message: &Message) -> String {
-    if message.is_outgoing {
-        return "You".to_owned();
-    }
-    match message.sender {
-        Sender::User(id) => format!("User {id}"),
-        Sender::Chat(id) => format!("Chat {id}"),
-    }
 }
 
 /// Format a Unix timestamp as `HH:MM` in UTC. Local-time conversion needs a
@@ -1411,8 +1398,8 @@ mod tests {
     // --- conversation / history pane (#81) ---
 
     use crate::conversation::{ConversationView, sample_message};
-    use std::collections::HashSet;
-    use tuigram_core::model::{FileRef, Photo, Reaction};
+    use std::collections::{HashMap, HashSet};
+    use tuigram_core::model::{FileRef, Photo, Reaction, Sender};
 
     /// A text message with the given id and body.
     fn text_message(id: i64, body: &str) -> Message {
@@ -1936,6 +1923,25 @@ mod tests {
             text.contains("recording a voice message"),
             "header indicator"
         );
+    }
+
+    #[test]
+    fn the_conversation_header_shows_the_resolved_sender_name() {
+        // A projected sender label (#160) replaces the numeric `User {id}` in the
+        // bold message header.
+        let mut view = ConversationView::default();
+        view.project(
+            10,
+            vec![text_message(1, "hi")],
+            HashSet::new(),
+            HashMap::from([(Sender::User(1), "Ada Lovelace (@ada)".to_owned())]),
+        );
+        let text = flatten(&render(&App::with_conversation(view), 80, 24));
+        assert!(
+            text.contains("Ada Lovelace (@ada)"),
+            "resolved sender name in the header"
+        );
+        assert!(!text.contains("User 1"), "numeric fallback replaced");
     }
 
     #[test]

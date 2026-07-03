@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 
 use tuigram_core::model::{
-    ChatAction, File, FormattedText, Message, MessageContent, Reaction, ReactionKind,
+    ChatAction, File, FormattedText, Message, MessageContent, Reaction, ReactionKind, Sender, User,
 };
 
 /// A confirmed pin toggle, recorded by `App` as a pure intent for the loop to
@@ -80,6 +80,12 @@ pub struct ConversationView {
     /// projects this from the core [`ChatActionStore`](tuigram_core::ChatActionStore);
     /// it is never part of the message history.
     chat_action: Option<ChatAction>,
+    /// Display labels for the history's message senders (#160), resolved by the loop
+    /// from the core user/chat stores and keyed by [`Sender`]: a user's
+    /// `"Name (@handle)"` or a chat's title. A sender absent here (its record not yet
+    /// folded) falls back to the bare `User {id}` / `Chat {id}` in
+    /// [`sender_label`](Self::sender_label), so the header is always legible.
+    senders: HashMap<Sender, String>,
 }
 
 impl ConversationView {
@@ -102,6 +108,7 @@ impl ConversationView {
             viewport: 0,
             downloads: HashMap::new(),
             chat_action: None,
+            senders: HashMap::new(),
         }
     }
 
@@ -126,7 +133,13 @@ impl ConversationView {
     /// bottom-anchored at the newest message (#158), the way a chat client does. The
     /// last-rendered viewport height carries over (the pane geometry is unchanged),
     /// so the anchor is right immediately; the next render re-confirms it.
-    pub fn project(&mut self, chat_id: i64, messages: Vec<Message>, pinned: HashSet<i64>) {
+    pub fn project(
+        &mut self,
+        chat_id: i64,
+        messages: Vec<Message>,
+        pinned: HashSet<i64>,
+        senders: HashMap<Sender, String>,
+    ) {
         if self.chat_id == Some(chat_id) {
             // Derive follow-ness from the *old* view before the swap: were we pinned
             // to the newest message? If so, advance onto the new newest; if not, hold
@@ -135,6 +148,7 @@ impl ConversationView {
             let anchor = self.selected_message().map(|m| m.id);
             self.messages = messages;
             self.pinned = pinned;
+            self.senders = senders;
             self.offset = if following {
                 self.newest_anchor_offset()
             } else {
@@ -154,6 +168,7 @@ impl ConversationView {
                 messages,
                 pinned,
                 viewport,
+                senders,
                 ..Self::default()
             };
             self.offset = self.newest_anchor_offset();
@@ -196,6 +211,25 @@ impl ConversationView {
     #[must_use]
     pub fn selected_message(&self) -> Option<&Message> {
         self.messages.get(self.offset)
+    }
+
+    /// The header name for a message (#160): `"You"` for our own messages, else the
+    /// sender's resolved display label — a user's `"Name (@handle)"` or a chat's
+    /// title, folded in by the loop — falling back to the bare `User {id}` / `Chat
+    /// {id}` when the record has not arrived yet, so the header is never blank or
+    /// ambiguous.
+    #[must_use]
+    pub(crate) fn sender_label(&self, message: &Message) -> String {
+        if message.is_outgoing {
+            return "You".to_owned();
+        }
+        if let Some(label) = self.senders.get(&message.sender) {
+            return label.clone();
+        }
+        match message.sender {
+            Sender::User(id) => format!("User {id}"),
+            Sender::Chat(id) => format!("Chat {id}"),
+        }
     }
 
     /// Toggle the pinned state of message `id`: pin it if it is not pinned, unpin
@@ -433,13 +467,32 @@ fn content_rows(content: &MessageContent) -> usize {
     }
 }
 
+/// The display label for a user sender (#160): `"Name (@handle)"` when the user has
+/// both a name and a primary username, `"Name"` when only a name, `"@handle"` when
+/// only a username, and otherwise core's [`User::display_name`] fallback ("Deleted
+/// Account" or the bare `User {id}`). The loop resolves each history sender through
+/// this before handing the labels to [`ConversationView::project`].
+#[must_use]
+pub(crate) fn sender_label_for(user: &User) -> String {
+    let name = format!("{} {}", user.first_name, user.last_name);
+    let name = name.trim();
+    match (name.is_empty(), user.username()) {
+        (false, Some(handle)) => format!("{name} (@{handle})"),
+        (false, None) => name.to_owned(),
+        (true, Some(handle)) => format!("@{handle}"),
+        (true, None) => user.display_name(),
+    }
+}
+
 #[cfg(test)]
 pub(crate) use tests::sample_message;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tuigram_core::model::{FormattedText, Message, MessageContent, SendState, Sender};
+    use tuigram_core::model::{
+        FormattedText, Message, MessageContent, Presence, SendState, Sender, UserKind,
+    };
 
     /// A minimal incoming [`Message`] for view tests: an id and content, every
     /// other field inert. Tests that need a timestamp, reactions, an outgoing
@@ -630,7 +683,12 @@ mod tests {
         // Viewport fits two 3-row messages; a five-message history opens with the
         // newest (5) at the bottom and message 4 at the top of the last screenful.
         let mut view = view_fitting(2);
-        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         assert_eq!(view.len(), 5);
         assert_eq!(view.offset(), 3, "top of the last screenful");
         assert_eq!(view.selected_message().map(|m| m.id), Some(4));
@@ -640,7 +698,12 @@ mod tests {
     #[test]
     fn jump_to_newest_from_any_offset_lands_at_the_same_bottom_anchor() {
         let mut view = view_fitting(2);
-        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         let anchor = view.offset();
         // Scroll to the very top, then jump: it lands back on the identical anchor.
         for _ in 0..10 {
@@ -657,7 +720,12 @@ mod tests {
         // Three 3-row messages (9 rows) in a 30-row viewport: everything fits, so the
         // anchor is the top with no blank gap to scroll past.
         let mut view = view_fitting(10);
-        view.project(10, (1..=3).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=3).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         assert_eq!(view.offset(), 0);
         assert!(view.is_at_newest());
     }
@@ -668,7 +736,7 @@ mod tests {
         // screen (offset on it) rather than falling off the bottom.
         let mut view = view_fitting(1); // 3 rows
         let tall = text(2, "l1\nl2\nl3\nl4\nl5"); // 1 + 5 + 1 = 7 rows > 3
-        view.project(10, vec![text(1, "m"), tall], HashSet::new());
+        view.project(10, vec![text(1, "m"), tall], HashSet::new(), HashMap::new());
         assert_eq!(
             view.offset(),
             1,
@@ -681,7 +749,12 @@ mod tests {
         // Four 3-row messages in a two-message viewport, so scrolling up genuinely
         // leaves the newest anchor (offset 2) onto message 2.
         let mut view = view_fitting(2);
-        view.project(10, (1..=4).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         view.scroll_up(); // off the newest anchor, onto message 2
         assert_eq!(view.selected_message().map(|m| m.id), Some(2));
         assert!(!view.is_at_newest(), "scrolled up: not following");
@@ -699,6 +772,7 @@ mod tests {
                 text(4, "m"),
             ],
             HashSet::new(),
+            HashMap::new(),
         );
         assert_eq!(
             view.selected_message().map(|m| m.id),
@@ -717,11 +791,21 @@ mod tests {
         // Sitting at the bottom-anchored newest, a new message arrives (#159): the
         // view advances onto the new newest rather than holding still.
         let mut view = view_fitting(2);
-        view.project(10, (1..=4).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         assert!(view.is_at_newest());
         let before = view.offset();
 
-        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         assert!(view.offset() > before, "the anchor advanced with the tail");
         assert!(view.is_at_newest(), "still pinned to the (new) newest");
         // The newest message is now the last one loaded.
@@ -731,14 +815,24 @@ mod tests {
     #[test]
     fn a_live_message_while_scrolled_up_does_not_move_the_cursor() {
         let mut view = view_fitting(2);
-        view.project(10, (1..=4).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         view.scroll_up();
         view.scroll_up();
         let (offset, selected) = (view.offset(), view.selected_message().map(|m| m.id));
         assert!(!view.is_at_newest(), "reading history: not following");
 
         // A newer message arrives; the reader is undisturbed.
-        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         assert_eq!(view.offset(), offset);
         assert_eq!(view.selected_message().map(|m| m.id), selected);
     }
@@ -746,7 +840,12 @@ mod tests {
     #[test]
     fn a_resize_while_following_re_anchors_to_the_newest() {
         let mut view = view_fitting(2);
-        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         let before = view.offset();
         // Growing the pane to fit three messages re-anchors upward; the offset moves.
         assert!(view.set_viewport_height(9), "re-anchored while following");
@@ -762,7 +861,12 @@ mod tests {
     #[test]
     fn a_resize_while_scrolled_up_leaves_the_cursor_put() {
         let mut view = view_fitting(2);
-        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         view.scroll_up();
         let offset = view.offset();
         // Not following: a resize records the height but does not move the cursor.
@@ -777,13 +881,19 @@ mod tests {
             10,
             (1..=4).map(|i| text(i, "m")).collect(),
             HashSet::from([1]),
+            HashMap::new(),
         );
         view.scroll_up();
         assert!(!view.is_at_newest());
 
         // A different chat replaces everything — messages, cursor, pinned set — and
         // opens bottom-anchored at its newest message.
-        view.project(20, (7..=9).map(|i| text(i, "z")).collect(), HashSet::new());
+        view.project(
+            20,
+            (7..=9).map(|i| text(i, "z")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         assert_eq!(view.len(), 3);
         assert!(view.is_at_newest(), "new chat opens pinned to the newest");
         assert_eq!(view.messages().last().map(|m| m.id), Some(9));
@@ -834,5 +944,98 @@ mod tests {
         }]);
         assert!(view.download(42).is_none(), "prior snapshot cleared");
         assert!(view.download(99).is_some());
+    }
+
+    /// A [`User`] with the given name and usernames; every other field inert. `kind`
+    /// stays `Regular` so the empty-name fallback is `User {id}`, not "Deleted".
+    fn user(id: i64, first: &str, last: &str, handles: &[&str]) -> User {
+        User {
+            id,
+            first_name: first.to_owned(),
+            last_name: last.to_owned(),
+            usernames: handles.iter().map(|h| (*h).to_owned()).collect(),
+            phone_number: None,
+            is_contact: false,
+            kind: UserKind::Regular,
+            status: Presence::Never,
+        }
+    }
+
+    #[test]
+    fn sender_label_for_joins_the_name_and_handle() {
+        assert_eq!(
+            sender_label_for(&user(7, "Ada", "Lovelace", &["ada"])),
+            "Ada Lovelace (@ada)"
+        );
+    }
+
+    #[test]
+    fn sender_label_for_uses_the_name_alone_without_a_handle() {
+        assert_eq!(
+            sender_label_for(&user(7, "Ada", "Lovelace", &[])),
+            "Ada Lovelace"
+        );
+    }
+
+    #[test]
+    fn sender_label_for_falls_back_to_the_handle_when_the_name_is_empty() {
+        assert_eq!(sender_label_for(&user(7, "", "", &["ada"])), "@ada");
+    }
+
+    #[test]
+    fn sender_label_for_falls_back_to_the_bare_id_when_nothing_is_known() {
+        // No name, no handle, and a regular (non-deleted) account: core's
+        // `display_name` bottoms out at `User {id}`.
+        assert_eq!(sender_label_for(&user(7, "", "", &[])), "User 7");
+    }
+
+    #[test]
+    fn sender_label_resolves_a_known_user_from_the_projected_map() {
+        let mut view = ConversationView::default();
+        let message = text(1, "hi"); // sample_message sets sender = User(1)
+        view.project(
+            10,
+            vec![message.clone()],
+            HashSet::new(),
+            HashMap::from([(Sender::User(1), "Ada Lovelace (@ada)".to_owned())]),
+        );
+        assert_eq!(view.sender_label(&message), "Ada Lovelace (@ada)");
+    }
+
+    #[test]
+    fn sender_label_falls_back_to_the_id_for_an_unresolved_user() {
+        let mut view = ConversationView::default();
+        let message = text(1, "hi");
+        view.project(10, vec![message.clone()], HashSet::new(), HashMap::new());
+        assert_eq!(view.sender_label(&message), "User 1");
+    }
+
+    #[test]
+    fn sender_label_resolves_a_chat_sender_to_its_title() {
+        let mut view = ConversationView::default();
+        let mut message = text(1, "post");
+        message.sender = Sender::Chat(-100);
+        view.project(
+            10,
+            vec![message.clone()],
+            HashSet::new(),
+            HashMap::from([(Sender::Chat(-100), "Rust News".to_owned())]),
+        );
+        assert_eq!(view.sender_label(&message), "Rust News");
+    }
+
+    #[test]
+    fn sender_label_reads_you_for_an_outgoing_message() {
+        let mut view = ConversationView::default();
+        let mut message = text(1, "mine");
+        message.is_outgoing = true;
+        // Even with a name in the map, our own messages read "You".
+        view.project(
+            10,
+            vec![message.clone()],
+            HashSet::new(),
+            HashMap::from([(Sender::User(1), "Ada Lovelace (@ada)".to_owned())]),
+        );
+        assert_eq!(view.sender_label(&message), "You");
     }
 }

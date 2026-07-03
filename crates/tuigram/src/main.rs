@@ -62,7 +62,7 @@ use crossterm::event::EventStream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::{ChatKind, ChatListKind, Message};
+use tuigram_core::model::{ChatKind, ChatListKind, Message, Sender};
 use tuigram_core::{
     Client, DOWNLOAD_PRIORITY, EditRequests, FileRequests, FormattedText, ForwardRequests,
     HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests,
@@ -73,6 +73,7 @@ use tuigram_core::{
 use crate::app::{Action, App};
 use crate::chat_list::{project_lists, project_secret_states};
 use crate::composer::Submission;
+use crate::conversation::sender_label_for;
 use crate::event::{AppEvent, spawn_core_source};
 use crate::keymap::Focus;
 use crate::login::{LoginEnd, run_login};
@@ -1005,7 +1006,7 @@ fn drive_storage_sweep(client: &Arc<Client>, settings: &StorageSettings) {
 /// snapshot. A `None` open chat (the user is browsing the list) is a no-op.
 fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) {
     let Some(chat_id) = open else { return };
-    let (messages, pinned, files) = client.read(|s| {
+    let (messages, pinned, files, senders) = client.read(|s| {
         let messages: Vec<Message> = s.messages().history(chat_id).into_iter().cloned().collect();
         let pinned = s
             .chats()
@@ -1020,9 +1021,26 @@ fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) 
             .filter_map(|m| m.content.file())
             .filter_map(|file| s.files().get(file.id).cloned())
             .collect();
-        (messages, pinned, files)
+        // Resolve each distinct sender to its display label (#160): a user's
+        // "Name (@handle)" via the user store, or a chat's title. A sender whose
+        // record has not been folded yet is left out — the view then falls back to a
+        // bare `User {id}` / `Chat {id}` and a later `updateUser` repaints the header.
+        let mut senders: HashMap<Sender, String> = HashMap::new();
+        for sender in messages.iter().map(|m| &m.sender) {
+            if senders.contains_key(sender) {
+                continue;
+            }
+            let label = match *sender {
+                Sender::User(id) => s.users().get(id).map(sender_label_for),
+                Sender::Chat(id) => s.chats().get(id).map(|chat| chat.title.clone()),
+            };
+            if let Some(label) = label {
+                senders.insert(sender.clone(), label);
+            }
+        }
+        (messages, pinned, files, senders)
     });
-    app.project_conversation(chat_id, messages, pinned);
+    app.project_conversation(chat_id, messages, pinned, senders);
     app.project_downloads(files);
 }
 

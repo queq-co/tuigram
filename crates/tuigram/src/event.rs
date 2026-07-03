@@ -114,6 +114,12 @@ fn classify_update(update: &Update) -> Option<AppEvent> {
         | Update::MessageContent(_)
         | Update::MessageInteractionInfo(_)
         | Update::DeleteMessages(_) => Some(AppEvent::Messages),
+        // A user record arrived or changed (#160): re-project the open chat so a
+        // sender name that lands after first paint replaces the numeric fallback in
+        // the header. Reuses the `Messages` signal — the conversation projection
+        // re-resolves senders from the (now updated) user store. `updateUserStatus`
+        // stays dropped below: presence churn must not wake the loop constantly.
+        Update::User(_) => Some(AppEvent::Messages),
         Update::File(_) => Some(AppEvent::File),
         // The E2E chat lifecycle: a state advance (pending/ready/closed) folds into
         // the secret-chat store, which the secret-state projection reads back (#121).
@@ -145,8 +151,42 @@ mod tests {
     use tuigram_core::enums::ConnectionState as Tc;
     use tuigram_core::types::{
         UpdateAuthorizationState, UpdateChatReadInbox, UpdateConnectionState, UpdateDeleteMessages,
-        UpdateFile, UpdateUserStatus,
+        UpdateFile, UpdateUser, UpdateUserStatus, User as TdUser,
     };
+
+    /// A minimal TDLib `User` for classification tests: only the variant matters to
+    /// [`classify_update`], so every field is zeroed/empty.
+    fn td_user(id: i64) -> TdUser {
+        TdUser {
+            id,
+            first_name: String::new(),
+            last_name: String::new(),
+            usernames: None,
+            phone_number: String::new(),
+            status: tuigram_core::enums::UserStatus::Recently(Default::default()),
+            profile_photo: None,
+            accent_color_id: 0,
+            background_custom_emoji_id: 0,
+            upgraded_gift_colors: None,
+            profile_accent_color_id: 0,
+            profile_background_custom_emoji_id: 0,
+            emoji_status: None,
+            is_contact: false,
+            is_mutual_contact: false,
+            is_close_friend: false,
+            verification_status: None,
+            is_premium: false,
+            is_support: false,
+            restriction_info: None,
+            active_story_state: None,
+            restricts_new_chats: false,
+            paid_message_star_count: 0,
+            have_access: true,
+            r#type: tuigram_core::enums::UserType::Regular,
+            language_code: String::new(),
+            added_to_attachment_menu: false,
+        }
+    }
 
     #[test]
     fn connection_updates_project_onto_the_status_state() {
@@ -238,6 +278,18 @@ mod tests {
                 status: tuigram_core::enums::UserStatus::Recently(Default::default()),
             }))),
             None
+        );
+    }
+
+    #[test]
+    fn a_user_record_repaints_the_open_chat() {
+        // updateUser folds a name into the users store; the header re-resolves it on
+        // the next conversation projection, so it must wake the loop (#160).
+        assert_eq!(
+            classify(RouterEvent::Update(Update::User(UpdateUser {
+                user: td_user(1),
+            }))),
+            Some(AppEvent::Messages)
         );
     }
 
