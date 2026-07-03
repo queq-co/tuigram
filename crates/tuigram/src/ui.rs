@@ -20,7 +20,7 @@ use ratatui::widgets::{
 
 use tuigram_core::model::{
     Chat, ChatAction, ChatKind, File, FormattedText, Message, MessageContent, ReactionKind,
-    SecretChatState, Sender,
+    SecretChatState,
 };
 
 use crate::chat_list::ChatListView;
@@ -166,16 +166,33 @@ fn chat_item(chat: &Chat) -> ListItem<'static> {
     ListItem::new(Line::from(spans))
 }
 
-/// One chat-list row (#80, extended in #87): a 🔒 marker and lifecycle state for a
-/// secret chat, the title, the unread badge, and a transient "typing…" indicator
-/// when someone is acting in the chat. The lifecycle state and the action are
-/// projected per chat id from the core stores (Phase 6); no encryption-key material
-/// is ever read or shown — only the [`SecretChatState`].
+/// The leading row marker for a chat, mimicking the official app's chat-type icons
+/// (#160): a secret chat's 🔒, 👥 for a group (basic or super), 📣 for a channel, and
+/// 🤖 for a private chat whose peer is a bot (resolved per chat id from the user
+/// store). Ordinary private chats and Saved Messages get no marker (`None`), the way
+/// the app leaves person-to-person chats unadorned. Secret takes precedence over the
+/// private-bot check since a secret chat is its own kind.
+fn chat_marker(kind: &ChatKind, is_bot: bool) -> Option<&'static str> {
+    match kind {
+        ChatKind::Secret { .. } => Some("🔒"),
+        ChatKind::BasicGroup { .. } | ChatKind::Supergroup { .. } => Some("👥"),
+        ChatKind::Channel { .. } => Some("📣"),
+        ChatKind::Private { .. } if is_bot => Some("🤖"),
+        ChatKind::Private { .. } => None,
+    }
+}
+
+/// One chat-list row (#80, extended in #87 and #160): a leading chat-type marker
+/// (secret 🔒, group 👥, channel 📣, bot 🤖 — see [`chat_marker`]), the title, the
+/// unread badge, a secret-chat lifecycle word, and a transient "typing…" indicator
+/// when someone is acting in the chat. The lifecycle state, the action, and the
+/// private-bot flag are projected per chat id from the core stores (Phase 6); no
+/// encryption-key material is ever read or shown — only the [`SecretChatState`].
 fn chat_list_item(view: &ChatListView, chat: &Chat) -> ListItem<'static> {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let mut spans = Vec::new();
-    if matches!(chat.kind, ChatKind::Secret { .. }) {
-        spans.push(Span::raw("🔒 "));
+    if let Some(marker) = chat_marker(&chat.kind, view.is_bot_chat(chat.id)) {
+        spans.push(Span::raw(format!("{marker} ")));
     }
     spans.push(Span::raw(chat.title.clone()));
     if chat.unread_count > 0 {
@@ -443,7 +460,7 @@ fn message_lines(view: &ConversationView, message: &Message, selected: bool) -> 
     if view.is_pinned(message.id) {
         header.push_str("📌 ");
     }
-    header.push_str(&sender_label(message));
+    header.push_str(&view.sender_label(message));
     header.push_str("  ");
     header.push_str(&hour_minute(message.date));
 
@@ -488,19 +505,6 @@ fn percent(file: &File) -> i64 {
         return 0;
     }
     (file.downloaded_size * 100 / total).clamp(0, 100)
-}
-
-/// The header's name for a message: "You" for our own messages, else the sender's
-/// id. Resolving ids to display names needs the user/chat store, which Phase 6
-/// wires; until then the id keeps the header unambiguous.
-fn sender_label(message: &Message) -> String {
-    if message.is_outgoing {
-        return "You".to_owned();
-    }
-    match message.sender {
-        Sender::User(id) => format!("User {id}"),
-        Sender::Chat(id) => format!("Chat {id}"),
-    }
 }
 
 /// Format a Unix timestamp as `HH:MM` in UTC. Local-time conversion needs a
@@ -1411,8 +1415,8 @@ mod tests {
     // --- conversation / history pane (#81) ---
 
     use crate::conversation::{ConversationView, sample_message};
-    use std::collections::HashSet;
-    use tuigram_core::model::{FileRef, Photo, Reaction};
+    use std::collections::{HashMap, HashSet};
+    use tuigram_core::model::{FileRef, Photo, Reaction, Sender};
 
     /// A text message with the given id and body.
     fn text_message(id: i64, body: &str) -> Message {
@@ -1916,6 +1920,73 @@ mod tests {
     }
 
     #[test]
+    fn chat_marker_maps_each_kind_to_its_app_icon() {
+        assert_eq!(
+            chat_marker(&ChatKind::BasicGroup { basic_group_id: 1 }, false),
+            Some("👥")
+        );
+        assert_eq!(
+            chat_marker(&ChatKind::Supergroup { supergroup_id: 1 }, false),
+            Some("👥")
+        );
+        assert_eq!(
+            chat_marker(&ChatKind::Channel { supergroup_id: 1 }, false),
+            Some("📣")
+        );
+        // A private chat with a bot peer is 🤖; an ordinary private chat (or Saved
+        // Messages) is unmarked, whatever the bot flag would say.
+        assert_eq!(
+            chat_marker(&ChatKind::Private { user_id: 5 }, true),
+            Some("🤖")
+        );
+        assert_eq!(chat_marker(&ChatKind::Private { user_id: 5 }, false), None);
+        assert_eq!(
+            chat_marker(
+                &ChatKind::Secret {
+                    secret_chat_id: 9,
+                    user_id: 7
+                },
+                false
+            ),
+            Some("🔒")
+        );
+    }
+
+    #[test]
+    fn a_group_row_shows_the_people_marker() {
+        let view = view_with_one_chat(
+            "Rustaceans",
+            ChatKind::BasicGroup { basic_group_id: 3 },
+            None,
+        );
+        let row = row_containing(&render(&App::with_chat_list(view), 120, 24), "Rustaceans");
+        assert!(row.contains('👥'), "group marker");
+    }
+
+    #[test]
+    fn a_channel_row_shows_the_megaphone_marker() {
+        let view = view_with_one_chat("Rust Blog", ChatKind::Channel { supergroup_id: 3 }, None);
+        let row = row_containing(&render(&App::with_chat_list(view), 120, 24), "Rust Blog");
+        assert!(row.contains('📣'), "channel marker");
+    }
+
+    #[test]
+    fn a_bot_chat_shows_the_robot_marker_while_a_user_chat_shows_none() {
+        // Same private kind; only the projected bot flag differs.
+        let mut bot = view_with_one_chat("Weather Bot", ChatKind::Private { user_id: 5 }, None);
+        bot.set_bot_chats(HashSet::from([5]));
+        let bot_row = row_containing(&render(&App::with_chat_list(bot), 120, 24), "Weather Bot");
+        assert!(bot_row.contains('🤖'), "bot marker");
+
+        let user = view_with_one_chat("Ada", ChatKind::Private { user_id: 5 }, None);
+        let user_row = row_containing(&render(&App::with_chat_list(user), 120, 24), "Ada");
+        assert!(
+            !user_row.contains('🤖') && !user_row.contains('👥') && !user_row.contains('📣'),
+            "an ordinary private chat is unmarked"
+        );
+    }
+
+    #[test]
     fn a_typing_sender_shows_an_indicator_in_the_chat_list() {
         let mut view = view_with_one_chat("Alice", ChatKind::Private { user_id: 5 }, None);
         view.set_action(5, Some(ChatAction::Typing));
@@ -1936,6 +2007,25 @@ mod tests {
             text.contains("recording a voice message"),
             "header indicator"
         );
+    }
+
+    #[test]
+    fn the_conversation_header_shows_the_resolved_sender_name() {
+        // A projected sender label (#160) replaces the numeric `User {id}` in the
+        // bold message header.
+        let mut view = ConversationView::default();
+        view.project(
+            10,
+            vec![text_message(1, "hi")],
+            HashSet::new(),
+            HashMap::from([(Sender::User(1), "Ada Lovelace (@ada)".to_owned())]),
+        );
+        let text = flatten(&render(&App::with_conversation(view), 80, 24));
+        assert!(
+            text.contains("Ada Lovelace (@ada)"),
+            "resolved sender name in the header"
+        );
+        assert!(!text.contains("User 1"), "numeric fallback replaced");
     }
 
     #[test]

@@ -4,11 +4,11 @@
 //! marks the frame dirty, and the loop repaints from the new state. Nothing here
 //! touches the terminal or awaits — it stays a pure, unit-testable reducer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::Event;
 use tuigram_core::StorageSettings;
-use tuigram_core::model::{File, Message, OutgoingMedia, SecretChatState};
+use tuigram_core::model::{File, Message, OutgoingMedia, SecretChatState, Sender};
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
@@ -454,6 +454,15 @@ impl App {
         self.dirty = true;
     }
 
+    /// Record which chats are private **bot** chats (#160), for the 🤖 row marker.
+    /// The loop resolves the set from the core user store on each chat-list signal
+    /// and hands it here right after [`project_chats`](Self::project_chats), so `App`
+    /// stays pure — the same split as [`project_secret_states`](Self::project_secret_states).
+    pub fn project_bot_chats(&mut self, ids: HashSet<i64>) {
+        self.chat_list.set_bot_chats(ids);
+        self.dirty = true;
+    }
+
     /// Re-project the conversation pane from the core
     /// [`MessageStore`](tuigram_core::messages::MessageStore) (#114). The loop reads
     /// the open `chat_id`'s history and pinned ids back from the `Client` on a
@@ -467,8 +476,10 @@ impl App {
         chat_id: i64,
         messages: Vec<Message>,
         pinned: HashSet<i64>,
+        senders: HashMap<Sender, String>,
     ) {
-        self.conversation.project(chat_id, messages, pinned);
+        self.conversation
+            .project(chat_id, messages, pinned, senders);
         // Honor a pending search-hit jump (#117): once this chat's history holds the
         // target message, scroll to it and clear the jump. A jump for a different chat
         // is stale (the user opened elsewhere) — drop it so it never moves a later
@@ -1510,7 +1521,7 @@ mod tests {
         // fits is the top — message 1 at the top of the pane (#158).
         app.set_conversation_viewport(40);
         app.clear_dirty();
-        app.project_conversation(10, vec![text(1), text(2)], HashSet::new());
+        app.project_conversation(10, vec![text(1), text(2)], HashSet::new(), HashMap::new());
         assert!(app.is_dirty());
         assert_eq!(app.conversation().len(), 2);
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
@@ -1534,7 +1545,12 @@ mod tests {
         // scrolling up and pressing G returns to the newest anchor (#158).
         let mut app = App::new();
         app.set_conversation_viewport(6);
-        app.project_conversation(10, (1..=5).map(text).collect(), HashSet::new());
+        app.project_conversation(
+            10,
+            (1..=5).map(text).collect(),
+            HashSet::new(),
+            HashMap::new(),
+        );
         let anchor = app.conversation().offset();
         assert!(anchor > 0, "a long history opens away from the top");
 
@@ -1745,7 +1761,7 @@ mod tests {
         app.dispatch(Action::ResultOpen); // first hit: chat 1, message 10
 
         // The first projection of chat 1 does not carry message 10 yet: no jump.
-        app.project_conversation(1, text_history(&[1, 2]), HashSet::new());
+        app.project_conversation(1, text_history(&[1, 2]), HashSet::new(), HashMap::new());
         assert_ne!(
             app.conversation().selected_message().map(|m| m.id),
             Some(10),
@@ -1753,7 +1769,12 @@ mod tests {
         );
 
         // The page carrying message 10 lands: the jump applies and clears.
-        app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
+        app.project_conversation(
+            1,
+            text_history(&[9, 10, 11]),
+            HashSet::new(),
+            HashMap::new(),
+        );
         assert_eq!(
             app.conversation().selected_message().map(|m| m.id),
             Some(10)
@@ -1769,11 +1790,16 @@ mod tests {
         app.dispatch(Action::ResultOpen); // hit for chat 1, message 10
 
         // The user opens chat 2 before chat 1's history arrives: the stale jump drops.
-        app.project_conversation(2, text_history(&[7, 8]), HashSet::new());
+        app.project_conversation(2, text_history(&[7, 8]), HashSet::new(), HashMap::new());
         // Chat 1's history (with message 10) arrives later, but the jump is gone, so
         // the view opens bottom-anchored (message 9 at the pane top, the whole history
         // fitting) rather than chasing message 10.
-        app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
+        app.project_conversation(
+            1,
+            text_history(&[9, 10, 11]),
+            HashSet::new(),
+            HashMap::new(),
+        );
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(9));
     }
 
@@ -1852,7 +1878,7 @@ mod tests {
             chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
         }]);
         let mut app = App::with_chat_list(view);
-        app.project_conversation(1, text_history(&[10, 11]), HashSet::new());
+        app.project_conversation(1, text_history(&[10, 11]), HashSet::new(), HashMap::new());
         app
     }
 

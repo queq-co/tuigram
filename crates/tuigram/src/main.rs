@@ -62,7 +62,7 @@ use crossterm::event::EventStream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::{ChatKind, ChatListKind, Message};
+use tuigram_core::model::{ChatKind, ChatListKind, Message, Sender, UserKind};
 use tuigram_core::{
     Client, DOWNLOAD_PRIORITY, EditRequests, FileRequests, FormattedText, ForwardRequests,
     HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests,
@@ -73,6 +73,7 @@ use tuigram_core::{
 use crate::app::{Action, App};
 use crate::chat_list::{project_lists, project_secret_states};
 use crate::composer::Submission;
+use crate::conversation::sender_label_for;
 use crate::event::{AppEvent, spawn_core_source};
 use crate::keymap::Focus;
 use crate::login::{LoginEnd, run_login};
@@ -286,8 +287,7 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         // client, so it lives here rather than in the pure `App` —
                         // which only receives the owned result.
                         AppEvent::Chats => {
-                            let lists = client.read(|s| project_lists(s.chats()));
-                            app.project_chats(lists);
+                            reproject_chats(&mut app, client);
                             // A new secret chat arrives as updateNewChat; re-project
                             // its lifecycle state so the fresh row shows it (#121).
                             reproject_secret_states(&mut app, client);
@@ -303,8 +303,7 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         AppEvent::Secret => reproject_secret_states(&mut app, client),
                         // A dropped-update gap: re-project both panes to be safe.
                         AppEvent::Lagged => {
-                            let lists = client.read(|s| project_lists(s.chats()));
-                            app.project_chats(lists);
+                            reproject_chats(&mut app, client);
                             reproject_secret_states(&mut app, client);
                             project_conversation(&mut app, client, history.open);
                         }
@@ -852,6 +851,35 @@ fn drive_settings(app: &mut App, storage_settings: &mut StorageSettings) {
     }
 }
 
+/// Re-read the folded chat lists from the client and re-project the pane (#113),
+/// resolving in the same read which private chats have a **bot** peer (#160) so
+/// their rows can carry the 🤖 marker — the chat's [`ChatKind`] says "private", only
+/// the [`UserStore`](tuigram_core::UserStore) says "bot". The projection needs the
+/// client, so it lives here rather than in the pure `App`, which only receives the
+/// owned results (lists, then the bot-id set).
+fn reproject_chats(app: &mut App, client: &Arc<Client>) {
+    let (lists, bots) = client.read(|s| {
+        let lists = project_lists(s.chats());
+        let bots: HashSet<i64> = lists
+            .iter()
+            .flat_map(|list| &list.chats)
+            .filter_map(|chat| match chat.kind {
+                ChatKind::Private { user_id }
+                    if s.users()
+                        .get(user_id)
+                        .is_some_and(|user| matches!(user.kind, UserKind::Bot)) =>
+                {
+                    Some(chat.id)
+                }
+                _ => None,
+            })
+            .collect();
+        (lists, bots)
+    });
+    app.project_chats(lists);
+    app.project_bot_chats(bots);
+}
+
 /// Re-read the folded secret-chat states from the client and re-project them onto
 /// the chat list (#121). The projection needs the client, so it lives here rather
 /// than in the pure `App` — which only receives the owned pairs — the same split as
@@ -1005,7 +1033,7 @@ fn drive_storage_sweep(client: &Arc<Client>, settings: &StorageSettings) {
 /// snapshot. A `None` open chat (the user is browsing the list) is a no-op.
 fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) {
     let Some(chat_id) = open else { return };
-    let (messages, pinned, files) = client.read(|s| {
+    let (messages, pinned, files, senders) = client.read(|s| {
         let messages: Vec<Message> = s.messages().history(chat_id).into_iter().cloned().collect();
         let pinned = s
             .chats()
@@ -1020,9 +1048,26 @@ fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) 
             .filter_map(|m| m.content.file())
             .filter_map(|file| s.files().get(file.id).cloned())
             .collect();
-        (messages, pinned, files)
+        // Resolve each distinct sender to its display label (#160): a user's
+        // "Name (@handle)" via the user store, or a chat's title. A sender whose
+        // record has not been folded yet is left out — the view then falls back to a
+        // bare `User {id}` / `Chat {id}` and a later `updateUser` repaints the header.
+        let mut senders: HashMap<Sender, String> = HashMap::new();
+        for sender in messages.iter().map(|m| &m.sender) {
+            if senders.contains_key(sender) {
+                continue;
+            }
+            let label = match *sender {
+                Sender::User(id) => s.users().get(id).map(sender_label_for),
+                Sender::Chat(id) => s.chats().get(id).map(|chat| chat.title.clone()),
+            };
+            if let Some(label) = label {
+                senders.insert(sender.clone(), label);
+            }
+        }
+        (messages, pinned, files, senders)
     });
-    app.project_conversation(chat_id, messages, pinned);
+    app.project_conversation(chat_id, messages, pinned, senders);
     app.project_downloads(files);
 }
 
