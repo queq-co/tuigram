@@ -221,8 +221,8 @@ fn action_phrase(action: &ChatAction) -> &'static str {
 /// Right/top pane: the conversation history (#81). Renders the open chat's
 /// messages — each a sender/timestamp header, a body or media placeholder, and a
 /// reaction line — windowed forward from the scroll offset so a long history never
-/// builds the whole buffer, with a scrollbar tracking the offset. An empty history
-/// (the Phase 5 pre-data state) keeps the welcome/liveness placeholder.
+/// builds the whole buffer, with a scrollbar tracking the offset. With no chat open
+/// the view is empty, so the pane falls through to the empty-state placeholder (#188).
 fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     let view = app.conversation();
     if view.is_empty() {
@@ -270,12 +270,18 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The pre-data conversation pane: a welcome banner shown until real history
-/// (a later Phase 6 issue) replaces it. The heartbeat counter it used to echo is
-/// gone with the fake source (#110); the connection state now lives in the status
-/// bar (#88), so the banner only carries the welcome.
+/// The conversation pane's empty state: shown while no chat is open (#188).
+/// Carries the app identity + version and a call to action naming the real
+/// binding — Enter, which opens the selected chat (`open_chat_id`). We deliberately
+/// stop here rather than auto-opening the first chat: a full auto-open would mark
+/// that chat's unread messages read on every launch (#115), and a read-safe preview
+/// would reopen the eager-loading question `open_chat_id` avoids (#114). Aligning
+/// with the official client, launching lands the user on the list to choose.
 fn render_conversation_placeholder(frame: &mut Frame, area: Rect, app: &App) {
-    let body = "tuigram — Phase 5 TUI skeleton\n\nselect a chat to begin";
+    let body = format!(
+        "tuigram v{}\n\nSelect a chat and press Enter to start messaging",
+        tuigram_core::version()
+    );
     let block = pane_block(" tuigram ".to_owned(), app.focus() == Focus::History)
         .title_alignment(Alignment::Center);
     let widget = Paragraph::new(body)
@@ -1413,11 +1419,37 @@ mod tests {
     }
 
     #[test]
-    fn empty_history_keeps_the_welcome_placeholder() {
-        // With no open chat, the pane is the welcome/liveness view, not history.
+    fn no_open_chat_shows_the_empty_state_placeholder() {
+        // With no open chat, the pane is the empty state (#188): app identity +
+        // version and a CTA naming the real binding (Enter opens the selected chat).
         let text = flatten(&render(&App::new(), 80, 24));
-        assert!(text.contains("tuigram — Phase 5"), "welcome banner");
-        assert!(text.contains("quit"), "quit hint");
+        assert!(
+            text.contains(&format!("tuigram v{}", tuigram_core::version())),
+            "app identity + version"
+        );
+        assert!(
+            text.contains("Select a chat and press Enter to start messaging"),
+            "CTA naming the real key binding"
+        );
+        // The developer-era scaffolding copy is gone.
+        assert!(!text.contains("Phase 5"), "no phase codename");
+        assert!(text.contains("quit"), "status-bar quit hint");
+    }
+
+    #[test]
+    fn open_chat_replaces_the_empty_state_with_history() {
+        // The empty-state copy appears only with no chat open: an open chat's
+        // history takes the pane, and the placeholder CTA is gone.
+        let text = flatten(&render(
+            &app_with_history(vec![text_message(1, "hi")]),
+            80,
+            24,
+        ));
+        assert!(text.contains("hi"), "history body shown");
+        assert!(
+            !text.contains("Select a chat and press Enter"),
+            "no empty-state CTA once a chat is open"
+        );
     }
 
     #[test]
