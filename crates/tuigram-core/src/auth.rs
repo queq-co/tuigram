@@ -122,7 +122,65 @@ pub trait AuthRequests {
     /// exits so the on-disk database is never left mid-write (which would leave it
     /// malformed for the next run to open). Carries no payload.
     async fn close(&self) -> Result<(), TdError>;
+
+    // --- Whole-operation teardown (#195) ---
+    //
+    // `log_out` and `close` above are the raw *seams* — they only issue the
+    // request. The two operations below bundle each with the **wait for `Closed`**
+    // it requires to be correct, so that requirement lives in one place and every
+    // front-end (the REPL harness and the TUI, whatever their execution model) gets
+    // it for free rather than each re-deriving it and drifting. They are the
+    // operations callers should reach for; the bare `log_out`/`close` are the
+    // primitives they build on.
+
+    /// Wait until TDLib reaches [`AuthorizationState::Closed`] — the signal that a
+    /// preceding [`log_out`](Self::log_out) has finished destroying local data, or a
+    /// [`close`](Self::close) has finished flushing the database. Bounded
+    /// (~[`WAIT_CLOSED_POLLS`] × [`WAIT_CLOSED_INTERVAL`] ≈ 5s) so a stuck teardown
+    /// can never wedge a caller; a query that errors (the client is already gone)
+    /// counts as closed.
+    async fn wait_until_closed(&self) {
+        for _ in 0..WAIT_CLOSED_POLLS {
+            match self.authorization_state().await {
+                Ok(AuthorizationState::Closed) | Err(_) => return,
+                Ok(_) => tokio::time::sleep(WAIT_CLOSED_INTERVAL).await,
+            }
+        }
+    }
+
+    /// Log out **and wait for the logout to complete** — the whole operation.
+    ///
+    /// [`log_out`](Self::log_out) only *acknowledges* the request; TDLib then
+    /// asynchronously destroys all local data and drives authorization to `Closed`.
+    /// A caller that quits or [`close`](Self::close)s before `Closed` strands a
+    /// half-cleared session the next run can neither resume nor cleanly replace — so
+    /// the wait is a **requirement of the operation**, not an optional extra, and
+    /// living here it holds for every front-end. A failed `log_out` (nothing was
+    /// torn down, so nothing to wait for) is propagated.
+    async fn log_out_and_wait(&self) -> Result<(), TdError> {
+        self.log_out().await?;
+        self.wait_until_closed().await;
+        Ok(())
+    }
+
+    /// Close **and wait for the close to complete** — the whole clean-shutdown
+    /// operation, the counterpart to [`log_out_and_wait`](Self::log_out_and_wait).
+    ///
+    /// [`close`](Self::close) only initiates the flush; returning before `Closed`
+    /// can exit with the database mid-write, malformed for the next run. An
+    /// already-closing/closed client rejects `close`, which is exactly the desired
+    /// end state — so the result is ignored and the wait returns at once.
+    async fn close_and_wait(&self) {
+        let _ = self.close().await;
+        self.wait_until_closed().await;
+    }
 }
+
+/// How many times [`AuthRequests::wait_until_closed`] polls before giving up
+/// (~5s at [`WAIT_CLOSED_INTERVAL`]), so a stuck teardown cannot hang the caller.
+const WAIT_CLOSED_POLLS: u32 = 50;
+/// The delay between [`AuthRequests::wait_until_closed`] polls.
+const WAIT_CLOSED_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl AuthRequests for Bridge {
     async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
@@ -387,7 +445,7 @@ impl<'a, C: AuthRequests> Login<'a, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use tdlib_rs::enums::AuthenticationCodeType;
     use tdlib_rs::types::{
         AuthenticationCodeInfo, AuthenticationCodeTypeSms, AuthorizationStateWaitCode,
@@ -628,6 +686,131 @@ mod tests {
             self.calls.borrow_mut().push("close()".to_owned());
             Ok(())
         }
+    }
+
+    /// A client that models TDLib's asynchronous teardown: it reports a non-closed
+    /// state for the first few `authorization_state` polls after a `log_out`/`close`,
+    /// then `Closed` — so a caller that does not wait would observe the pre-`Closed`
+    /// state. Only the teardown surface is implemented; the rest is unreachable here.
+    #[derive(Default)]
+    struct ClosingSpy {
+        tearing_down: Cell<bool>,
+        polls: Cell<u32>,
+    }
+
+    impl AuthRequests for ClosingSpy {
+        async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
+            if !self.tearing_down.get() {
+                return Ok(AuthorizationState::Ready);
+            }
+            let n = self.polls.get();
+            self.polls.set(n + 1);
+            // Ready for the first few polls (destruction in progress), then Closed.
+            Ok(if n >= 3 {
+                AuthorizationState::Closed
+            } else {
+                AuthorizationState::Ready
+            })
+        }
+        async fn log_out(&self) -> Result<(), TdError> {
+            self.tearing_down.set(true);
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), TdError> {
+            self.tearing_down.set(true);
+            Ok(())
+        }
+        async fn set_log_verbosity_level(&self, _: i32) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn set_tdlib_parameters(&self, _: ClientParameters) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn set_phone_number(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn check_authentication_code(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn check_authentication_password(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn register_user(&self, _: String, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn set_authentication_email_address(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn check_authentication_email_code(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+    }
+
+    /// `log_out_and_wait` must not return until authorization has reached `Closed` —
+    /// the requirement that keeps a front-end from stranding a half-cleared session
+    /// (#195). Paused time makes the poll sleeps advance instantly.
+    #[tokio::test(start_paused = true)]
+    async fn log_out_and_wait_blocks_until_closed() {
+        let spy = ClosingSpy::default();
+        spy.log_out_and_wait().await.expect("logout succeeds");
+        assert!(spy.tearing_down.get(), "log_out was issued");
+        assert!(
+            spy.polls.get() >= 4,
+            "it polled through the pre-Closed states rather than returning early"
+        );
+    }
+
+    /// `close_and_wait` waits the same way and, like the real clean shutdown,
+    /// tolerates a never-closing client by returning once the bound is hit rather
+    /// than hanging (#195).
+    #[tokio::test(start_paused = true)]
+    async fn close_and_wait_is_bounded_when_never_closing() {
+        // A client that reports `Ready` forever (close is a no-op here): the wait is
+        // bounded, so this returns instead of spinning.
+        struct NeverCloses;
+        impl AuthRequests for NeverCloses {
+            async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
+                Ok(AuthorizationState::Ready)
+            }
+            async fn close(&self) -> Result<(), TdError> {
+                Ok(())
+            }
+            async fn log_out(&self) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_log_verbosity_level(&self, _: i32) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_tdlib_parameters(&self, _: ClientParameters) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_phone_number(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn check_authentication_code(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn check_authentication_password(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn register_user(&self, _: String, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_authentication_email_address(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn check_authentication_email_code(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+        }
+        // Completes (the bound is hit) rather than hanging the test.
+        NeverCloses.close_and_wait().await;
     }
 
     fn params() -> ClientParameters {
