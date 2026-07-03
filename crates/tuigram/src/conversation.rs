@@ -17,7 +17,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use tuigram_core::model::{ChatAction, File, Message, Reaction, ReactionKind};
+use tuigram_core::model::{
+    ChatAction, File, FormattedText, Message, MessageContent, Reaction, ReactionKind,
+};
 
 /// A confirmed pin toggle, recorded by `App` as a pure intent for the loop to
 /// dispatch (#119) — the message, and whether the toggle **pinned** it or
@@ -62,6 +64,13 @@ pub struct ConversationView {
     /// Index of the topmost message to draw — also the selected-message cursor.
     /// Clamped to a valid row, or `0` when there are no messages.
     offset: usize,
+    /// The history pane's inner height (rows) from the last render, recorded by the
+    /// loop via [`set_viewport_height`](Self::set_viewport_height) (#158). The
+    /// bottom-anchoring walk sums per-message heights against it to decide which
+    /// message sits at the top when the newest is pinned to the bottom. `0` until the
+    /// first frame measures it; the anchor then falls back to the newest message
+    /// alone and the next render re-anchors against the real height.
+    viewport: usize,
     /// Download state of media files referenced by the messages, keyed by TDLib
     /// file id, for the download-progress indicator (#85). Phase 6 projects this
     /// from the core [`FileStore`](tuigram_core::files::FileStore); empty until then.
@@ -75,7 +84,9 @@ pub struct ConversationView {
 
 impl ConversationView {
     /// Build a view from the open chat's history (oldest first) and its set of
-    /// pinned message ids, scrolled to the top.
+    /// pinned message ids, scrolled to the top. The viewport is unmeasured (`0`),
+    /// so the bottom-anchoring of a real open ([`project`](Self::project)) is not in
+    /// play here; this is the raw seam the render tests place content with.
     ///
     /// The Phase 6 update path (and the render tests) build the view this way; the
     /// running binary still shows the empty [`default`](Self::default) until that
@@ -88,6 +99,7 @@ impl ConversationView {
             messages,
             pinned,
             offset: 0,
+            viewport: 0,
             downloads: HashMap::new(),
             chat_action: None,
         }
@@ -100,34 +112,51 @@ impl ConversationView {
     /// chat-list projection (#113).
     ///
     /// **Refreshing the same chat** (a live update, or a freshly-merged history
-    /// page) preserves the cursor by message *id*, not index: the selected message
-    /// keeps its place even as older messages are prepended above it or a new one
-    /// arrives below, so a background change never jumps the view. (A scroll-up at
-    /// the very top first triggers an older page; the cursor then sits one row down
-    /// from the top, so the next scroll-up reveals the newly loaded messages.)
+    /// page) keeps the reader where they are. If the view was pinned to the newest
+    /// message — sitting at the bottom-anchored position — it *follows* the tail onto
+    /// the new newest (#159). Otherwise the cursor is preserved by message *id*, not
+    /// index: the selected message keeps its place even as older messages are
+    /// prepended above it or a new one arrives below, so reading history is never
+    /// interrupted. (A scroll-up at the very top first triggers an older page; the
+    /// cursor then sits one row down from the top, so the next scroll-up reveals the
+    /// newly loaded messages.)
     ///
     /// **Switching to a different chat** drops the previous chat's view entirely —
-    /// messages, cursor, and the per-message download/typing state — and starts
-    /// fresh at the top of the new history.
+    /// messages, cursor, and the per-message download/typing state — and opens
+    /// bottom-anchored at the newest message (#158), the way a chat client does. The
+    /// last-rendered viewport height carries over (the pane geometry is unchanged),
+    /// so the anchor is right immediately; the next render re-confirms it.
     pub fn project(&mut self, chat_id: i64, messages: Vec<Message>, pinned: HashSet<i64>) {
         if self.chat_id == Some(chat_id) {
-            // Same chat: keep the selected message under the cursor across the swap.
+            // Derive follow-ness from the *old* view before the swap: were we pinned
+            // to the newest message? If so, advance onto the new newest; if not, hold
+            // the selected message under the cursor by id.
+            let following = self.is_at_newest();
             let anchor = self.selected_message().map(|m| m.id);
             self.messages = messages;
             self.pinned = pinned;
-            self.offset = anchor
-                .and_then(|id| self.messages.iter().position(|m| m.id == id))
-                .unwrap_or(self.offset)
-                .min(self.messages.len().saturating_sub(1));
+            self.offset = if following {
+                self.newest_anchor_offset()
+            } else {
+                anchor
+                    .and_then(|id| self.messages.iter().position(|m| m.id == id))
+                    .unwrap_or(self.offset)
+                    .min(self.messages.len().saturating_sub(1))
+            };
         } else {
-            // A different chat opened: a fresh view at the top, dropping the
-            // previous chat's per-message state (downloads, typing indicator).
+            // A different chat opened: a fresh view, dropping the previous chat's
+            // per-message state (downloads, typing indicator), bottom-anchored at the
+            // newest message. Carry the measured viewport so the anchor is not the
+            // one-frame fallback on every chat switch.
+            let viewport = self.viewport;
             *self = Self {
                 chat_id: Some(chat_id),
                 messages,
                 pinned,
+                viewport,
                 ..Self::default()
             };
+            self.offset = self.newest_anchor_offset();
         }
     }
 
@@ -287,6 +316,120 @@ impl ConversationView {
             }
             None => false,
         }
+    }
+
+    /// Jump to the bottom-anchored newest position (#158) — the `G` / `End` action.
+    /// The cursor lands on the topmost message of the last screenful (consistent with
+    /// the "message at offset" cursor); repeated `k` then walks upward from there.
+    pub fn jump_to_newest(&mut self) {
+        self.offset = self.newest_anchor_offset();
+    }
+
+    /// Whether the view is pinned to the newest message — sitting exactly at the
+    /// bottom-anchored position (#159). This is *derived*, not a toggled mode: opening
+    /// a chat and `G` land here, and any scroll away leaves it. A same-chat refresh
+    /// reads it to decide whether to follow the tail or hold the reader's place.
+    #[must_use]
+    pub fn is_at_newest(&self) -> bool {
+        self.offset == self.newest_anchor_offset()
+    }
+
+    /// Record the history pane's inner height (rows) measured by the last render
+    /// (#158). When the height changes while the view is pinned to the newest
+    /// message, re-anchor so a resize keeps the newest on screen. Returns whether the
+    /// offset moved, so the caller can repaint the corrected frame.
+    pub fn set_viewport_height(&mut self, height: usize) -> bool {
+        if height == self.viewport {
+            return false;
+        }
+        let following = self.is_at_newest();
+        self.viewport = height;
+        if following {
+            let previous = self.offset;
+            self.offset = self.newest_anchor_offset();
+            return self.offset != previous;
+        }
+        false
+    }
+
+    /// The offset that pins the newest message to the bottom of the viewport: walk
+    /// back from the last message summing [`message_height`](Self::message_height),
+    /// stopping at the oldest message that still fits whole. Returns `0` on an empty
+    /// history (or one that fits entirely, so it renders from the top with no blank
+    /// gap), the last message before the first render measures a viewport, and the
+    /// newest message alone when it is taller than the whole viewport (best effort —
+    /// the newest stays anchored even if it overflows).
+    fn newest_anchor_offset(&self) -> usize {
+        let Some(last) = self.messages.len().checked_sub(1) else {
+            return 0;
+        };
+        if self.viewport == 0 {
+            return last;
+        }
+        let mut used = 0;
+        let mut top = last;
+        for index in (0..=last).rev() {
+            used += self.message_height(&self.messages[index]);
+            if used > self.viewport {
+                break;
+            }
+            top = index;
+        }
+        top
+    }
+
+    /// The number of terminal rows one message occupies in the history pane — the
+    /// same count [`crate::ui::message_lines`] renders, since that pane does not wrap
+    /// (each `Line` is one row, so the height is width-independent). A drift-guard
+    /// test in `ui.rs` keeps this in lockstep with the renderer.
+    pub(crate) fn message_height(&self, message: &Message) -> usize {
+        // A bold header, the body, an optional download-progress line, an optional
+        // reaction line, and a blank separator below.
+        1 + content_rows(&message.content)
+            + usize::from(self.has_download_line(&message.content))
+            + usize::from(!message.reactions.is_empty())
+            + 1
+    }
+
+    /// Whether a message's content draws a download-progress line — mirroring
+    /// [`crate::ui::download_line`]: the file is known and either actively
+    /// downloading or already present.
+    fn has_download_line(&self, content: &MessageContent) -> bool {
+        content
+            .file()
+            .and_then(|file| self.downloads.get(&file.id))
+            .is_some_and(|file| file.is_downloading_active || file.is_present())
+    }
+}
+
+/// The row count of a message body, mirroring [`crate::ui::content_lines`]: text
+/// bodies and captions keep their own line breaks (an empty text still takes one
+/// line), and media placeholders add a single label line above any caption.
+fn content_rows(content: &MessageContent) -> usize {
+    fn text_rows(text: &FormattedText) -> usize {
+        text.text.split('\n').count()
+    }
+    fn caption_rows(caption: &FormattedText) -> usize {
+        if caption.text.is_empty() {
+            0
+        } else {
+            text_rows(caption)
+        }
+    }
+    match content {
+        MessageContent::Text(text) => text_rows(text),
+        MessageContent::Photo(p) => 1 + caption_rows(&p.caption),
+        MessageContent::Video(v) => 1 + caption_rows(&v.caption),
+        MessageContent::Document(d) => 1 + caption_rows(&d.caption),
+        MessageContent::Audio(a) => 1 + caption_rows(&a.caption),
+        MessageContent::Voice(v) => 1 + caption_rows(&v.caption),
+        MessageContent::Animation(a) => 1 + caption_rows(&a.caption),
+        MessageContent::Sticker(_)
+        | MessageContent::Location(_)
+        | MessageContent::Venue(_)
+        | MessageContent::Contact(_)
+        | MessageContent::Poll(_)
+        | MessageContent::Unsupported(_) => 1,
     }
 }
 
@@ -474,68 +617,176 @@ mod tests {
         assert!(!bucket.is_chosen);
     }
 
-    #[test]
-    fn projecting_a_chat_populates_the_history_at_the_top() {
+    /// A view with the viewport measured to hold exactly `messages` single-line
+    /// text messages (each 3 rows: header, body, blank), for deterministic anchoring.
+    fn view_fitting(messages: usize) -> ConversationView {
         let mut view = ConversationView::default();
-        view.project(
-            10,
-            vec![text(1, "a"), text(2, "b"), text(3, "c")],
-            HashSet::new(),
-        );
-        assert_eq!(view.len(), 3);
-        assert_eq!(view.offset(), 0, "a freshly opened chat lands at the top");
-        assert_eq!(view.selected_message().map(|m| m.id), Some(1));
+        view.set_viewport_height(messages * 3);
+        view
     }
 
     #[test]
-    fn refreshing_the_same_chat_keeps_the_selected_message_under_the_cursor() {
-        let mut view = ConversationView::default();
-        view.project(10, vec![text(2, "b"), text(3, "c")], HashSet::new());
-        view.scroll_down(); // select message 3
-        assert_eq!(view.selected_message().map(|m| m.id), Some(3));
+    fn opening_a_chat_lands_bottom_anchored_at_the_newest_message() {
+        // Viewport fits two 3-row messages; a five-message history opens with the
+        // newest (5) at the bottom and message 4 at the top of the last screenful.
+        let mut view = view_fitting(2);
+        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        assert_eq!(view.len(), 5);
+        assert_eq!(view.offset(), 3, "top of the last screenful");
+        assert_eq!(view.selected_message().map(|m| m.id), Some(4));
+        assert!(view.is_at_newest(), "an open is pinned to the newest");
+    }
 
-        // An older page is merged ahead of the loaded ones: 3 stays selected, its
-        // index shifts down by the two prepended messages.
+    #[test]
+    fn jump_to_newest_from_any_offset_lands_at_the_same_bottom_anchor() {
+        let mut view = view_fitting(2);
+        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        let anchor = view.offset();
+        // Scroll to the very top, then jump: it lands back on the identical anchor.
+        for _ in 0..10 {
+            view.scroll_up();
+        }
+        assert_eq!(view.offset(), 0);
+        view.jump_to_newest();
+        assert_eq!(view.offset(), anchor);
+        assert!(view.is_at_newest());
+    }
+
+    #[test]
+    fn a_history_shorter_than_the_viewport_anchors_at_the_top() {
+        // Three 3-row messages (9 rows) in a 30-row viewport: everything fits, so the
+        // anchor is the top with no blank gap to scroll past.
+        let mut view = view_fitting(10);
+        view.project(10, (1..=3).map(|i| text(i, "m")).collect(), HashSet::new());
+        assert_eq!(view.offset(), 0);
+        assert!(view.is_at_newest());
+    }
+
+    #[test]
+    fn a_message_taller_than_the_viewport_still_anchors_on_the_newest() {
+        // The newest message alone overflows the viewport; anchoring keeps it on
+        // screen (offset on it) rather than falling off the bottom.
+        let mut view = view_fitting(1); // 3 rows
+        let tall = text(2, "l1\nl2\nl3\nl4\nl5"); // 1 + 5 + 1 = 7 rows > 3
+        view.project(10, vec![text(1, "m"), tall], HashSet::new());
+        assert_eq!(
+            view.offset(),
+            1,
+            "newest stays anchored though it overflows"
+        );
+    }
+
+    #[test]
+    fn refreshing_the_same_chat_while_scrolled_up_keeps_the_selected_message() {
+        // Four 3-row messages in a two-message viewport, so scrolling up genuinely
+        // leaves the newest anchor (offset 2) onto message 2.
+        let mut view = view_fitting(2);
+        view.project(10, (1..=4).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.scroll_up(); // off the newest anchor, onto message 2
+        assert_eq!(view.selected_message().map(|m| m.id), Some(2));
+        assert!(!view.is_at_newest(), "scrolled up: not following");
+
+        // An older page is merged ahead of the loaded ones: 2 stays selected, its
+        // index shifts down by the two prepended messages — reading is not interrupted.
         view.project(
             10,
-            vec![text(0, "x"), text(1, "y"), text(2, "b"), text(3, "c")],
+            vec![
+                text(90, "x"),
+                text(91, "y"),
+                text(1, "m"),
+                text(2, "m"),
+                text(3, "m"),
+                text(4, "m"),
+            ],
             HashSet::new(),
         );
         assert_eq!(
             view.selected_message().map(|m| m.id),
-            Some(3),
+            Some(2),
             "cursor follows the id"
         );
-        assert_eq!(view.offset(), 3);
+        assert_eq!(
+            view.offset(),
+            3,
+            "index shifted by the two prepended messages"
+        );
     }
 
     #[test]
-    fn a_live_message_on_the_same_chat_appears_without_moving_the_cursor() {
-        let mut view = ConversationView::default();
-        view.project(10, vec![text(1, "a"), text(2, "b")], HashSet::new());
-        // A newer message arrives; the selected (top) message is unmoved.
+    fn a_live_message_while_pinned_to_the_newest_follows_the_tail() {
+        // Sitting at the bottom-anchored newest, a new message arrives (#159): the
+        // view advances onto the new newest rather than holding still.
+        let mut view = view_fitting(2);
+        view.project(10, (1..=4).map(|i| text(i, "m")).collect(), HashSet::new());
+        assert!(view.is_at_newest());
+        let before = view.offset();
+
+        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        assert!(view.offset() > before, "the anchor advanced with the tail");
+        assert!(view.is_at_newest(), "still pinned to the (new) newest");
+        // The newest message is now the last one loaded.
+        assert_eq!(view.messages().last().map(|m| m.id), Some(5));
+    }
+
+    #[test]
+    fn a_live_message_while_scrolled_up_does_not_move_the_cursor() {
+        let mut view = view_fitting(2);
+        view.project(10, (1..=4).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.scroll_up();
+        view.scroll_up();
+        let (offset, selected) = (view.offset(), view.selected_message().map(|m| m.id));
+        assert!(!view.is_at_newest(), "reading history: not following");
+
+        // A newer message arrives; the reader is undisturbed.
+        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        assert_eq!(view.offset(), offset);
+        assert_eq!(view.selected_message().map(|m| m.id), selected);
+    }
+
+    #[test]
+    fn a_resize_while_following_re_anchors_to_the_newest() {
+        let mut view = view_fitting(2);
+        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        let before = view.offset();
+        // Growing the pane to fit three messages re-anchors upward; the offset moves.
+        assert!(view.set_viewport_height(9), "re-anchored while following");
+        assert!(
+            view.offset() < before,
+            "more messages now fit above the newest"
+        );
+        assert!(view.is_at_newest());
+        // An unchanged height is a no-op that reports no move.
+        assert!(!view.set_viewport_height(9));
+    }
+
+    #[test]
+    fn a_resize_while_scrolled_up_leaves_the_cursor_put() {
+        let mut view = view_fitting(2);
+        view.project(10, (1..=5).map(|i| text(i, "m")).collect(), HashSet::new());
+        view.scroll_up();
+        let offset = view.offset();
+        // Not following: a resize records the height but does not move the cursor.
+        assert!(!view.set_viewport_height(9));
+        assert_eq!(view.offset(), offset);
+    }
+
+    #[test]
+    fn switching_chats_resets_to_a_fresh_bottom_anchored_view() {
+        let mut view = view_fitting(2);
         view.project(
             10,
-            vec![text(1, "a"), text(2, "b"), text(3, "c")],
-            HashSet::new(),
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::from([1]),
         );
+        view.scroll_up();
+        assert!(!view.is_at_newest());
+
+        // A different chat replaces everything — messages, cursor, pinned set — and
+        // opens bottom-anchored at its newest message.
+        view.project(20, (7..=9).map(|i| text(i, "z")).collect(), HashSet::new());
         assert_eq!(view.len(), 3);
-        assert_eq!(view.selected_message().map(|m| m.id), Some(1));
-        assert_eq!(view.offset(), 0);
-    }
-
-    #[test]
-    fn switching_chats_resets_to_a_fresh_view_at_the_top() {
-        let mut view = ConversationView::default();
-        view.project(10, vec![text(1, "a"), text(2, "b")], HashSet::from([1]));
-        view.scroll_down();
-        assert_eq!(view.offset(), 1);
-
-        // A different chat replaces everything — messages, cursor, pinned set.
-        view.project(20, vec![text(9, "z")], HashSet::new());
-        assert_eq!(view.len(), 1);
-        assert_eq!(view.offset(), 0, "new chat starts at the top");
-        assert_eq!(view.selected_message().map(|m| m.id), Some(9));
+        assert!(view.is_at_newest(), "new chat opens pinned to the newest");
+        assert_eq!(view.messages().last().map(|m| m.id), Some(9));
         assert!(!view.is_pinned(1), "the previous chat's pins are gone");
     }
 

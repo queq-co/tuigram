@@ -244,6 +244,13 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('G'), KeyCode::End]),
+        action: Action::JumpToNewest,
+        keys: "G / End",
+        description: "jump to the newest message (top of the last screenful)",
+    },
+    Binding {
+        context: Context::History,
         trigger: Trigger::Plain(&[KeyCode::Char('i')]),
         action: Action::SetFocus(Focus::Composer),
         keys: "i",
@@ -884,6 +891,21 @@ mod tests {
         assert_eq!(at(KeyCode::Char('k')), Action::ForwardPrev);
         assert_eq!(at(KeyCode::Enter), Action::ForwardConfirm);
         assert_eq!(at(KeyCode::Esc), Action::ForwardCancel);
+    }
+
+    #[test]
+    fn g_and_end_jump_to_the_newest_message_in_the_history() {
+        // `G` (Shift-g) and End jump to the bottom-anchored newest message (#158),
+        // only in the history pane — End still means end-of-line in the composer.
+        let shift_g = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(
+            resolve(Focus::History, Overlay::None, &shift_g),
+            Action::JumpToNewest
+        );
+        assert_eq!(resolved(Focus::History, KeyCode::End), Action::JumpToNewest);
+        assert_eq!(resolved(Focus::Composer, KeyCode::End), Action::ComposerEnd);
+        // Unbound in the chat list (history-only context).
+        assert_eq!(resolved(Focus::ChatList, KeyCode::End), Action::Noop);
     }
 
     #[test]
