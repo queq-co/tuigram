@@ -62,7 +62,7 @@ use crossterm::event::EventStream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::{ChatKind, ChatListKind, Message, Sender};
+use tuigram_core::model::{ChatKind, ChatListKind, Message, Sender, UserKind};
 use tuigram_core::{
     Client, DOWNLOAD_PRIORITY, EditRequests, FileRequests, FormattedText, ForwardRequests,
     HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests,
@@ -287,8 +287,7 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         // client, so it lives here rather than in the pure `App` —
                         // which only receives the owned result.
                         AppEvent::Chats => {
-                            let lists = client.read(|s| project_lists(s.chats()));
-                            app.project_chats(lists);
+                            reproject_chats(&mut app, client);
                             // A new secret chat arrives as updateNewChat; re-project
                             // its lifecycle state so the fresh row shows it (#121).
                             reproject_secret_states(&mut app, client);
@@ -304,8 +303,7 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         AppEvent::Secret => reproject_secret_states(&mut app, client),
                         // A dropped-update gap: re-project both panes to be safe.
                         AppEvent::Lagged => {
-                            let lists = client.read(|s| project_lists(s.chats()));
-                            app.project_chats(lists);
+                            reproject_chats(&mut app, client);
                             reproject_secret_states(&mut app, client);
                             project_conversation(&mut app, client, history.open);
                         }
@@ -851,6 +849,35 @@ fn drive_settings(app: &mut App, storage_settings: &mut StorageSettings) {
         // phrase, never the user's typed values, the same rule the send paths follow.
         app.notify(Notice::error("settings save", None));
     }
+}
+
+/// Re-read the folded chat lists from the client and re-project the pane (#113),
+/// resolving in the same read which private chats have a **bot** peer (#160) so
+/// their rows can carry the 🤖 marker — the chat's [`ChatKind`] says "private", only
+/// the [`UserStore`](tuigram_core::UserStore) says "bot". The projection needs the
+/// client, so it lives here rather than in the pure `App`, which only receives the
+/// owned results (lists, then the bot-id set).
+fn reproject_chats(app: &mut App, client: &Arc<Client>) {
+    let (lists, bots) = client.read(|s| {
+        let lists = project_lists(s.chats());
+        let bots: HashSet<i64> = lists
+            .iter()
+            .flat_map(|list| &list.chats)
+            .filter_map(|chat| match chat.kind {
+                ChatKind::Private { user_id }
+                    if s.users()
+                        .get(user_id)
+                        .is_some_and(|user| matches!(user.kind, UserKind::Bot)) =>
+                {
+                    Some(chat.id)
+                }
+                _ => None,
+            })
+            .collect();
+        (lists, bots)
+    });
+    app.project_chats(lists);
+    app.project_bot_chats(bots);
 }
 
 /// Re-read the folded secret-chat states from the client and re-project them onto

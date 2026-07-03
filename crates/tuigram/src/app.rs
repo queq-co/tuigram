@@ -454,6 +454,15 @@ impl App {
         self.dirty = true;
     }
 
+    /// Record which chats are private **bot** chats (#160), for the 🤖 row marker.
+    /// The loop resolves the set from the core user store on each chat-list signal
+    /// and hands it here right after [`project_chats`](Self::project_chats), so `App`
+    /// stays pure — the same split as [`project_secret_states`](Self::project_secret_states).
+    pub fn project_bot_chats(&mut self, ids: HashSet<i64>) {
+        self.chat_list.set_bot_chats(ids);
+        self.dirty = true;
+    }
+
     /// Re-project the conversation pane from the core
     /// [`MessageStore`](tuigram_core::messages::MessageStore) (#114). The loop reads
     /// the open `chat_id`'s history and pinned ids back from the `Client` on a
