@@ -53,7 +53,7 @@ use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
 use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use tokio_stream::StreamExt;
-use tuigram_core::enums::{AuthorizationState, Update};
+use tuigram_core::enums::Update;
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
     ApiCredentials, AuthRequests, AuthState, Bridge, Chat, ChatAction, ChatActionRequests,
@@ -968,11 +968,13 @@ async fn close_secret_chat(client: &Client, secret_chat_id: i32) {
 /// a half-cleared session the next run can neither resume nor cleanly replace.
 async fn logout(client: &Client) -> Flow {
     println!("Logging out…");
-    if let Err(e) = client.bridge().log_out().await {
+    // `log_out_and_wait` bundles the logOut with the wait for `Closed` that makes
+    // the teardown complete before we return (#195) — the same whole-operation the
+    // TUI uses, so the two clients cannot drift on what "logout" requires.
+    if let Err(e) = client.bridge().log_out_and_wait().await {
         println!("Logout failed: {} {}", e.code, e.message);
         return Flow::Continue;
     }
-    wait_until_closed(client.bridge()).await;
     println!("Logged out. The local session has been cleared — re-run to sign in again.");
     Flow::Done
 }
@@ -980,27 +982,12 @@ async fn logout(client: &Client) -> Flow {
 /// Cleanly close the TDLib instance before the process exits, so its database is
 /// flushed and properly closed rather than left mid-write. Called on every exit
 /// path; harmless when the session is already gone (e.g. straight after
-/// `logout`) — the `close` request just fails and the wait returns at once.
+/// `logout`) — `close_and_wait` ignores the rejected `close` and returns at once.
+///
+/// Delegates to the shared [`AuthRequests::close_and_wait`] whole-operation (#195),
+/// the same one the TUI's shutdown uses, so "clean shutdown" means one thing.
 async fn shutdown(client: &Client) {
-    // Ignore the result: an already-closing/closed client (the usual case after
-    // `logout`) rejects it, which is exactly the state we want.
-    let _ = client.bridge().close().await;
-    wait_until_closed(client.bridge()).await;
-}
-
-/// Wait for TDLib to reach `Closed` — the signal that `log_out`/`close` has
-/// finished flushing and closing the local database. Both teardown paths drive
-/// authorization through `Closing` to `Closed`; returning before then would exit
-/// with the database mid-write, leaving it malformed for the next run. Bounded
-/// (~5s) so a stuck teardown cannot hang the harness; a query that errors (the
-/// client is already gone) counts as closed.
-async fn wait_until_closed(bridge: &Bridge) {
-    for _ in 0..50 {
-        match bridge.authorization_state().await {
-            Ok(AuthorizationState::Closed) | Err(_) => return,
-            Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    }
+    client.bridge().close_and_wait().await;
 }
 
 /// Render one message for display: id, sender, send state, and its body. A

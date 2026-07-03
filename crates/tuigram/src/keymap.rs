@@ -77,6 +77,12 @@ pub enum Overlay {
     /// The retention settings editor (#146): edit the four download-cache knobs,
     /// applied live and written back to `settings.toml` on confirm.
     Settings,
+    /// The delete-message confirm (#195): pick the scope (for me / for everyone)
+    /// and confirm, or cancel. Gates the destructive delete behind an explicit step.
+    DeleteConfirm,
+    /// The logout confirm (#195): confirm ends the session and wipes the local
+    /// data, or cancel. Gates the destructive logout behind an explicit step.
+    LogoutConfirm,
 }
 
 /// The focus context a binding applies in. `Global` always applies; `Nav` applies
@@ -184,6 +190,20 @@ const BINDINGS: &[Binding] = &[
         keys: "Ctrl-G",
         description: "dismiss notification",
     },
+    Binding {
+        context: Context::Global,
+        trigger: Trigger::Ctrl(KeyCode::Char('r')),
+        action: Action::Resync,
+        keys: "Ctrl-R",
+        description: "resync after a dropped-update gap",
+    },
+    Binding {
+        context: Context::Global,
+        trigger: Trigger::Ctrl(KeyCode::Char('q')),
+        action: Action::LogoutOpen,
+        keys: "Ctrl-Q",
+        description: "log out (confirm first)",
+    },
     // Chat list.
     Binding {
         context: Context::ChatList,
@@ -259,8 +279,29 @@ const BINDINGS: &[Binding] = &[
     Binding {
         context: Context::History,
         trigger: Trigger::Plain(&[KeyCode::Char('r')]),
-        action: Action::ReactionOpen,
+        action: Action::ReplyMessage,
         keys: "r",
+        description: "reply to the selected message",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('e')]),
+        action: Action::EditMessage,
+        keys: "e",
+        description: "edit the selected message (your own)",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('d')]),
+        action: Action::DeleteMessage,
+        keys: "d",
+        description: "delete the selected message",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('R')]),
+        action: Action::ReactionOpen,
+        keys: "R",
         description: "react to the selected message",
     },
     Binding {
@@ -283,6 +324,13 @@ const BINDINGS: &[Binding] = &[
         action: Action::AttachOpen,
         keys: "a",
         description: "attach / send media",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('S')]),
+        action: Action::SaveMedia,
+        keys: "S",
+        description: "save / download the selected message's media",
     },
     // Composer — editing keys; any other printable character inserts (see resolve).
     Binding {
@@ -398,6 +446,8 @@ pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
         Overlay::SendMedia => resolve_send_media(key),
         Overlay::SecretChat => resolve_secret_chat(key),
         Overlay::Settings => resolve_settings(key),
+        Overlay::DeleteConfirm => resolve_delete_confirm(key),
+        Overlay::LogoutConfirm => resolve_logout_confirm(key),
     }
 }
 
@@ -574,6 +624,34 @@ fn resolve_secret_chat(key: &KeyEvent) -> Action {
     }
 }
 
+/// The delete-message confirm (#195): Enter runs the delete at the chosen scope,
+/// Tab flips between "for me" and "for everyone", Esc cancels. Ctrl-C still quits.
+fn resolve_delete_confirm(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::DeleteCancel,
+        KeyCode::Enter => Action::DeleteConfirm,
+        KeyCode::Tab => Action::DeleteToggleScope,
+        _ => Action::Noop,
+    }
+}
+
+/// The logout confirm (#195): Enter ends the session and wipes local data, Esc
+/// cancels. A deliberately spare confirm — a stray key does nothing — since the
+/// action is destructive. Ctrl-C still quits the app (without logging out).
+fn resolve_logout_confirm(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::LogoutCancel,
+        KeyCode::Enter => Action::LogoutConfirm,
+        _ => Action::Noop,
+    }
+}
+
 /// The character a key would insert, or `None` for a non-printable key or one
 /// held with Ctrl/Alt (a command, not text).
 fn printable(key: &KeyEvent) -> Option<char> {
@@ -721,6 +799,8 @@ mod tests {
             Overlay::SendMedia,
             Overlay::SecretChat,
             Overlay::Settings,
+            Overlay::DeleteConfirm,
+            Overlay::LogoutConfirm,
         ] {
             assert_eq!(
                 resolve(Focus::History, overlay, &ctrl('g')),
@@ -910,9 +990,25 @@ mod tests {
 
     #[test]
     fn history_keys_act_on_the_selected_message() {
-        // r / p / f / a operate on the selected message in the history pane.
+        // r / e / d / R / p / f / a / S operate on the selected message in the
+        // history pane. Reply took `r` (the vim/mutt/Telegram convention) and react
+        // moved to `R` (#195).
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('r')),
+            Action::ReplyMessage
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('e')),
+            Action::EditMessage
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('d')),
+            Action::DeleteMessage
+        );
+        // React is now the shifted `R`; the lowercase `r` replies.
+        let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert_eq!(
+            resolve(Focus::History, Overlay::None, &shift_r),
             Action::ReactionOpen
         );
         assert_eq!(
@@ -927,13 +1023,62 @@ mod tests {
             resolved(Focus::History, KeyCode::Char('a')),
             Action::AttachOpen
         );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('S')),
+            Action::SaveMedia
+        );
         // The same letters are plain text in the composer, not history commands.
         assert_eq!(
             resolved(Focus::Composer, KeyCode::Char('r')),
             Action::ComposerInput('r')
         );
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char('e')),
+            Action::ComposerInput('e')
+        );
         // …and unbound in the chat list (history-only context).
         assert_eq!(resolved(Focus::ChatList, KeyCode::Char('p')), Action::Noop);
+    }
+
+    #[test]
+    fn ctrl_r_resyncs_and_ctrl_q_opens_logout_from_every_focus() {
+        // Both are global Ctrl chords, so they fire from any pane — including the
+        // composer, where a bare letter would type (a Ctrl chord never inserts).
+        for focus in [Focus::ChatList, Focus::History, Focus::Composer] {
+            assert_eq!(resolve(focus, Overlay::None, &ctrl('r')), Action::Resync);
+            assert_eq!(
+                resolve(focus, Overlay::None, &ctrl('q')),
+                Action::LogoutOpen
+            );
+        }
+    }
+
+    #[test]
+    fn the_delete_confirm_overlay_picks_a_scope_and_confirms() {
+        let at = |code| resolve(Focus::History, Overlay::DeleteConfirm, &key(code));
+        assert_eq!(at(KeyCode::Enter), Action::DeleteConfirm);
+        assert_eq!(at(KeyCode::Tab), Action::DeleteToggleScope);
+        assert_eq!(at(KeyCode::Esc), Action::DeleteCancel);
+        // A stray key does nothing while the destructive confirm is up.
+        assert_eq!(at(KeyCode::Char('x')), Action::Noop);
+        // Ctrl-C still escapes the modal.
+        assert_eq!(
+            resolve(Focus::History, Overlay::DeleteConfirm, &ctrl('c')),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn the_logout_confirm_overlay_confirms_or_cancels() {
+        let at = |code| resolve(Focus::ChatList, Overlay::LogoutConfirm, &key(code));
+        assert_eq!(at(KeyCode::Enter), Action::LogoutConfirm);
+        assert_eq!(at(KeyCode::Esc), Action::LogoutCancel);
+        assert_eq!(at(KeyCode::Char('x')), Action::Noop);
+        // Ctrl-C quits the app without logging out.
+        assert_eq!(
+            resolve(Focus::ChatList, Overlay::LogoutConfirm, &ctrl('c')),
+            Action::Quit
+        );
     }
 
     #[test]
@@ -995,6 +1140,8 @@ mod tests {
             Overlay::Reaction,
             Overlay::SendMedia,
             Overlay::SecretChat,
+            Overlay::DeleteConfirm,
+            Overlay::LogoutConfirm,
         ] {
             assert_eq!(resolve(Focus::ChatList, overlay, &ctrl('c')), Action::Quit);
         }

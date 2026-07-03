@@ -8,11 +8,11 @@ use std::collections::{HashMap, HashSet};
 
 use crossterm::event::Event;
 use tuigram_core::StorageSettings;
-use tuigram_core::model::{File, Message, OutgoingMedia, SecretChatState, Sender};
+use tuigram_core::model::{File, Message, MessageContent, OutgoingMedia, SecretChatState, Sender};
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
-use crate::conversation::{ConversationView, PinIntent};
+use crate::conversation::{ConversationView, DeleteIntent, DeletePrompt, PinIntent};
 use crate::event::AppEvent;
 use crate::forward::{ForwardIntent, ForwardView};
 use crate::keymap::{self, Focus, Overlay};
@@ -21,7 +21,7 @@ use crate::reactions::{ReactionIntent, ReactionPicker};
 use crate::search::SearchView;
 use crate::secret::{SecretChatPrompt, SecretLifecycle};
 use crate::settingsform::SettingsDraft;
-use crate::status::{ConnectionState, Notifications};
+use crate::status::{ConnectionState, Notice, Notifications};
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
 /// render tick, core updates) is funnelled through this enum before it touches
@@ -206,6 +206,39 @@ pub enum Action {
     SettingsConfirm,
     /// Cancel the settings editor without saving.
     SettingsCancel,
+    /// Start a reply to the selected history message (`r`): put the composer into
+    /// reply mode against it and focus the composer (#195). A no-op on an empty
+    /// history. Reuses the already-built [`Composer::reply_to`](crate::composer::Composer::reply_to).
+    ReplyMessage,
+    /// Start editing the selected history message (`e`): pre-fill the composer with
+    /// its text and focus the composer (#195). Only our own text messages are
+    /// editable; anything else surfaces a toast and does nothing.
+    EditMessage,
+    /// Open the delete-confirm overlay for the selected history message (`d`), a
+    /// no-op on an empty history (#195).
+    DeleteMessage,
+    /// Flip the delete scope between "for me" and "for everyone" in the confirm
+    /// (Tab); only meaningful for our own message (#195).
+    DeleteToggleScope,
+    /// Confirm the delete at the chosen scope: record the intent for the loop and
+    /// close the overlay (#195).
+    DeleteConfirm,
+    /// Cancel the delete confirm without deleting (#195).
+    DeleteCancel,
+    /// Save / download the selected history message's media (`S`): record its file
+    /// id for the loop to reveal a local path or start the download (#195). A toast
+    /// with no downloadable media.
+    SaveMedia,
+    /// Re-query the chat list after a dropped-update gap (`Ctrl-R`), recording the
+    /// request for the loop to run against core (#195).
+    Resync,
+    /// Open the logout confirm (`Ctrl-Q`) (#195).
+    LogoutOpen,
+    /// Confirm the logout: record the request for the loop, which ends the session
+    /// and exits (#195).
+    LogoutConfirm,
+    /// Cancel the logout confirm without logging out (#195).
+    LogoutCancel,
     /// Dismiss the current transient toast immediately (#88), revealing the next
     /// queued one. A no-op when nothing is showing.
     NoticeDismiss,
@@ -326,6 +359,26 @@ pub struct App {
     /// swaps its live retention (the next sweep honours it), and persists it to
     /// `settings.toml`.
     pending_settings: Option<StorageSettings>,
+    /// The delete-confirm overlay's state (#195): the message a `d` targets and the
+    /// chosen scope. `Some` only while [`Overlay::DeleteConfirm`] is open.
+    delete: Option<DeletePrompt>,
+    /// A confirmed delete awaiting dispatch to core (#195). Confirming the delete
+    /// overlay records the target and scope here; the loop drains it via
+    /// [`take_delete`](Self::take_delete) and routes it to
+    /// [`DeleteRequests::delete`](tuigram_core::messages::DeleteRequests). No
+    /// optimistic change — the real `updateDeleteMessages` folds and re-projects.
+    pending_delete: Option<DeleteIntent>,
+    /// A file id whose media the user asked to save (`S`) (#195). `App` stays pure
+    /// and cannot read the file store, so it records the id; the loop drains it via
+    /// [`take_save`](Self::take_save), reveals the local path if the file is already
+    /// present, or starts the download otherwise.
+    pending_save: Option<i32>,
+    /// Set when the user asked to resync (`Ctrl-R`) (#195). The loop reads and
+    /// clears it via [`take_resync`](Self::take_resync) and re-queries the chat list.
+    pending_resync: bool,
+    /// Set when the user confirmed a logout (`Ctrl-Q`) (#195). The loop reads and
+    /// clears it via [`take_logout`](Self::take_logout), ends the session, and exits.
+    pending_logout: bool,
 }
 
 impl App {
@@ -413,6 +466,12 @@ impl App {
     /// The settings editor's state, for rendering the retention fields (#146).
     pub fn settings(&self) -> &SettingsDraft {
         &self.settings
+    }
+
+    /// The delete-confirm prompt's state, for rendering the overlay (#195); `None`
+    /// when the confirm is not open.
+    pub fn delete(&self) -> Option<&DeletePrompt> {
+        self.delete.as_ref()
     }
 
     /// Seed the in-effect retention policy from `settings.toml` at startup (#146), so
@@ -564,6 +623,34 @@ impl App {
     /// `None` means no settings edit was confirmed since the last drain.
     pub fn take_settings(&mut self) -> Option<StorageSettings> {
         self.pending_settings.take()
+    }
+
+    /// Take the pending delete, if any (#195). The loop drains this each tick and
+    /// dispatches it to [`DeleteRequests::delete`](tuigram_core::messages::DeleteRequests);
+    /// `None` means no delete was confirmed since the last drain.
+    pub fn take_delete(&mut self) -> Option<DeleteIntent> {
+        self.pending_delete.take()
+    }
+
+    /// Take the pending save/download file id, if any (#195). The loop drains this
+    /// each tick and either reveals the local path (already present) or starts the
+    /// download; `None` means nothing was requested since the last drain.
+    pub fn take_save(&mut self) -> Option<i32> {
+        self.pending_save.take()
+    }
+
+    /// Take the pending resync request (#195). The loop drains this each tick and
+    /// re-queries the chat list; `false` means no resync was requested since the last
+    /// drain.
+    pub fn take_resync(&mut self) -> bool {
+        std::mem::take(&mut self.pending_resync)
+    }
+
+    /// Take the pending logout request (#195). The loop drains this each tick, ends
+    /// the session, and exits; `false` means no logout was confirmed since the last
+    /// drain.
+    pub fn take_logout(&mut self) -> bool {
+        std::mem::take(&mut self.pending_logout)
     }
 
     /// Re-project the secret-chat lifecycle states from the core
@@ -1196,6 +1283,114 @@ impl App {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
+            Action::ReplyMessage => {
+                // Put the composer into reply mode against the selected message and
+                // jump to it (#195). The reply body is sent through the already-wired
+                // send seam on submit (#116). A no-op on an empty history.
+                let target = self.conversation.selected_message().map(|m| {
+                    let label = self.conversation.sender_label(m);
+                    (m.id, message_preview(&label, m))
+                });
+                if let Some((id, preview)) = target {
+                    self.composer.reply_to(id, preview);
+                    self.focus = Focus::Composer;
+                    self.dirty = true;
+                }
+            }
+            Action::EditMessage => {
+                // Pre-fill the composer with the selected message's text and jump to
+                // it (#195); submitting replaces the message through the edit seam
+                // (#116). Only our own text messages are editable — anything else
+                // explains why with a toast and does nothing.
+                let target = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.id, m.is_outgoing, m.text().map(str::to_owned)));
+                if let Some((id, own, text)) = target {
+                    match (own, text) {
+                        (true, Some(text)) => {
+                            self.composer.edit(id, text);
+                            self.focus = Focus::Composer;
+                        }
+                        (false, _) => {
+                            self.notify(Notice::info("You can only edit your own messages."));
+                        }
+                        (true, None) => {
+                            self.notify(Notice::info("Only text messages can be edited."));
+                        }
+                    }
+                    self.dirty = true;
+                }
+            }
+            Action::DeleteMessage => {
+                // Open the delete confirm for the selected message (#195). Reads the
+                // message's ownership so the confirm can offer "for everyone" only for
+                // our own messages. A no-op on an empty history.
+                let target = self.conversation.selected_message().map(|m| {
+                    let label = self.conversation.sender_label(m);
+                    (m.chat_id, m.id, m.is_outgoing, message_preview(&label, m))
+                });
+                if let Some((chat_id, id, own, preview)) = target {
+                    self.delete = Some(DeletePrompt::new(chat_id, id, own, preview));
+                    self.overlay = Overlay::DeleteConfirm;
+                    self.dirty = true;
+                }
+            }
+            Action::DeleteToggleScope => {
+                if let Some(prompt) = self.delete.as_mut() {
+                    prompt.toggle_revoke();
+                    self.dirty = true;
+                }
+            }
+            Action::DeleteConfirm => {
+                // Record the delete as a pure intent for the loop (#195), then close.
+                // No optimistic removal — the real `updateDeleteMessages` folds and
+                // re-projects the history.
+                if let Some(prompt) = self.delete.take() {
+                    self.pending_delete = Some(prompt.into_intent());
+                }
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::DeleteCancel => {
+                self.delete = None;
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::SaveMedia => {
+                // Record the selected message's file id for the loop to reveal or
+                // download (#195). `App` cannot read the file store, so it only
+                // resolves the id here; a message with no downloadable media (id 0 or
+                // a non-media body) explains why with a toast.
+                let file_id = self
+                    .conversation
+                    .selected_message()
+                    .and_then(|m| m.content.file())
+                    .map(|f| f.id)
+                    .filter(|id| *id != 0);
+                match file_id {
+                    Some(id) => self.pending_save = Some(id),
+                    None => self.notify(Notice::info("The selected message has no media to save.")),
+                }
+                self.dirty = true;
+            }
+            Action::Resync => {
+                self.pending_resync = true;
+                self.dirty = true;
+            }
+            Action::LogoutOpen => {
+                self.overlay = Overlay::LogoutConfirm;
+                self.dirty = true;
+            }
+            Action::LogoutConfirm => {
+                self.pending_logout = true;
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::LogoutCancel => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
             Action::NoticeDismiss => {
                 // Drop the showing toast (revealing any next); a no-op that does
                 // not repaint when none is up.
@@ -1206,6 +1401,44 @@ impl App {
             }
             Action::Quit => self.should_quit = true,
         }
+    }
+}
+
+/// A short one-line label of a message for the reply and delete prompts (#195):
+/// the sender label and a trimmed snippet of the body, or a bracketed media kind
+/// for a non-text message. Kept to a single line so it fits the composer's reply
+/// indicator and the delete confirm.
+fn message_preview(sender: &str, message: &Message) -> String {
+    const MAX: usize = 40;
+    let body = match message.text() {
+        Some(text) if !text.trim().is_empty() => {
+            let text = text.trim();
+            let mut out: String = text.chars().take(MAX).collect();
+            if text.chars().count() > MAX {
+                out.push('…');
+            }
+            out
+        }
+        _ => format!("<{}>", media_kind(&message.content)),
+    };
+    format!("{sender}: {body}")
+}
+
+/// The bracketed kind label for a non-text message body (#195).
+fn media_kind(content: &MessageContent) -> &'static str {
+    match content {
+        MessageContent::Text(_) | MessageContent::Unsupported(_) => "message",
+        MessageContent::Photo(_) => "photo",
+        MessageContent::Video(_) => "video",
+        MessageContent::Document(_) => "document",
+        MessageContent::Audio(_) => "audio",
+        MessageContent::Voice(_) => "voice",
+        MessageContent::Sticker(_) => "sticker",
+        MessageContent::Animation(_) => "animation",
+        MessageContent::Location(_) => "location",
+        MessageContent::Venue(_) => "venue",
+        MessageContent::Contact(_) => "contact",
+        MessageContent::Poll(_) => "poll",
     }
 }
 
@@ -2588,5 +2821,149 @@ mod tests {
             app.on_terminal_event(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
             Action::NoticeDismiss
         );
+    }
+
+    // ---- #195: REPL→TUI command-parity actions ----
+
+    /// Build an app whose open conversation is a single `message`, selected.
+    fn app_with_message(message: Message) -> App {
+        use crate::conversation::ConversationView;
+        App::with_conversation(ConversationView::from_messages(
+            vec![message],
+            HashSet::new(),
+        ))
+    }
+
+    /// A text message with `id`; `own` marks it as ours (outgoing).
+    fn text_message(id: i64, body: &str, own: bool) -> Message {
+        use tuigram_core::model::{FormattedText, MessageContent};
+        let mut m = crate::conversation::sample_message(
+            id,
+            MessageContent::Text(FormattedText {
+                text: body.to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        m.is_outgoing = own;
+        m
+    }
+
+    #[test]
+    fn reply_message_enters_reply_mode_and_focuses_the_composer() {
+        use crate::composer::ComposerMode;
+        let mut app = app_with_message(text_message(42, "hello", false));
+        app.dispatch(Action::ReplyMessage);
+        assert_eq!(app.focus(), Focus::Composer);
+        assert!(matches!(
+            app.composer().mode(),
+            ComposerMode::Reply { message_id: 42, .. }
+        ));
+    }
+
+    #[test]
+    fn edit_message_prefills_only_for_our_own_text_messages() {
+        use crate::composer::ComposerMode;
+        // Someone else's message: not editable — composer stays in compose, focus
+        // stays on the (default) chat list, and a toast explains why.
+        let mut app = app_with_message(text_message(7, "hi", false));
+        app.dispatch(Action::EditMessage);
+        assert_eq!(app.focus(), Focus::ChatList);
+        assert!(matches!(app.composer().mode(), ComposerMode::Compose));
+        assert!(app.notifications.current().is_some());
+
+        // Our own text message: editable — the composer pre-fills and focuses.
+        let mut app = app_with_message(text_message(9, "mine", true));
+        app.dispatch(Action::EditMessage);
+        assert_eq!(app.focus(), Focus::Composer);
+        assert!(matches!(
+            app.composer().mode(),
+            ComposerMode::Edit { message_id: 9 }
+        ));
+        assert_eq!(app.composer().text(), "mine");
+    }
+
+    #[test]
+    fn delete_message_opens_the_confirm_and_records_the_scoped_intent() {
+        let mut msg = text_message(5, "x", true);
+        msg.chat_id = 77;
+        let mut app = app_with_message(msg);
+        app.dispatch(Action::DeleteMessage);
+        assert_eq!(app.overlay(), Overlay::DeleteConfirm);
+        // Defaults to the safe scope (for me); Tab flips it to for everyone since the
+        // message is ours.
+        assert!(!app.delete().expect("prompt open").revoke());
+        app.dispatch(Action::DeleteToggleScope);
+        assert!(app.delete().expect("prompt open").revoke());
+        app.dispatch(Action::DeleteConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+        let intent = app.take_delete().expect("recorded delete");
+        assert_eq!(intent.chat_id, 77);
+        assert_eq!(intent.message_ids, vec![5]);
+        assert!(intent.revoke);
+    }
+
+    #[test]
+    fn delete_scope_stays_for_me_on_someone_elses_message() {
+        let mut app = app_with_message(text_message(3, "x", false));
+        app.dispatch(Action::DeleteMessage);
+        // Not ours: "for everyone" is unavailable, so the toggle never revokes.
+        assert!(!app.delete().expect("prompt open").can_revoke());
+        app.dispatch(Action::DeleteToggleScope);
+        assert!(!app.delete().expect("prompt open").revoke());
+        // Cancel drops the prompt without recording an intent.
+        app.dispatch(Action::DeleteCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.delete().is_none());
+        assert!(app.take_delete().is_none());
+    }
+
+    #[test]
+    fn save_media_records_a_file_id_for_media_and_toasts_otherwise() {
+        use tuigram_core::model::{FileRef, MessageContent, Photo};
+        // A media message: the file id is recorded for the loop to save.
+        let mut photo = crate::conversation::sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: Default::default(),
+                file: FileRef::new(99),
+                width: 1,
+                height: 1,
+            }),
+        );
+        photo.is_outgoing = false;
+        let mut app = app_with_message(photo);
+        app.dispatch(Action::SaveMedia);
+        assert_eq!(app.take_save(), Some(99));
+
+        // A text message has no media: nothing recorded, a toast instead.
+        let mut app = app_with_message(text_message(2, "hi", false));
+        app.dispatch(Action::SaveMedia);
+        assert_eq!(app.take_save(), None);
+        assert!(app.notifications.current().is_some());
+    }
+
+    #[test]
+    fn resync_records_a_request_drained_once() {
+        let mut app = App::new();
+        app.dispatch(Action::Resync);
+        assert!(app.take_resync(), "the request is recorded");
+        assert!(!app.take_resync(), "and cleared after one drain");
+    }
+
+    #[test]
+    fn logout_confirm_flow_records_a_request_and_cancel_does_not() {
+        let mut app = App::new();
+        app.dispatch(Action::LogoutOpen);
+        assert_eq!(app.overlay(), Overlay::LogoutConfirm);
+        // Cancel closes the confirm without recording a logout.
+        app.dispatch(Action::LogoutCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(!app.take_logout());
+        // Confirm records the logout for the loop and closes.
+        app.dispatch(Action::LogoutOpen);
+        app.dispatch(Action::LogoutConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.take_logout());
+        assert!(!app.take_logout(), "cleared after one drain");
     }
 }

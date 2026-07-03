@@ -139,10 +139,9 @@ impl Composer {
     /// Enter reply mode against `message_id`, showing `preview` in the indicator.
     /// The buffer is left as-is so a half-typed message survives starting a reply.
     ///
-    /// The key that starts a reply lands with #83's focus model (and #84's forward
-    /// flow), so this is unused in the non-test binary today; the render tests drive
-    /// it through [`with_composer`](crate::app::App::with_composer).
-    #[allow(dead_code)]
+    /// Driven by [`Action::ReplyMessage`](crate::app::Action::ReplyMessage) — `r` in
+    /// the history pane (#195) — which focuses the composer so the reply can be typed
+    /// straight away; submitting routes through the send seam as a reply (#116).
     pub fn reply_to(&mut self, message_id: i64, preview: String) {
         self.mode = ComposerMode::Reply {
             message_id,
@@ -153,10 +152,9 @@ impl Composer {
     /// Enter edit mode against `message_id`, pre-filling the buffer with its
     /// current `text` and placing the cursor at the end.
     ///
-    /// Like [`reply_to`](Self::reply_to), the key that starts an edit arrives with
-    /// #83's focus model, so this is unused in the non-test binary for now and the
-    /// render tests exercise it directly.
-    #[allow(dead_code)]
+    /// Driven by [`Action::EditMessage`](crate::app::Action::EditMessage) — `e` in
+    /// the history pane (#195), for our own text messages — which focuses the
+    /// composer; submitting routes through the edit seam (#116).
     pub fn edit(&mut self, message_id: i64, text: String) {
         self.input.set(text);
         self.mode = ComposerMode::Edit { message_id };
