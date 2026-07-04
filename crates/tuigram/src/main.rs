@@ -1139,7 +1139,13 @@ fn drive_avatars(
         tokio::spawn(async move {
             let protocol = tokio::task::spawn_blocking(move || {
                 let image = image::load_from_memory(&bytes).ok()?;
-                picker.new_protocol(image, size, Resize::Fit(None)).ok()
+                // `Fit` only ever shrinks (`min(target, image_size)` in its
+                // pixel math) — a minithumbnail is typically far smaller in
+                // pixels than one terminal cell, so `Fit` would render it at
+                // its tiny native size instead of filling the gutter. `Scale`
+                // resizes in both directions to hit `size`, upscaling a small
+                // source image the way this always-tiny minithumbnail needs.
+                picker.new_protocol(image, size, Resize::Scale(None)).ok()
             })
             .await
             .unwrap_or(None);
