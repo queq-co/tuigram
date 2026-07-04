@@ -42,10 +42,12 @@ differently:
   automatically while the composer has unsent text in the open chat (#197,
   throttled to avoid re-sending on every keystroke); the REPL's `typing`
   command remains a manual, explicit one-shot for testing/diagnostics.
-- **New secret chat targeting** — the REPL's `secret-new <user_id>` takes a raw
-  id typed in directly; the TUI's `n` contact-search picker (#197) reaches the
-  same arbitrary-user capability by searching contacts by name instead, since
-  there's no free-text id entry in a modal UI.
+- **New secret chat targeting** — the REPL's `secret-new <user_id>` takes any
+  raw id typed in directly, contact or not; the TUI's `n` contact-search picker
+  (#197) reaches the same capability restricted to contacts — `search_contacts`
+  only searches this account's contacts, so a non-contact user id (reachable in
+  the REPL) has no TUI path. There's no free-text id entry in a modal UI, so a
+  name search is the closer fit for the common case.
 
 ## Adding a new REPL command
 

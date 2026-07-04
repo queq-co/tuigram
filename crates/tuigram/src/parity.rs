@@ -79,10 +79,10 @@ fn bound_action(repl_command: &str) -> Option<Action> {
         "react" | "unreact" => Some(Action::ReactionConfirm),
         "pin" | "unpin" => Some(Action::PinToggle),
         "secret-close" => Some(Action::SecretOpen),
-        // "secret-new <user_id>" targets an arbitrary user by id; the chat-list-
-        // scoped `SecretOpen` can't reach one outside the open chat list, so the
-        // real analog is the contact-search picker (#197), which reaches the same
-        // arbitrary-user capability by name instead of a typed id.
+        // "secret-new <user_id>" targets any user id, contact or not; the
+        // chat-list-scoped `SecretOpen` can't reach one outside the open chat
+        // list, so the real analog is the contact-search picker (#197) — closer,
+        // though narrower (contacts only; see docs/repl-tui-divergences.md).
         "secret-new" => Some(Action::ContactSearchOpen),
         "resync" => Some(Action::Resync),
         "logout" => Some(Action::LogoutOpen),
