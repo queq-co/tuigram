@@ -1503,7 +1503,12 @@ impl App {
                 // our own messages. A no-op on an empty history.
                 let target = self.conversation.selected_message().map(|m| {
                     let label = self.conversation.sender_label(m);
-                    (m.chat_id, m.id, m.is_outgoing, message_preview(&label.label, m))
+                    (
+                        m.chat_id,
+                        m.id,
+                        m.is_outgoing,
+                        message_preview(&label.label, m),
+                    )
                 });
                 if let Some((chat_id, id, own, preview)) = target {
                     self.delete = Some(DeletePrompt::new(chat_id, id, own, preview));
