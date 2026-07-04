@@ -65,6 +65,10 @@ arboard = { version = "3" }
 # only: pulled in via `dep:rustyline` behind `login-harness`, never in the product
 # binary's dependency graph.
 rustyline = { version = "18", default-features = false }
+# Decodes TDLib's base64-encoded `Minithumbnail.data` (profile-photo mini
+# avatars, #201) once at projection time, so nothing downstream re-touches
+# base64. Already in the dependency graph transitively; promoted to direct.
+base64 = { version = "0.22" }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.

@@ -281,6 +281,11 @@ pub struct User {
     /// (#194): TDLib's fixed built-in ids are `0..=6`; `>=7` are Telegram
     /// Premium custom colors this crate does not resolve to an exact RGB yet.
     pub accent_color_id: i32,
+    /// The user's profile-photo minithumbnail, decoded to raw JPEG bytes
+    /// (#201): a small inline preview TDLib delivers with the user record
+    /// itself, needing no `downloadFile` round trip. `None` when the user has
+    /// no profile photo, or has one with no minithumbnail attached.
+    pub avatar_minithumbnail: Option<Vec<u8>>,
 }
 
 impl User {
@@ -308,6 +313,16 @@ impl User {
             kind: UserKind::from_tdlib(&user.r#type),
             status: Presence::from_tdlib(&user.status),
             accent_color_id: user.accent_color_id,
+            avatar_minithumbnail: user
+                .profile_photo
+                .as_ref()
+                .and_then(|photo| photo.minithumbnail.as_ref())
+                .and_then(|thumb| {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD
+                        .decode(&thumb.data)
+                        .ok()
+                }),
         }
     }
 
@@ -3037,6 +3052,7 @@ mod tests {
         assert_eq!(user.kind, UserKind::Regular);
         assert_eq!(user.status, Presence::Online { expires: 5 });
         assert_eq!(user.accent_color_id, 3);
+        assert_eq!(user.avatar_minithumbnail, None);
 
         // No usernames and an empty phone collapse to None/empty, not "".
         let bare = User::from_tdlib(&td_user(
@@ -3052,6 +3068,40 @@ mod tests {
         assert_eq!(bare.username(), None);
         assert!(bare.usernames.is_empty());
         assert_eq!(bare.phone_number, None);
+    }
+
+    #[test]
+    fn user_decodes_a_profile_photo_minithumbnail_when_present() {
+        use base64::Engine as _;
+        let raw = b"not really a jpeg, just test bytes".to_vec();
+        let mut td = td_user(
+            7,
+            "Ada",
+            "Lovelace",
+            vec![],
+            "",
+            TdUserType::Regular,
+            TdUserStatus::Empty,
+            0,
+        );
+        td.profile_photo = Some(tdlib_rs::types::ProfilePhoto {
+            id: 1,
+            small: TdFile::default(),
+            big: TdFile::default(),
+            minithumbnail: Some(tdlib_rs::types::Minithumbnail {
+                width: 8,
+                height: 8,
+                data: base64::engine::general_purpose::STANDARD.encode(&raw),
+            }),
+            has_animation: false,
+            is_personal: false,
+        });
+        let user = User::from_tdlib(&td);
+        assert_eq!(user.avatar_minithumbnail, Some(raw));
+
+        // A profile photo with no minithumbnail attached still projects to None.
+        td.profile_photo.as_mut().unwrap().minithumbnail = None;
+        assert_eq!(User::from_tdlib(&td).avatar_minithumbnail, None);
     }
 
     #[test]
