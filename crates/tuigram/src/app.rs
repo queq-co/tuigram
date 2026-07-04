@@ -314,6 +314,13 @@ pub struct App {
     /// request the loop services by paging older history (#114). The loop reads and
     /// clears it each tick via [`take_wants_older_history`](Self::take_wants_older_history).
     wants_older_history: bool,
+    /// Set when a composer edit leaves unsent text in the buffer (#197): a pulse,
+    /// not the text itself, since the loop already knows the open chat and reads
+    /// the composer's buffer directly. The loop reads and clears it each tick via
+    /// [`take_wants_typing_ping`](Self::take_wants_typing_ping), throttling the
+    /// actual `sendChatAction(typing)` broadcast so it isn't refired on every
+    /// keystroke.
+    wants_typing_ping: bool,
     /// A submitted composer buffer awaiting dispatch to core (#116). `App` is pure
     /// and never touches the `Client`, so a submit lands here and the loop drains it
     /// via [`take_outbound`](Self::take_outbound), routing it to the send/edit seam.
@@ -571,6 +578,15 @@ impl App {
     /// the loaded history, so the loop fetches the next older page for the open chat.
     pub fn take_wants_older_history(&mut self) -> bool {
         std::mem::take(&mut self.wants_older_history)
+    }
+
+    /// Take the pending typing-ping pulse, if any (#197). The loop reads and
+    /// clears this each tick: `true` means the composer holds unsent text as of
+    /// the last edit, so (throttled) the loop broadcasts `sendChatAction(typing)`
+    /// for the open chat; `false` means no composer edit was made since the last
+    /// drain.
+    pub fn take_wants_typing_ping(&mut self) -> bool {
+        std::mem::take(&mut self.wants_typing_ping)
     }
 
     /// Take the pending composer submission, if any (#116). The loop drains this
@@ -898,10 +914,18 @@ impl App {
             }
             Action::ComposerInput(c) => {
                 self.composer.insert(c);
+                // A character was just inserted, so the buffer can't be empty (#197).
+                self.wants_typing_ping = true;
                 self.dirty = true;
             }
             Action::ComposerBackspace => {
                 self.composer.backspace();
+                // Only ping while there's still unsent text to indicate (#197); a
+                // backspace that empties the buffer lets the action expire on its
+                // own rather than sending one more ping for nothing left to type.
+                if !self.composer.is_empty() {
+                    self.wants_typing_ping = true;
+                }
                 self.dirty = true;
             }
             Action::ComposerLeft => {
@@ -3003,6 +3027,28 @@ mod tests {
         app.dispatch(Action::CopyMessage);
         assert_eq!(app.take_copy(), None);
         assert!(app.notifications.current().is_none());
+    }
+
+    #[test]
+    fn composer_input_pings_typing_but_backspace_to_empty_does_not() {
+        let mut app = App::new();
+        assert!(!app.take_wants_typing_ping(), "nothing typed yet");
+
+        app.dispatch(Action::ComposerInput('h'));
+        assert!(app.take_wants_typing_ping());
+        // Draining clears the pulse until the next edit.
+        assert!(!app.take_wants_typing_ping());
+
+        app.dispatch(Action::ComposerBackspace);
+        // The buffer is empty again: nothing left to indicate.
+        assert!(!app.take_wants_typing_ping());
+
+        app.dispatch(Action::ComposerInput('h'));
+        app.dispatch(Action::ComposerInput('i'));
+        app.take_wants_typing_ping();
+        app.dispatch(Action::ComposerBackspace);
+        // Still "hi" -> "h" left in the buffer: still worth a ping.
+        assert!(app.take_wants_typing_ping());
     }
 
     #[test]

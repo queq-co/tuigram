@@ -66,12 +66,13 @@ use crossterm::event::EventStream;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::{ChatKind, ChatListKind, Message, Sender, UserKind};
+use tuigram_core::model::{ChatAction, ChatKind, ChatListKind, Message, Sender, UserKind};
 use tuigram_core::{
-    AuthRequests, Client, DOWNLOAD_PRIORITY, DeleteRequests, EditRequests, FileRequests,
-    FormattedText, ForwardRequests, HistoryRequests, NEWEST, PinRequests, ReactionRequests,
-    ReadRequests, SecretChatRequests, SendRequests, StorageRequests, StorageSettings,
-    load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
+    AuthRequests, ChatActionRequests, Client, DOWNLOAD_PRIORITY, DeleteRequests, EditRequests,
+    FileRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST, PinRequests,
+    ReactionRequests, ReadRequests, SecretChatRequests, SendRequests, StorageRequests,
+    StorageSettings, load_archive_list, load_folder_list, load_main_list, search_chat,
+    search_global,
 };
 
 use crate::app::{Action, App};
@@ -134,6 +135,13 @@ const SEARCH_PAGE: i32 = 50;
 /// that delivers a single projected result set when it finishes, so a shallow
 /// channel suffices.
 const SEARCH_CHANNEL_DEPTH: usize = 8;
+
+/// How often the outbound typing action is re-broadcast while composing (#197).
+/// TDLib/Telegram's `typing` action expires on its own a few seconds after the
+/// last broadcast, so a real client refreshes it periodically rather than once;
+/// this bounds how often a keystroke actually reaches the network, rather than
+/// firing `sendChatAction` on every character.
+const TYPING_RESEND: Duration = Duration::from_secs(4);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -387,6 +395,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         drive_save(&mut app, client);
         // A copy request writes the selected message's text to the OS clipboard (#197).
         drive_copy(&mut app);
+        // Unsent composer text broadcasts a typing action for the open chat,
+        // throttled so it isn't refired on every keystroke (#197).
+        drive_typing(&mut app, client, &mut history);
         // A resync re-queries the chat list after a dropped-update gap (#195).
         drive_resync(&mut app, client, &outbound_tx);
         // A confirmed logout ends the session and quits; awaited (not spawned)
@@ -425,6 +436,9 @@ struct HistoryState {
     /// call to one per new horizon — without it the loop would re-send the same
     /// view on every frame until the fold caught up.
     read_through: HashMap<i64, i64>,
+    /// Per-chat timestamp of the last outbound typing broadcast (#197), throttling
+    /// [`drive_typing`] to [`TYPING_RESEND`] instead of firing on every keystroke.
+    typing_sent: HashMap<i64, std::time::Instant>,
 }
 
 /// The chat to show in the conversation pane: the chat-list selection while the
@@ -1028,6 +1042,37 @@ fn drive_copy(app: &mut App) {
         Ok(()) => app.notify(Notice::success("Copied to clipboard")),
         Err(_) => app.notify(Notice::error("copy", None)),
     }
+}
+
+/// Broadcast a typing action for the open chat while the composer holds unsent
+/// text (#197), mirroring a normal client. `App` only pulses that an edit left
+/// text in the buffer — it never touches the `Client` and doesn't know the open
+/// chat id, which lives in `history` — so this pairs the pulse with the open
+/// chat and throttles the actual broadcast to once per [`TYPING_RESEND`] per
+/// chat, so a burst of keystrokes sends one `sendChatAction`, not one per
+/// character. Fire-and-forget, like the read path (#115) — advisory, never
+/// blocks composing.
+fn drive_typing(app: &mut App, client: &Arc<Client>, history: &mut HistoryState) {
+    if !app.take_wants_typing_ping() {
+        return;
+    }
+    let Some(chat_id) = history.open else { return };
+    let now = std::time::Instant::now();
+    let due = history
+        .typing_sent
+        .get(&chat_id)
+        .is_none_or(|&last| now.duration_since(last) >= TYPING_RESEND);
+    if !due {
+        return;
+    }
+    history.typing_sent.insert(chat_id, now);
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        let _ = client
+            .bridge()
+            .send_chat_action(chat_id, Some(ChatAction::Typing))
+            .await;
+    });
 }
 
 /// Re-query the chat list after a dropped-update gap (#195). `App` records the
