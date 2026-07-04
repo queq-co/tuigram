@@ -223,6 +223,9 @@ async fn main() -> ExitCode {
 /// loop reads the folded chat list back from it to project the left pane (#113).
 async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> {
     let mut app = App::new();
+    // Seed once from what `TerminalGuard::new` already detected (#201); `guard`
+    // keeps its own copy (needed nowhere else yet), so this is a clone, not a move.
+    app.set_avatar_support(guard.avatar_support().clone());
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(FRAME);
     // Ages a showing toast once a second (#139), independent of the render tick, so
