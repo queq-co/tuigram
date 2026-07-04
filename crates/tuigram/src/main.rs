@@ -43,6 +43,10 @@ mod forward;
 mod keymap;
 mod login;
 mod mediaform;
+// Test-only command-surface parity guard (#197): no runtime code, so it's
+// compiled only for `cargo test`, avoiding a dead-code warning on the plain bin.
+#[cfg(test)]
+mod parity;
 mod reactions;
 mod search;
 mod secret;
