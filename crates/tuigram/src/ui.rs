@@ -455,26 +455,32 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(body, rect);
 }
 
-/// The lines for one message: a bold sender/timestamp header (with a selection
-/// marker when this is the cursor message and a pin marker when pinned), the body
-/// or a media placeholder, a download-progress line for media being fetched, an
+/// The lines for one message: a bold `HH:MM Name (@handle)` header (with a
+/// selection marker when this is the cursor message and a pin marker when
+/// pinned), the sender's accent color tinting the name/handle so the timestamp
+/// always sits in a fixed column regardless of name length (#194), the body or
+/// a media placeholder, a download-progress line for media being fetched, an
 /// optional reaction line, and a blank separator below.
 fn message_lines(view: &ConversationView, message: &Message, selected: bool) -> Vec<Line<'static>> {
-    let mut header = String::new();
+    let mut prefix = String::new();
     if selected {
-        header.push_str(SELECTED_SYMBOL);
+        prefix.push_str(SELECTED_SYMBOL);
     }
     if view.is_pinned(message.id) {
-        header.push_str("📌 ");
+        prefix.push_str("📌 ");
     }
-    header.push_str(&view.sender_label(message));
-    header.push_str("  ");
-    header.push_str(&hour_minute(message.date));
+    prefix.push_str(&hour_minute(message.date));
+    prefix.push(' ');
 
-    let mut lines = vec![Line::from(Span::styled(
-        header,
-        Style::new().add_modifier(Modifier::BOLD),
-    ))];
+    let label = view.sender_label(message);
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let name_span = match label.color {
+        Some(color) => Span::styled(label.label, bold.fg(color)),
+        None => Span::styled(label.label, bold),
+    };
+    let header = vec![Span::styled(prefix, bold), name_span];
+
+    let mut lines = vec![Line::from(header)];
     lines.extend(content_lines(&message.content));
     if let Some(progress) = download_line(view, &message.content) {
         lines.push(progress);
@@ -514,12 +520,24 @@ fn percent(file: &File) -> i64 {
     (file.downloaded_size * 100 / total).clamp(0, 100)
 }
 
-/// Format a Unix timestamp as `HH:MM` in UTC. Local-time conversion needs a
-/// timezone database the core does not carry yet (a follow-up); UTC keeps the
-/// header deterministic and snapshot-testable in the meantime.
+/// Format a Unix timestamp as `HH:MM` in the viewer's local timezone (#194).
 fn hour_minute(date: i32) -> String {
-    let seconds = i64::from(date).rem_euclid(86_400);
-    format!("{:02}:{:02}", seconds / 3600, (seconds % 3600) / 60)
+    format_time_in(date, &chrono::Local)
+}
+
+/// `hour_minute`'s conversion, generic over the target timezone so the offset
+/// arithmetic is unit-testable without depending on the host machine's local
+/// timezone: tests pass a fixed offset, production passes [`chrono::Local`].
+fn format_time_in<Tz: chrono::TimeZone>(date: i32, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    use chrono::TimeZone as _;
+    chrono::Utc
+        .timestamp_opt(i64::from(date), 0)
+        .single()
+        .map(|utc| utc.with_timezone(tz).format("%H:%M").to_string())
+        .unwrap_or_default()
 }
 
 /// The body lines for a message's content: the text for a text message, or a
@@ -1549,7 +1567,7 @@ mod tests {
 
     // --- conversation / history pane (#81) ---
 
-    use crate::conversation::{ConversationView, sample_message};
+    use crate::conversation::{ConversationView, SenderLabel, sample_message};
     use std::collections::{HashMap, HashSet};
     use tuigram_core::model::{FileRef, Photo, Reaction, Sender};
 
@@ -2153,7 +2171,13 @@ mod tests {
             10,
             vec![text_message(1, "hi")],
             HashSet::new(),
-            HashMap::from([(Sender::User(1), "Ada Lovelace (@ada)".to_owned())]),
+            HashMap::from([(
+                Sender::User(1),
+                SenderLabel {
+                    label: "Ada Lovelace (@ada)".to_owned(),
+                    color: Some(Color::Red),
+                },
+            )]),
         );
         let text = flatten(&render(&App::with_conversation(view), 80, 24));
         assert!(
@@ -2161,6 +2185,43 @@ mod tests {
             "resolved sender name in the header"
         );
         assert!(!text.contains("User 1"), "numeric fallback replaced");
+    }
+
+    #[test]
+    fn the_conversation_header_shows_the_timestamp_before_the_sender_name() {
+        // The header reads `HH:MM Name (@handle)` (#194) — the timestamp always
+        // comes first so it lines up in a fixed column regardless of name length.
+        let mut view = ConversationView::default();
+        view.project(
+            10,
+            vec![text_message(1, "hi")],
+            HashSet::new(),
+            HashMap::from([(
+                Sender::User(1),
+                SenderLabel {
+                    label: "Ada Lovelace (@ada)".to_owned(),
+                    color: Some(Color::Red),
+                },
+            )]),
+        );
+        let buffer = render(&App::with_conversation(view), 80, 24);
+        let row = row_containing(&buffer, "Ada Lovelace (@ada)");
+        let time_at = row.find(':').map(|colon| colon - 2).unwrap_or(usize::MAX);
+        let name_at = row.find("Ada").unwrap_or(usize::MAX);
+        assert!(
+            time_at < name_at,
+            "timestamp should render before the sender name, got row {row:?}"
+        );
+    }
+
+    #[test]
+    fn format_time_in_converts_using_the_given_timezone() {
+        // 2024-01-01T23:30:00Z, viewed at a fixed UTC+9 offset, reads 08:30 the
+        // next day — verified independent of the host machine's local timezone
+        // (which `hour_minute` uses in production via `chrono::Local`).
+        let date = 1_704_151_800;
+        let tz = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        assert_eq!(format_time_in(date, &tz), "08:30");
     }
 
     #[test]

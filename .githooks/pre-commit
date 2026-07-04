@@ -1,0 +1,10 @@
+#!/bin/sh
+# Blocks commits that would fail CI's Format step (cargo fmt --all --check).
+# Install with: git config core.hooksPath .githooks
+set -e
+
+if ! cargo fmt --all --check; then
+    echo
+    echo "pre-commit: 'cargo fmt --all --check' failed — run 'cargo fmt --all' and re-stage." >&2
+    exit 1
+fi

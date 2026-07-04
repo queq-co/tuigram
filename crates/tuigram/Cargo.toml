@@ -44,6 +44,8 @@ tokio-stream = { workspace = true }
 # Ratatui front-end + crossterm backend (terminal lifecycle, async input events).
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+# Local-time message timestamps (#194).
+chrono = { workspace = true }
 # QR encoder for the login QR screen (#86): renders the device-confirmation link
 # as a scannable code in the terminal.
 qrcodegen = { workspace = true }

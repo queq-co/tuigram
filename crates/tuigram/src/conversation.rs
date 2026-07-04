@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use ratatui::style::Color;
 use tuigram_core::model::{
     ChatAction, File, FormattedText, Message, MessageContent, Reaction, ReactionKind, Sender, User,
 };
@@ -168,12 +169,13 @@ pub struct ConversationView {
     /// projects this from the core [`ChatActionStore`](tuigram_core::ChatActionStore);
     /// it is never part of the message history.
     chat_action: Option<ChatAction>,
-    /// Display labels for the history's message senders (#160), resolved by the loop
-    /// from the core user/chat stores and keyed by [`Sender`]: a user's
-    /// `"Name (@handle)"` or a chat's title. A sender absent here (its record not yet
-    /// folded) falls back to the bare `User {id}` / `Chat {id}` in
-    /// [`sender_label`](Self::sender_label), so the header is always legible.
-    senders: HashMap<Sender, String>,
+    /// Display labels for the history's message senders (#160, #194), resolved by
+    /// the loop from the core user/chat stores and keyed by [`Sender`]: a user's
+    /// `"Name (@handle)"` plus their accent color, or a chat's title (untinted). A
+    /// sender absent here (its record not yet folded) falls back to the bare
+    /// `User {id}` / `Chat {id}` in [`sender_label`](Self::sender_label), so the
+    /// header is always legible.
+    senders: HashMap<Sender, SenderLabel>,
 }
 
 impl ConversationView {
@@ -226,7 +228,7 @@ impl ConversationView {
         chat_id: i64,
         messages: Vec<Message>,
         pinned: HashSet<i64>,
-        senders: HashMap<Sender, String>,
+        senders: HashMap<Sender, SenderLabel>,
     ) {
         if self.chat_id == Some(chat_id) {
             // Derive follow-ness from the *old* view before the swap: were we pinned
@@ -301,23 +303,27 @@ impl ConversationView {
         self.messages.get(self.offset)
     }
 
-    /// The header name for a message (#160): `"You"` for our own messages, else the
-    /// sender's resolved display label — a user's `"Name (@handle)"` or a chat's
-    /// title, folded in by the loop — falling back to the bare `User {id}` / `Chat
-    /// {id}` when the record has not arrived yet, so the header is never blank or
-    /// ambiguous.
+    /// The header name for a message (#160, #194): `"You"` for our own messages,
+    /// else the sender's resolved [`SenderLabel`] — a user's `"Name (@handle)"`
+    /// tinted with their accent color, or a chat's untinted title, folded in by the
+    /// loop — falling back to the bare, untinted `User {id}` / `Chat {id}` when the
+    /// record has not arrived yet, so the header is never blank or ambiguous.
     #[must_use]
-    pub(crate) fn sender_label(&self, message: &Message) -> String {
+    pub(crate) fn sender_label(&self, message: &Message) -> SenderLabel {
         if message.is_outgoing {
-            return "You".to_owned();
+            return SenderLabel {
+                label: "You".to_owned(),
+                color: None,
+            };
         }
         if let Some(label) = self.senders.get(&message.sender) {
             return label.clone();
         }
-        match message.sender {
+        let label = match message.sender {
             Sender::User(id) => format!("User {id}"),
             Sender::Chat(id) => format!("Chat {id}"),
-        }
+        };
+        SenderLabel { label, color: None }
     }
 
     /// Toggle the pinned state of message `id`: pin it if it is not pinned, unpin
@@ -555,21 +561,71 @@ fn content_rows(content: &MessageContent) -> usize {
     }
 }
 
-/// The display label for a user sender (#160): `"Name (@handle)"` when the user has
-/// both a name and a primary username, `"Name"` when only a name, `"@handle"` when
-/// only a username, and otherwise core's [`User::display_name`] fallback ("Deleted
-/// Account" or the bare `User {id}`). The loop resolves each history sender through
-/// this before handing the labels to [`ConversationView::project`].
+/// A sender's resolved header text plus the accent color to tint it with
+/// (#194). `color` is `None` for senders that get no accent tint — "You", a
+/// chat (channel/anonymous-admin post), or an unresolved fallback id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SenderLabel {
+    pub(crate) label: String,
+    pub(crate) color: Option<Color>,
+}
+
+/// The display label for a user sender (#160, #194): `"Name (@handle)"` when the
+/// user has both a name and a primary username, `"Name"` when only a name,
+/// `"@handle"` when only a username, and otherwise core's [`User::display_name`]
+/// fallback ("Deleted Account" or the bare `User {id}`), tinted with the user's
+/// accent color. The loop resolves each history sender through this before
+/// handing the labels to [`ConversationView::project`].
 #[must_use]
-pub(crate) fn sender_label_for(user: &User) -> String {
+pub(crate) fn sender_label_for(user: &User) -> SenderLabel {
     let name = format!("{} {}", user.first_name, user.last_name);
     let name = name.trim();
-    match (name.is_empty(), user.username()) {
+    let label = match (name.is_empty(), user.username()) {
         (false, Some(handle)) => format!("{name} (@{handle})"),
         (false, None) => name.to_owned(),
         (true, Some(handle)) => format!("@{handle}"),
         (true, None) => user.display_name(),
+    };
+    SenderLabel {
+        label,
+        color: Some(accent_color(user.accent_color_id, user.id)),
     }
+}
+
+/// The 7 fixed Telegram peer colors (red/orange/violet/green/cyan/blue/pink),
+/// approximated onto ratatui's named ANSI colors — there is no exact
+/// Orange/Violet/Pink variant — so the header tint follows whatever palette the
+/// user's terminal theme maps these names to, rather than a fixed hex value.
+const ACCENT_PALETTE: [Color; 7] = [
+    Color::Red,
+    Color::Yellow,
+    Color::Magenta,
+    Color::Green,
+    Color::Cyan,
+    Color::Blue,
+    Color::LightMagenta,
+];
+
+/// A sender's accent color (#194): a built-in `accent_color_id` (`0..=6`) maps
+/// directly onto [`ACCENT_PALETTE`]; a custom Premium id (`>=7`) or an
+/// out-of-range/negative id falls back to a deterministic hash of the user id,
+/// so a user without a chosen accent still always gets one stable color.
+fn accent_color(accent_color_id: i32, user_id: i64) -> Color {
+    let index = usize::try_from(accent_color_id)
+        .ok()
+        .filter(|&id| id < ACCENT_PALETTE.len())
+        .unwrap_or_else(|| (hash_user_id(user_id) % ACCENT_PALETTE.len() as u64) as usize);
+    ACCENT_PALETTE[index]
+}
+
+/// A splitmix64 finalizer mix on the user id — deterministic across runs
+/// (unlike `HashMap`'s randomized `RandomState`), so the same user always
+/// falls back to the same accent color.
+fn hash_user_id(id: i64) -> u64 {
+    let mut x = id as u64;
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
 }
 
 #[cfg(test)]
@@ -1036,6 +1092,8 @@ mod tests {
 
     /// A [`User`] with the given name and usernames; every other field inert. `kind`
     /// stays `Regular` so the empty-name fallback is `User {id}`, not "Deleted".
+    /// `accent_color_id` is `-1` (out of the built-in `0..=6` range) so callers
+    /// that don't care about color land on the deterministic hash fallback.
     fn user(id: i64, first: &str, last: &str, handles: &[&str]) -> User {
         User {
             id,
@@ -1046,13 +1104,14 @@ mod tests {
             is_contact: false,
             kind: UserKind::Regular,
             status: Presence::Never,
+            accent_color_id: -1,
         }
     }
 
     #[test]
     fn sender_label_for_joins_the_name_and_handle() {
         assert_eq!(
-            sender_label_for(&user(7, "Ada", "Lovelace", &["ada"])),
+            sender_label_for(&user(7, "Ada", "Lovelace", &["ada"])).label,
             "Ada Lovelace (@ada)"
         );
     }
@@ -1060,21 +1119,49 @@ mod tests {
     #[test]
     fn sender_label_for_uses_the_name_alone_without_a_handle() {
         assert_eq!(
-            sender_label_for(&user(7, "Ada", "Lovelace", &[])),
+            sender_label_for(&user(7, "Ada", "Lovelace", &[])).label,
             "Ada Lovelace"
         );
     }
 
     #[test]
     fn sender_label_for_falls_back_to_the_handle_when_the_name_is_empty() {
-        assert_eq!(sender_label_for(&user(7, "", "", &["ada"])), "@ada");
+        assert_eq!(sender_label_for(&user(7, "", "", &["ada"])).label, "@ada");
     }
 
     #[test]
     fn sender_label_for_falls_back_to_the_bare_id_when_nothing_is_known() {
         // No name, no handle, and a regular (non-deleted) account: core's
         // `display_name` bottoms out at `User {id}`.
-        assert_eq!(sender_label_for(&user(7, "", "", &[])), "User 7");
+        assert_eq!(sender_label_for(&user(7, "", "", &[])).label, "User 7");
+    }
+
+    #[test]
+    fn sender_label_for_carries_the_users_accent_color() {
+        // A resolved user is always tinted, matching `accent_color`'s own mapping.
+        let with_id = user(7, "Ada", "Lovelace", &["ada"]);
+        assert_eq!(
+            sender_label_for(&with_id).color,
+            Some(accent_color(with_id.accent_color_id, with_id.id))
+        );
+    }
+
+    #[test]
+    fn accent_color_maps_builtin_ids_onto_the_palette() {
+        for id in 0..7 {
+            assert_eq!(accent_color(id, 0), ACCENT_PALETTE[id as usize]);
+        }
+    }
+
+    #[test]
+    fn accent_color_falls_back_deterministically_for_ids_outside_the_palette() {
+        // Any out-of-range id (negative, or >= the palette length) hashes the same
+        // way for a given user — the exact id past the built-in range is inert.
+        assert_eq!(accent_color(-1, 42), accent_color(999, 42));
+        assert_eq!(accent_color(7, 42), accent_color(-1, 42));
+        // Different users generally land on different fallback colors (a sanity
+        // check, not a collision proof).
+        assert_ne!(accent_color(-1, 1), accent_color(-1, 2));
     }
 
     #[test]
@@ -1085,9 +1172,15 @@ mod tests {
             10,
             vec![message.clone()],
             HashSet::new(),
-            HashMap::from([(Sender::User(1), "Ada Lovelace (@ada)".to_owned())]),
+            HashMap::from([(
+                Sender::User(1),
+                SenderLabel {
+                    label: "Ada Lovelace (@ada)".to_owned(),
+                    color: Some(Color::Red),
+                },
+            )]),
         );
-        assert_eq!(view.sender_label(&message), "Ada Lovelace (@ada)");
+        assert_eq!(view.sender_label(&message).label, "Ada Lovelace (@ada)");
     }
 
     #[test]
@@ -1095,7 +1188,7 @@ mod tests {
         let mut view = ConversationView::default();
         let message = text(1, "hi");
         view.project(10, vec![message.clone()], HashSet::new(), HashMap::new());
-        assert_eq!(view.sender_label(&message), "User 1");
+        assert_eq!(view.sender_label(&message).label, "User 1");
     }
 
     #[test]
@@ -1107,9 +1200,15 @@ mod tests {
             10,
             vec![message.clone()],
             HashSet::new(),
-            HashMap::from([(Sender::Chat(-100), "Rust News".to_owned())]),
+            HashMap::from([(
+                Sender::Chat(-100),
+                SenderLabel {
+                    label: "Rust News".to_owned(),
+                    color: None,
+                },
+            )]),
         );
-        assert_eq!(view.sender_label(&message), "Rust News");
+        assert_eq!(view.sender_label(&message).label, "Rust News");
     }
 
     #[test]
@@ -1122,8 +1221,14 @@ mod tests {
             10,
             vec![message.clone()],
             HashSet::new(),
-            HashMap::from([(Sender::User(1), "Ada Lovelace (@ada)".to_owned())]),
+            HashMap::from([(
+                Sender::User(1),
+                SenderLabel {
+                    label: "Ada Lovelace (@ada)".to_owned(),
+                    color: Some(Color::Red),
+                },
+            )]),
         );
-        assert_eq!(view.sender_label(&message), "You");
+        assert_eq!(view.sender_label(&message).label, "You");
     }
 }
