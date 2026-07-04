@@ -32,6 +32,12 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 # async Stream feeding the central tokio::select! loop. See research/ratatui.md.
 ratatui = { version = "0.30" }
 crossterm = { version = "0.29", features = ["event-stream"] }
+# Local-time rendering for message timestamps (#194) — chrono is already pulled
+# in transitively via serde_with (a tdlib-rs dependency), so this adds no new
+# crate to the build graph, just promotes it to a direct dependency. Preferred
+# over the `time` crate, whose local-offset read is unsound in a multithreaded
+# process (this is a tokio app).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Config (de)serialization for ~/.config/tuigram/config.toml (api_id/api_hash).
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1" }

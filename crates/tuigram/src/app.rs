@@ -13,7 +13,7 @@ use tuigram_core::model::{File, Message, MessageContent, OutgoingMedia, SecretCh
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
 use crate::contact_picker::{ContactHit, ContactPickerView};
-use crate::conversation::{ConversationView, DeleteIntent, DeletePrompt, PinIntent};
+use crate::conversation::{ConversationView, DeleteIntent, DeletePrompt, PinIntent, SenderLabel};
 use crate::event::AppEvent;
 use crate::forward::{ForwardIntent, ForwardView};
 use crate::keymap::{self, Focus, Overlay};
@@ -598,7 +598,7 @@ impl App {
         chat_id: i64,
         messages: Vec<Message>,
         pinned: HashSet<i64>,
-        senders: HashMap<Sender, String>,
+        senders: HashMap<Sender, SenderLabel>,
     ) {
         self.conversation
             .project(chat_id, messages, pinned, senders);
@@ -1464,7 +1464,7 @@ impl App {
                 // send seam on submit (#116). A no-op on an empty history.
                 let target = self.conversation.selected_message().map(|m| {
                     let label = self.conversation.sender_label(m);
-                    (m.id, message_preview(&label, m))
+                    (m.id, message_preview(&label.label, m))
                 });
                 if let Some((id, preview)) = target {
                     self.composer.reply_to(id, preview);
@@ -1503,7 +1503,7 @@ impl App {
                 // our own messages. A no-op on an empty history.
                 let target = self.conversation.selected_message().map(|m| {
                     let label = self.conversation.sender_label(m);
-                    (m.chat_id, m.id, m.is_outgoing, message_preview(&label, m))
+                    (m.chat_id, m.id, m.is_outgoing, message_preview(&label.label, m))
                 });
                 if let Some((chat_id, id, own, preview)) = target {
                     self.delete = Some(DeletePrompt::new(chat_id, id, own, preview));

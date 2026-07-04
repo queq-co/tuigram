@@ -277,6 +277,10 @@ pub struct User {
     pub kind: UserKind,
     /// Current online presence.
     pub status: Presence,
+    /// Identifier of the accent color for the user's name and header tint
+    /// (#194): TDLib's fixed built-in ids are `0..=6`; `>=7` are Telegram
+    /// Premium custom colors this crate does not resolve to an exact RGB yet.
+    pub accent_color_id: i32,
 }
 
 impl User {
@@ -303,6 +307,7 @@ impl User {
             is_contact: user.is_contact,
             kind: UserKind::from_tdlib(&user.r#type),
             status: Presence::from_tdlib(&user.status),
+            accent_color_id: user.accent_color_id,
         }
     }
 
@@ -2919,6 +2924,7 @@ mod tests {
     }
 
     /// A TDLib `User` with every field zeroed but the ones a test cares about.
+    #[allow(clippy::too_many_arguments)]
     fn td_user(
         id: i64,
         first: &str,
@@ -2927,6 +2933,7 @@ mod tests {
         phone: &str,
         kind: TdUserType,
         status: TdUserStatus,
+        accent_color_id: i32,
     ) -> TdUser {
         TdUser {
             id,
@@ -2939,7 +2946,7 @@ mod tests {
             phone_number: phone.to_owned(),
             status,
             profile_photo: None,
-            accent_color_id: 0,
+            accent_color_id,
             background_custom_emoji_id: 0,
             upgraded_gift_colors: None,
             profile_accent_color_id: 0,
@@ -3021,6 +3028,7 @@ mod tests {
             "+15551234",
             TdUserType::Regular,
             TdUserStatus::Online(tdlib_rs::types::UserStatusOnline { expires: 5 }),
+            3,
         ));
         assert_eq!(user.id, 7);
         assert_eq!(user.username(), Some("ada"));
@@ -3028,6 +3036,7 @@ mod tests {
         assert_eq!(user.phone_number.as_deref(), Some("+15551234"));
         assert_eq!(user.kind, UserKind::Regular);
         assert_eq!(user.status, Presence::Online { expires: 5 });
+        assert_eq!(user.accent_color_id, 3);
 
         // No usernames and an empty phone collapse to None/empty, not "".
         let bare = User::from_tdlib(&td_user(
@@ -3038,6 +3047,7 @@ mod tests {
             "",
             TdUserType::Regular,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(bare.username(), None);
         assert!(bare.usernames.is_empty());
@@ -3054,6 +3064,7 @@ mod tests {
             "",
             TdUserType::Regular,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(named.display_name(), "Ada Lovelace");
 
@@ -3066,6 +3077,7 @@ mod tests {
             "",
             TdUserType::Regular,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(handle.display_name(), "@grace");
 
@@ -3078,6 +3090,7 @@ mod tests {
             "",
             TdUserType::Deleted,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(gone.display_name(), "Deleted Account");
 
@@ -3090,6 +3103,7 @@ mod tests {
             "",
             TdUserType::Regular,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(anon.display_name(), "User 10");
     }

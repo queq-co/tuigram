@@ -80,7 +80,7 @@ use crate::app::{Action, App};
 use crate::chat_list::{project_lists, project_secret_states};
 use crate::composer::Submission;
 use crate::contact_picker::ContactHit;
-use crate::conversation::sender_label_for;
+use crate::conversation::{SenderLabel, sender_label_for};
 use crate::event::{AppEvent, spawn_core_source};
 use crate::keymap::Focus;
 use crate::login::{LoginEnd, run_login};
@@ -1321,18 +1321,22 @@ fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) 
             .filter_map(|m| m.content.file())
             .filter_map(|file| s.files().get(file.id).cloned())
             .collect();
-        // Resolve each distinct sender to its display label (#160): a user's
-        // "Name (@handle)" via the user store, or a chat's title. A sender whose
-        // record has not been folded yet is left out — the view then falls back to a
-        // bare `User {id}` / `Chat {id}` and a later `updateUser` repaints the header.
-        let mut senders: HashMap<Sender, String> = HashMap::new();
+        // Resolve each distinct sender to its display label (#160, #194): a user's
+        // "Name (@handle)" tinted with their accent color via the user store, or a
+        // chat's untinted title. A sender whose record has not been folded yet is
+        // left out — the view then falls back to a bare `User {id}` / `Chat {id}`
+        // and a later `updateUser` repaints the header.
+        let mut senders: HashMap<Sender, SenderLabel> = HashMap::new();
         for sender in messages.iter().map(|m| &m.sender) {
             if senders.contains_key(sender) {
                 continue;
             }
             let label = match *sender {
                 Sender::User(id) => s.users().get(id).map(sender_label_for),
-                Sender::Chat(id) => s.chats().get(id).map(|chat| chat.title.clone()),
+                Sender::Chat(id) => s.chats().get(id).map(|chat| SenderLabel {
+                    label: chat.title.clone(),
+                    color: None,
+                }),
             };
             if let Some(label) = label {
                 senders.insert(sender.clone(), label);

@@ -3070,6 +3070,7 @@ name = "tuigram"
 version = "2026.7.0"
 dependencies = [
  "arboard",
+ "chrono",
  "crossterm",
  "qrcodegen",
  "ratatui",
