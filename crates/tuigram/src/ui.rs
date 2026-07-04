@@ -94,6 +94,8 @@ pub fn ui(frame: &mut Frame, app: &App) -> usize {
         Overlay::Settings => render_settings(frame, frame.area(), app),
         Overlay::DeleteConfirm => render_delete_confirm(frame, frame.area(), app),
         Overlay::LogoutConfirm => render_logout_confirm(frame, frame.area(), app),
+        Overlay::ContactSearchInput => render_contact_search_input(frame, frame.area(), app),
+        Overlay::ContactSearchResults => render_contact_search_results(frame, frame.area(), app),
     }
 
     // A transient toast floats over the content too, but — unlike a modal overlay
@@ -380,6 +382,7 @@ fn mode_label(app: &App) -> &'static str {
         Overlay::Settings => "settings",
         Overlay::DeleteConfirm => "delete",
         Overlay::LogoutConfirm => "logout",
+        Overlay::ContactSearchInput | Overlay::ContactSearchResults => "new secret chat",
     }
 }
 
@@ -818,6 +821,75 @@ fn render_search_results(frame: &mut Frame, area: Rect, app: &App) {
         items,
         search.selected(),
         "j / k move · Enter open · f forward · Esc close",
+    );
+}
+
+/// The contact-search query line (#197): a centred modal with the editable query
+/// over a key hint. Mirrors [`render_search_input`].
+fn render_contact_search_input(frame: &mut Frame, area: Rect, app: &App) {
+    let contacts = app.contacts();
+    let query = if contacts.query().is_empty() {
+        Line::from(Span::styled(
+            "type a name to search contacts…",
+            Style::new().add_modifier(Modifier::DIM),
+        ))
+    } else {
+        input_line(contacts.query(), contacts.cursor())
+    };
+    let lines = vec![
+        query,
+        Line::from(""),
+        hint_line("Enter to search · Esc to cancel"),
+    ];
+
+    let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" New secret chat — search contacts ")
+                .title_alignment(Alignment::Center),
+        ),
+        popup,
+    );
+}
+
+/// The contact-search results overlay (#197): a centred modal listing the
+/// matching contacts. Confirming one opens the secret-chat confirm
+/// ([`render_secret_chat`]) for that user. Mirrors [`render_search_results`].
+fn render_contact_search_results(frame: &mut Frame, area: Rect, app: &App) {
+    let contacts = app.contacts();
+    let title = format!(
+        " Contacts — \"{}\" ({}) ",
+        truncate(contacts.query(), 30),
+        contacts.results().len()
+    );
+    if contacts.results().is_empty() {
+        let popup = centered_rect(OVERLAY_WIDTH, 3, area);
+        frame.render_widget(Clear, popup);
+        frame.render_widget(
+            Paragraph::new("no matches").block(
+                Block::bordered()
+                    .title(title)
+                    .title_alignment(Alignment::Center),
+            ),
+            popup,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = contacts
+        .results()
+        .iter()
+        .map(|hit| ListItem::new(hit.display_name.clone()))
+        .collect();
+    render_list_modal(
+        frame,
+        area,
+        title,
+        items,
+        contacts.selected(),
+        "j / k move · Enter start secret chat · Esc close",
     );
 }
 

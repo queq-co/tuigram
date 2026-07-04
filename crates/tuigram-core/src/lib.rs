@@ -9,7 +9,9 @@ pub mod auth;
 pub mod bridge;
 pub mod chats;
 pub mod client;
+pub mod command_surface;
 pub mod connection;
+pub mod contacts;
 pub mod credentials;
 pub mod files;
 pub mod messages;
@@ -28,7 +30,9 @@ pub use chats::{
     CHATS_EXHAUSTED, ChatRequests, ChatStore, load_archive_list, load_folder_list, load_main_list,
 };
 pub use client::{AccountState, Client};
+pub use command_surface::REPL_COMMANDS;
 pub use connection::{ConnectionState, ConnectionStore};
+pub use contacts::ContactRequests;
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };

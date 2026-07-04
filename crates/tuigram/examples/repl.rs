@@ -1648,40 +1648,12 @@ mod tests {
     #[test]
     fn every_dispatched_command_is_in_the_table() {
         // Guards the table against drifting from the `run_repl` match arms.
-        for name in [
-            "chats",
-            "open",
-            "history",
-            "send",
-            "reply",
-            "edit",
-            "delete",
-            "read",
-            "search",
-            "forward",
-            "download",
-            "file",
-            "sendmedia",
-            "archive",
-            "folders",
-            "folder",
-            "react",
-            "unreact",
-            "pin",
-            "unpin",
-            "typing",
-            "secret-new",
-            "secrets",
-            "secret-close",
-            "status",
-            "probe",
-            "resync",
-            "logout",
-            "help",
-            "quit",
-        ] {
+        // `REPL_COMMANDS` is the same list the TUI's command-parity guard
+        // (`crates/tuigram/src/parity.rs`) reads (#197) — kept here, not
+        // hand-duplicated, so the two checks can't drift apart.
+        for name in tuigram_core::command_surface::REPL_COMMANDS {
             assert!(
-                COMMANDS.iter().any(|c| c.name == name),
+                COMMANDS.iter().any(|c| c.name == *name),
                 "`{name}` is dispatched but missing from COMMANDS (help + completion)",
             );
         }

@@ -48,6 +48,9 @@ tempfile = { version = "3" }
 # link is drawn as a scannable code. Nayuki's reference implementation — pure
 # Rust, zero dependencies, deterministic output (so the render is snapshot-testable).
 qrcodegen = { version = "1.8" }
+# OS clipboard access for "copy the selected message" (`y`, #197). Cross-platform
+# (macOS Pasteboard / X11+Wayland / Windows), matching our brew-tap macOS target.
+arboard = { version = "3" }
 # Readline-style line editing for the headless REPL harness only (#156–#157):
 # in-session up/down history and command-name tab completion. `default-features
 # = false` drops the file-history + directory helpers, so `DefaultHistory` is the

@@ -26,6 +26,9 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
   real-TDLib lifecycle verification checklist run via the REPL (login, connection,
   send/read/react/pin/forward/search/media/secret, resync, logout), its recorded
   outcomes, and any gaps filed.
+- [repl-tui-divergences.md](repl-tui-divergences.md) — the allow-list of REPL
+  commands and behaviors with no TUI equivalent, and why; read by the
+  command-surface parity guard (`crates/tuigram/src/parity.rs`, #197).
 - [../settings.example.toml](../settings.example.toml) — annotated template for
   `~/.config/tuigram/settings.toml`: download-cache retention (per-kind TTLs and the
   global size backstop). Optional; copy it into place to opt in.
