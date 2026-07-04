@@ -58,3 +58,6 @@ rustyline = { workspace = true, optional = true }
 # Raster mini-avatar bubbles (#201): Picker/Protocol lifecycle for rendering
 # real photos as Sixel/Kitty/iTerm2 images in the conversation pane.
 ratatui-image = { workspace = true }
+# Decodes a sender's minithumbnail JPEG bytes before handing them to
+# `Picker::new_protocol` (#201).
+image = { workspace = true }

@@ -3703,6 +3703,7 @@ dependencies = [
  "arboard",
  "chrono",
  "crossterm",
+ "image",
  "qrcodegen",
  "ratatui",
  "ratatui-image",

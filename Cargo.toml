@@ -74,6 +74,11 @@ base64 = { version = "0.22" }
 # default `chafa-dyn`/`chafa-static`, avoiding a system `libchafa` build
 # dependency; see docs/research (Stage 2 verification) for why.
 ratatui-image = { version = "11", default-features = false, features = ["image-defaults"] }
+# Decodes a sender's minithumbnail JPEG bytes into the `DynamicImage`
+# `Picker::new_protocol` (#201) needs. Already in the graph transitively via
+# `ratatui-image`/`arboard`; promoted to direct since Stage 3 calls
+# `image::load_from_memory` itself. Default features include the JPEG codec.
+image = { version = "0.25" }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.
