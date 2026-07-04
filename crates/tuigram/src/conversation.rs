@@ -1105,6 +1105,7 @@ mod tests {
             kind: UserKind::Regular,
             status: Presence::Never,
             accent_color_id: -1,
+            avatar_minithumbnail: None,
         }
     }
 
