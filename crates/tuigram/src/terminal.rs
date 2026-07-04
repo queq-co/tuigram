@@ -18,6 +18,11 @@ use ratatui_image::picker::{Picker, ProtocolType};
 /// process's stdout.
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 
+/// Floor on the avatar gutter's width in columns (#201), so a very wide
+/// terminal font still leaves a bubble wide enough to read as an image rather
+/// than a sliver.
+const GUTTER_MIN_COLS: usize = 2;
+
 /// What [`Picker::from_query_stdio`] detected at startup for the raster
 /// mini-avatar (#201). Only real graphics protocols (Sixel/Kitty/iTerm2) count
 /// as supported; halfblocks and any detection failure both fall back to
@@ -26,9 +31,7 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// (halfblocks) visual path.
 #[derive(Debug, Clone, Default)]
 pub enum AvatarSupport {
-    /// A terminal that speaks Sixel, Kitty, or iTerm2 graphics. The `Picker` is
-    /// unused until Stage 3's render path calls `new_protocol` on it.
-    #[allow(dead_code)]
+    /// A terminal that speaks Sixel, Kitty, or iTerm2 graphics.
     Graphics(Picker),
     /// Halfblocks-only, or capability detection failed outright.
     #[default]
@@ -43,6 +46,27 @@ impl AvatarSupport {
             }
             ProtocolType::Halfblocks => AvatarSupport::None,
         }
+    }
+
+    /// Width, in terminal columns, of the avatar gutter reserved to the left
+    /// of each message (#201): `0` when this is `None`, so every line's
+    /// leading span collapses to nothing and the pane renders byte-identical
+    /// to pre-#201 output; otherwise sized from the terminal's own cell aspect
+    /// ratio (`round(2 rows tall / cell aspect)`) so the 2-row bubble reads as
+    /// roughly square, clamped to [`GUTTER_MIN_COLS`]. Shared by the render
+    /// path (the gutter span's width) and `drive_avatars` (the target size
+    /// handed to `Picker::new_protocol`), so an avatar is always encoded to
+    /// fill exactly the space reserved for it.
+    pub fn gutter_cols(&self) -> usize {
+        let Self::Graphics(picker) = self else {
+            return 0;
+        };
+        let font = picker.font_size();
+        if font.width == 0 {
+            return GUTTER_MIN_COLS;
+        }
+        let cols = (2.0 * f64::from(font.height) / f64::from(font.width)).round() as usize;
+        cols.max(GUTTER_MIN_COLS)
     }
 }
 
@@ -133,5 +157,23 @@ mod tests {
         let _support = Picker::from_query_stdio()
             .map(AvatarSupport::detect)
             .unwrap_or(AvatarSupport::None);
+    }
+
+    #[test]
+    fn gutter_cols_is_zero_without_graphics_support() {
+        // The `None` capability (halfblocks or no real terminal, #201) reserves
+        // no gutter at all — this is what keeps that path byte-identical to
+        // pre-#201 rendering.
+        assert_eq!(AvatarSupport::None.gutter_cols(), 0);
+    }
+
+    #[test]
+    fn gutter_cols_is_derived_from_the_pickers_font_aspect_ratio() {
+        // `Picker::halfblocks()` reports a 10×20px cell; a real
+        // graphics-capable `Picker` (any protocol) reports whatever the
+        // terminal answered. round(2 rows tall / (20/10) cell aspect) = 4.
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        assert_eq!(AvatarSupport::Graphics(picker).gutter_cols(), 4);
     }
 }

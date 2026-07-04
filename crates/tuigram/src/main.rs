@@ -64,6 +64,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::EventStream;
+use ratatui::layout::Size;
+use ratatui_image::Resize;
+use ratatui_image::protocol::Protocol;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
@@ -86,7 +89,7 @@ use crate::keymap::Focus;
 use crate::login::{LoginEnd, run_login};
 use crate::search::SearchHit;
 use crate::status::Notice;
-use crate::terminal::{TerminalGuard, install_panic_hook};
+use crate::terminal::{AvatarSupport, TerminalGuard, install_panic_hook};
 
 /// Render cadence cap (~30 FPS). Bounds repaint rate independently of network
 /// latency, so the UI stays smooth while core is mid-request.
@@ -146,6 +149,11 @@ const CONTACT_SEARCH_LIMIT: i32 = 50;
 /// one search that delivers a single resolved result set when it finishes, so a
 /// shallow channel suffices, matching [`SEARCH_CHANNEL_DEPTH`].
 const CONTACT_SEARCH_CHANNEL_DEPTH: usize = 8;
+
+/// Depth of the avatar-encode → loop completion channel (#201). Each distinct
+/// sender is encoded at most once per `AvatarCache` lifetime (or once more on
+/// a decode/encode failure's retry), so a shallow channel suffices.
+const AVATAR_CHANNEL_DEPTH: usize = 16;
 
 /// How often the outbound typing action is re-broadcast while composing (#197).
 /// TDLib/Telegram's `typing` action expires on its own a few seconds after the
@@ -257,6 +265,10 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // progress and the projection reflects it, without the loop re-requesting on
     // every re-projection.
     let mut downloading: HashSet<i32> = HashSet::new();
+    // The user ids whose avatar photo is being decoded+encoded off the render
+    // thread this run (#201), so a re-scan of the open chat never spawns a
+    // second encode for the same sender while one is already in flight.
+    let mut avatar_encoding: HashSet<i64> = HashSet::new();
     let (history_tx, mut history_rx) = mpsc::channel::<HistoryPage>(HISTORY_CHANNEL_DEPTH);
     // A spawned send/edit (#116) reports a seam-level rejection back here as a toast;
     // the loop surfaces it through the notification queue.
@@ -269,6 +281,10 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // `outbound_tx`'s toast.)
     let (contact_tx, mut contact_rx) =
         mpsc::channel::<Vec<ContactHit>>(CONTACT_SEARCH_CHANNEL_DEPTH);
+    // A spawned avatar encode (#201) reports the built protocol back here (or
+    // `None` on a decode/encode failure); the loop caches it and clears the
+    // sender's in-flight marker either way.
+    let (avatar_tx, mut avatar_rx) = mpsc::channel::<(i64, Option<Protocol>)>(AVATAR_CHANNEL_DEPTH);
 
     // Kick off the landing list (Main) before the first frame; the rest load on
     // demand as the user switches to them.
@@ -380,6 +396,18 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                     app.set_search_results(hits);
                 }
             }
+            // A spawned avatar encode finished (#201): clear its in-flight marker
+            // and cache the protocol so the next frame draws it instead of a
+            // blank gutter. `None` (a decode/encode failure) just clears the
+            // marker — that sender keeps its blank gutter this run.
+            maybe_avatar = avatar_rx.recv() => {
+                if let Some((user_id, protocol)) = maybe_avatar {
+                    avatar_encoding.remove(&user_id);
+                    if let Some(protocol) = protocol {
+                        app.cache_avatar(user_id, protocol);
+                    }
+                }
+            }
         }
 
         // A list switch may have moved onto a list we have not paged yet — load it.
@@ -414,6 +442,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // Pull down the open chat's incoming media, each file once, so the progress
         // lines and saved markers resolve as `updateFile` folds (#120).
         drive_downloads(client, &history, &mut downloading);
+        // Encode the open chat's sender avatars, each user once, so the gutter
+        // fills in as `Picker::new_protocol` finishes off the render thread (#201).
+        drive_avatars(&app, client, &history, &mut avatar_encoding, &avatar_tx);
         // A confirmed delete removes the message for us or everyone; the real
         // `updateDeleteMessages` folds and re-projects the history (#195).
         drive_delete(&mut app, client, &outbound_tx);
@@ -1046,6 +1077,79 @@ fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &m
                 .bridge()
                 .download_file(file_id, DOWNLOAD_PRIORITY)
                 .await;
+        });
+    }
+}
+
+/// Kick off avatar encoding for the open chat's user senders (#201): for each
+/// distinct [`Sender::User`] the history references, with a minithumbnail, not
+/// yet cached on `App` and not already in flight this run, decode the JPEG
+/// bytes and hand them to the `Picker` off the render thread, reporting the
+/// built [`Protocol`] back on `avatar_tx`. A no-op with graphics support off
+/// (#201's scope decision — nowhere to draw the result) or no chat open.
+///
+/// Like [`drive_downloads`], this dedups per-run via `encoding`; unlike it, a
+/// decode/encode failure still reports back (as `None`) so its in-flight
+/// marker clears rather than wedging that sender permanently skipped.
+fn drive_avatars(
+    app: &App,
+    client: &Arc<Client>,
+    history: &HistoryState,
+    encoding: &mut HashSet<i64>,
+    avatar_tx: &mpsc::Sender<(i64, Option<Protocol>)>,
+) {
+    let AvatarSupport::Graphics(picker) = app.avatar_support() else {
+        return;
+    };
+    // The exact cell area the render path reserves for the bubble (#201) — the
+    // same `gutter_cols()` the header's leading span is sized to — so the
+    // encoded image fills the gutter rather than a fixed, possibly-mismatched
+    // guess.
+    let size = Size::new(app.avatar_support().gutter_cols() as u16, 2);
+    let Some(chat_id) = history.open else { return };
+    // Distinct user senders in the loaded history with a minithumbnail, not
+    // already cached or in flight — read once as a batch rather than spawning
+    // a lookup per message.
+    let to_start: Vec<(i64, Vec<u8>)> = client.read(|s| {
+        let senders: HashSet<i64> = s
+            .messages()
+            .history(chat_id)
+            .into_iter()
+            .filter_map(|m| match m.sender {
+                Sender::User(id) => Some(id),
+                Sender::Chat(_) => None,
+            })
+            .filter(|id| app.cached_avatar(*id).is_none() && !encoding.contains(id))
+            .collect();
+        senders
+            .into_iter()
+            .filter_map(|id| {
+                s.users()
+                    .get(id)
+                    .and_then(|user| user.avatar_minithumbnail.clone())
+                    .map(|bytes| (id, bytes))
+            })
+            .collect()
+    });
+
+    for (user_id, bytes) in to_start {
+        encoding.insert(user_id);
+        let picker = picker.clone();
+        let avatar_tx = avatar_tx.clone();
+        tokio::spawn(async move {
+            let protocol = tokio::task::spawn_blocking(move || {
+                let image = image::load_from_memory(&bytes).ok()?;
+                // `Fit` only ever shrinks (`min(target, image_size)` in its
+                // pixel math) — a minithumbnail is typically far smaller in
+                // pixels than one terminal cell, so `Fit` would render it at
+                // its tiny native size instead of filling the gutter. `Scale`
+                // resizes in both directions to hit `size`, upscaling a small
+                // source image the way this always-tiny minithumbnail needs.
+                picker.new_protocol(image, size, Resize::Scale(None)).ok()
+            })
+            .await
+            .unwrap_or(None);
+            let _ = avatar_tx.send((user_id, protocol)).await;
         });
     }
 }

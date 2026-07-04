@@ -17,10 +17,12 @@ use ratatui::widgets::{
     Block, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
+use ratatui_image::Image;
+use ratatui_image::protocol::Protocol;
 
 use tuigram_core::model::{
     Chat, ChatAction, ChatKind, File, FormattedText, Message, MessageContent, ReactionKind,
-    SecretChatState,
+    SecretChatState, Sender,
 };
 
 use crate::chat_list::ChatListView;
@@ -263,14 +265,30 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     // full, building at most one message past the boundary — never the whole
     // history. `inner` excludes the block's top and bottom borders.
     let inner_rows = area.height.saturating_sub(2) as usize;
+    let gutter_cols = app.avatar_support().gutter_cols();
     let mut lines: Vec<Line> = Vec::new();
+    // Row offset (within `inner_rows`) and built protocol for each visible
+    // message whose sender's avatar has already been encoded this session
+    // (#201) — recorded here, alongside the text, so a second pass below can
+    // place the `Image` widget precisely on the header's first row. A message
+    // whose avatar has not been encoded yet (or has none, or graphics support
+    // is off) simply renders a blank gutter — [`drive_avatars`] in `main.rs`
+    // kicks off the encode and a later frame draws it once cached.
+    let mut avatars: Vec<(usize, &Protocol)> = Vec::new();
     // The message at the offset (the first built) is the selected one — the
     // cursor the reaction/pin affordances act on — so it carries the marker.
     for (i, message) in view.messages().iter().skip(view.offset()).enumerate() {
         if lines.len() >= inner_rows {
             break;
         }
-        lines.extend(message_lines(view, message, i == 0));
+        let row = lines.len();
+        if gutter_cols > 0
+            && let Sender::User(user_id) = message.sender
+            && let Some(protocol) = app.cached_avatar(user_id)
+        {
+            avatars.push((row, protocol));
+        }
+        lines.extend(message_lines(view, message, i == 0, gutter_cols));
     }
     lines.truncate(inner_rows);
 
@@ -283,6 +301,21 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block(title, app.focus() == Focus::History);
     let history = Paragraph::new(lines).block(block);
     frame.render_widget(history, area);
+
+    // Second pass (#201): overlay one 2-row `Image` widget per visible
+    // avatar-bearing message, at the inner column/row the header's leading
+    // gutter span reserved for it. Clip the height to what `truncate` above
+    // actually kept, so a message half-cut off at the pane's bottom edge
+    // never draws its bubble past the border.
+    for (row, protocol) in avatars {
+        let rect = Rect {
+            x: area.x + 1,
+            y: area.y + 1 + row as u16,
+            width: gutter_cols as u16,
+            height: 2.min((inner_rows - row) as u16),
+        };
+        frame.render_widget(Image::new(protocol), rect);
+    }
 
     // The scrollbar tracks the message offset, inset one row so it rides the
     // right border between the block's corners.
@@ -460,8 +493,18 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
 /// pinned), the sender's accent color tinting the name/handle so the timestamp
 /// always sits in a fixed column regardless of name length (#194), the body or
 /// a media placeholder, a download-progress line for media being fetched, an
-/// optional reaction line, and a blank separator below.
-fn message_lines(view: &ConversationView, message: &Message, selected: bool) -> Vec<Line<'static>> {
+/// optional reaction line, and a blank separator below. When `gutter_cols` is
+/// non-zero (real graphics support, #201), every line is prefixed with a blank
+/// span that width wide, reserving a left margin for the avatar bubble the
+/// caller overlays afterward — the marker/pin prefix that used to start in
+/// column 0 now starts just past the gutter instead. `gutter_cols == 0`
+/// renders byte-identical to pre-#201 output.
+fn message_lines(
+    view: &ConversationView,
+    message: &Message,
+    selected: bool,
+    gutter_cols: usize,
+) -> Vec<Line<'static>> {
     let mut prefix = String::new();
     if selected {
         prefix.push_str(SELECTED_SYMBOL);
@@ -478,18 +521,46 @@ fn message_lines(view: &ConversationView, message: &Message, selected: bool) -> 
         Some(color) => Span::styled(label.label, bold.fg(color)),
         None => Span::styled(label.label, bold),
     };
-    let header = vec![Span::styled(prefix, bold), name_span];
+    let mut header = gutter_span(gutter_cols);
+    header.push(Span::styled(prefix, bold));
+    header.push(name_span);
 
     let mut lines = vec![Line::from(header)];
-    lines.extend(content_lines(&message.content));
+    lines.extend(
+        content_lines(&message.content)
+            .into_iter()
+            .map(|line| indent_line(line, gutter_cols)),
+    );
     if let Some(progress) = download_line(view, &message.content) {
-        lines.push(progress);
+        lines.push(indent_line(progress, gutter_cols));
     }
     if let Some(reactions) = reaction_line(message) {
-        lines.push(reactions);
+        lines.push(indent_line(reactions, gutter_cols));
     }
     lines.push(Line::from(""));
     lines
+}
+
+/// A blank leading span reserving the avatar gutter's width (#201), or no span
+/// at all when `gutter_cols` is `0` — kept as its own `Vec` (not a `Line`) so
+/// [`message_lines`]'s header can push more spans after it on the same line.
+fn gutter_span(gutter_cols: usize) -> Vec<Span<'static>> {
+    if gutter_cols == 0 {
+        Vec::new()
+    } else {
+        vec![Span::raw(" ".repeat(gutter_cols))]
+    }
+}
+
+/// Prefix an already-built line with the avatar gutter (see [`gutter_span`]);
+/// a no-op when `gutter_cols` is `0`.
+fn indent_line(line: Line<'static>, gutter_cols: usize) -> Line<'static> {
+    if gutter_cols == 0 {
+        return line;
+    }
+    let mut spans = gutter_span(gutter_cols);
+    spans.extend(line.spans);
+    Line::from(spans)
 }
 
 /// The download-progress line for a media message, driven by the file's transfer
@@ -1272,6 +1343,7 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::AvatarSupport;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::{Buffer, Cell};
@@ -1585,6 +1657,38 @@ mod tests {
     /// An app whose history holds `messages`, none pinned.
     fn app_with_history(messages: Vec<Message>) -> App {
         App::with_conversation(ConversationView::from_messages(messages, HashSet::new()))
+    }
+
+    #[test]
+    fn graphics_avatar_support_indents_the_header_by_the_gutter_width() {
+        use ratatui_image::picker::{Picker, ProtocolType};
+
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut app = app_with_history(vec![text_message(1, "hi")]);
+        app.set_avatar_support(AvatarSupport::Graphics(picker));
+        let cols = app.avatar_support().gutter_cols();
+        let buffer = render(&app, 80, 24);
+
+        // Row 1 is the history pane's first inner row. The selected marker
+        // used to start right after that pane's left border; with graphics
+        // support active it now starts `cols` blank columns later, reserving
+        // the avatar bubble's left margin — check the chars immediately
+        // preceding the marker, rather than the row's absolute start, since
+        // the chat-list pane (a separate, narrower pane) precedes it on the
+        // same row.
+        let row: Vec<char> = row_text(&buffer, 1).chars().collect();
+        let marker_pos = row
+            .iter()
+            .position(|&c| c == '▶')
+            .expect("selected marker present");
+        let gutter: String = row[marker_pos - cols..marker_pos].iter().collect();
+        assert_eq!(gutter, " ".repeat(cols), "the gutter itself is blank");
+        assert_eq!(
+            row[marker_pos - cols - 1],
+            '│',
+            "the gutter starts right after the pane's left border"
+        );
     }
 
     #[test]
@@ -1954,13 +2058,17 @@ mod tests {
         for message in view.messages() {
             // The pane never wraps, so height is width-independent; the selection
             // marker only prefixes the header and never changes the row count.
+            // Neither does a non-zero gutter (#201) — it only prepends a span to
+            // existing lines, never adds one — so both are checked here.
             for selected in [false, true] {
-                assert_eq!(
-                    message_lines(&view, message, selected).len(),
-                    view.message_height(message),
-                    "height drifts from the renderer for message {}",
-                    message.id
-                );
+                for gutter_cols in [0, 4] {
+                    assert_eq!(
+                        message_lines(&view, message, selected, gutter_cols).len(),
+                        view.message_height(message),
+                        "height drifts from the renderer for message {}",
+                        message.id
+                    );
+                }
             }
         }
     }

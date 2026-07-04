@@ -37,16 +37,12 @@ pub struct AvatarCache(HashMap<i64, Protocol>);
 
 impl AvatarCache {
     /// The built protocol for a user, if their avatar has already been
-    /// encoded this session. Unused until Stage 3 starts populating the cache
-    /// from the render path.
-    #[allow(dead_code)]
+    /// encoded this session.
     pub fn get(&self, user_id: i64) -> Option<&Protocol> {
         self.0.get(&user_id)
     }
 
     /// Record a newly built protocol for a user, replacing any previous one.
-    /// Unused until Stage 3 starts populating the cache from the render path.
-    #[allow(dead_code)]
     pub fn insert(&mut self, user_id: i64, protocol: Protocol) {
         self.0.insert(user_id, protocol);
     }
@@ -478,9 +474,9 @@ pub struct App {
     /// or no real terminal) renders today's #194 plain header with no avatar
     /// gutter; only `Graphics` unlocks it (Stage 3).
     avatar_support: AvatarSupport,
-    /// Built avatar protocols for senders seen this session (#201). Empty until
-    /// Stage 3 starts encoding; present now so that work has somewhere to land.
-    #[allow(dead_code)]
+    /// Built avatar protocols for senders seen this session (#201), populated by
+    /// the render path via [`cache_avatar`](Self::cache_avatar) as `drive_avatars`
+    /// finishes encoding each sender's photo.
     avatar_cache: AvatarCache,
 }
 
@@ -601,26 +597,22 @@ impl App {
     }
 
     /// The graphics-protocol capability in effect, for the render path to
-    /// decide whether to draw an avatar gutter at all. Unused until Stage 3
-    /// wires up the render path that reads it.
-    #[allow(dead_code)]
+    /// decide whether to draw an avatar gutter at all.
     pub fn avatar_support(&self) -> &AvatarSupport {
         &self.avatar_support
     }
 
     /// The built protocol for a sender's avatar, if already encoded this
-    /// session. Unused until Stage 3 populates the cache via
-    /// [`cache_avatar`](Self::cache_avatar) from the render path.
-    #[allow(dead_code)]
+    /// session.
     pub fn cached_avatar(&self, user_id: i64) -> Option<&Protocol> {
         self.avatar_cache.get(user_id)
     }
 
-    /// Record a newly built avatar protocol for a sender. Unused until Stage 3
-    /// wires up the render path that calls it.
-    #[allow(dead_code)]
+    /// Record a newly built avatar protocol for a sender (`drive_avatars`,
+    /// #201), so the next render draws it instead of a blank gutter.
     pub fn cache_avatar(&mut self, user_id: i64, protocol: Protocol) {
         self.avatar_cache.insert(user_id, protocol);
+        self.dirty = true;
     }
 
     /// The core link's connection state, for the status bar's left field.
