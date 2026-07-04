@@ -385,6 +385,8 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // A save request reveals the media's local path (already downloaded) or
         // starts its download (#195).
         drive_save(&mut app, client);
+        // A copy request writes the selected message's text to the OS clipboard (#197).
+        drive_copy(&mut app);
         // A resync re-queries the chat list after a dropped-update gap (#195).
         drive_resync(&mut app, client, &outbound_tx);
         // A confirmed logout ends the session and quits; awaited (not spawned)
@@ -1010,6 +1012,21 @@ fn drive_save(app: &mut App, client: &Arc<Client>) {
                 "Downloading… progress shows in the conversation; press S again when it completes.",
             ));
         }
+    }
+}
+
+/// Write the selected message's text to the OS clipboard (`y`, #197). `App`
+/// records the text (it cannot reach the OS clipboard and stays pure); the loop
+/// drains it and writes it out here, toasting either result. Best-effort: no
+/// clipboard on this host (e.g. a headless Linux session with no X11/Wayland
+/// server) surfaces as a failure toast rather than a panic.
+fn drive_copy(app: &mut App) {
+    let Some(text) = app.take_copy() else {
+        return;
+    };
+    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+        Ok(()) => app.notify(Notice::success("Copied to clipboard")),
+        Err(_) => app.notify(Notice::error("copy", None)),
     }
 }
 

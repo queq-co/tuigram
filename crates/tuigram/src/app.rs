@@ -229,6 +229,11 @@ pub enum Action {
     /// id for the loop to reveal a local path or start the download (#195). A toast
     /// with no downloadable media.
     SaveMedia,
+    /// Copy the selected history message's text to the OS clipboard (`y`, #197).
+    /// Records the text for the loop to copy — `App` cannot reach the OS clipboard
+    /// directly and stays pure. A toast when there is no text to copy (an empty
+    /// history, or a non-text message).
+    CopyMessage,
     /// Re-query the chat list after a dropped-update gap (`Ctrl-R`), recording the
     /// request for the loop to run against core (#195).
     Resync,
@@ -373,6 +378,10 @@ pub struct App {
     /// [`take_save`](Self::take_save), reveals the local path if the file is already
     /// present, or starts the download otherwise.
     pending_save: Option<i32>,
+    /// Text the user asked to copy (`y`) (#197). `App` cannot reach the OS
+    /// clipboard, so it records the text; the loop drains it via
+    /// [`take_copy`](Self::take_copy) and writes it out, toasting the result.
+    pending_copy: Option<String>,
     /// Set when the user asked to resync (`Ctrl-R`) (#195). The loop reads and
     /// clears it via [`take_resync`](Self::take_resync) and re-queries the chat list.
     pending_resync: bool,
@@ -637,6 +646,13 @@ impl App {
     /// download; `None` means nothing was requested since the last drain.
     pub fn take_save(&mut self) -> Option<i32> {
         self.pending_save.take()
+    }
+
+    /// Take the pending copy text, if any (#197). The loop drains this each tick
+    /// and writes it to the OS clipboard; `None` means nothing was requested since
+    /// the last drain.
+    pub fn take_copy(&mut self) -> Option<String> {
+        self.pending_copy.take()
     }
 
     /// Take the pending resync request (#195). The loop drains this each tick and
@@ -1373,6 +1389,20 @@ impl App {
                     None => self.notify(Notice::info("The selected message has no media to save.")),
                 }
                 self.dirty = true;
+            }
+            Action::CopyMessage => {
+                // Copy the selected message's text (`y`, #197). `App` cannot reach
+                // the OS clipboard, so it only resolves the text here; a non-text
+                // message explains why with a toast, the same shape as
+                // `EditMessage`'s restriction. A no-op on an empty history.
+                match self.conversation.selected_message().map(|m| m.text()) {
+                    Some(Some(text)) => {
+                        self.pending_copy = Some(text.to_owned());
+                        self.dirty = true;
+                    }
+                    Some(None) => self.notify(Notice::info("Only text messages can be copied.")),
+                    None => {}
+                }
             }
             Action::Resync => {
                 self.pending_resync = true;
@@ -2940,6 +2970,39 @@ mod tests {
         app.dispatch(Action::SaveMedia);
         assert_eq!(app.take_save(), None);
         assert!(app.notifications.current().is_some());
+    }
+
+    #[test]
+    fn copy_message_records_text_for_a_text_message_and_toasts_otherwise() {
+        use tuigram_core::model::{FileRef, MessageContent, Photo};
+        // A text message: its text is recorded for the loop to copy.
+        let mut app = app_with_message(text_message(1, "hello there", false));
+        app.dispatch(Action::CopyMessage);
+        assert_eq!(app.take_copy().as_deref(), Some("hello there"));
+
+        // A media message has no text: nothing recorded, a toast instead.
+        let mut photo = crate::conversation::sample_message(
+            2,
+            MessageContent::Photo(Photo {
+                caption: Default::default(),
+                file: FileRef::new(9),
+                width: 1,
+                height: 1,
+            }),
+        );
+        photo.is_outgoing = false;
+        let mut app = app_with_message(photo);
+        app.dispatch(Action::CopyMessage);
+        assert_eq!(app.take_copy(), None);
+        assert!(app.notifications.current().is_some());
+    }
+
+    #[test]
+    fn copy_message_on_an_empty_history_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::CopyMessage);
+        assert_eq!(app.take_copy(), None);
+        assert!(app.notifications.current().is_none());
     }
 
     #[test]

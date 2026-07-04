@@ -332,6 +332,13 @@ const BINDINGS: &[Binding] = &[
         keys: "S",
         description: "save / download the selected message's media",
     },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('y')]),
+        action: Action::CopyMessage,
+        keys: "y",
+        description: "copy the selected message's text",
+    },
     // Composer — editing keys; any other printable character inserts (see resolve).
     Binding {
         context: Context::Composer,
@@ -1026,6 +1033,10 @@ mod tests {
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('S')),
             Action::SaveMedia
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('y')),
+            Action::CopyMessage
         );
         // The same letters are plain text in the composer, not history commands.
         assert_eq!(
