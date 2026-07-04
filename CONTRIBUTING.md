@@ -16,6 +16,9 @@ cargo build
 cargo test
 cargo fmt --check
 cargo clippy --workspace --all-targets
+
+# Enforce formatting locally, so CI's Format step never surprises a PR
+git config core.hooksPath .githooks
 ```
 
 TDLib system dependencies and `tdjson` setup are documented in
@@ -27,3 +30,5 @@ for power users).
 - Never commit secrets: `api_id`/`api_hash`, tokens, or session data.
 - Keep `tuigram-core` free of terminal/UI dependencies so it stays unit-testable.
 - `cargo test` must pass before a PR is merged.
+- `cargo fmt --all --check` must pass before a PR is merged — install the
+  `.githooks/pre-commit` hook (see Setup) so this is caught locally, not in CI.
