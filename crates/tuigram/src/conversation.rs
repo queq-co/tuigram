@@ -610,7 +610,11 @@ const ACCENT_PALETTE: [Color; 7] = [
 /// directly onto [`ACCENT_PALETTE`]; a custom Premium id (`>=7`) or an
 /// out-of-range/negative id falls back to a deterministic hash of the user id,
 /// so a user without a chosen accent still always gets one stable color.
-fn accent_color(accent_color_id: i32, user_id: i64) -> Color {
+///
+/// `pub(crate)` (not module-private) so the generated fallback-avatar bubble
+/// (#201, Stage 4) tints itself with the same palette/hash mapping as the
+/// header, rather than reimplementing it.
+pub(crate) fn accent_color(accent_color_id: i32, user_id: i64) -> Color {
     let index = usize::try_from(accent_color_id)
         .ok()
         .filter(|&id| id < ACCENT_PALETTE.len())

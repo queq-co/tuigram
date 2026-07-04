@@ -34,6 +34,7 @@
 //! ever started.
 
 mod app;
+mod avatar;
 mod bootstrap;
 mod chat_list;
 mod composer;
@@ -70,7 +71,7 @@ use ratatui_image::protocol::Protocol;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::{ChatAction, ChatKind, ChatListKind, Message, Sender, UserKind};
+use tuigram_core::model::{ChatAction, ChatKind, ChatListKind, Message, Sender, User, UserKind};
 use tuigram_core::{
     AuthRequests, ChatActionRequests, Client, ContactRequests, DOWNLOAD_PRIORITY, DeleteRequests,
     EditRequests, FileRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST,
@@ -1081,12 +1082,21 @@ fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &m
     }
 }
 
+/// The source image for one sender's avatar bubble (#201): a real photo's
+/// minithumbnail JPEG bytes, or — Stage 4 — the sender's own `User` record to
+/// build a generated fallback bubble from when they have no photo.
+enum AvatarSource {
+    Photo(Vec<u8>),
+    Fallback(User),
+}
+
 /// Kick off avatar encoding for the open chat's user senders (#201): for each
-/// distinct [`Sender::User`] the history references, with a minithumbnail, not
-/// yet cached on `App` and not already in flight this run, decode the JPEG
-/// bytes and hand them to the `Picker` off the render thread, reporting the
-/// built [`Protocol`] back on `avatar_tx`. A no-op with graphics support off
-/// (#201's scope decision — nowhere to draw the result) or no chat open.
+/// distinct [`Sender::User`] the history references, not yet cached on `App`
+/// and not already in flight this run, build a [`Protocol`] — from a decoded
+/// minithumbnail if the sender has one, else a generated fallback bubble
+/// (Stage 4) — off the render thread, reporting it back on `avatar_tx`. A
+/// no-op with graphics support off (#201's scope decision — nowhere to draw
+/// the result) or no chat open.
 ///
 /// Like [`drive_downloads`], this dedups per-run via `encoding`; unlike it, a
 /// decode/encode failure still reports back (as `None`) so its in-flight
@@ -1101,16 +1111,17 @@ fn drive_avatars(
     let AvatarSupport::Graphics(picker) = app.avatar_support() else {
         return;
     };
+    let font_size = picker.font_size();
+    let gutter_cols = app.avatar_support().gutter_cols();
     // The exact cell area the render path reserves for the bubble (#201) — the
     // same `gutter_cols()` the header's leading span is sized to — so the
     // encoded image fills the gutter rather than a fixed, possibly-mismatched
     // guess.
-    let size = Size::new(app.avatar_support().gutter_cols() as u16, 2);
+    let size = Size::new(gutter_cols as u16, 2);
     let Some(chat_id) = history.open else { return };
-    // Distinct user senders in the loaded history with a minithumbnail, not
-    // already cached or in flight — read once as a batch rather than spawning
-    // a lookup per message.
-    let to_start: Vec<(i64, Vec<u8>)> = client.read(|s| {
+    // Distinct user senders in the loaded history, not already cached or in
+    // flight — read once as a batch rather than spawning a lookup per message.
+    let to_start: Vec<(i64, AvatarSource)> = client.read(|s| {
         let senders: HashSet<i64> = s
             .messages()
             .history(chat_id)
@@ -1124,21 +1135,28 @@ fn drive_avatars(
         senders
             .into_iter()
             .filter_map(|id| {
-                s.users()
-                    .get(id)
-                    .and_then(|user| user.avatar_minithumbnail.clone())
-                    .map(|bytes| (id, bytes))
+                let user = s.users().get(id)?;
+                let source = match &user.avatar_minithumbnail {
+                    Some(bytes) => AvatarSource::Photo(bytes.clone()),
+                    None => AvatarSource::Fallback(user.clone()),
+                };
+                Some((id, source))
             })
             .collect()
     });
 
-    for (user_id, bytes) in to_start {
+    for (user_id, source) in to_start {
         encoding.insert(user_id);
         let picker = picker.clone();
         let avatar_tx = avatar_tx.clone();
         tokio::spawn(async move {
             let protocol = tokio::task::spawn_blocking(move || {
-                let image = image::load_from_memory(&bytes).ok()?;
+                let image = match source {
+                    AvatarSource::Photo(bytes) => image::load_from_memory(&bytes).ok()?,
+                    AvatarSource::Fallback(user) => {
+                        avatar::fallback_bubble(font_size, gutter_cols, &user)
+                    }
+                };
                 // `Fit` only ever shrinks (`min(target, image_size)` in its
                 // pixel math) — a minithumbnail is typically far smaller in
                 // pixels than one terminal cell, so `Fit` would render it at

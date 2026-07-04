@@ -61,3 +61,6 @@ ratatui-image = { workspace = true }
 # Decodes a sender's minithumbnail JPEG bytes before handing them to
 # `Picker::new_protocol` (#201).
 image = { workspace = true }
+# Generated fallback avatar bubble for senders with no profile photo (#201).
+imageproc = { workspace = true }
+ab_glyph = { workspace = true }
