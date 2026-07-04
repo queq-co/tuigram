@@ -5,8 +5,10 @@
 //! touches the terminal or awaits — it stays a pure, unit-testable reducer.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 use crossterm::event::Event;
+use ratatui_image::protocol::Protocol;
 use tuigram_core::StorageSettings;
 use tuigram_core::model::{File, Message, MessageContent, OutgoingMedia, SecretChatState, Sender};
 
@@ -23,6 +25,40 @@ use crate::search::SearchView;
 use crate::secret::{SecretChatPrompt, SecretLifecycle};
 use crate::settingsform::SettingsDraft;
 use crate::status::{ConnectionState, Notice, Notifications};
+use crate::terminal::AvatarSupport;
+
+/// Built avatar protocols, keyed by sender user id (#201), so each user's photo
+/// is decoded and handed to the `Picker` at most once per process lifetime —
+/// same shape as `downloads: HashMap<i32, File>` in `conversation.rs`.
+/// `ratatui_image::protocol::Protocol` has no `Debug` impl, so this wraps the
+/// map in a type with a hand-written one instead of blocking `App`'s derive.
+#[derive(Default)]
+pub struct AvatarCache(HashMap<i64, Protocol>);
+
+impl AvatarCache {
+    /// The built protocol for a user, if their avatar has already been
+    /// encoded this session. Unused until Stage 3 starts populating the cache
+    /// from the render path.
+    #[allow(dead_code)]
+    pub fn get(&self, user_id: i64) -> Option<&Protocol> {
+        self.0.get(&user_id)
+    }
+
+    /// Record a newly built protocol for a user, replacing any previous one.
+    /// Unused until Stage 3 starts populating the cache from the render path.
+    #[allow(dead_code)]
+    pub fn insert(&mut self, user_id: i64, protocol: Protocol) {
+        self.0.insert(user_id, protocol);
+    }
+}
+
+impl fmt::Debug for AvatarCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AvatarCache")
+            .field("cached_avatars", &self.0.len())
+            .finish()
+    }
+}
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
 /// render tick, core updates) is funnelled through this enum before it touches
@@ -436,6 +472,16 @@ pub struct App {
     /// Set when the user confirmed a logout (`Ctrl-Q`) (#195). The loop reads and
     /// clears it via [`take_logout`](Self::take_logout), ends the session, and exits.
     pending_logout: bool,
+    /// The graphics-protocol capability detected once at startup (#201), seeded
+    /// via [`set_avatar_support`](Self::set_avatar_support) from
+    /// `TerminalGuard::avatar_support` and read-only afterward. `None` (halfblocks
+    /// or no real terminal) renders today's #194 plain header with no avatar
+    /// gutter; only `Graphics` unlocks it (Stage 3).
+    avatar_support: AvatarSupport,
+    /// Built avatar protocols for senders seen this session (#201). Empty until
+    /// Stage 3 starts encoding; present now so that work has somewhere to land.
+    #[allow(dead_code)]
+    avatar_cache: AvatarCache,
 }
 
 impl App {
@@ -543,6 +589,38 @@ impl App {
     /// never to touch the file.
     pub fn set_storage_settings(&mut self, settings: StorageSettings) {
         self.storage = settings;
+    }
+
+    /// Seed the graphics-protocol capability detected once at startup (#201).
+    /// The loop calls this immediately after `TerminalGuard::new` succeeds, with
+    /// a clone of `TerminalGuard::avatar_support` (the guard keeps its own copy
+    /// for the rest of the process's lifetime) — mirrors
+    /// [`set_storage_settings`](Self::set_storage_settings)'s seed-once shape.
+    pub fn set_avatar_support(&mut self, support: AvatarSupport) {
+        self.avatar_support = support;
+    }
+
+    /// The graphics-protocol capability in effect, for the render path to
+    /// decide whether to draw an avatar gutter at all. Unused until Stage 3
+    /// wires up the render path that reads it.
+    #[allow(dead_code)]
+    pub fn avatar_support(&self) -> &AvatarSupport {
+        &self.avatar_support
+    }
+
+    /// The built protocol for a sender's avatar, if already encoded this
+    /// session. Unused until Stage 3 populates the cache via
+    /// [`cache_avatar`](Self::cache_avatar) from the render path.
+    #[allow(dead_code)]
+    pub fn cached_avatar(&self, user_id: i64) -> Option<&Protocol> {
+        self.avatar_cache.get(user_id)
+    }
+
+    /// Record a newly built avatar protocol for a sender. Unused until Stage 3
+    /// wires up the render path that calls it.
+    #[allow(dead_code)]
+    pub fn cache_avatar(&mut self, user_id: i64, protocol: Protocol) {
+        self.avatar_cache.insert(user_id, protocol);
     }
 
     /// The core link's connection state, for the status bar's left field.

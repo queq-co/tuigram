@@ -55,3 +55,6 @@ arboard = { workspace = true }
 # only (#156–#157). Optional and pulled in solely by the `login-harness` feature
 # (`dep:rustyline` above), so a default `cargo build --workspace` never compiles it.
 rustyline = { workspace = true, optional = true }
+# Raster mini-avatar bubbles (#201): Picker/Protocol lifecycle for rendering
+# real photos as Sixel/Kitty/iTerm2 images in the conversation pane.
+ratatui-image = { workspace = true }

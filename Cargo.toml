@@ -69,6 +69,11 @@ rustyline = { version = "18", default-features = false }
 # avatars, #201) once at projection time, so nothing downstream re-touches
 # base64. Already in the dependency graph transitively; promoted to direct.
 base64 = { version = "0.22" }
+# Renders the raster mini-avatar bubble (#201) as a Sixel/Kitty/iTerm2 image
+# widget. `image-defaults` picks the pure-Rust encoder path instead of the
+# default `chafa-dyn`/`chafa-static`, avoiding a system `libchafa` build
+# dependency; see docs/research (Stage 2 verification) for why.
+ratatui-image = { version = "11", default-features = false, features = ["image-defaults"] }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.
