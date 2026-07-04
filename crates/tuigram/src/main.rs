@@ -37,6 +37,7 @@ mod app;
 mod bootstrap;
 mod chat_list;
 mod composer;
+mod contact_picker;
 mod conversation;
 mod event;
 mod forward;
@@ -68,16 +69,17 @@ use tokio_stream::StreamExt;
 
 use tuigram_core::model::{ChatAction, ChatKind, ChatListKind, Message, Sender, UserKind};
 use tuigram_core::{
-    AuthRequests, ChatActionRequests, Client, DOWNLOAD_PRIORITY, DeleteRequests, EditRequests,
-    FileRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST, PinRequests,
-    ReactionRequests, ReadRequests, SecretChatRequests, SendRequests, StorageRequests,
-    StorageSettings, load_archive_list, load_folder_list, load_main_list, search_chat,
-    search_global,
+    AuthRequests, ChatActionRequests, Client, ContactRequests, DOWNLOAD_PRIORITY, DeleteRequests,
+    EditRequests, FileRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST,
+    PinRequests, ReactionRequests, ReadRequests, SecretChatRequests, SendRequests, StorageRequests,
+    StorageSettings, UserRequests, load_archive_list, load_folder_list, load_main_list,
+    search_chat, search_global,
 };
 
 use crate::app::{Action, App};
 use crate::chat_list::{project_lists, project_secret_states};
 use crate::composer::Submission;
+use crate::contact_picker::ContactHit;
 use crate::conversation::sender_label_for;
 use crate::event::{AppEvent, spawn_core_source};
 use crate::keymap::Focus;
@@ -135,6 +137,15 @@ const SEARCH_PAGE: i32 = 50;
 /// that delivers a single projected result set when it finishes, so a shallow
 /// channel suffices.
 const SEARCH_CHANNEL_DEPTH: usize = 8;
+
+/// How many contacts to request per `search_contacts` call (#197). A picker list,
+/// not a paged history — one page is plenty for a name search.
+const CONTACT_SEARCH_LIMIT: i32 = 50;
+
+/// Depth of the contact-search → loop completion channel (#197). A submit spawns
+/// one search that delivers a single resolved result set when it finishes, so a
+/// shallow channel suffices, matching [`SEARCH_CHANNEL_DEPTH`].
+const CONTACT_SEARCH_CHANNEL_DEPTH: usize = 8;
 
 /// How often the outbound typing action is re-broadcast while composing (#197).
 /// TDLib/Telegram's `typing` action expires on its own a few seconds after the
@@ -250,6 +261,11 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // A spawned search (#117) reports its projected hits back here; the loop feeds
     // them into the search overlay. (A failed search reuses `outbound_tx`'s toast.)
     let (search_tx, mut search_rx) = mpsc::channel::<Vec<SearchHit>>(SEARCH_CHANNEL_DEPTH);
+    // A spawned contact search (#197) reports its resolved hits back here; the loop
+    // feeds them into the contact-search overlay. (A failed search reuses
+    // `outbound_tx`'s toast.)
+    let (contact_tx, mut contact_rx) =
+        mpsc::channel::<Vec<ContactHit>>(CONTACT_SEARCH_CHANNEL_DEPTH);
 
     // Kick off the landing list (Main) before the first frame; the rest load on
     // demand as the user switches to them.
@@ -349,6 +365,12 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                     app.notify(notice);
                 }
             }
+            // A spawned contact search finished (#197): fill the overlay with its hits.
+            maybe_contacts = contact_rx.recv() => {
+                if let Some(hits) = maybe_contacts {
+                    app.set_contact_results(hits);
+                }
+            }
             // A spawned search finished (#117): fill the overlay with its hits.
             maybe_hits = search_rx.recv() => {
                 if let Some(hits) = maybe_hits {
@@ -369,6 +391,8 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         drive_outbound(&mut app, client, &history, &outbound_tx);
         // A submitted search query runs against core, in-chat or global by context (#117).
         drive_search(&mut app, client, &history, &search_tx, &outbound_tx);
+        // A submitted contact-search query resolves matching contacts by name (#197).
+        drive_contact_search(&mut app, client, &contact_tx, &outbound_tx);
         // A confirmed forward copies its messages into the picked target chat (#118).
         drive_forward(&mut app, client, &outbound_tx);
         // A confirmed reaction/pin toggle hits Telegram; the real update reconciles
@@ -660,6 +684,66 @@ fn drive_search(
             Err(err) => {
                 let _ = outbound_tx
                     .send(Notice::from_core_error("search", &err.message))
+                    .await;
+            }
+        }
+    });
+}
+
+/// Run a submitted contact-search query against core (#197). `App` records the
+/// query as a pure intent; here the loop drains it, searches this account's
+/// contacts, and resolves each returned id to a display name — reading the
+/// folded user store back, backfilling via `get_user` for any id the update
+/// stream hasn't announced yet, the same backfill any other id-only result
+/// (a message sender, a private chat's peer) goes through. Spawned off an
+/// `Arc<Client>` clone so the round-trips never block the loop.
+///
+/// On success the hits land on `contact_tx`, which the loop drains into the
+/// overlay. A failed search reuses the `outbound_tx` toast path (#116) to
+/// surface an error naming the action.
+fn drive_contact_search(
+    app: &mut App,
+    client: &Arc<Client>,
+    contact_tx: &mpsc::Sender<Vec<ContactHit>>,
+    outbound_tx: &mpsc::Sender<Notice>,
+) {
+    let Some(query) = app.take_contact_search() else {
+        return;
+    };
+    let client = Arc::clone(client);
+    let contact_tx = contact_tx.clone();
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        match client
+            .bridge()
+            .search_contacts(query, CONTACT_SEARCH_LIMIT)
+            .await
+        {
+            Ok(ids) => {
+                let mut hits = Vec::with_capacity(ids.len());
+                for user_id in ids {
+                    let known = client.read(|state| state.users().get(user_id).cloned());
+                    let name = match known {
+                        Some(user) => user.display_name(),
+                        None => match client.bridge().get_user(user_id).await {
+                            Ok(user) => user.display_name(),
+                            // A lookup failure for one contact shouldn't drop the
+                            // whole result set — fall back to the bare id, the same
+                            // graceful degradation `UserStore::display_name` uses
+                            // for an unresolved sender.
+                            Err(_) => format!("User {user_id}"),
+                        },
+                    };
+                    hits.push(ContactHit::new(user_id, name));
+                }
+                let _ = contact_tx.send(hits).await;
+            }
+            // The TDLib message is a fixed error code, never the user's query —
+            // safe to show; `from_core_error` normalizes it to a readable phrase
+            // (#122).
+            Err(err) => {
+                let _ = outbound_tx
+                    .send(Notice::from_core_error("contact search", &err.message))
                     .await;
             }
         }

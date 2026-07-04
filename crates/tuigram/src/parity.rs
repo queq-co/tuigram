@@ -17,7 +17,10 @@ use crate::keymap::Focus;
 /// `docs/repl-tui-divergences.md`'s "REPL-only commands" table — keep both in
 /// sync.
 pub const DIVERGENT: &[(&str, &str)] = &[
-    ("chats", "the TUI's chat-list pane is always visible; no toggle needed"),
+    (
+        "chats",
+        "the TUI's chat-list pane is always visible; no toggle needed",
+    ),
     (
         "history",
         "the TUI's history pane always shows the open chat; no separate on-demand fetch",
@@ -42,7 +45,10 @@ pub const DIVERGENT: &[(&str, &str)] = &[
         "the TUI already shows each chat row's secret-chat lifecycle state inline; the REPL has \
          no persistent view, so it needs an explicit listing command",
     ),
-    ("status", "the TUI's status bar always shows connection state; no on-demand command needed"),
+    (
+        "status",
+        "the TUI's status bar always shows connection state; no on-demand command needed",
+    ),
     (
         "probe",
         "a terminal-injection self-test (#174); a developer/security diagnostic, not a user action",
@@ -72,7 +78,12 @@ fn bound_action(repl_command: &str) -> Option<Action> {
         "archive" | "folders" => Some(Action::NextList),
         "react" | "unreact" => Some(Action::ReactionConfirm),
         "pin" | "unpin" => Some(Action::PinToggle),
-        "secret-new" | "secret-close" => Some(Action::SecretOpen),
+        "secret-close" => Some(Action::SecretOpen),
+        // "secret-new <user_id>" targets an arbitrary user by id; the chat-list-
+        // scoped `SecretOpen` can't reach one outside the open chat list, so the
+        // real analog is the contact-search picker (#197), which reaches the same
+        // arbitrary-user capability by name instead of a typed id.
+        "secret-new" => Some(Action::ContactSearchOpen),
         "resync" => Some(Action::Resync),
         "logout" => Some(Action::LogoutOpen),
         "help" => Some(Action::ToggleHelp),

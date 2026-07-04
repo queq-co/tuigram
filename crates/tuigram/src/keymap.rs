@@ -74,6 +74,12 @@ pub enum Overlay {
     SendMedia,
     /// The secret-chat lifecycle confirm: start or close a secret chat (#87).
     SecretChat,
+    /// The contact-search query line (#197): typing builds the query, Enter runs
+    /// it against `search_contacts`.
+    ContactSearchInput,
+    /// The contact-search results list (#197): navigate hits, Enter opens the
+    /// secret-chat confirm for the selected contact, or close.
+    ContactSearchResults,
     /// The retention settings editor (#146): edit the four download-cache knobs,
     /// applied live and written back to `settings.toml` on confirm.
     Settings,
@@ -246,6 +252,13 @@ const BINDINGS: &[Binding] = &[
         action: Action::SecretOpen,
         keys: "s",
         description: "secret chat: start / close",
+    },
+    Binding {
+        context: Context::ChatList,
+        trigger: Trigger::Plain(&[KeyCode::Char('n')]),
+        action: Action::ContactSearchOpen,
+        keys: "n",
+        description: "new secret chat with a contact (search by name)",
     },
     // History.
     Binding {
@@ -452,6 +465,8 @@ pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
         Overlay::Reaction => resolve_reaction(key),
         Overlay::SendMedia => resolve_send_media(key),
         Overlay::SecretChat => resolve_secret_chat(key),
+        Overlay::ContactSearchInput => resolve_contact_search_input(key),
+        Overlay::ContactSearchResults => resolve_contact_search_results(key),
         Overlay::Settings => resolve_settings(key),
         Overlay::DeleteConfirm => resolve_delete_confirm(key),
         Overlay::LogoutConfirm => resolve_logout_confirm(key),
@@ -627,6 +642,43 @@ fn resolve_secret_chat(key: &KeyEvent) -> Action {
     match key.code {
         KeyCode::Esc => Action::SecretCancel,
         KeyCode::Enter => Action::SecretConfirm,
+        _ => Action::Noop,
+    }
+}
+
+/// The contact-search query line (#197): typing edits the query, Enter runs it,
+/// Esc cancels. Mirrors [`resolve_search_input`].
+fn resolve_contact_search_input(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::ContactSearchCancel,
+        KeyCode::Enter => Action::ContactSearchSubmit,
+        KeyCode::Backspace => Action::ContactSearchBackspace,
+        KeyCode::Left => Action::ContactSearchLeft,
+        KeyCode::Right => Action::ContactSearchRight,
+        KeyCode::Home => Action::ContactSearchHome,
+        KeyCode::End => Action::ContactSearchEnd,
+        _ => match printable(key) {
+            Some(c) => Action::ContactSearchInput(c),
+            None => Action::Noop,
+        },
+    }
+}
+
+/// The contact-search results list (#197): navigate hits, Enter opens the
+/// secret-chat confirm for the selected one, Esc closes. Mirrors
+/// [`resolve_search_results`] minus the forward shortcut (not meaningful here).
+fn resolve_contact_search_results(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::ContactSearchCancel,
+        KeyCode::Char('j') | KeyCode::Down => Action::ContactResultNext,
+        KeyCode::Char('k') | KeyCode::Up => Action::ContactResultPrev,
+        KeyCode::Enter => Action::ContactResultConfirm,
         _ => Action::Noop,
     }
 }

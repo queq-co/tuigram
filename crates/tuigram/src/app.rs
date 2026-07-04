@@ -12,6 +12,7 @@ use tuigram_core::model::{File, Message, MessageContent, OutgoingMedia, SecretCh
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
+use crate::contact_picker::{ContactHit, ContactPickerView};
 use crate::conversation::{ConversationView, DeleteIntent, DeletePrompt, PinIntent};
 use crate::event::AppEvent;
 use crate::forward::{ForwardIntent, ForwardView};
@@ -183,6 +184,37 @@ pub enum Action {
     SecretConfirm,
     /// Cancel the secret-chat prompt without acting.
     SecretCancel,
+    /// Open the contact-search picker on a fresh, empty query (`n` in the chat
+    /// list, #197) — the entry point for starting a secret chat with a contact
+    /// not already in the chat list.
+    ContactSearchOpen,
+    /// Insert a typed character into the contact-search query at the cursor.
+    ContactSearchInput(char),
+    /// Delete the character before the contact-search query cursor (Backspace).
+    ContactSearchBackspace,
+    /// Move the contact-search query cursor one character left.
+    ContactSearchLeft,
+    /// Move the contact-search query cursor one character right.
+    ContactSearchRight,
+    /// Move the contact-search query cursor to the start of the line.
+    ContactSearchHome,
+    /// Move the contact-search query cursor to the end of the line.
+    ContactSearchEnd,
+    /// Run the typed query and switch to the results list. The loop dispatches
+    /// the core `search_contacts` call; for now the results are whatever has
+    /// been injected.
+    ContactSearchSubmit,
+    /// Close the contact-search overlay (from either the query line or the
+    /// results).
+    ContactSearchCancel,
+    /// Move the contact-search results selection down one hit.
+    ContactResultNext,
+    /// Move the contact-search results selection up one hit.
+    ContactResultPrev,
+    /// Confirm the selected contact: open the secret-chat confirm
+    /// ([`Overlay::SecretChat`]) for that user, reusing the same "are you sure"
+    /// step the chat-list-scoped lifecycle uses. A no-op with no hits.
+    ContactResultConfirm,
     /// Open the retention settings editor (#146), pre-filled with the policy in
     /// effect.
     SettingsOpen,
@@ -279,6 +311,9 @@ pub struct App {
     help_scroll: u16,
     /// The search overlay's state: the query line and the hit list it renders from.
     search: SearchView,
+    /// The contact-search picker's state (#197): the query line and the matching
+    /// contacts it renders from.
+    contacts: ContactPickerView,
     /// The forward overlay's state: the messages being forwarded and the target
     /// picker. Inert until a forward is started.
     forward: ForwardView,
@@ -331,6 +366,12 @@ pub struct App {
     /// global by context), and feeds the hits back through
     /// [`set_search_results`](Self::set_search_results).
     pending_search: Option<String>,
+    /// A submitted contact-search query awaiting dispatch to core (#197). Like
+    /// `pending_search`, `App` records the intent and the loop drains it via
+    /// [`take_contact_search`](Self::take_contact_search), runs
+    /// `search_contacts`, and feeds the resolved hits back through
+    /// [`set_contact_results`](Self::set_contact_results).
+    pending_contact_search: Option<String>,
     /// A `(chat_id, message_id)` the user opened from a search hit and wants the
     /// conversation to land on (#117). The loop opens the chat; the next projection
     /// of that chat scrolls to the message if it is loaded, then clears this. Cleared
@@ -456,6 +497,12 @@ impl App {
     /// The search overlay's state, for rendering the query line and results.
     pub fn search(&self) -> &SearchView {
         &self.search
+    }
+
+    /// The contact-search picker's state, for rendering the query line and
+    /// matching contacts (#197).
+    pub fn contacts(&self) -> &ContactPickerView {
+        &self.contacts
     }
 
     /// The forward overlay's state, for rendering the target picker.
@@ -604,6 +651,15 @@ impl App {
         self.pending_search.take()
     }
 
+    /// Take the pending contact-search query, if any (#197). The loop drains
+    /// this each tick, runs `search_contacts`, resolves each hit's display name,
+    /// and feeds the results back through
+    /// [`set_contact_results`](Self::set_contact_results); `None` means nothing
+    /// was submitted since the last drain.
+    pub fn take_contact_search(&mut self) -> Option<String> {
+        self.pending_contact_search.take()
+    }
+
     /// Take the pending forward, if any (#118). The loop drains this each tick and
     /// dispatches it to
     /// [`ForwardRequests::forward_messages`](tuigram_core::messages::ForwardRequests::forward_messages);
@@ -736,6 +792,14 @@ impl App {
     /// completes.
     pub fn set_search_results(&mut self, hits: Vec<crate::search::SearchHit>) {
         self.search.set_results(hits);
+        self.dirty = true;
+    }
+
+    /// Replace the contact-search picker's hits with a fresh, resolved result set
+    /// (#197), resetting the selection to the top. The loop calls this when a
+    /// spawned `search_contacts` + name resolution completes.
+    pub fn set_contact_results(&mut self, hits: Vec<ContactHit>) {
+        self.contacts.set_results(hits);
         self.dirty = true;
     }
 
@@ -1271,6 +1335,77 @@ impl App {
                 self.secret = None;
                 self.overlay = Overlay::None;
                 self.dirty = true;
+            }
+            Action::ContactSearchOpen => {
+                // A fresh search each time, so a previous query never leaks in (#197).
+                self.contacts.reset();
+                self.overlay = Overlay::ContactSearchInput;
+                self.dirty = true;
+            }
+            Action::ContactSearchInput(c) => {
+                self.contacts.insert(c);
+                self.dirty = true;
+            }
+            Action::ContactSearchBackspace => {
+                self.contacts.backspace();
+                self.dirty = true;
+            }
+            Action::ContactSearchLeft => {
+                self.contacts.move_left();
+                self.dirty = true;
+            }
+            Action::ContactSearchRight => {
+                self.contacts.move_right();
+                self.dirty = true;
+            }
+            Action::ContactSearchHome => {
+                self.contacts.move_home();
+                self.dirty = true;
+            }
+            Action::ContactSearchEnd => {
+                self.contacts.move_end();
+                self.dirty = true;
+            }
+            Action::ContactSearchSubmit => {
+                // Record the query as a pure intent the loop drains and runs against
+                // `search_contacts` (#197); `App` never touches the `Client`, so the
+                // hits arrive later via `set_contact_results`. Clear any stale hits
+                // now so the overlay is empty until they land. A blank query is a
+                // no-op that stays on the input line.
+                let query = self.contacts.query().trim().to_owned();
+                if !query.is_empty() {
+                    self.pending_contact_search = Some(query);
+                    self.contacts.set_results(Vec::new());
+                    self.overlay = Overlay::ContactSearchResults;
+                    self.dirty = true;
+                }
+            }
+            Action::ContactSearchCancel => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::ContactResultNext => {
+                self.contacts.select_next();
+                self.dirty = true;
+            }
+            Action::ContactResultPrev => {
+                self.contacts.select_prev();
+                self.dirty = true;
+            }
+            Action::ContactResultConfirm => {
+                // Hand off to the same secret-chat confirm the chat-list-scoped
+                // lifecycle uses (#87, #121): the "are you sure" step and the
+                // create seam are shared, only the target's origin differs. A no
+                // selected hit (empty results) is a no-op that stays on the results
+                // overlay.
+                if let Some(hit) = self.contacts.selected_hit() {
+                    let lifecycle = SecretLifecycle::Start {
+                        user_id: hit.user_id,
+                    };
+                    self.secret = Some(SecretChatPrompt::new(lifecycle, hit.display_name.clone()));
+                    self.overlay = Overlay::SecretChat;
+                    self.dirty = true;
+                }
             }
             Action::SettingsOpen => {
                 // Open the editor pre-filled with the policy in effect, so the fields
@@ -2774,6 +2909,84 @@ mod tests {
         assert_eq!(
             app.on_terminal_event(key(KeyCode::Enter, KeyModifiers::NONE)),
             Action::SecretConfirm
+        );
+    }
+
+    // --- #197: contact-search picker for new secret chats ---
+
+    #[test]
+    fn contact_search_open_resets_and_opens_the_query_overlay() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        assert_eq!(app.overlay(), Overlay::ContactSearchInput);
+        assert_eq!(app.contacts().query(), "");
+    }
+
+    #[test]
+    fn contact_search_submit_records_the_query_and_switches_to_results() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        for c in "ada".chars() {
+            app.dispatch(Action::ContactSearchInput(c));
+        }
+        app.dispatch(Action::ContactSearchSubmit);
+        assert_eq!(app.overlay(), Overlay::ContactSearchResults);
+        assert_eq!(app.take_contact_search().as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn contact_search_submit_on_a_blank_query_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        app.dispatch(Action::ContactSearchSubmit);
+        assert_eq!(
+            app.overlay(),
+            Overlay::ContactSearchInput,
+            "stays on the input line"
+        );
+        assert!(app.take_contact_search().is_none());
+    }
+
+    #[test]
+    fn confirming_a_contact_hit_opens_the_shared_secret_chat_confirm() {
+        use crate::contact_picker::ContactHit;
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        app.set_contact_results(vec![ContactHit::new(7, "Ada Lovelace")]);
+        app.dispatch(Action::ContactResultConfirm);
+        assert_eq!(app.overlay(), Overlay::SecretChat);
+        assert_eq!(
+            app.secret().map(|p| p.lifecycle()),
+            Some(SecretLifecycle::Start { user_id: 7 })
+        );
+        assert!(app.secret().unwrap().prompt().contains("Ada Lovelace"));
+    }
+
+    #[test]
+    fn confirming_with_no_contact_hits_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        app.dispatch(Action::ContactResultConfirm);
+        assert_eq!(app.overlay(), Overlay::ContactSearchInput);
+        assert!(app.secret().is_none());
+    }
+
+    #[test]
+    fn contact_search_cancel_closes_the_overlay() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        app.dispatch(Action::ContactSearchCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+    }
+
+    #[test]
+    fn contact_search_keys_resolve_through_the_overlay_not_the_panes() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        // `n` would reopen the picker in the chat list; inside the input line it types.
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            Action::ContactSearchInput('n')
         );
     }
 
