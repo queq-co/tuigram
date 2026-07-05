@@ -2778,6 +2778,7 @@ mod tests {
             )]),
             i64::MAX,
             0,
+            true,
         );
         let text = flatten(&render(&App::with_conversation(view), 80, 24));
         assert!(
@@ -2805,6 +2806,7 @@ mod tests {
             )]),
             i64::MAX,
             0,
+            true,
         );
         let buffer = render(&App::with_conversation(view), 80, 24);
         let row = row_containing(&buffer, "Ada Lovelace (@ada)");
@@ -2859,6 +2861,7 @@ mod tests {
             HashMap::new(),
             0,
             2, // last_read_outbox: message 2 has been read, message 3 has not
+            true,
         );
         let buffer = render(&App::with_conversation(view), 80, 40);
         let header_above =
@@ -2906,6 +2909,7 @@ mod tests {
             HashMap::new(),
             1,
             0,
+            true,
         );
         let buffer = render(&App::with_conversation(view), 80, 40);
         // Line order for message 2: rule, header, body ("second msg") — the rule
@@ -2933,6 +2937,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         let text = flatten(&render(&App::with_conversation(view), 80, 40));
         assert!(!text.contains("── unread ──"));

@@ -700,7 +700,10 @@ impl App {
     /// snapshot here, so `App` stays pure — the same split as
     /// [`project_chats`](Self::project_chats). [`ConversationView::project`] keeps
     /// the selected message under the cursor when refreshing the same chat, and
-    /// starts fresh at the top when a different chat is opened.
+    /// starts fresh at the top when a different chat is opened. `fresh_open` marks
+    /// the one call that is a genuine open (#164) — the loop's own open/close
+    /// tracking, not derivable from `chat_id` alone (see `project`'s doc).
+    #[allow(clippy::too_many_arguments)]
     pub fn project_conversation(
         &mut self,
         chat_id: i64,
@@ -709,6 +712,7 @@ impl App {
         senders: HashMap<Sender, SenderLabel>,
         last_read_inbox: i64,
         last_read_outbox: i64,
+        fresh_open: bool,
     ) {
         self.conversation.project(
             chat_id,
@@ -717,6 +721,7 @@ impl App {
             senders,
             last_read_inbox,
             last_read_outbox,
+            fresh_open,
         );
         // Honor a pending search-hit jump (#117): once this chat's history holds the
         // target message, scroll to it and clear the jump. A jump for a different chat
@@ -2166,6 +2171,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         render_and_record(&mut app);
 
@@ -2516,6 +2522,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         assert!(app.is_dirty());
         assert_eq!(app.conversation().len(), 2);
@@ -2547,6 +2554,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         let anchor = app.conversation().offset();
         assert!(anchor > 0, "a long history opens away from the top");
@@ -2765,6 +2773,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         assert_ne!(
             app.conversation().selected_message().map(|m| m.id),
@@ -2780,6 +2789,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         assert_eq!(
             app.conversation().selected_message().map(|m| m.id),
@@ -2803,6 +2813,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         // Chat 1's history (with message 10) arrives later, but the jump is gone, so
         // the view opens bottom-anchored (message 9 at the pane top, the whole history
@@ -2814,6 +2825,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(9));
     }
@@ -2900,6 +2912,7 @@ mod tests {
             HashMap::new(),
             i64::MAX,
             0,
+            true,
         );
         app
     }

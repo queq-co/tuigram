@@ -362,14 +362,16 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         AppEvent::ChatReadOutbox => {
                             reproject_chats(&mut app, client);
                             reproject_secret_states(&mut app, client);
-                            project_conversation(&mut app, client, history.open);
+                            project_conversation(&mut app, client, history.open, false);
                         }
                         // A message change in some chat: refresh the open chat's
                         // history (a no-op projection if nothing it shows changed).
-                        AppEvent::Messages => project_conversation(&mut app, client, history.open),
+                        AppEvent::Messages => {
+                            project_conversation(&mut app, client, history.open, false);
+                        }
                         // A file transfer advanced (#120): re-project so the open
                         // chat's download-progress lines reflect the newest `updateFile`.
-                        AppEvent::File => project_conversation(&mut app, client, history.open),
+                        AppEvent::File => project_conversation(&mut app, client, history.open, false),
                         // A secret chat's lifecycle advanced (#121): re-project the
                         // secret-state map so the row reflects pending → ready → closed.
                         AppEvent::Secret => reproject_secret_states(&mut app, client),
@@ -377,7 +379,7 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         AppEvent::Lagged => {
                             reproject_chats(&mut app, client);
                             reproject_secret_states(&mut app, client);
-                            project_conversation(&mut app, client, history.open);
+                            project_conversation(&mut app, client, history.open, false);
                         }
                         // Connection folds into the status bar; the rest repaint
                         // until their own projection lands.
@@ -397,7 +399,7 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         history.exhausted.insert(page.chat_id);
                     }
                     if history.open == Some(page.chat_id) {
-                        project_conversation(&mut app, client, history.open);
+                        project_conversation(&mut app, client, history.open, false);
                     }
                 }
             }
@@ -556,7 +558,10 @@ fn drive_open_chat(
         if let Some(chat_id) = open {
             // Project whatever the store already holds (possibly empty, then filled
             // as the landing page lands), and fetch that page once per chat per run.
-            project_conversation(app, client, Some(chat_id));
+            // This is the one genuine "opened this chat" moment (#164) — including a
+            // re-open of the same chat after focus left and came back, which #158's
+            // own chat_id check alone cannot distinguish from a mere continuation.
+            project_conversation(app, client, Some(chat_id), true);
             if history.first_paged.insert(chat_id) {
                 history.loading.insert(chat_id);
                 spawn_history_page(client, chat_id, NEWEST, history_tx.clone());
@@ -1453,7 +1458,15 @@ fn drive_storage_sweep(client: &Arc<Client>, settings: &StorageSettings) {
 /// project them onto the conversation pane (#114). The projection needs the client,
 /// so it lives here rather than in the pure `App`, which only receives the owned
 /// snapshot. A `None` open chat (the user is browsing the list) is a no-op.
-fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) {
+///
+/// `fresh_open` is `true` only from [`drive_open_chat`]'s own open-transition —
+/// the one call that is a genuine "the user opened this chat" (#164), as opposed
+/// to a live-update or history-page reproject of an already-open chat. It is *not*
+/// derivable from `open`/`chat_id` alone: focus leaving and returning to the same
+/// chat is not a fresh open (#158 deliberately preserves the cursor for that), but
+/// it must still reset the unread-separator watermark so a chat that has since
+/// been fully read no longer shows a stale rule — see [`ConversationView::project`].
+fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>, fresh_open: bool) {
     let Some(chat_id) = open else { return };
     let (messages, pinned, files, senders, last_read_inbox, last_read_outbox) = client.read(|s| {
         let messages: Vec<Message> = s.messages().history(chat_id).into_iter().cloned().collect();
@@ -1511,6 +1524,7 @@ fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) 
         senders,
         last_read_inbox,
         last_read_outbox,
+        fresh_open,
     );
     app.project_downloads(files);
 }
