@@ -311,6 +311,13 @@ impl ConversationView {
         // wrong answer before the real messages ever arrive as a same-chat refresh.
         // Once resolved, it is left alone — a later live update (mark-read, a new
         // message) must not erase or move the rule out from under the reader.
+        //
+        // This correctly waits for that landing page only because `last_read_inbox`
+        // itself cannot have advanced yet on an empty open: `drive_read_state`
+        // (main.rs) early-returns when the store holds no loaded messages for the
+        // chat, so mark-read never races ahead of the history it would need to mark.
+        // If that early-return were ever removed, this resolution would need to gate
+        // on more than "non-empty" to still catch the true first-unread message.
         if self.unread_separator.is_none() && !self.messages.is_empty() {
             self.unread_separator = Some(
                 self.messages
