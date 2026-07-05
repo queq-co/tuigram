@@ -311,6 +311,10 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // Record the pane rectangles this frame drew into, so a mouse event can
             // be hit-tested to a pane without re-running layout (#161/#162).
             app.set_pane_layout(render_out.panes);
+            // Record the chat/message row maps this frame drew, so a mouse click on
+            // an actual row can open the chat or select the message directly.
+            app.set_chat_rows(render_out.chat_rows);
+            app.set_history_rows(render_out.history_rows);
         }
 
         tokio::select! {

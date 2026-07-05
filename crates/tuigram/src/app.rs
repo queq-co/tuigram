@@ -78,6 +78,14 @@ pub enum Action {
     /// Move input focus directly to a specific pane (e.g. Enter on a chat opens
     /// the history; `i` in the history jumps to the composer).
     SetFocus(Focus),
+    /// Open the chat with this id and focus the history pane (a mouse click on a
+    /// chat-list row) — the click-equivalent of selecting it, then pressing Enter.
+    OpenChat(i64),
+    /// Scroll the history so this message id is at the top and focus the history
+    /// pane (a mouse click on a history row). Selection and scroll offset are the
+    /// same thing here (see [`ConversationView::select_message`]), so this also
+    /// brings the clicked message to the top of the pane, same as the wheel does.
+    SelectMessageAt(i64),
     /// Show or hide the help overlay.
     ToggleHelp,
     /// Scroll the help overlay one line toward the end (`j` / ↓).
@@ -484,6 +492,16 @@ pub struct App {
     /// (all-zero) rects until the first frame, which hit-test to `None` and so map
     /// mouse events to `Noop`.
     pane_layout: crate::ui::PaneLayout,
+    /// Row → chat id map the last render drew, recorded via
+    /// [`set_chat_rows`](Self::set_chat_rows), so a click on an actual chat row
+    /// can open that chat directly. Empty until the first frame, which hit-tests
+    /// every row to `None` and so falls back to focusing the pane.
+    chat_rows: crate::ui::ChatRows,
+    /// Row-range → message id map the last render drew, recorded via
+    /// [`set_history_rows`](Self::set_history_rows), so a click on an actual
+    /// history row can select that message directly. Empty until the first
+    /// frame, same fallback as `chat_rows`.
+    history_rows: crate::ui::HistoryRows,
 }
 
 impl App {
@@ -861,6 +879,23 @@ impl App {
         self.pane_layout = panes;
     }
 
+    /// Record the chat-list row map the last render drew, so the next mouse
+    /// click on a chat row can open it directly. The loop calls this after each
+    /// `draw` with the [`RenderOutput::chat_rows`](crate::ui::RenderOutput) it
+    /// measured. Pure bookkeeping, like [`set_pane_layout`](Self::set_pane_layout).
+    pub fn set_chat_rows(&mut self, rows: crate::ui::ChatRows) {
+        self.chat_rows = rows;
+    }
+
+    /// Record the history row map the last render drew, so the next mouse click
+    /// on a message row can select it directly. The loop calls this after each
+    /// `draw` with the
+    /// [`RenderOutput::history_rows`](crate::ui::RenderOutput) it measured. Pure
+    /// bookkeeping, like [`set_pane_layout`](Self::set_pane_layout).
+    pub fn set_history_rows(&mut self, rows: crate::ui::HistoryRows) {
+        self.history_rows = rows;
+    }
+
     /// Open the forward target picker for `message_id` from `source_chat_id`, shared
     /// by the two entry points (a search hit, `ForwardOpen`; the selected history
     /// message, `ForwardMessage`). The picker reuses a snapshot of the chat list as
@@ -969,12 +1004,14 @@ impl App {
     }
 
     /// Map a mouse event to an [`Action`] against the pane rectangles the last
-    /// render recorded (#161/#162). A left-click focuses the pane under the pointer;
-    /// the wheel moves the chat-list selection or scrolls the history — the pane the
-    /// pointer is *over*, regardless of which pane holds focus. Clicks/wheels over
-    /// the status bar or empty space, the wheel over the composer, and anything
-    /// while a modal overlay is open are ignored (#161 scopes overlay hit-testing to
-    /// a follow-up). Pure, like [`on_terminal_event`](Self::on_terminal_event).
+    /// render recorded (#161/#162). A left-click focuses the pane under the
+    /// pointer — or, on an actual chat/history row, opens/selects it directly
+    /// (see [`on_click`](Self::on_click)); the wheel moves the chat-list
+    /// selection or scrolls the history — the pane the pointer is *over*,
+    /// regardless of which pane holds focus. Clicks/wheels over the status bar or
+    /// empty space, the wheel over the composer, and anything while a modal
+    /// overlay is open are ignored (#161 scopes overlay hit-testing to a
+    /// follow-up). Pure, like [`on_terminal_event`](Self::on_terminal_event).
     fn on_mouse(&self, mouse: MouseEvent) -> Action {
         // A modal overlay captures input, so mouse events fall through to nothing
         // rather than reaching the panes drawn underneath it.
@@ -983,7 +1020,7 @@ impl App {
         }
         let pane = self.pane_layout.focus_at(mouse.column, mouse.row);
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => pane.map_or(Action::Noop, Action::SetFocus),
+            MouseEventKind::Down(MouseButton::Left) => self.on_click(pane, mouse.row),
             MouseEventKind::ScrollUp => match pane {
                 Some(Focus::ChatList) => Action::SelectPrev,
                 Some(Focus::History) => Action::ScrollUp,
@@ -995,6 +1032,29 @@ impl App {
                 _ => Action::Noop,
             },
             _ => Action::Noop,
+        }
+    }
+
+    /// A left-click's action for the pane it landed in and the row it hit within
+    /// that pane. A hit on an actual chat row opens that chat (`OpenChat`); a hit
+    /// on an actual history row selects that message (`SelectMessageAt`) — both
+    /// looked up from the row maps the last render recorded ([`ChatRows`](crate::ui::ChatRows),
+    /// [`HistoryRows`](crate::ui::HistoryRows)). Anything else in a pane — empty
+    /// list/history space below the last row, the composer, a pane with no row
+    /// concept — falls back to #161's plain focus-only click; outside any pane is
+    /// `Noop`. Pure, like [`on_mouse`](Self::on_mouse).
+    fn on_click(&self, pane: Option<Focus>, row: u16) -> Action {
+        match pane {
+            Some(Focus::ChatList) => self
+                .chat_rows
+                .chat_at(row)
+                .map_or(Action::SetFocus(Focus::ChatList), Action::OpenChat),
+            Some(Focus::History) => self
+                .history_rows
+                .message_at(row)
+                .map_or(Action::SetFocus(Focus::History), Action::SelectMessageAt),
+            Some(focus) => Action::SetFocus(focus),
+            None => Action::Noop,
         }
     }
 
@@ -1036,6 +1096,18 @@ impl App {
             }
             Action::SetFocus(focus) => {
                 self.focus = focus;
+                self.dirty = true;
+            }
+            Action::OpenChat(chat_id) => {
+                // Mirrors `ResultOpen`'s "select + focus history" (#117) minus the
+                // message jump: a chat-row click has no target message, just the chat.
+                self.chat_list.select_chat(chat_id);
+                self.focus = Focus::History;
+                self.dirty = true;
+            }
+            Action::SelectMessageAt(message_id) => {
+                self.conversation.select_message(message_id);
+                self.focus = Focus::History;
                 self.dirty = true;
             }
             Action::ToggleHelp => {
@@ -1909,6 +1981,108 @@ mod tests {
         assert_eq!(
             app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 50, 1)),
             Action::Noop
+        );
+    }
+
+    /// Render `app` (real chat/message data, not the synthetic rects
+    /// `app_with_panes` uses) into an 80×24 `TestBackend` frame and record the
+    /// pane rects and chat/message row maps onto it — the same three calls the
+    /// live loop makes after every `draw` (see `main.rs`), so a click test
+    /// exercises the exact hit-testing a real session would.
+    fn render_and_record(app: &mut App) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut output = crate::ui::RenderOutput::default();
+        terminal
+            .draw(|frame| output = crate::ui::ui(frame, app))
+            .unwrap();
+        app.set_pane_layout(output.panes);
+        app.set_chat_rows(output.chat_rows);
+        app.set_history_rows(output.history_rows);
+    }
+
+    #[test]
+    fn left_click_on_a_chat_row_opens_that_chat() {
+        use crate::chat_list::{ChatList, ChatListView, sample_chat};
+        use tuigram_core::model::ChatListKind;
+
+        // Two chats so the click can target the second row specifically,
+        // proving the hit follows the row clicked rather than just whatever
+        // happens to already be selected.
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
+        }]);
+        let mut app = App::with_chat_list(view);
+        render_and_record(&mut app);
+
+        let row = (0..24)
+            .find(|&r| {
+                matches!(
+                    app.on_terminal_event(mouse(LEFT_CLICK, 1, r)),
+                    Action::OpenChat(2)
+                )
+            })
+            .expect("Bob's row resolves to OpenChat(2)");
+
+        app.dispatch(Action::OpenChat(2));
+        assert_eq!(
+            app.focus(),
+            Focus::History,
+            "click opens into the history pane"
+        );
+        assert_eq!(app.chat_list().selected_chat().map(|c| c.id), Some(2));
+
+        // A click on a row that maps to no chat (empty list space) still just
+        // focuses the pane — #161's original behavior is preserved there.
+        let below_last_row = row + 1;
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 1, below_last_row)),
+            Action::SetFocus(Focus::ChatList)
+        );
+    }
+
+    #[test]
+    fn left_click_on_a_history_row_selects_that_message() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let text = |id: i64| {
+            sample_message(
+                id,
+                MessageContent::Text(FormattedText {
+                    text: format!("m{id}"),
+                    entities: Vec::new(),
+                }),
+            )
+        };
+        let mut app = App::new();
+        // A tall viewport so both messages fit and the open bottom-anchors at the
+        // top, same as `projecting_a_conversation_fills_the_history_and_dirties`.
+        app.set_conversation_viewport(40);
+        app.project_conversation(10, vec![text(1), text(2)], HashSet::new(), HashMap::new());
+        render_and_record(&mut app);
+
+        (0..24)
+            .find(|&r| {
+                matches!(
+                    app.on_terminal_event(mouse(LEFT_CLICK, 50, r)),
+                    Action::SelectMessageAt(2)
+                )
+            })
+            .expect("message 2's row resolves to SelectMessageAt(2)");
+
+        app.dispatch(Action::SelectMessageAt(2));
+        assert_eq!(app.focus(), Focus::History);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(2));
+
+        // Message 1's header sits on the history pane's first inner row.
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 50, 1)),
+            Action::SelectMessageAt(1)
         );
     }
 
