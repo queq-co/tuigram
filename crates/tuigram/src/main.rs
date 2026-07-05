@@ -315,6 +315,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // an actual row can open the chat or select the message directly.
             app.set_chat_rows(render_out.chat_rows);
             app.set_history_rows(render_out.history_rows);
+            // Record the open overlay's row map this frame drew, so a mouse click
+            // on an actual overlay row can select-and-confirm it directly (#217).
+            app.set_overlay_rows(render_out.overlay_rows);
         }
 
         tokio::select! {

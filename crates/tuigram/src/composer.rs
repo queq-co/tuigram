@@ -136,6 +136,12 @@ impl Composer {
         self.input.move_end();
     }
 
+    /// Move the cursor directly to a character index (a click on the composer
+    /// line), clamping to the end of the buffer.
+    pub fn set_cursor(&mut self, index: usize) {
+        self.input.set_cursor(index);
+    }
+
     /// Enter reply mode against `message_id`, showing `preview` in the indicator.
     /// The buffer is left as-is so a half-typed message survives starting a reply.
     ///
