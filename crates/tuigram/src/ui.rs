@@ -154,14 +154,46 @@ impl HistoryRows {
     }
 }
 
+/// Row → list-index map for a modal overlay's selectable list (search results,
+/// forward targets, the reaction palette, contact results), recorded from the
+/// last render so a click on an actual row can select-and-confirm it directly
+/// (#217; extends #161/#162's/#216's row-map pattern). A hit requires both the
+/// row **and** the column to fall inside the popup's list area — the popup is
+/// centred and narrower than the screen, and the panes underneath stay visible
+/// (there is no full-screen backdrop), so a stray click at the same row but off
+/// to the side must miss rather than resolve to that row's item.
+#[derive(Debug, Clone, Default)]
+pub struct OverlayRows {
+    /// The list area's `[x, x + width)` column range.
+    columns: (u16, u16),
+    /// Row → index into the overlay's item list.
+    rows: Vec<(u16, usize)>,
+}
+
+impl OverlayRows {
+    /// The list index drawn at frame position `(col, row)`, if any.
+    #[must_use]
+    pub fn index_at(&self, col: u16, row: u16) -> Option<usize> {
+        if col < self.columns.0 || col >= self.columns.1 {
+            return None;
+        }
+        self.rows
+            .iter()
+            .find(|&&(r, _)| r == row)
+            .map(|&(_, idx)| idx)
+    }
+}
+
 /// What one render measured for the loop to record back onto `App`: the history
 /// pane's inner height (#158), the pane rectangles for mouse hit-testing
-/// (#161/#162), and the chat/message row maps for click-to-open/click-to-select.
-/// The renderer stays a pure snapshot; the loop owns feeding these back through
+/// (#161/#162), the chat/message row maps for click-to-open/click-to-select, and
+/// the overlay row map for click-to-select in modal list overlays (#217). The
+/// renderer stays a pure snapshot; the loop owns feeding these back through
 /// [`App::set_conversation_viewport`](crate::app::App::set_conversation_viewport),
 /// [`App::set_pane_layout`](crate::app::App::set_pane_layout),
-/// [`App::set_chat_rows`](crate::app::App::set_chat_rows), and
-/// [`App::set_history_rows`](crate::app::App::set_history_rows).
+/// [`App::set_chat_rows`](crate::app::App::set_chat_rows),
+/// [`App::set_history_rows`](crate::app::App::set_history_rows), and
+/// [`App::set_overlay_rows`](crate::app::App::set_overlay_rows).
 #[derive(Debug, Clone, Default)]
 pub struct RenderOutput {
     /// The history pane's inner height (rows) — the number of visible message rows
@@ -173,6 +205,9 @@ pub struct RenderOutput {
     pub chat_rows: ChatRows,
     /// Row-range → message id map this frame drew.
     pub history_rows: HistoryRows,
+    /// Row/column → list-index map for the open overlay, if any (empty when none
+    /// is open, or the open one has no selectable list).
+    pub overlay_rows: OverlayRows,
 }
 
 /// Render the whole UI for one frame from the current `App` state, returning what
@@ -185,22 +220,49 @@ pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
     render_composer(frame, panes.composer, app);
     render_status_bar(frame, panes.status, app);
 
-    // A modal overlay floats above the panes, capturing input while open.
-    match app.overlay() {
-        Overlay::None => {}
-        Overlay::Help => render_help(frame, frame.area(), app),
-        Overlay::SearchInput => render_search_input(frame, frame.area(), app),
+    // A modal overlay floats above the panes, capturing input while open. Only
+    // the list overlays (#217) return a non-empty row map; the rest render and
+    // fall back to `OverlayRows::default()`, which hit-tests every click to
+    // `None`.
+    let overlay_rows = match app.overlay() {
+        Overlay::None => OverlayRows::default(),
+        Overlay::Help => {
+            render_help(frame, frame.area(), app);
+            OverlayRows::default()
+        }
+        Overlay::SearchInput => {
+            render_search_input(frame, frame.area(), app);
+            OverlayRows::default()
+        }
         Overlay::SearchResults => render_search_results(frame, frame.area(), app),
         Overlay::Forward => render_forward(frame, frame.area(), app),
         Overlay::Reaction => render_reaction(frame, frame.area(), app),
-        Overlay::SendMedia => render_send_media(frame, frame.area(), app),
-        Overlay::SecretChat => render_secret_chat(frame, frame.area(), app),
-        Overlay::Settings => render_settings(frame, frame.area(), app),
-        Overlay::DeleteConfirm => render_delete_confirm(frame, frame.area(), app),
-        Overlay::LogoutConfirm => render_logout_confirm(frame, frame.area(), app),
-        Overlay::ContactSearchInput => render_contact_search_input(frame, frame.area(), app),
+        Overlay::SendMedia => {
+            render_send_media(frame, frame.area(), app);
+            OverlayRows::default()
+        }
+        Overlay::SecretChat => {
+            render_secret_chat(frame, frame.area(), app);
+            OverlayRows::default()
+        }
+        Overlay::Settings => {
+            render_settings(frame, frame.area(), app);
+            OverlayRows::default()
+        }
+        Overlay::DeleteConfirm => {
+            render_delete_confirm(frame, frame.area(), app);
+            OverlayRows::default()
+        }
+        Overlay::LogoutConfirm => {
+            render_logout_confirm(frame, frame.area(), app);
+            OverlayRows::default()
+        }
+        Overlay::ContactSearchInput => {
+            render_contact_search_input(frame, frame.area(), app);
+            OverlayRows::default()
+        }
         Overlay::ContactSearchResults => render_contact_search_results(frame, frame.area(), app),
-    }
+    };
 
     // A transient toast floats over the content too, but — unlike a modal overlay
     // — it never captures input, so the loop keeps responding while it shows. The
@@ -220,6 +282,7 @@ pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
         panes,
         chat_rows,
         history_rows,
+        overlay_rows,
     }
 }
 
@@ -1026,7 +1089,7 @@ fn render_search_input(frame: &mut Frame, area: Rect, app: &App) {
 /// The search results overlay (#84): a centred modal listing the hits — a separate
 /// view over the conversation, never a rewrite of the history pane — with the
 /// selected hit marked. An empty result set shows a "no matches" note.
-fn render_search_results(frame: &mut Frame, area: Rect, app: &App) {
+fn render_search_results(frame: &mut Frame, area: Rect, app: &App) -> OverlayRows {
     let search = app.search();
     let title = format!(
         " Results — \"{}\" ({}) ",
@@ -1044,7 +1107,7 @@ fn render_search_results(frame: &mut Frame, area: Rect, app: &App) {
             ),
             popup,
         );
-        return;
+        return OverlayRows::default();
     }
 
     let items: Vec<ListItem> = search
@@ -1059,7 +1122,7 @@ fn render_search_results(frame: &mut Frame, area: Rect, app: &App) {
         items,
         search.selected(),
         "j / k move · Enter open · f forward · Esc close",
-    );
+    )
 }
 
 /// The contact-search query line (#197): a centred modal with the editable query
@@ -1095,7 +1158,7 @@ fn render_contact_search_input(frame: &mut Frame, area: Rect, app: &App) {
 /// The contact-search results overlay (#197): a centred modal listing the
 /// matching contacts. Confirming one opens the secret-chat confirm
 /// ([`render_secret_chat`]) for that user. Mirrors [`render_search_results`].
-fn render_contact_search_results(frame: &mut Frame, area: Rect, app: &App) {
+fn render_contact_search_results(frame: &mut Frame, area: Rect, app: &App) -> OverlayRows {
     let contacts = app.contacts();
     let title = format!(
         " Contacts — \"{}\" ({}) ",
@@ -1113,7 +1176,7 @@ fn render_contact_search_results(frame: &mut Frame, area: Rect, app: &App) {
             ),
             popup,
         );
-        return;
+        return OverlayRows::default();
     }
 
     let items: Vec<ListItem> = contacts
@@ -1128,13 +1191,13 @@ fn render_contact_search_results(frame: &mut Frame, area: Rect, app: &App) {
         items,
         contacts.selected(),
         "j / k move · Enter start secret chat · Esc close",
-    );
+    )
 }
 
 /// The forward target picker (#84): a centred modal that **reuses the chat-list
 /// widget** to choose where the selected message(s) go, with a key hint along the
 /// bottom.
-fn render_forward(frame: &mut Frame, area: Rect, app: &App) {
+fn render_forward(frame: &mut Frame, area: Rect, app: &App) -> OverlayRows {
     let forward = app.forward();
     let title = format!(" Forward {} message(s) to… ", forward.count());
     let items: Vec<ListItem> = forward
@@ -1150,16 +1213,19 @@ fn render_forward(frame: &mut Frame, area: Rect, app: &App) {
         items,
         forward.targets().selected(),
         "j / k pick · Enter send · Esc cancel",
-    );
+    )
 }
 
 /// The reaction picker (#85): a centred modal listing the emoji palette with the
 /// selected one marked (palette mode), or the custom-emoji entry line (custom mode,
 /// #119). Confirming toggles the effective emoji on the selected message.
-fn render_reaction(frame: &mut Frame, area: Rect, app: &App) {
+fn render_reaction(frame: &mut Frame, area: Rect, app: &App) -> OverlayRows {
     let picker = app.reaction();
     match picker.custom_input() {
-        Some(buffer) => render_reaction_custom(frame, area, buffer),
+        Some(buffer) => {
+            render_reaction_custom(frame, area, buffer);
+            OverlayRows::default()
+        }
         None => render_reaction_palette(frame, area, picker),
     }
 }
@@ -1170,7 +1236,8 @@ fn render_reaction_palette(
     frame: &mut Frame,
     area: Rect,
     picker: &crate::reactions::ReactionPicker,
-) {
+) -> OverlayRows {
+    let palette_len = picker.palette().len();
     let items: Vec<ListItem> = picker
         .palette()
         .iter()
@@ -1208,6 +1275,16 @@ fn render_reaction_palette(
         Paragraph::new(hint_line("j / k move · Enter react · Esc cancel")),
         hint_area,
     );
+
+    OverlayRows {
+        columns: (list_area.x, list_area.x + list_area.width),
+        rows: (0..palette_len)
+            .skip(state.offset())
+            .take(list_area.height as usize)
+            .enumerate()
+            .map(|(i, idx)| (list_area.y + i as u16, idx))
+            .collect(),
+    }
 }
 
 /// Custom mode: the editable custom-emoji line (with the caret) over the key hint.
@@ -1456,9 +1533,10 @@ fn render_list_modal(
     items: Vec<ListItem>,
     selected: usize,
     hint: &'static str,
-) {
+) -> OverlayRows {
+    let item_count = items.len();
     // Border (2) + the hint row (1) frame the list rows.
-    let height = items.len() as u16 + 3;
+    let height = item_count as u16 + 3;
     let popup = centered_rect(OVERLAY_WIDTH, height, area);
     frame.render_widget(Clear, popup);
 
@@ -1477,6 +1555,16 @@ fn render_list_modal(
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, list_area, &mut state);
     frame.render_widget(Paragraph::new(hint_line(hint)), hint_area);
+
+    OverlayRows {
+        columns: (list_area.x, list_area.x + list_area.width),
+        rows: (0..item_count)
+            .skip(state.offset())
+            .take(list_area.height as usize)
+            .enumerate()
+            .map(|(i, idx)| (list_area.y + i as u16, idx))
+            .collect(),
+    }
 }
 
 /// Shorten `s` to at most `max` characters, ending in an ellipsis when clipped, so
@@ -1902,6 +1990,29 @@ mod tests {
         // Message 2 starts on the row right after message 1's range ends.
         let message_2_row = top + message_1_rows.len() as u16;
         assert_eq!(output.history_rows.message_at(message_2_row), Some(2));
+    }
+
+    #[test]
+    fn overlay_rows_is_empty_with_no_overlay_open() {
+        let output = render_output(&app_with_lists(), 80, 24);
+        assert_eq!(output.overlay_rows.index_at(40, 5), None);
+    }
+
+    #[test]
+    fn overlay_rows_maps_search_result_rows_and_rejects_a_stray_column() {
+        // #217: a click on the search-results popup should resolve to the hit's
+        // index, but only inside the popup's own (centred, narrower-than-screen)
+        // column range — the panes underneath stay visible with no backdrop, so a
+        // click at the same row but off to the side must miss.
+        let output = render_output(&app_on_results(), 80, 24);
+        let row = (0..24)
+            .find(|&r| output.overlay_rows.index_at(40, r) == Some(1))
+            .expect("Bob's hit resolves to index 1 at a column inside the popup");
+        assert_eq!(
+            output.overlay_rows.index_at(1, row),
+            None,
+            "same row, but a column outside the centred popup misses"
+        );
     }
 
     #[test]

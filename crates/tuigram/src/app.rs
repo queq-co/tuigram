@@ -86,6 +86,15 @@ pub enum Action {
     /// same thing here (see [`ConversationView::select_message`]), so this also
     /// brings the clicked message to the top of the pane, same as the wheel does.
     SelectMessageAt(i64),
+    /// Move the composer cursor to a character index and focus the composer (a
+    /// mouse click on the composer line) — the click-equivalent of tabbing into
+    /// the composer and pressing Left/Right/Home/End to land the cursor there.
+    ComposerClickAt(usize),
+    /// Select and confirm the row at this index in the open modal list overlay —
+    /// search results, forward targets, the reaction palette, or contact
+    /// results (a mouse click on that overlay's row, #217). Resolved against
+    /// whichever overlay is open; a no-op if it has no selectable list.
+    OverlayRowClick(usize),
     /// Show or hide the help overlay.
     ToggleHelp,
     /// Scroll the help overlay one line toward the end (`j` / ↓).
@@ -502,6 +511,11 @@ pub struct App {
     /// history row can select that message directly. Empty until the first
     /// frame, same fallback as `chat_rows`.
     history_rows: crate::ui::HistoryRows,
+    /// Row/column → list-index map the open overlay's last render drew,
+    /// recorded via [`set_overlay_rows`](Self::set_overlay_rows), so a click on
+    /// an actual overlay row can select-and-confirm it directly (#217). Empty
+    /// when no overlay is open, or the open one has no selectable list.
+    overlay_rows: crate::ui::OverlayRows,
 }
 
 impl App {
@@ -896,6 +910,13 @@ impl App {
         self.history_rows = rows;
     }
 
+    /// Record the overlay row map the loop's last `draw` measured — the loop calls
+    /// this each frame with the [`RenderOutput::overlay_rows`](crate::ui::RenderOutput)
+    /// it measured. Pure bookkeeping, like [`set_pane_layout`](Self::set_pane_layout).
+    pub fn set_overlay_rows(&mut self, rows: crate::ui::OverlayRows) {
+        self.overlay_rows = rows;
+    }
+
     /// Open the forward target picker for `message_id` from `source_chat_id`, shared
     /// by the two entry points (a search hit, `ForwardOpen`; the selected history
     /// message, `ForwardMessage`). The picker reuses a snapshot of the chat list as
@@ -905,6 +926,85 @@ impl App {
         self.forward = ForwardView::new(source_chat_id, vec![message_id], self.chat_list.clone());
         self.overlay = Overlay::Forward;
         self.dirty = true;
+    }
+
+    /// Confirm the selected search hit (#117), shared by `ResultOpen` (Enter) and
+    /// a click on the hit's row (`OverlayRowClick`, #217): jump to its chat, focus
+    /// the history so the loop opens and pages it, and record the target so the
+    /// next projection of that chat scrolls to the message if it is loaded. A hit
+    /// whose chat is not in the active list (a global hit in a folder/archive)
+    /// still closes the overlay and focuses the history; the chat just stays
+    /// whatever was selected. No selected hit is a no-op.
+    fn confirm_search_result(&mut self) {
+        if let Some(hit) = self.search.selected_hit() {
+            let (chat_id, message_id) = (hit.chat_id, hit.message_id);
+            self.pending_jump = Some((chat_id, message_id));
+            self.chat_list.select_chat(chat_id);
+            self.focus = Focus::History;
+            self.overlay = Overlay::None;
+            self.dirty = true;
+        }
+    }
+
+    /// Confirm the forward to the selected target (#118), shared by
+    /// `ForwardConfirm` (Enter) and a click on the target's row
+    /// (`OverlayRowClick`, #217): record the send as a pure intent for the loop
+    /// and close the picker back to browsing. An empty picker (no target chat)
+    /// has nowhere to send, so it just closes without recording an intent.
+    fn confirm_forward(&mut self) {
+        if let Some(to_chat_id) = self.forward.selected_target().map(|c| c.id) {
+            self.pending_forward = Some(ForwardIntent {
+                from_chat_id: self.forward.source_chat_id(),
+                message_ids: self.forward.message_ids().to_vec(),
+                to_chat_id,
+            });
+        }
+        self.overlay = Overlay::None;
+        self.dirty = true;
+    }
+
+    /// React with the effective emoji (#119), shared by `ReactionConfirm`
+    /// (Enter) and a click on a palette row (`OverlayRowClick`, #217): the typed
+    /// custom one, or the highlighted palette one, then close. The optimistic
+    /// flip updates the `{emoji×n*}` chips directly; the intent it records
+    /// drives the core add/remove, whose real counts fold in later. Whether we
+    /// already had that reaction (pre-toggle) decides add vs remove. An empty
+    /// custom line has nothing to send, so it just closes.
+    fn confirm_reaction(&mut self) {
+        if let Some(emoji) = self.reaction.confirmed_emoji()
+            && let Some((chat_id, id)) = self
+                .conversation
+                .selected_message()
+                .map(|m| (m.chat_id, m.id))
+        {
+            let add = !self.conversation.has_own_reaction(id, &emoji);
+            self.conversation.toggle_reaction(id, &emoji);
+            self.pending_reaction = Some(ReactionIntent {
+                chat_id,
+                message_id: id,
+                emoji,
+                add,
+            });
+        }
+        self.overlay = Overlay::None;
+        self.dirty = true;
+    }
+
+    /// Confirm the selected contact (#197), shared by `ContactResultConfirm`
+    /// (Enter) and a click on the contact's row (`OverlayRowClick`, #217): hand
+    /// off to the same secret-chat confirm the chat-list-scoped lifecycle uses
+    /// (#87, #121) — the "are you sure" step and the create seam are shared,
+    /// only the target's origin differs. No selected hit (empty results) is a
+    /// no-op that stays on the results overlay.
+    fn confirm_contact_result(&mut self) {
+        if let Some(hit) = self.contacts.selected_hit() {
+            let lifecycle = SecretLifecycle::Start {
+                user_id: hit.user_id,
+            };
+            self.secret = Some(SecretChatPrompt::new(lifecycle, hit.display_name.clone()));
+            self.overlay = Overlay::SecretChat;
+            self.dirty = true;
+        }
     }
 
     /// Replace the search overlay's hits with a fresh, projected result set (#117),
@@ -1004,23 +1104,29 @@ impl App {
     }
 
     /// Map a mouse event to an [`Action`] against the pane rectangles the last
-    /// render recorded (#161/#162). A left-click focuses the pane under the
-    /// pointer — or, on an actual chat/history row, opens/selects it directly
-    /// (see [`on_click`](Self::on_click)); the wheel moves the chat-list
-    /// selection or scrolls the history — the pane the pointer is *over*,
-    /// regardless of which pane holds focus. Clicks/wheels over the status bar or
-    /// empty space, the wheel over the composer, and anything while a modal
-    /// overlay is open are ignored (#161 scopes overlay hit-testing to a
-    /// follow-up). Pure, like [`on_terminal_event`](Self::on_terminal_event).
+    /// render recorded (#161/#162). While a modal overlay is open, a left-click
+    /// is hit-tested against its row map instead (see
+    /// [`on_overlay_click`](Self::on_overlay_click)) and every other mouse event
+    /// is ignored — overlay wheel-scroll stays out of scope (#217). Otherwise a
+    /// left-click focuses the pane under the pointer — or, on an actual
+    /// chat/history/composer position, opens/selects/places the cursor directly
+    /// (see [`on_click`](Self::on_click)) — and the wheel moves the chat-list
+    /// selection or scrolls the history, the pane the pointer is *over*
+    /// regardless of which pane holds focus. Clicks/wheels over the status bar
+    /// or empty space, and the wheel over the composer, are ignored. Pure, like
+    /// [`on_terminal_event`](Self::on_terminal_event).
     fn on_mouse(&self, mouse: MouseEvent) -> Action {
-        // A modal overlay captures input, so mouse events fall through to nothing
-        // rather than reaching the panes drawn underneath it.
         if self.overlay != Overlay::None {
-            return Action::Noop;
+            return match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.on_overlay_click(mouse.column, mouse.row)
+                }
+                _ => Action::Noop,
+            };
         }
         let pane = self.pane_layout.focus_at(mouse.column, mouse.row);
         match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.on_click(pane, mouse.row),
+            MouseEventKind::Down(MouseButton::Left) => self.on_click(pane, mouse.column, mouse.row),
             MouseEventKind::ScrollUp => match pane {
                 Some(Focus::ChatList) => Action::SelectPrev,
                 Some(Focus::History) => Action::ScrollUp,
@@ -1035,15 +1141,19 @@ impl App {
         }
     }
 
-    /// A left-click's action for the pane it landed in and the row it hit within
-    /// that pane. A hit on an actual chat row opens that chat (`OpenChat`); a hit
-    /// on an actual history row selects that message (`SelectMessageAt`) — both
-    /// looked up from the row maps the last render recorded ([`ChatRows`](crate::ui::ChatRows),
-    /// [`HistoryRows`](crate::ui::HistoryRows)). Anything else in a pane — empty
-    /// list/history space below the last row, the composer, a pane with no row
-    /// concept — falls back to #161's plain focus-only click; outside any pane is
-    /// `Noop`. Pure, like [`on_mouse`](Self::on_mouse).
-    fn on_click(&self, pane: Option<Focus>, row: u16) -> Action {
+    /// A left-click's action for the pane it landed in and the position it hit
+    /// within that pane. A hit on an actual chat row opens that chat
+    /// (`OpenChat`); a hit on an actual history row selects that message
+    /// (`SelectMessageAt`) — both looked up from the row maps the last render
+    /// recorded ([`ChatRows`](crate::ui::ChatRows), [`HistoryRows`](crate::ui::HistoryRows)).
+    /// A hit in the composer places the cursor at the clicked column
+    /// (`ComposerClickAt`) — the composer's rect always passed `focus_at`'s
+    /// containment check, so the column is already known to be inside it; the
+    /// text starts one column past the left border (`Block::bordered()`).
+    /// A chat-list/history click with no row under it (empty list/history space
+    /// below the last row) falls back to #161's plain focus-only click; outside
+    /// any pane is `Noop`. Pure, like [`on_mouse`](Self::on_mouse).
+    fn on_click(&self, pane: Option<Focus>, column: u16, row: u16) -> Action {
         match pane {
             Some(Focus::ChatList) => self
                 .chat_rows
@@ -1053,9 +1163,25 @@ impl App {
                 .history_rows
                 .message_at(row)
                 .map_or(Action::SetFocus(Focus::History), Action::SelectMessageAt),
-            Some(focus) => Action::SetFocus(focus),
+            Some(Focus::Composer) => {
+                let inner_x = self.pane_layout.composer.x + 1;
+                Action::ComposerClickAt(column.saturating_sub(inner_x) as usize)
+            }
             None => Action::Noop,
         }
+    }
+
+    /// A left-click's action while a modal list overlay is open: a hit on an
+    /// actual row selects and confirms it (`OverlayRowClick`), looked up from the
+    /// overlay row map the last render recorded ([`OverlayRows`](crate::ui::OverlayRows)),
+    /// which already rejects a column outside the popup's list area. An overlay
+    /// with no selectable list (help, a text-entry line, a confirm prompt) has an
+    /// empty row map, so every click on it is `Noop`. Pure, like
+    /// [`on_mouse`](Self::on_mouse).
+    fn on_overlay_click(&self, column: u16, row: u16) -> Action {
+        self.overlay_rows
+            .index_at(column, row)
+            .map_or(Action::Noop, Action::OverlayRowClick)
     }
 
     /// Map a core [`AppEvent`] to an [`Action`]. Pure: the live source already
@@ -1110,6 +1236,30 @@ impl App {
                 self.focus = Focus::History;
                 self.dirty = true;
             }
+            Action::ComposerClickAt(index) => {
+                self.focus = Focus::Composer;
+                self.composer.set_cursor(index);
+                self.dirty = true;
+            }
+            Action::OverlayRowClick(index) => match self.overlay {
+                Overlay::SearchResults => {
+                    self.search.select(index);
+                    self.confirm_search_result();
+                }
+                Overlay::Forward => {
+                    self.forward.select(index);
+                    self.confirm_forward();
+                }
+                Overlay::Reaction => {
+                    self.reaction.select(index);
+                    self.confirm_reaction();
+                }
+                Overlay::ContactSearchResults => {
+                    self.contacts.select(index);
+                    self.confirm_contact_result();
+                }
+                _ => {}
+            },
             Action::ToggleHelp => {
                 // Toggles between no overlay and the help cheatsheet; the keymap
                 // only emits this from browsing or while help is already open. A
@@ -1269,22 +1419,7 @@ impl App {
                 self.search.select_prev();
                 self.dirty = true;
             }
-            Action::ResultOpen => {
-                // Jump to the selected hit (#117): select its chat in the list, focus
-                // the history so the loop opens and pages it, and record the target so
-                // the next projection of that chat scrolls to the message if it is
-                // loaded. A hit whose chat is not in the active list (a global hit in a
-                // folder/archive) still closes the overlay and focuses the history; the
-                // chat just stays whatever was selected. No selected hit is a no-op.
-                if let Some(hit) = self.search.selected_hit() {
-                    let (chat_id, message_id) = (hit.chat_id, hit.message_id);
-                    self.pending_jump = Some((chat_id, message_id));
-                    self.chat_list.select_chat(chat_id);
-                    self.focus = Focus::History;
-                    self.overlay = Overlay::None;
-                    self.dirty = true;
-                }
-            }
+            Action::ResultOpen => self.confirm_search_result(),
             Action::ForwardOpen => {
                 // Forward the selected hit. The picker reuses a snapshot of the
                 // chat list as its target list; the hit's chat is the source the
@@ -1315,21 +1450,7 @@ impl App {
                 self.forward.select_prev();
                 self.dirty = true;
             }
-            Action::ForwardConfirm => {
-                // Record the forward as a pure intent for the loop to send through
-                // `forward_messages` (#118), then close the picker back to browsing.
-                // An empty picker (no target chat) has nowhere to send, so it just
-                // closes without recording an intent.
-                if let Some(to_chat_id) = self.forward.selected_target().map(|c| c.id) {
-                    self.pending_forward = Some(ForwardIntent {
-                        from_chat_id: self.forward.source_chat_id(),
-                        message_ids: self.forward.message_ids().to_vec(),
-                        to_chat_id,
-                    });
-                }
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
+            Action::ForwardConfirm => self.confirm_forward(),
             Action::ForwardCancel => {
                 // Back to wherever the forward was started from — the search results
                 // (forward from a hit) or the conversation (forward from history).
@@ -1410,31 +1531,7 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::ReactionConfirm => {
-                // React with the effective emoji — the typed custom one, or the
-                // highlighted palette one — then close. The optimistic flip updates the
-                // `{emoji×n*}` chips directly; the intent it records drives the core
-                // add/remove (#119), whose real counts fold in later. Whether we already
-                // had that reaction (pre-toggle) decides add vs remove. An empty custom
-                // line has nothing to send, so it just closes.
-                if let Some(emoji) = self.reaction.confirmed_emoji()
-                    && let Some((chat_id, id)) = self
-                        .conversation
-                        .selected_message()
-                        .map(|m| (m.chat_id, m.id))
-                {
-                    let add = !self.conversation.has_own_reaction(id, &emoji);
-                    self.conversation.toggle_reaction(id, &emoji);
-                    self.pending_reaction = Some(ReactionIntent {
-                        chat_id,
-                        message_id: id,
-                        emoji,
-                        add,
-                    });
-                }
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
+            Action::ReactionConfirm => self.confirm_reaction(),
             Action::ReactionCancel => {
                 // Esc backs out of the custom line to the palette first; a second Esc
                 // (now in palette mode) closes the overlay.
@@ -1582,21 +1679,7 @@ impl App {
                 self.contacts.select_prev();
                 self.dirty = true;
             }
-            Action::ContactResultConfirm => {
-                // Hand off to the same secret-chat confirm the chat-list-scoped
-                // lifecycle uses (#87, #121): the "are you sure" step and the
-                // create seam are shared, only the target's origin differs. A no
-                // selected hit (empty results) is a no-op that stays on the results
-                // overlay.
-                if let Some(hit) = self.contacts.selected_hit() {
-                    let lifecycle = SecretLifecycle::Start {
-                        user_id: hit.user_id,
-                    };
-                    self.secret = Some(SecretChatPrompt::new(lifecycle, hit.display_name.clone()));
-                    self.overlay = Overlay::SecretChat;
-                    self.dirty = true;
-                }
-            }
+            Action::ContactResultConfirm => self.confirm_contact_result(),
             Action::SettingsOpen => {
                 // Open the editor pre-filled with the policy in effect, so the fields
                 // show the live values a Tab-and-type edits (#146).
@@ -1901,7 +1984,7 @@ mod tests {
 
     #[test]
     fn left_click_focuses_the_pane_under_the_pointer() {
-        let app = app_with_panes();
+        let mut app = app_with_panes();
         assert_eq!(
             app.on_terminal_event(mouse(LEFT_CLICK, 1, 1)),
             Action::SetFocus(Focus::ChatList)
@@ -1910,10 +1993,13 @@ mod tests {
             app.on_terminal_event(mouse(LEFT_CLICK, 50, 1)),
             Action::SetFocus(Focus::History)
         );
-        assert_eq!(
-            app.on_terminal_event(mouse(LEFT_CLICK, 50, 21)),
-            Action::SetFocus(Focus::Composer)
-        );
+        // The composer resolves to a cursor-placement action rather than a plain
+        // focus one (#217) — dispatching it still focuses the pane, with the
+        // cursor landed at the clicked column too.
+        let composer_click = app.on_terminal_event(mouse(LEFT_CLICK, 50, 21));
+        assert!(matches!(composer_click, Action::ComposerClickAt(_)));
+        app.dispatch(composer_click);
+        assert_eq!(app.focus(), Focus::Composer);
     }
 
     #[test]
@@ -1986,9 +2072,9 @@ mod tests {
 
     /// Render `app` (real chat/message data, not the synthetic rects
     /// `app_with_panes` uses) into an 80×24 `TestBackend` frame and record the
-    /// pane rects and chat/message row maps onto it — the same three calls the
-    /// live loop makes after every `draw` (see `main.rs`), so a click test
-    /// exercises the exact hit-testing a real session would.
+    /// pane rects, chat/message row maps, and overlay row map onto it — the same
+    /// calls the live loop makes after every `draw` (see `main.rs`), so a click
+    /// test exercises the exact hit-testing a real session would.
     fn render_and_record(app: &mut App) {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -2001,6 +2087,7 @@ mod tests {
         app.set_pane_layout(output.panes);
         app.set_chat_rows(output.chat_rows);
         app.set_history_rows(output.history_rows);
+        app.set_overlay_rows(output.overlay_rows);
     }
 
     #[test]
@@ -2083,6 +2170,64 @@ mod tests {
         assert_eq!(
             app.on_terminal_event(mouse(LEFT_CLICK, 50, 1)),
             Action::SelectMessageAt(1)
+        );
+    }
+
+    #[test]
+    fn left_click_in_the_composer_moves_the_cursor_there() {
+        let mut composer = Composer::default();
+        for c in "hello world".chars() {
+            composer.insert(c);
+        }
+        let mut app = App::with_composer(composer);
+        render_and_record(&mut app);
+
+        // The composer's inner text starts one column past its left border
+        // (`Block::bordered()`); its inner row is one row past its top border.
+        let panes = crate::ui::pane_layout(ratatui::layout::Rect::new(0, 0, 80, 24));
+        let inner_x = panes.composer.x + 1;
+        let row = panes.composer.y + 1;
+
+        // Click 3 columns into "hello world" — the cursor should land between
+        // the "hel" and "lo world" it split, i.e. character index 3.
+        let action = app.on_terminal_event(mouse(LEFT_CLICK, inner_x + 3, row));
+        assert_eq!(action, Action::ComposerClickAt(3));
+
+        app.dispatch(action);
+        assert_eq!(app.focus(), Focus::Composer, "click focuses the composer");
+        assert_eq!(app.composer().cursor(), 3);
+    }
+
+    #[test]
+    fn left_click_on_a_search_result_row_selects_and_opens_it() {
+        // #217: clicking a hit should behave exactly like navigating to it and
+        // pressing Enter (`ResultOpen`, see `opening_a_hit_jumps_to_its_chat_and_focuses_the_history`).
+        let mut app = app_on_results(); // chats Alice(1)/Bob(2); hits (1,10),(2,20)
+        render_and_record(&mut app);
+
+        // Column 40 sits inside the centred results popup at this width.
+        let (hit_row, action) = (0..24)
+            .find_map(|r| match app.on_terminal_event(mouse(LEFT_CLICK, 40, r)) {
+                Action::OverlayRowClick(1) => Some((r, Action::OverlayRowClick(1))),
+                _ => None,
+            })
+            .expect("Bob's hit (index 1) resolves to OverlayRowClick(1)");
+
+        // A click at that same row but off to the side of the centred popup
+        // (column 1, over the panes underneath) must not hit the overlay —
+        // checked before dispatching, while the overlay is still open.
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 1, hit_row)),
+            Action::Noop
+        );
+
+        app.dispatch(action);
+        assert_eq!(app.overlay(), Overlay::None, "overlay closed on jump");
+        assert_eq!(app.focus(), Focus::History);
+        assert_eq!(
+            app.chat_list().selected_chat().map(|c| c.id),
+            Some(2),
+            "the clicked hit's chat is selected"
         );
     }
 
@@ -2858,6 +3003,38 @@ mod tests {
             })
         );
         assert_eq!(app.take_reaction(), None, "the intent is drained once");
+    }
+
+    #[test]
+    fn left_click_on_a_reaction_palette_row_selects_and_confirms_it() {
+        // #217: a click on a palette emoji should behave exactly like navigating
+        // to it and pressing Enter, same as the search-result click.
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        app.dispatch(Action::ReactionOpen);
+        render_and_record(&mut app);
+
+        let chosen = app.reaction().palette()[2];
+        let action = (0..24)
+            .find_map(|r| match app.on_terminal_event(mouse(LEFT_CLICK, 40, r)) {
+                Action::OverlayRowClick(2) => Some(Action::OverlayRowClick(2)),
+                _ => None,
+            })
+            .expect("the third palette emoji resolves to OverlayRowClick(2)");
+
+        app.dispatch(action);
+        assert_eq!(app.overlay(), Overlay::None, "confirm closes the picker");
+        let message = app
+            .conversation()
+            .messages()
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert_eq!(message.reactions.len(), 1);
+        assert_eq!(
+            message.reactions[0].kind,
+            ReactionKind::Emoji(chosen.to_owned())
+        );
     }
 
     #[test]

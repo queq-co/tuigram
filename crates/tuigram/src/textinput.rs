@@ -90,6 +90,13 @@ impl TextInput {
         self.cursor = self.char_count();
     }
 
+    /// Move the cursor directly to a character index, clamping to the end of the
+    /// buffer — a click on the input line maps its column to an index and lands
+    /// here, the same clamp [`move_right`](Self::move_right) uses.
+    pub fn set_cursor(&mut self, index: usize) {
+        self.cursor = index.min(self.char_count());
+    }
+
     /// Replace the buffer with `text`, placing the cursor at the end — the seam an
     /// edit (prefill) or a programmatic set uses.
     pub fn set(&mut self, text: String) {

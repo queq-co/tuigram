@@ -275,6 +275,16 @@ impl ChatListView {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// Move the selection directly to a row index (a click on a chat, or a
+    /// forward-target picker click), clamping at the last row. A no-op on an
+    /// empty list.
+    pub fn select(&mut self, index: usize) {
+        let len = self.active_chats().len();
+        if len > 0 {
+            self.selected = index.min(len - 1);
+        }
+    }
+
     /// Select the chat with `chat_id` in the **active** list, returning whether it
     /// was found. Used to open a chat the user jumped to from elsewhere — a search
     /// hit (#117). A chat not in the active list (e.g. a global hit in a folder or
