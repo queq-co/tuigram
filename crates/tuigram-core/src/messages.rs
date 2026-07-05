@@ -936,21 +936,17 @@ impl MessageStore {
     /// message is filed under its own chat and id, so re-merging an overlapping
     /// page is idempotent — duplicates collapse onto the same entry.
     ///
-    /// An id already known to the store is left untouched rather than replaced
-    /// (#207). A history page can be in flight — fetched from TDLib's own local
-    /// cache — at the same moment a live update ([`reduce`](Self::reduce)) folds
-    /// fresher state (a reaction, an edit) onto that same message; landing after
-    /// the fold, the page's older copy would otherwise clobber it. Anything
-    /// already known already reached the store through a fold at least as
-    /// current as a re-fetched page, so a page's only job here is filling in ids
-    /// this store has not seen yet.
+    /// A re-fetched page **replaces** an already-known message rather than
+    /// skipping it: `getChatHistory` is server-authoritative, and is the one
+    /// documented recovery path (#207) for a message whose reactions or content
+    /// changed while its chat was closed and so never arrived as a live update —
+    /// opening the chat and re-paging its history is what catches those up mid
+    /// session, exactly as a restart does. A live fold ([`reduce`](Self::reduce))
+    /// racing a page fetch for the same id is a narrower, separate concern than
+    /// disabling that recovery path is worth trading away here.
     pub fn merge(&mut self, messages: impl IntoIterator<Item = Message>) {
         for message in messages {
-            self.by_chat
-                .entry(message.chat_id)
-                .or_default()
-                .entry(message.id)
-                .or_insert(message);
+            self.insert(message);
         }
     }
 
@@ -1219,21 +1215,31 @@ mod tests {
     }
 
     #[test]
-    fn a_re_fetched_page_never_regresses_an_already_folded_reaction() {
-        // #207: a history page can race a live `updateMessageInteractionInfo` —
-        // in flight against TDLib's own cache at the moment a fresher reaction
-        // fold lands. Landing after the fold, the page's older copy (no
-        // reactions) must not clobber it.
+    fn a_re_fetched_page_refreshes_reactions_missed_while_the_chat_was_closed() {
+        // #207: opening a chat and re-paging its history is the documented
+        // recovery path for reactions that changed while the chat was closed —
+        // TDLib only guarantees live `updateMessageInteractionInfo` delivery for
+        // an open chat, so a message reacted-to while closed can only catch up
+        // through a fresh, server-authoritative `getChatHistory` page. `merge`
+        // must let that page win over the stale (reaction-less) copy already
+        // known from a live `updateNewMessage`.
         let mut store = MessageStore::new();
         store.merge([msg(10, 1), msg(10, 2)]);
-        store.reduce(&reaction_update(10, 2, &[("👍", 1, true)]));
-        assert!(!store.get(10, 2).unwrap().reactions.is_empty());
+        assert!(store.get(10, 2).unwrap().reactions.is_empty());
 
-        // The delayed page for the same ids lands after the fold.
-        store.merge([msg(10, 1), msg(10, 2)]);
+        // The chat is (re)opened; the landing page comes back with the reaction
+        // that landed while it was closed.
+        let mut reacted = msg(10, 2);
+        reacted.reactions = vec![Reaction {
+            kind: crate::model::ReactionKind::Emoji("👍".to_owned()),
+            count: 1,
+            is_chosen: true,
+        }];
+        store.merge([msg(10, 1), reacted]);
+
         assert!(
             !store.get(10, 2).unwrap().reactions.is_empty(),
-            "a re-fetched page must not overwrite an already-known message"
+            "a re-fetched page must refresh an already-known message"
         );
     }
 
