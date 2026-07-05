@@ -355,6 +355,15 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                             // its lifecycle state so the fresh row shows it (#121).
                             reproject_secret_states(&mut app, client);
                         }
+                        // The peer read one of our messages (#163): everything
+                        // `Chats` does, plus a conversation reproject so the open
+                        // pane's read-receipt glyph (✓ → ✓✓) advances live — the one
+                        // chat-list update the open pane itself depends on.
+                        AppEvent::ChatReadOutbox => {
+                            reproject_chats(&mut app, client);
+                            reproject_secret_states(&mut app, client);
+                            project_conversation(&mut app, client, history.open);
+                        }
                         // A message change in some chat: refresh the open chat's
                         // history (a no-op projection if nothing it shows changed).
                         AppEvent::Messages => project_conversation(&mut app, client, history.open),
@@ -1446,13 +1455,17 @@ fn drive_storage_sweep(client: &Arc<Client>, settings: &StorageSettings) {
 /// snapshot. A `None` open chat (the user is browsing the list) is a no-op.
 fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) {
     let Some(chat_id) = open else { return };
-    let (messages, pinned, files, senders) = client.read(|s| {
+    let (messages, pinned, files, senders, last_read_inbox, last_read_outbox) = client.read(|s| {
         let messages: Vec<Message> = s.messages().history(chat_id).into_iter().cloned().collect();
-        let pinned = s
-            .chats()
-            .get(chat_id)
+        let chat = s.chats().get(chat_id);
+        let pinned = chat
             .map(|chat| chat.pinned_message_ids.iter().copied().collect())
             .unwrap_or_default();
+        // The chat's read watermarks (#163, #164), fetched from the same record —
+        // last_read_inbox for the unread separator, last_read_outbox for outgoing
+        // messages' read-receipt glyph.
+        let last_read_inbox = chat.map_or(0, |chat| chat.last_read_inbox_message_id);
+        let last_read_outbox = chat.map_or(0, |chat| chat.last_read_outbox_message_id);
         // The download state of every file the history's media references, read back
         // from the file store so the progress lines project alongside the messages
         // (#120). A file the store has not folded yet is simply absent until it does.
@@ -1482,9 +1495,23 @@ fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) 
                 senders.insert(sender.clone(), label);
             }
         }
-        (messages, pinned, files, senders)
+        (
+            messages,
+            pinned,
+            files,
+            senders,
+            last_read_inbox,
+            last_read_outbox,
+        )
     });
-    app.project_conversation(chat_id, messages, pinned, senders);
+    app.project_conversation(
+        chat_id,
+        messages,
+        pinned,
+        senders,
+        last_read_inbox,
+        last_read_outbox,
+    );
     app.project_downloads(files);
 }
 

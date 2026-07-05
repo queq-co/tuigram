@@ -707,9 +707,17 @@ impl App {
         messages: Vec<Message>,
         pinned: HashSet<i64>,
         senders: HashMap<Sender, SenderLabel>,
+        last_read_inbox: i64,
+        last_read_outbox: i64,
     ) {
-        self.conversation
-            .project(chat_id, messages, pinned, senders);
+        self.conversation.project(
+            chat_id,
+            messages,
+            pinned,
+            senders,
+            last_read_inbox,
+            last_read_outbox,
+        );
         // Honor a pending search-hit jump (#117): once this chat's history holds the
         // target message, scroll to it and clear the jump. A jump for a different chat
         // is stale (the user opened elsewhere) — drop it so it never moves a later
@@ -1198,6 +1206,7 @@ impl App {
             AppEvent::Connection(state) => Action::SetConnection(state),
             AppEvent::Auth
             | AppEvent::Chats
+            | AppEvent::ChatReadOutbox
             | AppEvent::Messages
             | AppEvent::File
             | AppEvent::Secret
@@ -2150,7 +2159,14 @@ mod tests {
         // A tall viewport so both messages fit and the open bottom-anchors at the
         // top, same as `projecting_a_conversation_fills_the_history_and_dirties`.
         app.set_conversation_viewport(40);
-        app.project_conversation(10, vec![text(1), text(2)], HashSet::new(), HashMap::new());
+        app.project_conversation(
+            10,
+            vec![text(1), text(2)],
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+        );
         render_and_record(&mut app);
 
         (0..24)
@@ -2493,7 +2509,14 @@ mod tests {
         // fits is the top — message 1 at the top of the pane (#158).
         app.set_conversation_viewport(40);
         app.clear_dirty();
-        app.project_conversation(10, vec![text(1), text(2)], HashSet::new(), HashMap::new());
+        app.project_conversation(
+            10,
+            vec![text(1), text(2)],
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+        );
         assert!(app.is_dirty());
         assert_eq!(app.conversation().len(), 2);
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
@@ -2522,6 +2545,8 @@ mod tests {
             (1..=5).map(text).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         let anchor = app.conversation().offset();
         assert!(anchor > 0, "a long history opens away from the top");
@@ -2733,7 +2758,14 @@ mod tests {
         app.dispatch(Action::ResultOpen); // first hit: chat 1, message 10
 
         // The first projection of chat 1 does not carry message 10 yet: no jump.
-        app.project_conversation(1, text_history(&[1, 2]), HashSet::new(), HashMap::new());
+        app.project_conversation(
+            1,
+            text_history(&[1, 2]),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+        );
         assert_ne!(
             app.conversation().selected_message().map(|m| m.id),
             Some(10),
@@ -2746,6 +2778,8 @@ mod tests {
             text_history(&[9, 10, 11]),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert_eq!(
             app.conversation().selected_message().map(|m| m.id),
@@ -2762,7 +2796,14 @@ mod tests {
         app.dispatch(Action::ResultOpen); // hit for chat 1, message 10
 
         // The user opens chat 2 before chat 1's history arrives: the stale jump drops.
-        app.project_conversation(2, text_history(&[7, 8]), HashSet::new(), HashMap::new());
+        app.project_conversation(
+            2,
+            text_history(&[7, 8]),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+        );
         // Chat 1's history (with message 10) arrives later, but the jump is gone, so
         // the view opens bottom-anchored (message 9 at the pane top, the whole history
         // fitting) rather than chasing message 10.
@@ -2771,6 +2812,8 @@ mod tests {
             text_history(&[9, 10, 11]),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(9));
     }
@@ -2850,7 +2893,14 @@ mod tests {
             chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
         }]);
         let mut app = App::with_chat_list(view);
-        app.project_conversation(1, text_history(&[10, 11]), HashSet::new(), HashMap::new());
+        app.project_conversation(
+            1,
+            text_history(&[10, 11]),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+        );
         app
     }
 

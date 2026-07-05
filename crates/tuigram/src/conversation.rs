@@ -176,6 +176,18 @@ pub struct ConversationView {
     /// `User {id}` / `Chat {id}` in [`sender_label`](Self::sender_label), so the
     /// header is always legible.
     senders: HashMap<Sender, SenderLabel>,
+    /// The chat's outbox read watermark (#163): the id of the last message of ours
+    /// the peer has read. Kept live on every [`project`](Self::project) (unlike
+    /// [`unread_separator`](Self::unread_separator), it is not frozen), since the
+    /// read receipt glyph should advance the instant a read-outbox update repaints
+    /// this view.
+    last_read_outbox: i64,
+    /// The id of the first unread incoming message *as of the open that loaded this
+    /// chat* (#164), or `None` when there was nothing unread. Computed once, on the
+    /// different-chat branch of [`project`](Self::project), from the inbox watermark
+    /// at that moment — never recomputed on a same-chat refresh, so the mark-read
+    /// that fires on open cannot erase the separator it draws.
+    unread_separator: Option<i64>,
 }
 
 impl ConversationView {
@@ -199,6 +211,8 @@ impl ConversationView {
             downloads: HashMap::new(),
             chat_action: None,
             senders: HashMap::new(),
+            last_read_outbox: 0,
+            unread_separator: None,
         }
     }
 
@@ -229,7 +243,10 @@ impl ConversationView {
         messages: Vec<Message>,
         pinned: HashSet<i64>,
         senders: HashMap<Sender, SenderLabel>,
+        last_read_inbox: i64,
+        last_read_outbox: i64,
     ) {
+        self.last_read_outbox = last_read_outbox;
         if self.chat_id == Some(chat_id) {
             // Derive follow-ness from the *old* view before the swap: were we pinned
             // to the newest message? If so, advance onto the new newest; if not, hold
@@ -253,12 +270,22 @@ impl ConversationView {
             // newest message. Carry the measured viewport so the anchor is not the
             // one-frame fallback on every chat switch.
             let viewport = self.viewport;
+            // The first loaded incoming message past the inbox watermark *as of this
+            // open* (#164) — frozen here, not recomputed on same-chat refreshes, so the
+            // mark-read that fires moments after open (which advances the live
+            // watermark) can never erase the rule out from under the render.
+            let unread_separator = messages
+                .iter()
+                .find(|m| !m.is_outgoing && m.id > last_read_inbox)
+                .map(|m| m.id);
             *self = Self {
                 chat_id: Some(chat_id),
                 messages,
                 pinned,
                 viewport,
                 senders,
+                last_read_outbox,
+                unread_separator,
                 ..Self::default()
             };
             self.offset = self.newest_anchor_offset();
@@ -293,6 +320,20 @@ impl ConversationView {
     #[must_use]
     pub fn is_pinned(&self, id: i64) -> bool {
         self.pinned.contains(&id)
+    }
+
+    /// The chat's outbox read watermark (#163): a message with this id or lower, if
+    /// ours, has been read by the peer.
+    #[must_use]
+    pub fn last_read_outbox(&self) -> i64 {
+        self.last_read_outbox
+    }
+
+    /// Whether the unread-messages rule (#164) belongs immediately above message
+    /// `id` — the first incoming message unread as of this chat's open.
+    #[must_use]
+    pub fn unread_separator_before(&self, id: i64) -> bool {
+        self.unread_separator == Some(id)
     }
 
     /// The selected message — the one at the scroll [`offset`](Self::offset),
@@ -836,11 +877,83 @@ mod tests {
             (1..=5).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert_eq!(view.len(), 5);
         assert_eq!(view.offset(), 3, "top of the last screenful");
         assert_eq!(view.selected_message().map(|m| m.id), Some(4));
         assert!(view.is_at_newest(), "an open is pinned to the newest");
+    }
+
+    #[test]
+    fn opening_a_chat_with_unread_messages_marks_the_first_one() {
+        // #164: last_read_inbox = 2, so message 3 is the first unread incoming
+        // message — the separator belongs immediately above it.
+        let mut view = ConversationView::default();
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            2,
+            0,
+        );
+        assert!(view.unread_separator_before(3));
+        assert!(!view.unread_separator_before(1));
+        assert!(
+            !view.unread_separator_before(4),
+            "only the first unread one"
+        );
+    }
+
+    #[test]
+    fn opening_a_fully_read_chat_sets_no_separator() {
+        let mut view = ConversationView::default();
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            5,
+            0,
+        );
+        for id in 1..=5 {
+            assert!(!view.unread_separator_before(id));
+        }
+    }
+
+    #[test]
+    fn a_same_chat_refresh_never_recomputes_the_frozen_separator() {
+        // The separator is computed once, on the different-chat branch of
+        // `project`, from the inbox watermark *as of that open* (#164) — a
+        // same-chat refresh must not recompute it even though the live watermark
+        // moves on moments after open (the open-triggered mark-read).
+        let mut view = ConversationView::default();
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            2,
+            0,
+        );
+        assert!(view.unread_separator_before(3));
+        // A same-chat refresh arrives with the watermark already advanced past
+        // everything (as mark-read-on-open would report) — the separator must
+        // hold at message 3, not vanish or move.
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            5,
+            0,
+        );
+        assert!(
+            view.unread_separator_before(3),
+            "frozen at open, not recomputed on refresh"
+        );
     }
 
     #[test]
@@ -851,6 +964,8 @@ mod tests {
             (1..=5).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         let anchor = view.offset();
         // Scroll to the very top, then jump: it lands back on the identical anchor.
@@ -873,6 +988,8 @@ mod tests {
             (1..=3).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert_eq!(view.offset(), 0);
         assert!(view.is_at_newest());
@@ -884,7 +1001,14 @@ mod tests {
         // screen (offset on it) rather than falling off the bottom.
         let mut view = view_fitting(1); // 3 rows
         let tall = text(2, "l1\nl2\nl3\nl4\nl5"); // 1 + 5 + 1 = 7 rows > 3
-        view.project(10, vec![text(1, "m"), tall], HashSet::new(), HashMap::new());
+        view.project(
+            10,
+            vec![text(1, "m"), tall],
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+        );
         assert_eq!(
             view.offset(),
             1,
@@ -902,6 +1026,8 @@ mod tests {
             (1..=4).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         view.scroll_up(); // off the newest anchor, onto message 2
         assert_eq!(view.selected_message().map(|m| m.id), Some(2));
@@ -921,6 +1047,8 @@ mod tests {
             ],
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert_eq!(
             view.selected_message().map(|m| m.id),
@@ -944,6 +1072,8 @@ mod tests {
             (1..=4).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert!(view.is_at_newest());
         let before = view.offset();
@@ -953,6 +1083,8 @@ mod tests {
             (1..=5).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert!(view.offset() > before, "the anchor advanced with the tail");
         assert!(view.is_at_newest(), "still pinned to the (new) newest");
@@ -968,6 +1100,8 @@ mod tests {
             (1..=4).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         view.scroll_up();
         view.scroll_up();
@@ -980,6 +1114,8 @@ mod tests {
             (1..=5).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert_eq!(view.offset(), offset);
         assert_eq!(view.selected_message().map(|m| m.id), selected);
@@ -993,6 +1129,8 @@ mod tests {
             (1..=5).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         let before = view.offset();
         // Growing the pane to fit three messages re-anchors upward; the offset moves.
@@ -1014,6 +1152,8 @@ mod tests {
             (1..=5).map(|i| text(i, "m")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         view.scroll_up();
         let offset = view.offset();
@@ -1030,6 +1170,8 @@ mod tests {
             (1..=4).map(|i| text(i, "m")).collect(),
             HashSet::from([1]),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         view.scroll_up();
         assert!(!view.is_at_newest());
@@ -1041,6 +1183,8 @@ mod tests {
             (7..=9).map(|i| text(i, "z")).collect(),
             HashSet::new(),
             HashMap::new(),
+            i64::MAX,
+            0,
         );
         assert_eq!(view.len(), 3);
         assert!(view.is_at_newest(), "new chat opens pinned to the newest");
@@ -1184,6 +1328,8 @@ mod tests {
                     color: Some(Color::Red),
                 },
             )]),
+            i64::MAX,
+            0,
         );
         assert_eq!(view.sender_label(&message).label, "Ada Lovelace (@ada)");
     }
@@ -1192,7 +1338,14 @@ mod tests {
     fn sender_label_falls_back_to_the_id_for_an_unresolved_user() {
         let mut view = ConversationView::default();
         let message = text(1, "hi");
-        view.project(10, vec![message.clone()], HashSet::new(), HashMap::new());
+        view.project(
+            10,
+            vec![message.clone()],
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+        );
         assert_eq!(view.sender_label(&message).label, "User 1");
     }
 
@@ -1212,6 +1365,8 @@ mod tests {
                     color: None,
                 },
             )]),
+            i64::MAX,
+            0,
         );
         assert_eq!(view.sender_label(&message).label, "Rust News");
     }
@@ -1233,6 +1388,8 @@ mod tests {
                     color: Some(Color::Red),
                 },
             )]),
+            i64::MAX,
+            0,
         );
         assert_eq!(view.sender_label(&message).label, "You");
     }
