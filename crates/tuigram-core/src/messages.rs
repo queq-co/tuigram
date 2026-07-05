@@ -935,6 +935,15 @@ impl MessageStore {
     /// Merge a history page (or any batch of messages) into the store. Each
     /// message is filed under its own chat and id, so re-merging an overlapping
     /// page is idempotent — duplicates collapse onto the same entry.
+    ///
+    /// A re-fetched page **replaces** an already-known message rather than
+    /// skipping it: `getChatHistory` is server-authoritative, and is the one
+    /// documented recovery path (#207) for a message whose reactions or content
+    /// changed while its chat was closed and so never arrived as a live update —
+    /// opening the chat and re-paging its history is what catches those up mid
+    /// session, exactly as a restart does. A live fold ([`reduce`](Self::reduce))
+    /// racing a page fetch for the same id is a narrower, separate concern than
+    /// disabling that recovery path is worth trading away here.
     pub fn merge(&mut self, messages: impl IntoIterator<Item = Message>) {
         for message in messages {
             self.insert(message);
@@ -1203,6 +1212,35 @@ mod tests {
         store.merge([msg(10, 20), msg(10, 30)]);
 
         assert_eq!(ids(&store.history(10)), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn a_re_fetched_page_refreshes_reactions_missed_while_the_chat_was_closed() {
+        // #207: opening a chat and re-paging its history is the documented
+        // recovery path for reactions that changed while the chat was closed —
+        // TDLib only guarantees live `updateMessageInteractionInfo` delivery for
+        // an open chat, so a message reacted-to while closed can only catch up
+        // through a fresh, server-authoritative `getChatHistory` page. `merge`
+        // must let that page win over the stale (reaction-less) copy already
+        // known from a live `updateNewMessage`.
+        let mut store = MessageStore::new();
+        store.merge([msg(10, 1), msg(10, 2)]);
+        assert!(store.get(10, 2).unwrap().reactions.is_empty());
+
+        // The chat is (re)opened; the landing page comes back with the reaction
+        // that landed while it was closed.
+        let mut reacted = msg(10, 2);
+        reacted.reactions = vec![Reaction {
+            kind: crate::model::ReactionKind::Emoji("👍".to_owned()),
+            count: 1,
+            is_chosen: true,
+        }];
+        store.merge([msg(10, 1), reacted]);
+
+        assert!(
+            !store.get(10, 2).unwrap().reactions.is_empty(),
+            "a re-fetched page must refresh an already-known message"
+        );
     }
 
     #[test]

@@ -27,7 +27,8 @@ pub use actions::{ChatActionRequests, ChatActionStore};
 pub use auth::{AuthRequests, AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
 pub use chats::{
-    CHATS_EXHAUSTED, ChatRequests, ChatStore, load_archive_list, load_folder_list, load_main_list,
+    CHATS_EXHAUSTED, ChatLifecycleRequests, ChatRequests, ChatStore, load_archive_list,
+    load_folder_list, load_main_list,
 };
 pub use client::{AccountState, Client};
 pub use command_surface::REPL_COMMANDS;

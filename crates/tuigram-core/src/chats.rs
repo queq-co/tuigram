@@ -95,6 +95,38 @@ impl ChatRequests for Bridge {
     }
 }
 
+/// Tell TDLib which chat, if any, tuigram currently has open (#207).
+///
+/// TDLib documents several update families — including `updateMessageInteractionInfo`
+/// (reactions) and `updateMessageContent` (edits) from *other* devices/users — as
+/// guaranteed only for a chat it considers open; a chat never marked open may
+/// simply never receive them, leaving the local copy stale until the next full
+/// history refetch (e.g. a restart). This is advisory, like the read and reaction
+/// seams: it never blocks on a reply, and the live updates it unlocks fold through
+/// the usual router path, not through this trait.
+#[allow(async_fn_in_trait)]
+pub trait ChatLifecycleRequests {
+    /// Mark a chat open, TDLib's `openChat`. Call once per genuine open (a chat
+    /// switch), not on every re-projection of an already-open chat.
+    async fn open_chat(&self, chat_id: i64) -> Result<(), TdError>;
+
+    /// Mark a chat no longer open, TDLib's `closeChat` — the counterpart to
+    /// [`open_chat`](Self::open_chat). Call when the chat stops being the one
+    /// shown (switching away, or leaving the history pane), including when it is
+    /// replaced by a different chat becoming open.
+    async fn close_chat(&self, chat_id: i64) -> Result<(), TdError>;
+}
+
+impl ChatLifecycleRequests for Bridge {
+    async fn open_chat(&self, chat_id: i64) -> Result<(), TdError> {
+        tdlib_rs::functions::open_chat(chat_id, self.id()).await
+    }
+
+    async fn close_chat(&self, chat_id: i64) -> Result<(), TdError> {
+        tdlib_rs::functions::close_chat(chat_id, self.id()).await
+    }
+}
+
 /// The TDLib error code returned by `loadChats` once every chat in the list has
 /// been loaded. Not a failure — the natural terminal condition of paging.
 pub const CHATS_EXHAUSTED: i32 = 404;
@@ -1079,6 +1111,45 @@ mod tests {
                     draft: None,
                 },
             ]
+        );
+    }
+
+    /// A spy `ChatLifecycleRequests` recording every open/close call in order, so
+    /// a test can assert the exact lifecycle a chat switch drives (#207).
+    struct LifecycleSpy {
+        calls: RefCell<Vec<(i64, bool)>>,
+    }
+
+    impl LifecycleSpy {
+        fn new() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ChatLifecycleRequests for LifecycleSpy {
+        async fn open_chat(&self, chat_id: i64) -> Result<(), TdError> {
+            self.calls.borrow_mut().push((chat_id, true));
+            Ok(())
+        }
+
+        async fn close_chat(&self, chat_id: i64) -> Result<(), TdError> {
+            self.calls.borrow_mut().push((chat_id, false));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn opening_then_closing_a_chat_threads_through_the_seam_in_order() {
+        let spy = LifecycleSpy::new();
+        spy.open_chat(10).await.unwrap();
+        spy.close_chat(10).await.unwrap();
+        spy.open_chat(20).await.unwrap();
+
+        assert_eq!(
+            *spy.calls.borrow(),
+            vec![(10, true), (10, false), (20, true)]
         );
     }
 
