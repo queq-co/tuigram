@@ -10,7 +10,7 @@
 //! against the `TestBackend` harness below.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -55,33 +55,92 @@ const COMPOSER_PLACEHOLDER: &str = "type a message…";
 /// Marker prefixed to the focused pane's border title.
 const FOCUS_MARKER: &str = "●";
 
-/// Render the whole UI for one frame from the current `App` state, returning the
-/// history pane's inner height (rows) so the loop can record it on the conversation
-/// view (#158) — the number of visible message rows the bottom-anchoring walk sums
-/// against. The renderer stays a pure snapshot; the loop owns feeding the height
-/// back through [`App::set_conversation_viewport`](crate::app::App::set_conversation_viewport).
-pub fn ui(frame: &mut Frame, app: &App) -> usize {
+/// The four top-level pane rectangles a frame is laid out into — the single source
+/// of truth for [`ui`]'s layout, recorded back onto `App` so a mouse event can be
+/// hit-tested to a pane without re-running (or duplicating) the layout (#161/#162).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaneLayout {
+    /// Left pane: the chat list (#80).
+    pub list: Rect,
+    /// Right-top pane: the scrolling message history (#81).
+    pub history: Rect,
+    /// Right-bottom pane: the fixed-height composer (#82).
+    pub composer: Rect,
+    /// Bottom strip: the status bar (#88). Not a focus target.
+    pub status: Rect,
+}
+
+impl PaneLayout {
+    /// The focusable pane a point at `(col, row)` lands in, or `None` for the
+    /// status bar or any gap. Focus-only per #161: the status strip and anything
+    /// outside the three panes are not focus targets.
+    #[must_use]
+    pub fn focus_at(&self, col: u16, row: u16) -> Option<Focus> {
+        let at = Position::new(col, row);
+        if self.list.contains(at) {
+            Some(Focus::ChatList)
+        } else if self.history.contains(at) {
+            Some(Focus::History)
+        } else if self.composer.contains(at) {
+            Some(Focus::Composer)
+        } else {
+            None
+        }
+    }
+}
+
+/// Split `area` into the four top-level pane rectangles. The one place the frame
+/// layout is defined: [`ui`] renders into these rects and the loop records the same
+/// ones on `App` (via [`RenderOutput`]) for mouse hit-testing, so what was drawn and
+/// what is hit-tested can never drift.
+pub fn pane_layout(area: Rect) -> PaneLayout {
     // Outer split: the three panes over a one-row status bar pinned to the bottom.
-    let [content_area, status_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)])
-            .areas(frame.area());
+    let [content_area, status] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(area);
 
     // Content split: chat list | conversation (fills the rest).
-    let [list_area, convo_area] = Layout::horizontal([
+    let [list, convo_area] = Layout::horizontal([
         Constraint::Percentage(CHAT_LIST_PERCENT),
         Constraint::Min(0),
     ])
     .areas(content_area);
 
     // Conversation split: message history over a fixed composer line.
-    let [history_area, composer_area] =
+    let [history, composer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(COMPOSER_HEIGHT)])
             .areas(convo_area);
 
-    render_chat_list(frame, list_area, app);
-    render_conversation(frame, history_area, app);
-    render_composer(frame, composer_area, app);
-    render_status_bar(frame, status_area, app);
+    PaneLayout {
+        list,
+        history,
+        composer,
+        status,
+    }
+}
+
+/// What one render measured for the loop to record back onto `App`: the history
+/// pane's inner height (#158) and the pane rectangles for mouse hit-testing
+/// (#161/#162). The renderer stays a pure snapshot; the loop owns feeding these
+/// back through [`App::set_conversation_viewport`](crate::app::App::set_conversation_viewport)
+/// and [`App::set_pane_layout`](crate::app::App::set_pane_layout).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RenderOutput {
+    /// The history pane's inner height (rows) — the number of visible message rows
+    /// the bottom-anchoring walk (#158) sums against.
+    pub convo_viewport: usize,
+    /// The pane rectangles this frame was drawn into.
+    pub panes: PaneLayout,
+}
+
+/// Render the whole UI for one frame from the current `App` state, returning what
+/// the loop records back onto `App` (see [`RenderOutput`]).
+pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
+    let panes = pane_layout(frame.area());
+
+    render_chat_list(frame, panes.list, app);
+    render_conversation(frame, panes.history, app);
+    render_composer(frame, panes.composer, app);
+    render_status_bar(frame, panes.status, app);
 
     // A modal overlay floats above the panes, capturing input while open.
     match app.overlay() {
@@ -101,14 +160,22 @@ pub fn ui(frame: &mut Frame, app: &App) -> usize {
     }
 
     // A transient toast floats over the content too, but — unlike a modal overlay
-    // — it never captures input, so the loop keeps responding while it shows.
+    // — it never captures input, so the loop keeps responding while it shows. The
+    // content region is the frame minus the bottom status strip.
     if app.notifications().current().is_some() {
+        let content_area = Rect {
+            height: frame.area().height.saturating_sub(STATUS_HEIGHT),
+            ..frame.area()
+        };
         render_toast(frame, content_area, app);
     }
 
-    // The history pane's inner height (excluding the block's top and bottom borders)
-    // — the row budget the bottom-anchoring walk (#158) fits messages into.
-    history_area.height.saturating_sub(2) as usize
+    RenderOutput {
+        // The history pane's inner height (excluding the block's top and bottom
+        // borders) — the row budget the bottom-anchoring walk (#158) fits messages into.
+        convo_viewport: panes.history.height.saturating_sub(2) as usize,
+        panes,
+    }
 }
 
 /// A pane's bordered block, with the focus highlight applied when `focused`: a
@@ -1370,6 +1437,24 @@ mod tests {
         (0..buffer.area.width)
             .map(|x| buffer[(x, y)].symbol())
             .collect()
+    }
+
+    #[test]
+    fn pane_layout_hit_tests_each_pane() {
+        // The same 80×24 geometry the skeleton renders at, so this exercises the
+        // exact rects `ui` draws into. A point lands in the pane whose rect holds
+        // it; the status strip and out-of-bounds are not focus targets (#161).
+        let panes = pane_layout(Rect::new(0, 0, 80, 24));
+        // Chat list is the left column.
+        assert_eq!(panes.focus_at(1, 1), Some(Focus::ChatList));
+        // History fills the right column above the composer.
+        assert_eq!(panes.focus_at(50, 1), Some(Focus::History));
+        // Composer is the fixed block just above the status bar.
+        assert_eq!(panes.focus_at(50, panes.composer.y), Some(Focus::Composer));
+        // The bottom status strip is not a focus target.
+        assert_eq!(panes.focus_at(0, panes.status.y), None);
+        // A point past the right edge hits nothing.
+        assert_eq!(panes.focus_at(80, 0), None);
     }
 
     #[test]

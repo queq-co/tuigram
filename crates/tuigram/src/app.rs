@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use ratatui_image::protocol::Protocol;
 use tuigram_core::StorageSettings;
 use tuigram_core::model::{File, Message, MessageContent, OutgoingMedia, SecretChatState, Sender};
@@ -478,6 +478,12 @@ pub struct App {
     /// the render path via [`cache_avatar`](Self::cache_avatar) as `drive_avatars`
     /// finishes encoding each sender's photo.
     avatar_cache: AvatarCache,
+    /// The pane rectangles the last render drew into (#161/#162), recorded by the
+    /// loop after each `draw` via [`set_pane_layout`](Self::set_pane_layout) so a
+    /// mouse event can be hit-tested to a pane without re-running layout. Default
+    /// (all-zero) rects until the first frame, which hit-test to `None` and so map
+    /// mouse events to `Noop`.
+    pane_layout: crate::ui::PaneLayout,
 }
 
 impl App {
@@ -846,6 +852,15 @@ impl App {
         }
     }
 
+    /// Record the pane rectangles the last render drew into (#161/#162), so the
+    /// next mouse event can be hit-tested to a pane. The loop calls this after each
+    /// `draw` with the [`RenderOutput::panes`](crate::ui::RenderOutput) it measured.
+    /// Pure bookkeeping — it never re-dirties, since geometry does not change what
+    /// is drawn.
+    pub fn set_pane_layout(&mut self, panes: crate::ui::PaneLayout) {
+        self.pane_layout = panes;
+    }
+
     /// Open the forward target picker for `message_id` from `source_chat_id`, shared
     /// by the two entry points (a search hit, `ForwardOpen`; the selected history
     /// message, `ForwardMessage`). The picker reuses a snapshot of the chat list as
@@ -944,8 +959,41 @@ impl App {
     pub fn on_terminal_event(&self, event: Event) -> Action {
         match event {
             Event::Key(key) => keymap::resolve(self.focus, self.overlay, &key),
+            // A left-click focuses the pane under the pointer; the wheel scrolls the
+            // pane it is over (#161/#162), hit-tested against the last render.
+            Event::Mouse(mouse) => self.on_mouse(mouse),
             // A resize must repaint against the new viewport.
             Event::Resize(_, _) => Action::Render,
+            _ => Action::Noop,
+        }
+    }
+
+    /// Map a mouse event to an [`Action`] against the pane rectangles the last
+    /// render recorded (#161/#162). A left-click focuses the pane under the pointer;
+    /// the wheel moves the chat-list selection or scrolls the history — the pane the
+    /// pointer is *over*, regardless of which pane holds focus. Clicks/wheels over
+    /// the status bar or empty space, the wheel over the composer, and anything
+    /// while a modal overlay is open are ignored (#161 scopes overlay hit-testing to
+    /// a follow-up). Pure, like [`on_terminal_event`](Self::on_terminal_event).
+    fn on_mouse(&self, mouse: MouseEvent) -> Action {
+        // A modal overlay captures input, so mouse events fall through to nothing
+        // rather than reaching the panes drawn underneath it.
+        if self.overlay != Overlay::None {
+            return Action::Noop;
+        }
+        let pane = self.pane_layout.focus_at(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => pane.map_or(Action::Noop, Action::SetFocus),
+            MouseEventKind::ScrollUp => match pane {
+                Some(Focus::ChatList) => Action::SelectPrev,
+                Some(Focus::History) => Action::ScrollUp,
+                _ => Action::Noop,
+            },
+            MouseEventKind::ScrollDown => match pane {
+                Some(Focus::ChatList) => Action::SelectNext,
+                Some(Focus::History) => Action::ScrollDown,
+                _ => Action::Noop,
+            },
             _ => Action::Noop,
         }
     }
@@ -1754,6 +1802,114 @@ mod tests {
     fn resize_requests_render() {
         let app = App::new();
         assert_eq!(app.on_terminal_event(Event::Resize(80, 24)), Action::Render);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// An app whose recorded pane rects match an 80×24 frame — the geometry the
+    /// render tests use — so the coordinates below hit-test to real panes
+    /// (#161/#162). Chat list: left column; history: right column, rows 0..19;
+    /// composer: rows 20..22; status: row 23.
+    fn app_with_panes() -> App {
+        let mut app = App::new();
+        app.set_pane_layout(crate::ui::pane_layout(ratatui::layout::Rect::new(
+            0, 0, 80, 24,
+        )));
+        app
+    }
+
+    const LEFT_CLICK: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+
+    #[test]
+    fn left_click_focuses_the_pane_under_the_pointer() {
+        let app = app_with_panes();
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 1, 1)),
+            Action::SetFocus(Focus::ChatList)
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 50, 1)),
+            Action::SetFocus(Focus::History)
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 50, 21)),
+            Action::SetFocus(Focus::Composer)
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_status_bar_or_empty_space_is_ignored() {
+        let app = app_with_panes();
+        // The status strip is not a focus target.
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 0, 23)),
+            Action::Noop
+        );
+        // Past the right edge hits nothing.
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 100, 5)),
+            Action::Noop
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_chat_list_moves_its_selection() {
+        // Regardless of focus: the app lands focused on the chat list, but the
+        // pointer is what selects the target pane (#162).
+        let app = app_with_panes();
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 1, 1)),
+            Action::SelectNext
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollUp, 1, 1)),
+            Action::SelectPrev
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_history_pane_scrolls_it() {
+        let app = app_with_panes();
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 50, 1)),
+            Action::ScrollDown
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollUp, 50, 1)),
+            Action::ScrollUp
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_composer_is_ignored() {
+        // Only the chat list and history scroll on the wheel (#162); the composer
+        // and status bar do not.
+        let app = app_with_panes();
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 50, 21)),
+            Action::Noop
+        );
+    }
+
+    #[test]
+    fn mouse_events_are_ignored_while_a_modal_overlay_is_open() {
+        // An overlay captures input, so a click/wheel falls through to nothing
+        // rather than reaching the panes underneath (#161).
+        let mut app = app_with_panes();
+        app.dispatch(Action::ToggleHelp);
+        assert_ne!(app.overlay(), Overlay::None, "help overlay should be open");
+        assert_eq!(app.on_terminal_event(mouse(LEFT_CLICK, 1, 1)), Action::Noop);
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 50, 1)),
+            Action::Noop
+        );
     }
 
     #[test]

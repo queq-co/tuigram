@@ -74,10 +74,10 @@ use tokio_stream::StreamExt;
 use tuigram_core::model::{ChatAction, ChatKind, ChatListKind, Message, Sender, User, UserKind};
 use tuigram_core::{
     AuthRequests, ChatActionRequests, Client, ContactRequests, DOWNLOAD_PRIORITY, DeleteRequests,
-    EditRequests, FileRequests, FormattedText, ForwardRequests, HistoryRequests, NEWEST,
-    PinRequests, ReactionRequests, ReadRequests, SecretChatRequests, SendRequests, StorageRequests,
-    StorageSettings, UserRequests, load_archive_list, load_folder_list, load_main_list,
-    search_chat, search_global,
+    EditRequests, FileRequests, FormattedText, ForwardRequests, HistoryRequests, InterfaceSettings,
+    NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests, SendRequests,
+    StorageRequests, StorageSettings, UserRequests, load_archive_list, load_folder_list,
+    load_main_list, search_chat, search_global,
 };
 
 use crate::app::{Action, App};
@@ -177,7 +177,12 @@ async fn main() -> ExitCode {
     };
 
     install_panic_hook();
-    let mut guard = match TerminalGuard::new() {
+    // Read the mouse toggle before entering the terminal so capture is enabled (or
+    // not) from the first frame (#161). A missing/malformed settings file defaults
+    // to mouse on; `StorageSettings::load` (in `run`) surfaces a parse warning, so
+    // this stays quiet.
+    let interface = InterfaceSettings::load();
+    let mut guard = match TerminalGuard::new(interface.mouse) {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("tuigram: could not initialize the terminal: {err}");
@@ -297,12 +302,15 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // so an open/`G`/tail-follow can bottom-anchor against the real number of
             // visible rows (#158). A first measurement or a resize while following
             // re-anchors and re-dirties, so the corrected frame paints next iteration.
-            let mut convo_viewport = 0;
+            let mut render_out = ui::RenderOutput::default();
             guard
                 .terminal_mut()
-                .draw(|frame| convo_viewport = ui::ui(frame, &app))?;
+                .draw(|frame| render_out = ui::ui(frame, &app))?;
             app.clear_dirty();
-            app.set_conversation_viewport(convo_viewport);
+            app.set_conversation_viewport(render_out.convo_viewport);
+            // Record the pane rectangles this frame drew into, so a mouse event can
+            // be hit-tested to a pane without re-running layout (#161/#162).
+            app.set_pane_layout(render_out.panes);
         }
 
         tokio::select! {

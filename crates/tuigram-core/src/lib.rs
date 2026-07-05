@@ -55,7 +55,7 @@ pub use router::{Router, UpdateSink};
 pub use sanitize::{scrub_line, scrub_prose};
 pub use secret_chats::{SecretChatRequests, SecretChatStore};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
-pub use settings::{CacheCap, KeepMedia, StorageSettings};
+pub use settings::{CacheCap, InterfaceSettings, KeepMedia, StorageSettings};
 pub use users::{UserRequests, UserStore};
 
 /// TDLib's typed request API and data model, re-exported so callers depend on
