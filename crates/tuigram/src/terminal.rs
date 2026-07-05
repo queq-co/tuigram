@@ -6,6 +6,7 @@
 use std::io::{self, Stdout};
 
 use crossterm::cursor::Show;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -82,10 +83,19 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     /// Enter raw mode + the alternate screen and wrap stdout in a Ratatui
     /// terminal. The screen is restored when the returned guard is dropped.
-    pub fn new() -> io::Result<Self> {
+    ///
+    /// `mouse` turns on crossterm mouse reporting (#161/#162) so the loop receives
+    /// click and wheel events; it is off when the `[interface] mouse` setting is
+    /// `false`, leaving the terminal's native text selection intact. Teardown
+    /// ([`restore`]) disables mouse capture unconditionally, so leaving it off here
+    /// is always safe.
+    pub fn new(mouse: bool) -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
+        if mouse {
+            execute!(stdout, EnableMouseCapture)?;
+        }
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         // Must run after entering the alternate screen but before any terminal
         // events are read (`Picker`'s own contract) — right here, before the
@@ -121,13 +131,21 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Tear down raw mode + the alternate screen on the process's stdout and make
-/// the cursor visible again. Idempotent and best-effort, so it is safe to call
-/// from both [`TerminalGuard`]'s `Drop` and the panic hook even if the terminal
-/// was already (partly) restored.
+/// Tear down raw mode + the alternate screen on the process's stdout, disable
+/// mouse capture, and make the cursor visible again. Idempotent and best-effort,
+/// so it is safe to call from both [`TerminalGuard`]'s `Drop` and the panic hook
+/// even if the terminal was already (partly) restored. Mouse capture is disabled
+/// unconditionally — the escape is a no-op when it was never enabled — so an
+/// unrestored terminal never leaks capture (and stray mouse-escape garbage on
+/// scroll) regardless of the `[interface] mouse` setting.
 pub fn restore() -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, Show)?;
+    execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    )?;
     Ok(())
 }
 

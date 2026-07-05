@@ -10,7 +10,7 @@
 //! against the `TestBackend` harness below.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -55,33 +55,135 @@ const COMPOSER_PLACEHOLDER: &str = "type a message…";
 /// Marker prefixed to the focused pane's border title.
 const FOCUS_MARKER: &str = "●";
 
-/// Render the whole UI for one frame from the current `App` state, returning the
-/// history pane's inner height (rows) so the loop can record it on the conversation
-/// view (#158) — the number of visible message rows the bottom-anchoring walk sums
-/// against. The renderer stays a pure snapshot; the loop owns feeding the height
-/// back through [`App::set_conversation_viewport`](crate::app::App::set_conversation_viewport).
-pub fn ui(frame: &mut Frame, app: &App) -> usize {
+/// The four top-level pane rectangles a frame is laid out into — the single source
+/// of truth for [`ui`]'s layout, recorded back onto `App` so a mouse event can be
+/// hit-tested to a pane without re-running (or duplicating) the layout (#161/#162).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PaneLayout {
+    /// Left pane: the chat list (#80).
+    pub list: Rect,
+    /// Right-top pane: the scrolling message history (#81).
+    pub history: Rect,
+    /// Right-bottom pane: the fixed-height composer (#82).
+    pub composer: Rect,
+    /// Bottom strip: the status bar (#88). Not a focus target.
+    pub status: Rect,
+}
+
+impl PaneLayout {
+    /// The focusable pane a point at `(col, row)` lands in, or `None` for the
+    /// status bar or any gap. Focus-only per #161: the status strip and anything
+    /// outside the three panes are not focus targets.
+    #[must_use]
+    pub fn focus_at(&self, col: u16, row: u16) -> Option<Focus> {
+        let at = Position::new(col, row);
+        if self.list.contains(at) {
+            Some(Focus::ChatList)
+        } else if self.history.contains(at) {
+            Some(Focus::History)
+        } else if self.composer.contains(at) {
+            Some(Focus::Composer)
+        } else {
+            None
+        }
+    }
+}
+
+/// Split `area` into the four top-level pane rectangles. The one place the frame
+/// layout is defined: [`ui`] renders into these rects and the loop records the same
+/// ones on `App` (via [`RenderOutput`]) for mouse hit-testing, so what was drawn and
+/// what is hit-tested can never drift.
+pub fn pane_layout(area: Rect) -> PaneLayout {
     // Outer split: the three panes over a one-row status bar pinned to the bottom.
-    let [content_area, status_area] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)])
-            .areas(frame.area());
+    let [content_area, status] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(area);
 
     // Content split: chat list | conversation (fills the rest).
-    let [list_area, convo_area] = Layout::horizontal([
+    let [list, convo_area] = Layout::horizontal([
         Constraint::Percentage(CHAT_LIST_PERCENT),
         Constraint::Min(0),
     ])
     .areas(content_area);
 
     // Conversation split: message history over a fixed composer line.
-    let [history_area, composer_area] =
+    let [history, composer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(COMPOSER_HEIGHT)])
             .areas(convo_area);
 
-    render_chat_list(frame, list_area, app);
-    render_conversation(frame, history_area, app);
-    render_composer(frame, composer_area, app);
-    render_status_bar(frame, status_area, app);
+    PaneLayout {
+        list,
+        history,
+        composer,
+        status,
+    }
+}
+
+/// Row → chat id map for the chat-list pane, recorded from the last render so a
+/// click on an actual chat row can open that chat directly rather than just
+/// focusing the pane (extends #161/#162's pane-level hit-testing). Built from
+/// the [`ListState`] offset the widget itself scrolled to during rendering, so
+/// this always matches what was actually drawn even when the selection isn't at
+/// the top of the viewport.
+#[derive(Debug, Clone, Default)]
+pub struct ChatRows(Vec<(u16, i64)>);
+
+impl ChatRows {
+    /// The chat drawn at frame row `row`, if any.
+    #[must_use]
+    pub fn chat_at(&self, row: u16) -> Option<i64> {
+        self.0.iter().find(|&&(r, _)| r == row).map(|&(_, id)| id)
+    }
+}
+
+/// Row-range → message id map for the history pane, recorded from the last
+/// render so a click on an actual message row can select it directly (extends
+/// #161/#162's pane-level hit-testing). Unlike [`ChatRows`], each message spans
+/// a variable number of rows (header, content, reactions), so a hit is a row
+/// *range* containment rather than an exact-row match.
+#[derive(Debug, Clone, Default)]
+pub struct HistoryRows(Vec<(u16, u16, i64)>);
+
+impl HistoryRows {
+    /// The message drawn at frame row `row`, if any.
+    #[must_use]
+    pub fn message_at(&self, row: u16) -> Option<i64> {
+        self.0
+            .iter()
+            .find(|&&(start, end, _)| (start..end).contains(&row))
+            .map(|&(_, _, id)| id)
+    }
+}
+
+/// What one render measured for the loop to record back onto `App`: the history
+/// pane's inner height (#158), the pane rectangles for mouse hit-testing
+/// (#161/#162), and the chat/message row maps for click-to-open/click-to-select.
+/// The renderer stays a pure snapshot; the loop owns feeding these back through
+/// [`App::set_conversation_viewport`](crate::app::App::set_conversation_viewport),
+/// [`App::set_pane_layout`](crate::app::App::set_pane_layout),
+/// [`App::set_chat_rows`](crate::app::App::set_chat_rows), and
+/// [`App::set_history_rows`](crate::app::App::set_history_rows).
+#[derive(Debug, Clone, Default)]
+pub struct RenderOutput {
+    /// The history pane's inner height (rows) — the number of visible message rows
+    /// the bottom-anchoring walk (#158) sums against.
+    pub convo_viewport: usize,
+    /// The pane rectangles this frame was drawn into.
+    pub panes: PaneLayout,
+    /// Row → chat id map this frame drew.
+    pub chat_rows: ChatRows,
+    /// Row-range → message id map this frame drew.
+    pub history_rows: HistoryRows,
+}
+
+/// Render the whole UI for one frame from the current `App` state, returning what
+/// the loop records back onto `App` (see [`RenderOutput`]).
+pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
+    let panes = pane_layout(frame.area());
+
+    let chat_rows = render_chat_list(frame, panes.list, app);
+    let history_rows = render_conversation(frame, panes.history, app);
+    render_composer(frame, panes.composer, app);
+    render_status_bar(frame, panes.status, app);
 
     // A modal overlay floats above the panes, capturing input while open.
     match app.overlay() {
@@ -101,14 +203,24 @@ pub fn ui(frame: &mut Frame, app: &App) -> usize {
     }
 
     // A transient toast floats over the content too, but — unlike a modal overlay
-    // — it never captures input, so the loop keeps responding while it shows.
+    // — it never captures input, so the loop keeps responding while it shows. The
+    // content region is the frame minus the bottom status strip.
     if app.notifications().current().is_some() {
+        let content_area = Rect {
+            height: frame.area().height.saturating_sub(STATUS_HEIGHT),
+            ..frame.area()
+        };
         render_toast(frame, content_area, app);
     }
 
-    // The history pane's inner height (excluding the block's top and bottom borders)
-    // — the row budget the bottom-anchoring walk (#158) fits messages into.
-    history_area.height.saturating_sub(2) as usize
+    RenderOutput {
+        // The history pane's inner height (excluding the block's top and bottom
+        // borders) — the row budget the bottom-anchoring walk (#158) fits messages into.
+        convo_viewport: panes.history.height.saturating_sub(2) as usize,
+        panes,
+        chat_rows,
+        history_rows,
+    }
 }
 
 /// A pane's bordered block, with the focus highlight applied when `focused`: a
@@ -128,7 +240,7 @@ fn pane_block(title: String, focused: bool) -> Block<'static> {
 /// with an unread badge — under a title naming the active list, with the selected
 /// row highlighted. An empty list shows a placeholder. List switching and moving
 /// the selection are driven through [`App`]'s reducer by the keymap.
-fn render_chat_list(frame: &mut Frame, area: Rect, app: &App) {
+fn render_chat_list(frame: &mut Frame, area: Rect, app: &App) -> ChatRows {
     let view = app.chat_list();
     let block = pane_block(
         format!(" Chats — {} ", view.active_label()),
@@ -138,7 +250,7 @@ fn render_chat_list(frame: &mut Frame, area: Rect, app: &App) {
     let chats = view.active_chats();
     if chats.is_empty() {
         frame.render_widget(Paragraph::new("(no chats yet)").block(block), area);
-        return;
+        return ChatRows::default();
     }
 
     let items: Vec<ListItem> = chats
@@ -155,6 +267,20 @@ fn render_chat_list(frame: &mut Frame, area: Rect, app: &App) {
     // without the (immutable) render path holding mutable scroll state.
     let mut state = ListState::default().with_selected(Some(view.selected()));
     frame.render_stateful_widget(list, area, &mut state);
+
+    // Row → chat id map: `render_stateful_widget` above settles `state`'s offset
+    // to whatever it actually scrolled to, so reading it back here can never
+    // drift from what was drawn.
+    let top = area.y + 1;
+    let visible_rows = area.height.saturating_sub(2) as usize;
+    let rows = chats
+        .iter()
+        .enumerate()
+        .skip(state.offset())
+        .take(visible_rows)
+        .map(|(i, chat)| (top + (i - state.offset()) as u16, chat.id))
+        .collect();
+    ChatRows(rows)
 }
 
 /// One chat row: the title, plus a bold unread badge when the chat has unread
@@ -254,11 +380,11 @@ fn action_phrase(action: &ChatAction) -> &'static str {
 /// reaction line — windowed forward from the scroll offset so a long history never
 /// builds the whole buffer, with a scrollbar tracking the offset. With no chat open
 /// the view is empty, so the pane falls through to the empty-state placeholder (#188).
-fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
+fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows {
     let view = app.conversation();
     if view.is_empty() {
         render_conversation_placeholder(frame, area, app);
-        return;
+        return HistoryRows::default();
     }
 
     // Window forward from the offset: format messages until the visible rows are
@@ -275,6 +401,10 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
     // is off) simply renders a blank gutter — [`drive_avatars`] in `main.rs`
     // kicks off the encode and a later frame draws it once cached.
     let mut avatars: Vec<(usize, &Protocol)> = Vec::new();
+    // Row range (within `inner_rows`) each visible message occupies, alongside
+    // its id, so a click on any of its rows (header, body, or reaction line)
+    // resolves to that message rather than just the header row.
+    let mut message_rows: Vec<(usize, usize, i64)> = Vec::new();
     // The message at the offset (the first built) is the selected one — the
     // cursor the reaction/pin affordances act on — so it carries the marker.
     for (i, message) in view.messages().iter().skip(view.offset()).enumerate() {
@@ -288,7 +418,9 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
         {
             avatars.push((row, protocol));
         }
-        lines.extend(message_lines(view, message, i == 0, gutter_cols));
+        let rendered = message_lines(view, message, i == 0, gutter_cols);
+        message_rows.push((row, row + rendered.len(), message.id));
+        lines.extend(rendered);
     }
     lines.truncate(inner_rows);
 
@@ -330,6 +462,23 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) {
         }),
         &mut scrollbar_state,
     );
+
+    // Absolute-row rows for hit-testing (matches the avatar overlay's own
+    // `area.y + 1 + row` above), clipped to what `truncate` above actually kept
+    // so a message half-cut off at the pane's bottom edge never claims rows past
+    // the border.
+    HistoryRows(
+        message_rows
+            .into_iter()
+            .map(|(start, end, id)| {
+                (
+                    area.y + 1 + start as u16,
+                    area.y + 1 + end.min(inner_rows) as u16,
+                    id,
+                )
+            })
+            .collect(),
+    )
 }
 
 /// The conversation pane's empty state: shown while no chat is open (#188).
@@ -1360,6 +1509,20 @@ mod tests {
         terminal.backend().buffer().clone()
     }
 
+    /// Like [`render`], but returns the [`RenderOutput`] the frame measured
+    /// instead of the buffer — for tests on the pane rects and chat/message row
+    /// maps a click resolves against (#161/#162).
+    fn render_output(app: &App, width: u16, height: u16) -> RenderOutput {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut output = RenderOutput::default();
+        terminal
+            .draw(|frame| {
+                output = ui(frame, app);
+            })
+            .unwrap();
+        output
+    }
+
     /// Whole-buffer text, for substring assertions on rendered content.
     fn flatten(buffer: &Buffer) -> String {
         buffer.content().iter().map(Cell::symbol).collect()
@@ -1370,6 +1533,24 @@ mod tests {
         (0..buffer.area.width)
             .map(|x| buffer[(x, y)].symbol())
             .collect()
+    }
+
+    #[test]
+    fn pane_layout_hit_tests_each_pane() {
+        // The same 80×24 geometry the skeleton renders at, so this exercises the
+        // exact rects `ui` draws into. A point lands in the pane whose rect holds
+        // it; the status strip and out-of-bounds are not focus targets (#161).
+        let panes = pane_layout(Rect::new(0, 0, 80, 24));
+        // Chat list is the left column.
+        assert_eq!(panes.focus_at(1, 1), Some(Focus::ChatList));
+        // History fills the right column above the composer.
+        assert_eq!(panes.focus_at(50, 1), Some(Focus::History));
+        // Composer is the fixed block just above the status bar.
+        assert_eq!(panes.focus_at(50, panes.composer.y), Some(Focus::Composer));
+        // The bottom status strip is not a focus target.
+        assert_eq!(panes.focus_at(0, panes.status.y), None);
+        // A point past the right edge hits nothing.
+        assert_eq!(panes.focus_at(80, 0), None);
     }
 
     #[test]
@@ -1637,6 +1818,46 @@ mod tests {
         assert!(!text.contains("Alice"), "main chats gone");
     }
 
+    #[test]
+    fn chat_rows_follows_the_list_once_it_scrolls() {
+        // More chats than an 80×24 frame fits, selection moved to the last one so
+        // ratatui's `List` scrolls its offset — the case `ChatRows` reads
+        // `state.offset()` back for. A stale (always-zero) offset would map every
+        // row to the wrong chat once the list has scrolled.
+        let titles: Vec<(&str, i32)> = vec![("Chat", 0); 30];
+        let view = ChatListView::from_lists(vec![chat_list(ChatListKind::Main, "Main", &titles)]);
+        let mut app = App::with_chat_list(view);
+        for _ in 0..29 {
+            app.dispatch(Action::SelectNext);
+        }
+
+        let output = render_output(&app, 80, 24);
+        let top = output.panes.list.y + 1;
+        let visible_rows = output.panes.list.height.saturating_sub(2);
+        assert!(
+            (top..top + visible_rows).any(|row| output.chat_rows.chat_at(row) == Some(29)),
+            "the selected (last) chat scrolled into view"
+        );
+        assert!(
+            (top..top + visible_rows).all(|row| output.chat_rows.chat_at(row) != Some(0)),
+            "the first chat scrolled out of view"
+        );
+    }
+
+    #[test]
+    fn chat_rows_maps_each_visible_row_to_its_chat_id() {
+        // Alice (id 0), Bob (id 1), Carol (id 2), one row each below the list's
+        // top border — a click on a row should resolve to that row's chat, not
+        // just focus the pane (extends #161/#162).
+        let output = render_output(&app_with_lists(), 80, 24);
+        let top = output.panes.list.y + 1;
+        assert_eq!(output.chat_rows.chat_at(top), Some(0), "Alice's row");
+        assert_eq!(output.chat_rows.chat_at(top + 1), Some(1), "Bob's row");
+        assert_eq!(output.chat_rows.chat_at(top + 2), Some(2), "Carol's row");
+        // Empty list space below the last chat, still inside the pane, is not a hit.
+        assert_eq!(output.chat_rows.chat_at(top + 3), None);
+    }
+
     // --- conversation / history pane (#81) ---
 
     use crate::conversation::{ConversationView, SenderLabel, sample_message};
@@ -1657,6 +1878,30 @@ mod tests {
     /// An app whose history holds `messages`, none pinned.
     fn app_with_history(messages: Vec<Message>) -> App {
         App::with_conversation(ConversationView::from_messages(messages, HashSet::new()))
+    }
+
+    #[test]
+    fn history_rows_maps_a_multi_row_message_range_to_its_id() {
+        // Each message spans several rows (header, body, trailing blank line),
+        // not just its header — a click anywhere in that range should resolve to
+        // the message, not just its first row (extends #161/#162).
+        let output = render_output(
+            &app_with_history(vec![text_message(1, "m1"), text_message(2, "m2")]),
+            80,
+            24,
+        );
+        let top = output.panes.history.y + 1;
+        assert_eq!(output.history_rows.message_at(top), Some(1), "header row");
+        let message_1_rows: Vec<u16> = (top..top + 10)
+            .filter(|&row| output.history_rows.message_at(row) == Some(1))
+            .collect();
+        assert!(
+            message_1_rows.len() > 1,
+            "message 1's block spans more than just its header row"
+        );
+        // Message 2 starts on the row right after message 1's range ends.
+        let message_2_row = top + message_1_rows.len() as u16;
+        assert_eq!(output.history_rows.message_at(message_2_row), Some(2));
     }
 
     #[test]
