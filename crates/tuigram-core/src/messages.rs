@@ -935,9 +935,22 @@ impl MessageStore {
     /// Merge a history page (or any batch of messages) into the store. Each
     /// message is filed under its own chat and id, so re-merging an overlapping
     /// page is idempotent — duplicates collapse onto the same entry.
+    ///
+    /// An id already known to the store is left untouched rather than replaced
+    /// (#207). A history page can be in flight — fetched from TDLib's own local
+    /// cache — at the same moment a live update ([`reduce`](Self::reduce)) folds
+    /// fresher state (a reaction, an edit) onto that same message; landing after
+    /// the fold, the page's older copy would otherwise clobber it. Anything
+    /// already known already reached the store through a fold at least as
+    /// current as a re-fetched page, so a page's only job here is filling in ids
+    /// this store has not seen yet.
     pub fn merge(&mut self, messages: impl IntoIterator<Item = Message>) {
         for message in messages {
-            self.insert(message);
+            self.by_chat
+                .entry(message.chat_id)
+                .or_default()
+                .entry(message.id)
+                .or_insert(message);
         }
     }
 
@@ -1203,6 +1216,25 @@ mod tests {
         store.merge([msg(10, 20), msg(10, 30)]);
 
         assert_eq!(ids(&store.history(10)), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn a_re_fetched_page_never_regresses_an_already_folded_reaction() {
+        // #207: a history page can race a live `updateMessageInteractionInfo` —
+        // in flight against TDLib's own cache at the moment a fresher reaction
+        // fold lands. Landing after the fold, the page's older copy (no
+        // reactions) must not clobber it.
+        let mut store = MessageStore::new();
+        store.merge([msg(10, 1), msg(10, 2)]);
+        store.reduce(&reaction_update(10, 2, &[("👍", 1, true)]));
+        assert!(!store.get(10, 2).unwrap().reactions.is_empty());
+
+        // The delayed page for the same ids lands after the fold.
+        store.merge([msg(10, 1), msg(10, 2)]);
+        assert!(
+            !store.get(10, 2).unwrap().reactions.is_empty(),
+            "a re-fetched page must not overwrite an already-known message"
+        );
     }
 
     #[test]

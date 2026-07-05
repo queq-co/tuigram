@@ -73,11 +73,11 @@ use tokio_stream::StreamExt;
 
 use tuigram_core::model::{ChatAction, ChatKind, ChatListKind, Message, Sender, User, UserKind};
 use tuigram_core::{
-    AuthRequests, ChatActionRequests, Client, ContactRequests, DOWNLOAD_PRIORITY, DeleteRequests,
-    EditRequests, FileRequests, FormattedText, ForwardRequests, HistoryRequests, InterfaceSettings,
-    NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests, SendRequests,
-    StorageRequests, StorageSettings, UserRequests, load_archive_list, load_folder_list,
-    load_main_list, search_chat, search_global,
+    AuthRequests, ChatActionRequests, ChatLifecycleRequests, Client, ContactRequests,
+    DOWNLOAD_PRIORITY, DeleteRequests, EditRequests, FileRequests, FormattedText, ForwardRequests,
+    HistoryRequests, InterfaceSettings, NEWEST, PinRequests, ReactionRequests, ReadRequests,
+    SecretChatRequests, SendRequests, StorageRequests, StorageSettings, UserRequests,
+    load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
 };
 
 use crate::app::{Action, App};
@@ -554,8 +554,20 @@ fn drive_open_chat(
 ) {
     let open = open_chat_id(app);
     if open != history.open {
+        let previous = history.open;
         history.open = open;
+        // Tell TDLib the previously open chat no longer is (#207) — the `openChat`
+        // lifecycle's close half, fired on every transition away, including onto a
+        // different chat becoming open.
+        if let Some(chat_id) = previous {
+            spawn_close_chat(client, chat_id);
+        }
         if let Some(chat_id) = open {
+            // Mark this chat open (#207) before anything else: several update
+            // families TDLib streams (message reactions, edits) are only
+            // guaranteed for a chat it considers open, so this must precede the
+            // projection and paging below that depend on those updates arriving.
+            spawn_open_chat(client, chat_id);
             // Project whatever the store already holds (possibly empty, then filled
             // as the landing page lands), and fetch that page once per chat per run.
             // This is the one genuine "opened this chat" moment (#164) — including a
@@ -1562,6 +1574,28 @@ fn spawn_history_page(
                 reached_start,
             })
             .await;
+    });
+}
+
+/// Tell TDLib a chat is now open (#207), fire-and-forget like the reaction and
+/// pin drivers — the loop never blocks a chat switch on this acknowledging.
+/// TDLib only guarantees delivery of some live updates (message reactions,
+/// edits) for a chat it considers open, so this must run for the open chat's
+/// live updates to be trusted; see [`drive_open_chat`].
+fn spawn_open_chat(client: &Arc<Client>, chat_id: i64) {
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        let _ = client.bridge().open_chat(chat_id).await;
+    });
+}
+
+/// The close counterpart to [`spawn_open_chat`] (#207), fired when a chat stops
+/// being the open one. Best-effort, like the open call: a failure just means
+/// TDLib keeps treating it as open a little longer.
+fn spawn_close_chat(client: &Arc<Client>, chat_id: i64) {
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        let _ = client.bridge().close_chat(chat_id).await;
     });
 }
 
