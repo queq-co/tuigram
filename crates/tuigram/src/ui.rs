@@ -22,7 +22,7 @@ use ratatui_image::protocol::Protocol;
 
 use tuigram_core::model::{
     Chat, ChatAction, ChatKind, File, FormattedText, Message, MessageContent, ReactionKind,
-    SecretChatState, Sender,
+    SecretChatState, SendState, Sender,
 };
 
 use crate::chat_list::ChatListView;
@@ -390,6 +390,19 @@ fn chat_list_item(view: &ChatListView, chat: &Chat) -> ListItem<'static> {
         spans.push(Span::raw(format!("{marker} ")));
     }
     spans.push(Span::raw(chat.title.clone()));
+    // Delivery status of our own last message (#165), reusing #163's glyph
+    // helper — no preview text, just the checkmark/hourglass/cross real chat
+    // clients show so "did they read it" is visible without opening the chat.
+    if let Some(last) = &chat.last_message
+        && last.is_outgoing
+    {
+        spans.push(Span::raw("  "));
+        spans.push(Span::raw(delivery_glyph(
+            &last.send_state,
+            last.id,
+            chat.last_read_outbox_message_id,
+        )));
+    }
     if chat.unread_count > 0 {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
@@ -404,6 +417,21 @@ fn chat_list_item(view: &ChatListView, chat: &Chat) -> ListItem<'static> {
         spans.push(Span::styled(format!("  {}", action_phrase(action)), dim));
     }
     ListItem::new(Line::from(spans))
+}
+
+/// The delivery-status glyph for one of our own outgoing messages (#163, #165):
+/// `⌛` while the send is still in flight, `✗` if the server rejected it, `✓✓` once
+/// the peer's outbox watermark has passed it (read), else a plain `✓` (sent, not
+/// yet read). Shared by the conversation header ([`message_lines`]) and the
+/// chat-list's last-message line ([`chat_list_item`]) so both read the same
+/// mapping from one source of truth.
+fn delivery_glyph(send_state: &SendState, message_id: i64, last_read_outbox: i64) -> &'static str {
+    match send_state {
+        SendState::Failed { .. } => "✗",
+        SendState::Pending => "⌛",
+        SendState::Sent if message_id <= last_read_outbox => "✓✓",
+        SendState::Sent => "✓",
+    }
 }
 
 /// The lifecycle word shown after a secret chat's title (#87).
@@ -473,6 +501,9 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
     for (i, message) in view.messages().iter().skip(view.offset()).enumerate() {
         if lines.len() >= inner_rows {
             break;
+        }
+        if view.unread_separator_before(message.id) {
+            lines.push(indent_line(unread_separator_line(), gutter_cols));
         }
         let row = lines.len();
         if gutter_cols > 0
@@ -725,6 +756,14 @@ fn message_lines(
         prefix.push_str("📌 ");
     }
     prefix.push_str(&hour_minute(message.date));
+    if message.is_outgoing {
+        prefix.push(' ');
+        prefix.push_str(delivery_glyph(
+            &message.send_state,
+            message.id,
+            view.last_read_outbox(),
+        ));
+    }
     prefix.push(' ');
 
     let label = view.sender_label(message);
@@ -745,6 +784,9 @@ fn message_lines(
     );
     if let Some(progress) = download_line(view, &message.content) {
         lines.push(indent_line(progress, gutter_cols));
+    }
+    if let Some(failure) = failed_send_line(message) {
+        lines.push(indent_line(failure, gutter_cols));
     }
     if let Some(reactions) = reaction_line(message) {
         lines.push(indent_line(reactions, gutter_cols));
@@ -789,6 +831,40 @@ fn download_line(view: &ConversationView, content: &MessageContent) -> Option<Li
     };
     Some(Line::from(Span::styled(
         text,
+        Style::new().add_modifier(Modifier::DIM),
+    )))
+}
+
+/// The unread-messages rule (#164): drawn once, immediately above the first
+/// incoming message that was unread as of this chat's open (see
+/// [`ConversationView::unread_separator_before`]). Not part of any message's own
+/// hit-test range — a click on the rule resolves to no message, same as the
+/// blank line already trailing each one.
+fn unread_separator_line() -> Line<'static> {
+    Line::from(Span::styled(
+        "── unread ──",
+        Style::new().add_modifier(Modifier::DIM),
+    ))
+}
+
+/// The failed-send detail line (#163): TDLib's error code and message, shown
+/// under one of our own messages whose send failed — always visible, not gated
+/// on selection, since a delivery failure is important to notice without hunting
+/// for it. No retry affordance here; that is explicitly out of scope (backlog),
+/// this line only surfaces what went wrong.
+fn failed_send_line(message: &Message) -> Option<Line<'static>> {
+    if !message.is_outgoing {
+        return None;
+    }
+    let SendState::Failed {
+        code,
+        message: text,
+    } = &message.send_state
+    else {
+        return None;
+    };
+    Some(Line::from(Span::styled(
+        format!("✗ send failed ({code}): {text}"),
         Style::new().add_modifier(Modifier::DIM),
     )))
 }
@@ -1880,6 +1956,64 @@ mod tests {
     }
 
     #[test]
+    fn the_chat_list_shows_our_last_message_s_delivery_glyph() {
+        // #165: reuses #163's glyph helper — no preview text, just the checkmark
+        // on the row when the chat's last message is ours.
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent, SendState};
+
+        let outgoing = |id: i64, state: SendState| {
+            let mut m = sample_message(
+                id,
+                MessageContent::Text(FormattedText {
+                    text: "hi".to_owned(),
+                    entities: Vec::new(),
+                }),
+            );
+            m.is_outgoing = true;
+            m.send_state = state;
+            m
+        };
+        let mut read = sample_chat(5, "Read", 0);
+        read.last_message = Some(outgoing(1, SendState::Sent));
+        read.last_read_outbox_message_id = 1;
+        let mut pending = sample_chat(6, "Pending", 0);
+        pending.last_message = Some(outgoing(2, SendState::Pending));
+
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![read, pending],
+        }]);
+        let app = App::with_chat_list(view);
+        let buffer = render(&app, 80, 24);
+        assert!(row_containing(&buffer, "Read").contains("✓✓"));
+        assert!(row_containing(&buffer, "Pending").contains('⌛'));
+    }
+
+    #[test]
+    fn an_incoming_last_message_shows_no_delivery_glyph() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let mut chat = sample_chat(5, "Alice", 0);
+        chat.last_message = Some(sample_message(
+            1,
+            MessageContent::Text(FormattedText {
+                text: "hi".to_owned(),
+                entities: Vec::new(),
+            }),
+        ));
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![chat],
+        }]);
+        let text = flatten(&render(&App::with_chat_list(view), 80, 24));
+        assert!(!text.contains('⌛') && !text.contains('✓') && !text.contains('✗'));
+    }
+
+    #[test]
     fn the_selected_row_carries_the_highlight_marker() {
         let mut app = app_with_lists();
         // Move the selection onto the second row (Bob).
@@ -2642,6 +2776,9 @@ mod tests {
                     color: Some(Color::Red),
                 },
             )]),
+            i64::MAX,
+            0,
+            true,
         );
         let text = flatten(&render(&App::with_conversation(view), 80, 24));
         assert!(
@@ -2667,6 +2804,9 @@ mod tests {
                     color: Some(Color::Red),
                 },
             )]),
+            i64::MAX,
+            0,
+            true,
         );
         let buffer = render(&App::with_conversation(view), 80, 24);
         let row = row_containing(&buffer, "Ada Lovelace (@ada)");
@@ -2676,6 +2816,131 @@ mod tests {
             time_at < name_at,
             "timestamp should render before the sender name, got row {row:?}"
         );
+    }
+
+    /// The index of the first row whose text contains `needle`, for locating a
+    /// message's header row relative to its (uniquely worded) body row below it.
+    fn row_index_containing(buffer: &Buffer, needle: &str) -> u16 {
+        (0..buffer.area.height)
+            .find(|&y| row_text(buffer, y).contains(needle))
+            .unwrap_or_else(|| panic!("no row contains {needle:?}"))
+    }
+
+    #[test]
+    fn outgoing_messages_show_their_delivery_status_glyph() {
+        // #163: ⌛ pending, a plain ✓ once sent but not yet read, ✓✓ once the
+        // chat's outbox watermark has passed the message's id (read), and ✗ for a
+        // rejected send — each read off the message's own header row, one row
+        // above its (uniquely worded) body so the right glyph is checked.
+        let outgoing = |id: i64, body: &str, state: SendState| {
+            let mut m = text_message(id, body);
+            m.is_outgoing = true;
+            m.send_state = state;
+            m
+        };
+        let mut view = ConversationView::default();
+        // A generous viewport so the bottom-anchoring open (#158) lands on the
+        // first message rather than the one-frame fallback of the newest alone.
+        view.set_viewport_height(100);
+        view.project(
+            10,
+            vec![
+                outgoing(1, "pending msg", SendState::Pending),
+                outgoing(2, "read msg", SendState::Sent),
+                outgoing(3, "sent msg", SendState::Sent),
+                outgoing(
+                    4,
+                    "failed msg",
+                    SendState::Failed {
+                        code: 400,
+                        message: "FLOOD_WAIT".to_owned(),
+                    },
+                ),
+            ],
+            HashSet::new(),
+            HashMap::new(),
+            0,
+            2, // last_read_outbox: message 2 has been read, message 3 has not
+            true,
+        );
+        let buffer = render(&App::with_conversation(view), 80, 40);
+        let header_above =
+            |body_needle| row_text(&buffer, row_index_containing(&buffer, body_needle) - 1);
+
+        assert!(
+            header_above("pending msg").contains('⌛'),
+            "a send in flight shows the hourglass"
+        );
+        assert!(
+            header_above("sent msg").contains('✓') && !header_above("sent msg").contains("✓✓"),
+            "sent but not yet read shows a plain check"
+        );
+        assert!(
+            header_above("read msg").contains("✓✓"),
+            "read (id at or before the outbox watermark) shows the double check"
+        );
+        assert!(
+            header_above("failed msg").contains('✗'),
+            "a rejected send shows the cross"
+        );
+        assert!(
+            flatten(&buffer).contains("send failed (400): FLOOD_WAIT"),
+            "the failed message's error detail surfaces inline"
+        );
+    }
+
+    #[test]
+    fn incoming_messages_never_show_a_delivery_glyph() {
+        let view = ConversationView::from_messages(vec![text_message(1, "hi")], HashSet::new());
+        let text = flatten(&render(&App::with_conversation(view), 80, 24));
+        assert!(!text.contains('⌛') && !text.contains('✓') && !text.contains('✗'));
+    }
+
+    #[test]
+    fn opening_a_chat_with_unread_messages_draws_the_rule_above_the_first_one() {
+        // #164: last_read_inbox = 1, so message 2 is the first unread message —
+        // the rule renders on the row immediately above its header.
+        let mut view = ConversationView::default();
+        view.set_viewport_height(100);
+        view.project(
+            10,
+            vec![text_message(1, "read msg"), text_message(2, "second msg")],
+            HashSet::new(),
+            HashMap::new(),
+            1,
+            0,
+            true,
+        );
+        let buffer = render(&App::with_conversation(view), 80, 40);
+        // Line order for message 2: rule, header, body ("second msg") — the rule
+        // sits two rows above the body, directly above the header.
+        let second_row = row_index_containing(&buffer, "second msg");
+        assert!(
+            row_text(&buffer, second_row - 2).contains("── unread ──"),
+            "the rule sits immediately above the first unread message's header"
+        );
+        assert_eq!(
+            flatten(&buffer).matches("── unread ──").count(),
+            1,
+            "the rule appears exactly once"
+        );
+    }
+
+    #[test]
+    fn a_fully_read_chat_shows_no_unread_rule() {
+        let mut view = ConversationView::default();
+        view.set_viewport_height(100);
+        view.project(
+            10,
+            vec![text_message(1, "hi"), text_message(2, "there")],
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        let text = flatten(&render(&App::with_conversation(view), 80, 40));
+        assert!(!text.contains("── unread ──"));
     }
 
     #[test]

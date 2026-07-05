@@ -32,6 +32,14 @@ pub enum AppEvent {
     Auth,
     /// A chat-list update folded by core: the chat list may have changed.
     Chats,
+    /// `updateChatReadOutbox`: the peer's read-outbox watermark advanced (#163).
+    /// Split out of the generic [`Chats`](Self::Chats) signal because it is the one
+    /// chat-list update the open conversation pane also cares about — its own
+    /// outgoing messages' read-receipt glyph depends on this watermark — so this
+    /// nudges both the chat list and (when a chat is open) the conversation
+    /// projection, without the broader `Chats` signal (drafts, positions, folders)
+    /// ever touching the open pane.
+    ChatReadOutbox,
     /// A message update folded by core: a chat's history may have changed.
     Messages,
     /// `updateFile`: a download or upload made progress.
@@ -104,10 +112,10 @@ fn classify_update(update: &Update) -> Option<AppEvent> {
         | Update::ChatPosition(_)
         | Update::ChatLastMessage(_)
         | Update::ChatReadInbox(_)
-        | Update::ChatReadOutbox(_)
         | Update::ChatDraftMessage(_)
         | Update::ChatFolders(_)
         | Update::MessageIsPinned(_) => Some(AppEvent::Chats),
+        Update::ChatReadOutbox(_) => Some(AppEvent::ChatReadOutbox),
         Update::NewMessage(_)
         | Update::MessageSendSucceeded(_)
         | Update::MessageSendFailed(_)
@@ -150,8 +158,8 @@ mod tests {
     use super::*;
     use tuigram_core::enums::ConnectionState as Tc;
     use tuigram_core::types::{
-        UpdateAuthorizationState, UpdateChatReadInbox, UpdateConnectionState, UpdateDeleteMessages,
-        UpdateFile, UpdateUser, UpdateUserStatus, User as TdUser,
+        UpdateAuthorizationState, UpdateChatReadInbox, UpdateChatReadOutbox, UpdateConnectionState,
+        UpdateDeleteMessages, UpdateFile, UpdateUser, UpdateUserStatus, User as TdUser,
     };
 
     /// A minimal TDLib `User` for classification tests: only the variant matters to
@@ -249,6 +257,21 @@ mod tests {
             })),
             Some(AppEvent::Auth)
         );
+    }
+
+    #[test]
+    fn a_read_outbox_update_gets_its_own_signal_distinct_from_chats() {
+        // #163: split out of the generic `Chats` bucket so the run loop can also
+        // repaint the open conversation's read-receipt glyph on this signal alone,
+        // without every draft/position/folder change doing the same.
+        let signal = classify(RouterEvent::Update(Update::ChatReadOutbox(
+            UpdateChatReadOutbox {
+                chat_id: 1,
+                last_read_outbox_message_id: 10,
+            },
+        )));
+        assert_eq!(signal, Some(AppEvent::ChatReadOutbox));
+        assert_ne!(signal, Some(AppEvent::Chats));
     }
 
     #[test]
