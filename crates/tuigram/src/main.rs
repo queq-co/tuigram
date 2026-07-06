@@ -1332,16 +1332,19 @@ fn drive_inline_media(
         let media_tx = media_tx.clone();
         tokio::spawn(async move {
             let protocol = tokio::task::spawn_blocking(move || {
-                let bytes = match source {
-                    MediaSource::File(path) => std::fs::read(path).ok()?,
-                    MediaSource::Bytes(bytes) => bytes,
+                // `File` is a downloaded `Photo`/static `Sticker` — normal-or-larger
+                // than the box, so `Fit` (shrink-only) is correct. `Bytes` is always
+                // a `Video`/`Animation` minithumbnail — TDLib caps these at a few
+                // dozen pixels, far smaller than the reserved cell area, so (like
+                // the avatar path above, for the same reason) it needs `Scale` to
+                // upscale into the box; `Fit` would leave it at its tiny native
+                // size, rendering as a mini-thumbnail inside the empty reservation.
+                let (bytes, resize) = match source {
+                    MediaSource::File(path) => (std::fs::read(path).ok()?, Resize::Fit(None)),
+                    MediaSource::Bytes(bytes) => (bytes, Resize::Scale(None)),
                 };
                 let image = image::load_from_memory(&bytes).ok()?;
-                // `Fit` only ever shrinks (unlike the avatar path's `Scale`,
-                // which deliberately upscales a tiny minithumbnail): these
-                // images are normal-or-larger, so shrink-to-fit into the box
-                // rather than stretching past their real size.
-                picker.new_protocol(image, size, Resize::Fit(None)).ok()
+                picker.new_protocol(image, size, resize).ok()
             })
             .await
             .unwrap_or(None);
