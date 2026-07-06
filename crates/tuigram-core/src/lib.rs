@@ -41,16 +41,17 @@ pub use files::{
     DOWNLOAD_PRIORITY, FileRequests, FileStore, SWEEP_IMMUNITY_DELAY, StorageRequests,
 };
 pub use messages::{
-    DeleteRequests, EditRequests, ForwardRequests, HistoryRequests, MessageRequests, MessageStore,
-    NEWEST, PinRequests, ReactionRequests, ReadRequests, SearchPage, SearchRequests, SearchResults,
-    SendRequests, load_history, search_chat, search_global,
+    DeleteRequests, EditRequests, FormatRequests, ForwardRequests, HistoryRequests,
+    MessageRequests, MessageStore, NEWEST, PinRequests, ReactionRequests, ReadRequests, SearchPage,
+    SearchRequests, SearchResults, SendRequests, edit_formatted_text, load_history, search_chat,
+    search_global, send_formatted_text,
 };
 pub use model::{
     Animation, Audio, Chat, ChatAction, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition,
     Contact, Document, Draft, EntityKind, File, FileRef, FormattedText, Location, Message,
     MessageContent, OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, Reaction,
-    ReactionKind, SecretChat, SecretChatState, SendState, Sender, Sticker, TextEntity, User,
-    UserKind, Venue, Video, Voice,
+    ReactionKind, ReplyTo, SecretChat, SecretChatState, SendState, Sender, Sticker, TextEntity,
+    User, UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
 pub use sanitize::{scrub_line, scrub_prose};

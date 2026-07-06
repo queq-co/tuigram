@@ -77,10 +77,11 @@ use tuigram_core::model::{
 };
 use tuigram_core::{
     AuthRequests, ChatActionRequests, ChatLifecycleRequests, Client, ContactRequests,
-    DOWNLOAD_PRIORITY, DeleteRequests, EditRequests, FileRequests, FormattedText, ForwardRequests,
-    HistoryRequests, InterfaceSettings, NEWEST, PinRequests, ReactionRequests, ReadRequests,
-    SecretChatRequests, SendRequests, StorageRequests, StorageSettings, UserRequests,
+    DOWNLOAD_PRIORITY, DeleteRequests, FileRequests, ForwardRequests, HistoryRequests,
+    InterfaceSettings, NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests,
+    SendRequests, StorageRequests, StorageSettings, UserRequests, edit_formatted_text,
     load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
+    send_formatted_text,
 };
 
 use crate::app::{Action, App};
@@ -716,7 +717,8 @@ fn drive_read_state(client: &Arc<Client>, history: &mut HistoryState) {
 /// Dispatch a submitted composer buffer to Telegram (#116). `App` records the
 /// submission as a pure intent; here the loop pairs it with the open chat and routes
 /// it to the matching seam — a new message or reply through
-/// [`SendRequests::send_text`], an edit through [`EditRequests::edit_text`].
+/// [`send_formatted_text`], an edit through [`edit_formatted_text`] — each parsing
+/// the buffer as markdown before it goes out (#212).
 ///
 /// The send is fire-and-forget, like the read path (#115): TDLib streams the
 /// optimistic `Pending` message (and later its `Sent`/`Failed` resolution) as
@@ -744,22 +746,23 @@ fn drive_outbound(
     let client = Arc::clone(client);
     let outbound_tx = outbound_tx.clone();
     tokio::spawn(async move {
+        // #212: the composer's text is parsed as MarkdownV2 before it goes out
+        // — `send_formatted_text`/`edit_formatted_text` fall back to plain text
+        // themselves on a parse error, so this never blocks on malformed markup.
         let result = match submission {
-            Submission::Send { text } => client
-                .bridge()
-                .send_text(chat_id, None, plain_text(text))
+            Submission::Send { text } => send_formatted_text(client.bridge(), chat_id, None, text)
                 .await
                 .map(|_| ()),
-            Submission::Reply { reply_to, text } => client
-                .bridge()
-                .send_text(chat_id, Some(reply_to), plain_text(text))
-                .await
-                .map(|_| ()),
-            Submission::Edit { message_id, text } => client
-                .bridge()
-                .edit_text(chat_id, message_id, plain_text(text))
-                .await
-                .map(|_| ()),
+            Submission::Reply { reply_to, text } => {
+                send_formatted_text(client.bridge(), chat_id, Some(reply_to), text)
+                    .await
+                    .map(|_| ())
+            }
+            Submission::Edit { message_id, text } => {
+                edit_formatted_text(client.bridge(), chat_id, message_id, text)
+                    .await
+                    .map(|_| ())
+            }
         };
         if let Err(err) = result {
             // The TDLib message is a fixed error code (e.g. CHAT_WRITE_FORBIDDEN),
@@ -770,16 +773,6 @@ fn drive_outbound(
                 .await;
         }
     });
-}
-
-/// A plain [`FormattedText`] (no formatting entities) for a composer send or edit
-/// (#116). The composer is a single-line plain-text input today; rich entities
-/// arrive with a later formatting pass.
-fn plain_text(text: String) -> FormattedText {
-    FormattedText {
-        text,
-        entities: Vec::new(),
-    }
 }
 
 /// Run a submitted search query against core (#117). `App` records the query as a
