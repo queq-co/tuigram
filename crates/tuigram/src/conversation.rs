@@ -153,6 +153,14 @@ pub struct ConversationView {
     /// Index of the topmost message to draw — also the selected-message cursor.
     /// Clamped to a valid row, or `0` when there are no messages.
     offset: usize,
+    /// Rows of `messages[offset]` already scrolled past (#222): `0` means its
+    /// header is the first visible row, up to one less than
+    /// `message_height(messages[offset])` otherwise, so at least one of its
+    /// rows (down to the trailing blank separator) stays on screen. The
+    /// row-granular counterpart to `offset`, which stays a message index —
+    /// `offset` alone still answers "which message is selected," `row_skip`
+    /// alone answers "how far into it has the reader scrolled."
+    row_skip: usize,
     /// The history pane's inner height (rows) from the last render, recorded by the
     /// loop via [`set_viewport_height`](Self::set_viewport_height) (#158). The
     /// bottom-anchoring walk sums per-message heights against it to decide which
@@ -220,6 +228,7 @@ impl ConversationView {
             messages,
             pinned,
             offset: 0,
+            row_skip: 0,
             viewport: 0,
             downloads: HashMap::new(),
             chat_action: None,
@@ -282,14 +291,18 @@ impl ConversationView {
             self.messages = messages;
             self.pinned = pinned;
             self.senders = senders;
-            self.offset = if following {
-                self.newest_anchor_offset()
+            if following {
+                (self.offset, self.row_skip) = self.newest_anchor();
             } else {
-                anchor
+                self.offset = anchor
                     .and_then(|id| self.messages.iter().position(|m| m.id == id))
                     .unwrap_or(self.offset)
-                    .min(self.messages.len().saturating_sub(1))
-            };
+                    .min(self.messages.len().saturating_sub(1));
+                // The target message's own shape may have changed (a reaction
+                // added, media finishing a download); land on its header rather
+                // than trying to preserve an exact row position across that.
+                self.row_skip = 0;
+            }
         } else {
             // A different chat opened: a fresh view, dropping the previous chat's
             // per-message state (downloads, typing indicator), bottom-anchored at the
@@ -309,7 +322,7 @@ impl ConversationView {
                 graphics_capable,
                 ..Self::default()
             };
-            self.offset = self.newest_anchor_offset();
+            (self.offset, self.row_skip) = self.newest_anchor();
         }
 
         // #164: a genuine re-open resets the separator to *pending*, regardless of
@@ -364,6 +377,15 @@ impl ConversationView {
     #[must_use]
     pub fn offset(&self) -> usize {
         self.offset
+    }
+
+    /// Rows of the message at [`offset`](Self::offset) already scrolled past
+    /// (#222) — `0` means its header is the first visible row. The render
+    /// loop drops this many lines from that message's own block before
+    /// drawing it.
+    #[must_use]
+    pub(crate) fn row_skip(&self) -> usize {
+        self.row_skip
     }
 
     /// Whether the message with id `id` is pinned in this chat.
@@ -511,15 +533,62 @@ impl ConversationView {
         self.downloads = files.into_iter().map(|file| (file.id, file)).collect();
     }
 
-    /// Scroll one message toward the newest, clamping at the last message. A no-op
-    /// on an empty history.
+    /// Scroll one row toward the newest (#222): advances within the current
+    /// message's own rows, rolling onto the next message once they are
+    /// exhausted. Clamps at the bottom-anchored position
+    /// ([`newest_anchor`](Self::newest_anchor)) rather than allowing an
+    /// overscroll past it — a real pager's "you're at the end." A no-op on an
+    /// empty history.
     pub fn scroll_down(&mut self) {
-        self.offset = (self.offset + 1).min(self.messages.len().saturating_sub(1));
+        if self.messages.is_empty() {
+            return;
+        }
+        let (anchor_offset, anchor_skip) = self.newest_anchor();
+        let at_or_past_anchor = self.offset > anchor_offset
+            || (self.offset == anchor_offset && self.row_skip >= anchor_skip);
+        if at_or_past_anchor {
+            return;
+        }
+        let height = self.message_height(&self.messages[self.offset]);
+        if self.row_skip + 1 < height {
+            self.row_skip += 1;
+        } else if self.offset + 1 < self.messages.len() {
+            self.offset += 1;
+            self.row_skip = 0;
+        }
     }
 
-    /// Scroll one message toward the oldest, clamping at the top.
+    /// Scroll one row toward the oldest (#222): retreats within the current
+    /// message's own rows, rolling onto the previous message's trailing row
+    /// (its blank separator) once exhausted. Clamps at the very top.
     pub fn scroll_up(&mut self) {
-        self.offset = self.offset.saturating_sub(1);
+        if self.row_skip > 0 {
+            self.row_skip -= 1;
+        } else if self.offset > 0 {
+            self.offset -= 1;
+            self.row_skip = self
+                .message_height(&self.messages[self.offset])
+                .saturating_sub(1);
+        }
+    }
+
+    /// Scroll a full viewport toward the newest (#222) — the `PageDown`
+    /// action, meaningfully bigger than [`scroll_down`](Self::scroll_down)'s
+    /// single-row step now that the distinction is possible. Reuses the same
+    /// row-step (and its anchor clamp) rather than duplicating the stepping
+    /// logic; falls back to a single row before the first render measures a
+    /// viewport.
+    pub fn page_down(&mut self) {
+        for _ in 0..self.viewport.max(1) {
+            self.scroll_down();
+        }
+    }
+
+    /// Scroll a full viewport toward the oldest (#222) — the `PageUp` action.
+    pub fn page_up(&mut self) {
+        for _ in 0..self.viewport.max(1) {
+            self.scroll_up();
+        }
     }
 
     /// Move the cursor to message `message_id` if it is in the loaded history,
@@ -531,6 +600,7 @@ impl ConversationView {
         match self.messages.iter().position(|m| m.id == message_id) {
             Some(index) => {
                 self.offset = index;
+                self.row_skip = 0;
                 true
             }
             None => false,
@@ -541,7 +611,7 @@ impl ConversationView {
     /// The cursor lands on the topmost message of the last screenful (consistent with
     /// the "message at offset" cursor); repeated `k` then walks upward from there.
     pub fn jump_to_newest(&mut self) {
-        self.offset = self.newest_anchor_offset();
+        (self.offset, self.row_skip) = self.newest_anchor();
     }
 
     /// Whether the view is pinned to the newest message — sitting exactly at the
@@ -550,7 +620,7 @@ impl ConversationView {
     /// reads it to decide whether to follow the tail or hold the reader's place.
     #[must_use]
     pub fn is_at_newest(&self) -> bool {
-        self.offset == self.newest_anchor_offset()
+        (self.offset, self.row_skip) == self.newest_anchor()
     }
 
     /// Record the history pane's inner height (rows) measured by the last render
@@ -564,9 +634,9 @@ impl ConversationView {
         let following = self.is_at_newest();
         self.viewport = height;
         if following {
-            let previous = self.offset;
-            self.offset = self.newest_anchor_offset();
-            return self.offset != previous;
+            let previous = (self.offset, self.row_skip);
+            (self.offset, self.row_skip) = self.newest_anchor();
+            return (self.offset, self.row_skip) != previous;
         }
         false
     }
@@ -582,30 +652,34 @@ impl ConversationView {
         self.graphics_capable = capable;
     }
 
-    /// The offset that pins the newest message to the bottom of the viewport: walk
-    /// back from the last message summing [`message_height`](Self::message_height),
-    /// stopping at the oldest message that still fits whole. Returns `0` on an empty
-    /// history (or one that fits entirely, so it renders from the top with no blank
-    /// gap), the last message before the first render measures a viewport, and the
-    /// newest message alone when it is taller than the whole viewport (best effort —
-    /// the newest stays anchored even if it overflows).
-    fn newest_anchor_offset(&self) -> usize {
+    /// The `(message index, row skip)` that pins the newest message to the
+    /// bottom of the viewport (#158, row-granular since #222): walk back from
+    /// the last message summing [`message_height`](Self::message_height); the
+    /// first message that would overflow the remaining space is included
+    /// *partially* — skip exactly its excess rows from the top — so the
+    /// newest message's last row lands exactly on the viewport's bottom row,
+    /// rather than the pre-#222 whole-message-only anchor (which excluded an
+    /// overflowing message entirely, leaving a gap above it). Returns `(0, 0)`
+    /// on an empty history, or one that fits the viewport with room to spare;
+    /// `(last, 0)` before the first render measures a viewport; and
+    /// `(last, height - viewport)` when even the newest message alone
+    /// overflows — best effort, showing its tail rather than its head.
+    fn newest_anchor(&self) -> (usize, usize) {
         let Some(last) = self.messages.len().checked_sub(1) else {
-            return 0;
+            return (0, 0);
         };
         if self.viewport == 0 {
-            return last;
+            return (last, 0);
         }
         let mut used = 0;
-        let mut top = last;
         for index in (0..=last).rev() {
-            used += self.message_height(&self.messages[index]);
-            if used > self.viewport {
-                break;
+            let height = self.message_height(&self.messages[index]);
+            if used + height >= self.viewport {
+                return (index, used + height - self.viewport);
             }
-            top = index;
+            used += height;
         }
-        top
+        (0, 0)
     }
 
     /// The number of terminal rows one message occupies in the history pane — the
@@ -863,7 +937,7 @@ mod tests {
     #[test]
     fn select_message_for_an_unloaded_id_is_a_noop() {
         let mut view = history(4);
-        view.scroll_down();
+        view.select_message(1);
         assert_eq!(view.offset(), 1);
         // Id 99 is not in the loaded history: the cursor stays put.
         assert!(!view.select_message(99));
@@ -871,14 +945,144 @@ mod tests {
     }
 
     #[test]
-    fn scroll_down_advances_then_clamps_at_the_last_message() {
+    fn scroll_down_steps_one_row_rolling_onto_the_next_message_once_exhausted() {
+        // #222: scroll_down is now a row step, not a message step.
+        // `history`'s plain-text messages are 3 rows each (header, body, blank
+        // separator) with no viewport measured, so 2 steps stay within
+        // message 0's own rows and the 3rd rolls onto message 1.
         let mut view = history(3);
         view.scroll_down();
         view.scroll_down();
-        assert_eq!(view.offset(), 2);
-        // Already on the last of three messages: clamps, does not run off the end.
+        assert_eq!(view.offset(), 0, "still within message 0's own 3 rows");
         view.scroll_down();
-        assert_eq!(view.offset(), 2);
+        assert_eq!(
+            view.offset(),
+            1,
+            "message 0's rows exhausted, rolls onto message 1"
+        );
+    }
+
+    #[test]
+    fn scroll_down_clamps_at_the_bottom_anchored_position() {
+        // #222: the row-granular clamp is the bottom anchor itself (a real
+        // pager's "you're at the end"), not the old raw `min(len - 1)`.
+        // Viewport fits two 3-row messages; the anchor is offset 3, row 0
+        // (verified in `opening_a_chat_lands_bottom_anchored_at_the_newest_message`).
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        // More steps than rows in the whole history: scrolling down this much
+        // must still land exactly on the anchor, not past it.
+        for _ in 0..100 {
+            view.scroll_down();
+        }
+        assert!(
+            view.is_at_newest(),
+            "repeated scrolling down stops exactly at the bottom anchor"
+        );
+    }
+
+    #[test]
+    fn scroll_down_moves_one_row_while_page_down_moves_a_full_viewport() {
+        // #222: PageDown must be meaningfully bigger than a single j/k step.
+        let mut single = view_fitting(2); // 6-row viewport
+        single.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        for _ in 0..100 {
+            single.scroll_up();
+        }
+        single.scroll_down();
+        assert_eq!(
+            single.offset(),
+            0,
+            "one row-step barely moves within message 0's own 3 rows"
+        );
+
+        let mut paged = view_fitting(2);
+        paged.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        for _ in 0..100 {
+            paged.scroll_up();
+        }
+        paged.page_down();
+        assert_eq!(
+            paged.offset(),
+            2,
+            "PageDown moves a full 6-row viewport (two 3-row messages) at once"
+        );
+    }
+
+    #[test]
+    fn page_up_moves_a_full_viewport_back_toward_the_oldest() {
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        assert!(view.is_at_newest());
+        view.page_up();
+        assert_eq!(
+            view.offset(),
+            1,
+            "a full 6-row viewport back from the anchor at offset 3"
+        );
+    }
+
+    #[test]
+    fn scrolling_through_a_media_message_advances_one_row_at_a_time() {
+        // #222: this is the bug the issue fixes — before, crossing a media
+        // message jumped the whole way in a single scroll step; now it takes
+        // one row-step per row, same as any other message.
+        let mut view =
+            ConversationView::from_messages(vec![photo(1, 42), text(2, "after")], HashSet::new());
+        view.set_graphics_capable(true);
+        view.set_downloads(vec![present_file(42)]);
+        let height = view.message_height(&view.messages()[0].clone());
+        assert!(
+            height > 10,
+            "a ready photo is much taller than a plain-text message"
+        );
+
+        for step in 1..height {
+            view.scroll_down();
+            assert_eq!(
+                view.offset(),
+                0,
+                "still within the photo message's own {height} rows at step {step}"
+            );
+        }
+        view.scroll_down();
+        assert_eq!(
+            view.offset(),
+            1,
+            "the photo's rows are exhausted, rolls onto the next message"
+        );
     }
 
     #[test]
@@ -908,7 +1112,10 @@ mod tests {
     fn the_selected_message_is_the_one_at_the_offset() {
         let mut view = history(3);
         assert_eq!(view.selected_message().map(|m| m.id), Some(0), "top first");
-        view.scroll_down();
+        // #222: 3 row-steps to exhaust message 0's own 3 rows and roll onto message 1.
+        for _ in 0..3 {
+            view.scroll_down();
+        }
         assert_eq!(view.selected_message().map(|m| m.id), Some(1));
         assert_eq!(ConversationView::default().selected_message(), None);
     }

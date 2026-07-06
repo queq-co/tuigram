@@ -263,17 +263,31 @@ const BINDINGS: &[Binding] = &[
     // History.
     Binding {
         context: Context::History,
-        trigger: Trigger::Plain(&[KeyCode::Char('j'), KeyCode::Down, KeyCode::PageDown]),
+        trigger: Trigger::Plain(&[KeyCode::Char('j'), KeyCode::Down]),
         action: Action::ScrollDown,
-        keys: "j / ↓ / PgDn",
-        description: "scroll down",
+        keys: "j / ↓",
+        description: "scroll down one row",
     },
     Binding {
         context: Context::History,
-        trigger: Trigger::Plain(&[KeyCode::Char('k'), KeyCode::Up, KeyCode::PageUp]),
+        trigger: Trigger::Plain(&[KeyCode::Char('k'), KeyCode::Up]),
         action: Action::ScrollUp,
-        keys: "k / ↑ / PgUp",
-        description: "scroll up",
+        keys: "k / ↑",
+        description: "scroll up one row",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::PageDown]),
+        action: Action::PageDown,
+        keys: "PgDn",
+        description: "scroll down a full page",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::PageUp]),
+        action: Action::PageUp,
+        keys: "PgUp",
+        description: "scroll up a full page",
     },
     Binding {
         context: Context::History,
