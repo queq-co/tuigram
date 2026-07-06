@@ -1130,17 +1130,29 @@ fn reproject_secret_states(app: &mut App, client: &Arc<Client>) {
 /// fetch.
 fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &mut HashSet<i32>) {
     let Some(chat_id) = history.open else { return };
-    // The ids to start: files the history references that the store knows, are not
-    // yet present or active, and have not been requested this run. Photos with no
-    // sizes carry a 0 ref, which is not downloadable — skip it.
+    // The ids to start: files the history references that are not already present
+    // or actively transferring, and have not been requested this run. Photos with
+    // no sizes carry a 0 ref, which is not downloadable — skip it.
+    //
+    // A file the store has not folded an `updateFile` for yet reads as "unknown",
+    // not "definitely fine" — TDLib does not proactively announce every file a
+    // loaded history references, only ones a client has shown interest in, so an
+    // unknown file must still be attempted or it would never be requested at all
+    // (a chicken-and-egg gap: the first `updateFile` only arrives *because* a
+    // download started). `is_none_or` treats "unknown" the same as "not present,
+    // not active" — attempt it — while a *known* file still skips correctly once
+    // it settles into present or actively downloading.
     let to_start: Vec<i32> = client.read(|s| {
         s.messages()
             .history(chat_id)
             .into_iter()
             .filter_map(|m| m.content.file())
             .filter(|file| file.id != 0 && !downloading.contains(&file.id))
-            .filter_map(|file| s.files().get(file.id))
-            .filter(|file| !file.is_present() && !file.is_downloading_active)
+            .filter(|file| {
+                s.files()
+                    .get(file.id)
+                    .is_none_or(|f| !f.is_present() && !f.is_downloading_active)
+            })
             .map(|file| file.id)
             .collect()
     });
