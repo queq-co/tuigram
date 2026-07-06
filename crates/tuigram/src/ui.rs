@@ -2869,12 +2869,16 @@ mod tests {
 
     #[test]
     fn message_height_matches_the_rendered_line_count_with_a_ready_media_box() {
-        // Same drift guard as above, but for the one case that changes a
-        // message's height at all (#208): graphics-capable *and* the photo's
-        // file already present. Stubbed picker, same technique as
+        // Same drift guard as above, but for the cases that change a message's
+        // height at all (#208): graphics-capable and the content ready
+        // (Photo's file present, Video's embedded minithumbnail) — plus one
+        // that stays *not* ready despite graphics support and a present file
+        // (an animated Sticker), so height/render parity is pinned for every
+        // #208 content type this PR touches, not just Photo by coincidence of
+        // a shared constant. Stubbed picker, same technique as
         // `graphics_avatar_support_indents_the_header_by_the_gutter_width`.
         use ratatui_image::picker::{Picker, ProtocolType};
-        use tuigram_core::model::{FileRef, Photo};
+        use tuigram_core::model::{FileRef, Photo, Sticker, Video};
 
         let photo = sample_message(
             1,
@@ -2885,32 +2889,72 @@ mod tests {
                 height: 0,
             }),
         );
-        let mut app = app_with_history(vec![photo]);
+        let video = sample_message(
+            2,
+            MessageContent::Video(Video {
+                caption: FormattedText::default(),
+                file: FileRef::new(8),
+                width: 0,
+                height: 0,
+                duration: 0,
+                file_name: String::new(),
+                mime_type: "video/mp4".to_owned(),
+                minithumbnail: Some(b"jpeg bytes".to_vec()),
+            }),
+        );
+        let animated_sticker = sample_message(
+            3,
+            MessageContent::Sticker(Sticker {
+                file: FileRef::new(9),
+                width: 0,
+                height: 0,
+                emoji: "😀".to_owned(),
+                is_static: false,
+            }),
+        );
+        let mut app = app_with_history(vec![photo, video, animated_sticker]);
         let mut picker = Picker::halfblocks();
         picker.set_protocol_type(ProtocolType::Kitty);
         app.set_avatar_support(AvatarSupport::Graphics(picker));
-        app.project_downloads(vec![File {
-            id: 7,
-            size: 10,
-            downloaded_size: 10,
-            is_downloading_completed: true,
-            local_path: "/tmp/7".to_owned(),
-            ..File::default()
-        }]);
+        app.project_downloads(vec![
+            File {
+                id: 7,
+                size: 10,
+                downloaded_size: 10,
+                is_downloading_completed: true,
+                local_path: "/tmp/7".to_owned(),
+                ..File::default()
+            },
+            // The animated sticker's file is present too, to prove it is
+            // `media_ready`'s missing minithumbnail keeping it unreserved, not
+            // an incidentally-absent download.
+            File {
+                id: 9,
+                size: 10,
+                downloaded_size: 10,
+                is_downloading_completed: true,
+                local_path: "/tmp/9".to_owned(),
+                ..File::default()
+            },
+        ]);
 
         let view = app.conversation();
-        let message = &view.messages()[0];
-        let media_rows = media_rows_for(&app, view, &message.content);
-        assert_eq!(
-            media_rows,
-            crate::conversation::MEDIA_ROWS,
-            "sanity: box is reserved"
-        );
-        assert_eq!(
-            message_lines(view, message, true, 0, media_rows).len(),
-            view.message_height(message),
-            "height drifts from the renderer once the media box is ready"
-        );
+        let expected_ready = [true, true, false];
+        for (message, expect_ready) in view.messages().iter().zip(expected_ready) {
+            let media_rows = media_rows_for(&app, view, &message.content);
+            assert_eq!(
+                media_rows > 0,
+                expect_ready,
+                "readiness mismatch for message {}",
+                message.id
+            );
+            assert_eq!(
+                message_lines(view, message, true, 0, media_rows).len(),
+                view.message_height(message),
+                "height drifts from the renderer for message {}",
+                message.id
+            );
+        }
     }
 
     #[test]
