@@ -466,6 +466,22 @@ fn action_phrase(action: &ChatAction) -> &'static str {
     }
 }
 
+/// The inline-media box's actual column width for a history pane `area_width`
+/// cols wide with a `gutter_cols`-wide avatar gutter reserved: never wider than
+/// [`crate::conversation::MEDIA_COLS`], and never wider than the pane can
+/// actually draw into (borders + gutter subtracted). Shared by
+/// `render_conversation` and `drive_inline_media`'s (`main.rs`) encode-time
+/// sizing so the two can never drift out of sync — a mismatch here is exactly
+/// what let `allow_clipping` (#222) silently crop the right edge on any
+/// terminal narrower than `MEDIA_COLS` (#226).
+pub(crate) fn media_cols(area_width: u16, gutter_cols: usize) -> usize {
+    crate::conversation::MEDIA_COLS.min(
+        (area_width as usize)
+            .saturating_sub(2)
+            .saturating_sub(gutter_cols),
+    )
+}
+
 /// Right/top pane: the conversation history (#81). Renders the open chat's
 /// messages — each a sender/timestamp header, a body or media placeholder, and a
 /// reaction line — windowed forward from the scroll offset so a long history never
@@ -600,11 +616,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
     // Bounded to a fraction of the pane's own width (never wider than the body
     // column left after the gutter), not just `MEDIA_COLS`, so a narrow
     // terminal never draws past its own border.
-    let media_cols = crate::conversation::MEDIA_COLS.min(
-        (area.width as usize)
-            .saturating_sub(2)
-            .saturating_sub(gutter_cols),
-    );
+    let media_cols = media_cols(area.width, gutter_cols);
     for (row, protocol) in media {
         let rect = Rect {
             x: area.x + 1 + gutter_cols as u16,
@@ -1828,6 +1840,27 @@ mod tests {
         assert_eq!(panes.focus_at(0, panes.status.y), None);
         // A point past the right edge hits nothing.
         assert_eq!(panes.focus_at(80, 0), None);
+    }
+
+    #[test]
+    fn media_cols_shrinks_below_the_fixed_size_on_a_narrow_pane() {
+        // At a realistic narrow width (#226) the available space (borders +
+        // gutter subtracted) is below `MEDIA_COLS`, so the box must shrink to
+        // fit rather than staying at the fixed size and getting cropped later
+        // by `allow_clipping`.
+        let narrow = media_cols(50, 5);
+        assert!(
+            narrow < crate::conversation::MEDIA_COLS,
+            "expected a narrow pane to shrink the box below MEDIA_COLS, got {narrow}"
+        );
+        assert_eq!(narrow, 50usize.saturating_sub(2).saturating_sub(5));
+    }
+
+    #[test]
+    fn media_cols_caps_at_the_fixed_size_on_a_wide_pane() {
+        // A generously wide pane must not inflate the box past `MEDIA_COLS` —
+        // it's a cap, not a fill-the-pane target.
+        assert_eq!(media_cols(200, 5), crate::conversation::MEDIA_COLS);
     }
 
     #[test]
