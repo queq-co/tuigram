@@ -74,6 +74,22 @@ pub fn version() -> &'static str {
     VERSION
 }
 
+/// Serializes tests that create a real `tdjson` client (#223).
+///
+/// `tdjson`'s receive queue and observer are process-global —
+/// [`Bridge`](bridge::Bridge)'s own module doc documents "at most one
+/// `Bridge` per process" as an invariant — but Rust's default test harness
+/// runs `#[test]`/`#[tokio::test]` functions in parallel across threads
+/// within one process. [`prebuilt_tdjson_loads_and_creates_a_client`] (below)
+/// and `bridge::tests::live_request_correlates_and_updates_stream` both
+/// create a client, so without this lock they can race each other, which is
+/// the suspected cause of a Windows-only CI hang (#223 — unconfirmed on other
+/// platforms, since it hasn't been observed there). A `tokio::sync::Mutex`
+/// (not `std::sync::Mutex`) because the async test holds the guard across
+/// `.await` points.
+#[cfg(test)]
+pub(crate) static TDJSON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[cfg(test)]
 mod tests {
     use super::version;
@@ -91,6 +107,7 @@ mod tests {
     /// it. The async request/update bridge over this client lands in #5.
     #[test]
     fn prebuilt_tdjson_loads_and_creates_a_client() {
+        let _guard = crate::TDJSON_TEST_LOCK.blocking_lock();
         let client_id = tdlib_rs::create_client();
         assert!(client_id >= 0, "tdjson returned an invalid client id");
     }
