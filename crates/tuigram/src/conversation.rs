@@ -901,6 +901,7 @@ mod tests {
             content,
             send_state: SendState::Sent,
             reactions: Vec::new(),
+            reply_to: None,
         }
     }
 

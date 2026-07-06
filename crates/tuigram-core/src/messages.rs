@@ -1054,6 +1054,7 @@ mod tests {
             }),
             send_state: SendState::Sent,
             reactions: vec![],
+            reply_to: None,
         }
     }
 

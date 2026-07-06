@@ -320,6 +320,13 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('g')]),
+        action: Action::JumpToQuoted,
+        keys: "g",
+        description: "jump to the message the selected reply quotes",
+    },
+    Binding {
+        context: Context::History,
         trigger: Trigger::Plain(&[KeyCode::Char('d')]),
         action: Action::DeleteMessage,
         keys: "d",

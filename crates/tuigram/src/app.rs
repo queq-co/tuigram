@@ -10,7 +10,9 @@ use std::fmt;
 use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
 use ratatui_image::protocol::Protocol;
 use tuigram_core::StorageSettings;
-use tuigram_core::model::{File, Message, MessageContent, OutgoingMedia, SecretChatState, Sender};
+use tuigram_core::model::{
+    File, Message, MessageContent, OutgoingMedia, ReplyTo, SecretChatState, Sender,
+};
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
@@ -338,6 +340,11 @@ pub enum Action {
     /// its text and focus the composer (#195). Only our own text messages are
     /// editable; anything else surfaces a toast and does nothing.
     EditMessage,
+    /// Jump to the message the selected history message replies to (`g`, #210):
+    /// moves the cursor onto it if it is loaded in the same chat. A quiet no-op
+    /// otherwise — the selected message is not a reply, its target is in another
+    /// chat, or it is not (yet) in the loaded window.
+    JumpToQuoted,
     /// Open the delete-confirm overlay for the selected history message (`d`), a
     /// no-op on an empty history (#195).
     DeleteMessage,
@@ -1963,6 +1970,30 @@ impl App {
                             self.notify(Notice::info("Only text messages can be edited."));
                         }
                     }
+                    self.dirty = true;
+                }
+            }
+            Action::JumpToQuoted => {
+                // Follow the selected message's reply to its target (#210) — only
+                // within the same chat, since the target is always in the currently
+                // open chat's own loaded window, never a different one to switch to.
+                // `select_message` already no-ops cleanly for an id it can't find (not
+                // loaded, deleted, or a story reply), matching this action's own
+                // "quiet no-op otherwise".
+                let target = self.conversation.selected_message().and_then(|m| {
+                    let ReplyTo::Message {
+                        chat_id,
+                        message_id,
+                        ..
+                    } = m.reply_to.as_ref()?
+                    else {
+                        return None;
+                    };
+                    (*chat_id == m.chat_id).then_some(*message_id)
+                });
+                if let Some(message_id) = target
+                    && self.conversation.select_message(message_id)
+                {
                     self.dirty = true;
                 }
             }
@@ -4019,6 +4050,51 @@ mod tests {
             ComposerMode::Edit { message_id: 9 }
         ));
         assert_eq!(app.composer().text(), "mine");
+    }
+
+    /// #210: jumping from a reply moves the selection onto its (loaded)
+    /// target, wherever it sits in the loaded history.
+    #[test]
+    fn jump_to_quoted_moves_the_selection_onto_the_replied_to_message() {
+        use crate::conversation::ConversationView;
+
+        let mut reply = text_message(2, "sure thing", false);
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: reply.chat_id,
+            message_id: 1,
+            quote: None,
+        });
+        let target = text_message(1, "original message", false);
+        // `reply` at offset 0 so it starts out selected.
+        let mut app = App::with_conversation(ConversationView::from_messages(
+            vec![reply, target],
+            HashSet::new(),
+        ));
+        app.dispatch(Action::JumpToQuoted);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    /// A plain (non-reply) selected message has nothing to jump to.
+    #[test]
+    fn jump_to_quoted_is_a_noop_for_a_non_reply_message() {
+        let mut app = app_with_message(text_message(1, "hi", false));
+        app.dispatch(Action::JumpToQuoted);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    /// A reply whose target is not loaded (paged out, or a different chat's
+    /// message id) is a quiet no-op, not an error or a stale jump.
+    #[test]
+    fn jump_to_quoted_is_a_noop_for_an_unloaded_target() {
+        let mut reply = text_message(2, "sure thing", false);
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: reply.chat_id,
+            message_id: 999,
+            quote: None,
+        });
+        let mut app = app_with_message(reply);
+        app.dispatch(Action::JumpToQuoted);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(2));
     }
 
     #[test]
