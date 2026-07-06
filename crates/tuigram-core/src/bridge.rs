@@ -350,6 +350,10 @@ mod tests {
     /// receive loop runs (see the single-bridge invariant).
     #[tokio::test]
     async fn live_request_correlates_and_updates_stream() {
+        // #223: serialized against `prebuilt_tdjson_loads_and_creates_a_client`
+        // (crate::TDJSON_TEST_LOCK's doc) so the two real-`tdjson`-client tests
+        // never run concurrently in the same process.
+        let _guard = crate::TDJSON_TEST_LOCK.lock().await;
         let bridge = Bridge::new();
         // Subscribe before the request so the startup update burst it triggers
         // is captured (the broadcast does not replay pre-subscription updates).

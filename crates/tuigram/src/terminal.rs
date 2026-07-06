@@ -172,6 +172,7 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::IsTerminal;
 
     // `Picker::from_query_stdio` manages its own raw mode and genuinely queries
     // real stdio (see its `query_with_timeout`), so this test's outcome is
@@ -179,8 +180,22 @@ mod tests {
     // `None`, but run inside a real Sixel/Kitty/iTerm2 terminal it can validly
     // detect `Graphics`. Only assert what's actually guaranteed everywhere —
     // that detection completes without panicking — not a specific variant.
+    //
+    // Skipped outright when stdin is not a real terminal (#223): on
+    // Windows, `enable_raw_mode`'s query path opens the system console
+    // (`CONIN$`) directly rather than the process's actual stdin handle, so
+    // it succeeds even when stdin itself is redirected (as it always is in
+    // CI) — unlike Unix, where the analogous `tcgetattr` call fails fast on
+    // a non-tty stdin. That leaves the query reading from a stdin no real
+    // terminal will ever answer: each zero-byte read resends a "busy" signal
+    // that resets `query_with_timeout`'s own deadline, so it never times out
+    // on its own — a live lock, not a hang that self-resolves. This is the
+    // suspected cause of the windows-x86_64 CI hang.
     #[test]
     fn avatar_support_detects_without_panicking() {
+        if !std::io::stdin().is_terminal() {
+            return;
+        }
         let _support = Picker::from_query_stdio()
             .map(AvatarSupport::detect)
             .unwrap_or(AvatarSupport::None);
