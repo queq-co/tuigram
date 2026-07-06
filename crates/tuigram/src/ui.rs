@@ -22,7 +22,7 @@ use ratatui_image::protocol::Protocol;
 
 use tuigram_core::model::{
     Chat, ChatAction, ChatKind, File, FormattedText, Message, MessageContent, ReactionKind,
-    SecretChatState, SendState, Sender,
+    ReplyTo, SecretChatState, SendState, Sender, TextEntity,
 };
 
 use crate::chat_list::ChatListView;
@@ -538,7 +538,9 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
         }
         let header_row_in_block = block.len();
         let media_rows = media_rows_for(app, view, &message.content);
-        let media_row_in_block = header_row_in_block + 1 + content_lines(&message.content).len();
+        let quote_rows = usize::from(message.reply_to.is_some());
+        let media_row_in_block =
+            header_row_in_block + quote_rows + 1 + content_lines(&message.content, i == 0).len();
         block.extend(message_lines(
             view,
             message,
@@ -867,7 +869,12 @@ fn message_lines(
 
     let mut lines = vec![Line::from(header)];
     lines.extend(
-        content_lines(&message.content)
+        quote_lines(view, message)
+            .into_iter()
+            .map(|line| indent_line(line, gutter_cols)),
+    );
+    lines.extend(
+        content_lines(&message.content, selected)
             .into_iter()
             .map(|line| indent_line(line, gutter_cols)),
     );
@@ -889,6 +896,63 @@ fn message_lines(
     }
     lines.push(Line::from(""));
     lines
+}
+
+/// The greentext quote line above a reply's body (#210) — one line for a
+/// reply, none for a plain message; `message_lines` and the media-row offset
+/// math both rely on this being 0 or 1 line, never more.
+///
+/// Resolution is **render-time**, not cached on the model: it looks up the
+/// quoted message in `view`'s currently loaded history, so a target that
+/// loads later (a history page paged in after this reply was first seen)
+/// naturally resolves on the next render — the mechanism #207 left in place
+/// for exactly this kind of live catch-up. A target in another chat, one
+/// deleted or outside the loaded window, or a reply to a story all fall back
+/// to a bare `>reply`.
+fn quote_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>> {
+    let Some(reply) = &message.reply_to else {
+        return Vec::new();
+    };
+    let style = Style::new().fg(Color::Green).add_modifier(Modifier::DIM);
+    let text = match reply {
+        // TDLib documents `chat_id` as "may be 0 if the replied message is in
+        // unknown chat" — so `0` is treated as same-chat (not a cross-chat
+        // reply) rather than a mismatch, or an ordinary same-chat reply could
+        // silently never resolve depending on whether TDLib actually fills in
+        // the real id here. A genuinely different, known chat id is still
+        // cross-chat and never in `view`'s single-chat window anyway.
+        ReplyTo::Message {
+            chat_id,
+            message_id,
+            ..
+        } if *chat_id == 0 || *chat_id == message.chat_id => view
+            .messages()
+            .iter()
+            .find(|m| m.id == *message_id)
+            .map(|quoted| {
+                let sender = view.sender_label(quoted).label;
+                format!(
+                    ">{sender}: {}",
+                    truncate(&content_snippet(&quoted.content), 60)
+                )
+            })
+            .unwrap_or_else(|| ">reply".to_owned()),
+        ReplyTo::Message { .. } | ReplyTo::Unsupported(_) => ">reply".to_owned(),
+    };
+    vec![Line::from(Span::styled(text, style))]
+}
+
+/// A one-line, unstyled snippet of a message's content — its text's first
+/// line, or a media placeholder — for the quote line. Reuses
+/// [`content_lines`] rather than re-deriving the placeholder labels, so the
+/// snippet always matches what the quoted message would show as its own
+/// first body line.
+fn content_snippet(content: &MessageContent) -> String {
+    content_lines(content, false)
+        .into_iter()
+        .next()
+        .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+        .unwrap_or_default()
 }
 
 /// A blank leading span reserving the avatar gutter's width (#201), or no span
@@ -1028,19 +1092,20 @@ where
 /// `[Kind]` placeholder for media (with its caption, when set, on the lines
 /// below). Media bytes are not rendered in a terminal; the placeholder names what
 /// the message carries.
-fn content_lines(content: &MessageContent) -> Vec<Line<'static>> {
+fn content_lines(content: &MessageContent, selected: bool) -> Vec<Line<'static>> {
     match content {
-        MessageContent::Text(text) => text_lines(text),
-        MessageContent::Photo(p) => placeholder_lines("[Photo]", &p.caption),
-        MessageContent::Video(v) => placeholder_lines("[▶ video]", &v.caption),
+        MessageContent::Text(text) => text_lines(text, selected),
+        MessageContent::Photo(p) => placeholder_lines("[Photo]", &p.caption, selected),
+        MessageContent::Video(v) => placeholder_lines("[▶ video]", &v.caption, selected),
         MessageContent::Document(d) => placeholder_lines(
             &format!("[Document {}]", trimmed_name(&d.file_name)),
             &d.caption,
+            selected,
         ),
-        MessageContent::Audio(a) => placeholder_lines("[Audio]", &a.caption),
-        MessageContent::Voice(v) => placeholder_lines("[Voice]", &v.caption),
+        MessageContent::Audio(a) => placeholder_lines("[Audio]", &a.caption, selected),
+        MessageContent::Voice(v) => placeholder_lines("[Voice]", &v.caption, selected),
         MessageContent::Sticker(s) => one_line(format!("[Sticker {}]", s.emoji).trim_end()),
-        MessageContent::Animation(a) => placeholder_lines("[GIF]", &a.caption),
+        MessageContent::Animation(a) => placeholder_lines("[GIF]", &a.caption, selected),
         MessageContent::Location(_) => one_line("[Location]"),
         MessageContent::Venue(v) => one_line(format!("[Venue {}]", v.title).trim_end()),
         MessageContent::Contact(c) => {
@@ -1051,20 +1116,51 @@ fn content_lines(content: &MessageContent) -> Vec<Line<'static>> {
     }
 }
 
-/// The lines of a text body, preserving its own line breaks. Empty text still
-/// yields one (empty) line so the header is not left bodyless.
-fn text_lines(text: &FormattedText) -> Vec<Line<'static>> {
+/// The lines of a text body, preserving its own line breaks and rendering its
+/// formatting entities (#211) — bold/italic/code/strikethrough/spoiler, with
+/// overlapping entities composed rather than one silently overwriting
+/// another (see [`crate::richtext::styled_spans`]). `selected` gates spoiler
+/// reveal. Empty text still yields one (empty) line so the header is not left
+/// bodyless.
+fn text_lines(text: &FormattedText, selected: bool) -> Vec<Line<'static>> {
+    // Entity offsets are UTF-16 code units into the *whole* `text.text`
+    // (TDLib's convention); track each split-out line's UTF-16 span so every
+    // entity can be intersected against it and re-offset to be line-local —
+    // `styled_spans` then treats each line as a standalone string.
+    let mut utf16_pos: i32 = 0;
     text.text
         .split('\n')
-        .map(|line| Line::from(line.to_owned()))
+        .map(|line| {
+            let line_start = utf16_pos;
+            let line_end = utf16_pos + line.encode_utf16().count() as i32;
+            let local_entities: Vec<TextEntity> = text
+                .entities
+                .iter()
+                .filter_map(|e| {
+                    let start = e.offset.max(line_start);
+                    let end = (e.offset + e.length).min(line_end);
+                    (start < end).then(|| TextEntity {
+                        offset: start - line_start,
+                        length: end - start,
+                        kind: e.kind.clone(),
+                    })
+                })
+                .collect();
+            utf16_pos = line_end + 1; // the '\n' consumed by `split` is one UTF-16 unit
+            Line::from(crate::richtext::styled_spans(
+                line,
+                &local_entities,
+                selected,
+            ))
+        })
         .collect()
 }
 
 /// A media placeholder line, with the caption's lines below it when non-empty.
-fn placeholder_lines(label: &str, caption: &FormattedText) -> Vec<Line<'static>> {
+fn placeholder_lines(label: &str, caption: &FormattedText, selected: bool) -> Vec<Line<'static>> {
     let mut lines = one_line(label);
     if !caption.text.is_empty() {
-        lines.extend(text_lines(caption));
+        lines.extend(text_lines(caption, selected));
     }
     lines
 }
@@ -1885,7 +1981,7 @@ mod tests {
             text: tuigram_core::scrub_prose(hostile),
             entities: Vec::new(),
         });
-        let rendered: String = content_lines(&content)
+        let rendered: String = content_lines(&content, false)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
@@ -1896,6 +1992,238 @@ mod tests {
         );
         assert!(rendered.contains('\u{fffd}'), "tampering is marked");
         assert!(rendered.contains("hello") && rendered.contains("world"));
+    }
+
+    /// #211: a bold entity styles only its own span, leaving the rest of the
+    /// line plain — the render half of `richtext::styled_spans`'s unit
+    /// coverage, exercised through the real `content_lines` seam.
+    #[test]
+    fn formatting_entities_style_the_conversation_pane() {
+        use tuigram_core::model::EntityKind;
+
+        let content = MessageContent::Text(FormattedText {
+            text: "bold text".to_owned(),
+            entities: vec![TextEntity {
+                offset: 0,
+                length: 4,
+                kind: EntityKind::Bold,
+            }],
+        });
+        let spans: Vec<Span> = content_lines(&content, false)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .collect();
+        let bold = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "bold")
+            .expect("bold span");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        let rest = spans
+            .iter()
+            .find(|s| s.content.as_ref() == " text")
+            .expect("plain span");
+        assert!(!rest.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// #211: a spoiler stays concealed while its message is not selected, and
+    /// reveals once it is — rendering depends on UI selection state, not just
+    /// the message's own content.
+    #[test]
+    fn a_spoiler_conceals_by_default_and_reveals_when_selected() {
+        use tuigram_core::model::EntityKind;
+
+        let content = MessageContent::Text(FormattedText {
+            text: "secret".to_owned(),
+            entities: vec![TextEntity {
+                offset: 0,
+                length: 6,
+                kind: EntityKind::Spoiler,
+            }],
+        });
+        let concealed: String = content_lines(&content, false)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .map(|s| s.content.into_owned())
+            .collect();
+        assert!(!concealed.contains("secret"), "concealed: {concealed:?}");
+
+        let revealed: String = content_lines(&content, true)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .map(|s| s.content.into_owned())
+            .collect();
+        assert!(
+            revealed.contains("secret"),
+            "revealed on selection: {revealed:?}"
+        );
+    }
+
+    /// #210: a reply to a message loaded in the same chat resolves its
+    /// sender and a snippet of its body onto the greentext quote line.
+    #[test]
+    fn quote_lines_resolves_the_sender_and_snippet_of_a_loaded_target() {
+        use crate::conversation::sample_message;
+        use std::collections::HashSet;
+        use tuigram_core::model::ReplyTo;
+
+        let original = sample_message(
+            1,
+            MessageContent::Text(FormattedText {
+                text: "original message".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        let mut reply = sample_message(
+            2,
+            MessageContent::Text(FormattedText {
+                text: "sure thing".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: original.chat_id,
+            message_id: 1,
+            quote: None,
+        });
+        let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
+
+        let lines = quote_lines(&view, &reply);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("original message"), "snippet: {text:?}");
+        assert!(text.starts_with('>'), "greentext marker: {text:?}");
+    }
+
+    /// #210: a reply whose target is not in the loaded window (deleted, or
+    /// simply not paged in yet) falls back to a bare `>reply`, never blocking
+    /// or erroring.
+    #[test]
+    fn quote_lines_falls_back_to_bare_reply_for_an_unloaded_target() {
+        use crate::conversation::sample_message;
+        use std::collections::HashSet;
+        use tuigram_core::model::ReplyTo;
+
+        let mut reply = sample_message(
+            2,
+            MessageContent::Text(FormattedText {
+                text: "sure thing".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: reply.chat_id,
+            message_id: 999,
+            quote: None,
+        });
+        let view = ConversationView::from_messages(vec![reply.clone()], HashSet::new());
+
+        let lines = quote_lines(&view, &reply);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, ">reply");
+    }
+
+    /// #210: once a re-projection brings the previously-unloaded target into
+    /// `view`'s history (e.g. paging up), the *same* reply message resolves
+    /// its quote line without any change to the reply itself — the
+    /// render-time lookup, not a cached value, is what catches up.
+    #[test]
+    fn quote_lines_catches_up_once_the_target_loads() {
+        use crate::conversation::sample_message;
+        use std::collections::HashSet;
+        use tuigram_core::model::ReplyTo;
+
+        let mut reply = sample_message(
+            2,
+            MessageContent::Text(FormattedText {
+                text: "sure thing".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: reply.chat_id,
+            message_id: 1,
+            quote: None,
+        });
+
+        let before = ConversationView::from_messages(vec![reply.clone()], HashSet::new());
+        let before_text: String = quote_lines(&before, &reply)[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(before_text, ">reply", "not loaded yet");
+
+        let original = sample_message(
+            1,
+            MessageContent::Text(FormattedText {
+                text: "original message".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        let after = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
+        let after_text: String = quote_lines(&after, &reply)[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            after_text.contains("original message"),
+            "resolved after the target loaded: {after_text:?}"
+        );
+    }
+
+    /// A plain (non-reply) message has no quote line at all.
+    #[test]
+    fn quote_lines_is_empty_for_a_plain_message() {
+        use crate::conversation::sample_message;
+        use std::collections::HashSet;
+
+        let message = sample_message(
+            1,
+            MessageContent::Text(FormattedText {
+                text: "hi".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        let view = ConversationView::from_messages(vec![message.clone()], HashSet::new());
+        assert!(quote_lines(&view, &message).is_empty());
+    }
+
+    /// #210: TDLib documents `MessageReplyToMessage.chat_id` as "may be 0 if
+    /// the replied message is in unknown chat" — a same-chat reply must still
+    /// resolve rather than always falling back to bare `>reply` if TDLib
+    /// reports `0` here instead of the real (matching) chat id.
+    #[test]
+    fn quote_lines_resolves_a_reply_whose_chat_id_is_reported_as_zero() {
+        use crate::conversation::sample_message;
+        use std::collections::HashSet;
+        use tuigram_core::model::ReplyTo;
+
+        let original = sample_message(
+            1,
+            MessageContent::Text(FormattedText {
+                text: "original message".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        let mut reply = sample_message(
+            2,
+            MessageContent::Text(FormattedText {
+                text: "sure thing".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: 0,
+            message_id: 1,
+            quote: None,
+        });
+        let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
+
+        let lines = quote_lines(&view, &reply);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("original message"), "snippet: {text:?}");
     }
 
     #[test]

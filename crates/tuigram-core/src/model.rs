@@ -16,15 +16,16 @@
 //! [`Voice`], [`Sticker`], [`Animation`]), and the **structured** types
 //! ([`Location`], [`Venue`], [`Contact`], [`Poll`]); rarer content is
 //! `Unsupported`, for follow-up issues. Message **reactions** are modeled (#51,
-//! see [`Reaction`]); forwards, replies, and service messages are out of scope
-//! for this model.
+//! see [`Reaction`]) and so are **replies** (#210, see [`ReplyTo`]); forwards
+//! and service messages are still out of scope for this model.
 
 use tdlib_rs::enums::{
     ChatAction as TdChatAction, ChatList as TdChatList, ChatType as TdChatType,
     InputFile as TdInputFile, InputMessageContent as TdInputMessageContent,
     InputMessageReplyTo as TdInputMessageReplyTo, MessageContent as TdMessageContent,
-    MessageSender as TdMessageSender, MessageSendingState as TdMessageSendingState,
-    PollType as TdPollType, ReactionType as TdReactionType, SecretChatState as TdSecretChatState,
+    MessageReplyTo as TdMessageReplyTo, MessageSender as TdMessageSender,
+    MessageSendingState as TdMessageSendingState, PollType as TdPollType,
+    ReactionType as TdReactionType, SecretChatState as TdSecretChatState,
     StickerFormat as TdStickerFormat, TextEntityType as TdTextEntityType,
     UserStatus as TdUserStatus, UserType as TdUserType,
 };
@@ -1821,6 +1822,53 @@ pub(crate) fn reactions_from(info: Option<&TdMessageInteractionInfo>) -> Vec<Rea
         .unwrap_or_default()
 }
 
+/// What a message replies to — tuigram's projection of TDLib's
+/// `MessageReplyTo` (#210). A construction-time field like
+/// [`Message::content`]/[`Message::sender`]: TDLib has no live "reply
+/// changed" update, so unlike [`Reaction`] this needs no store-reducer fold.
+///
+/// Resolving *who* was replied to and *what they said* is deliberately not
+/// done here: it is a render-time lookup against the currently loaded
+/// history (so it naturally catches up once a history page brings the
+/// target message in, per #207's re-projection fix), not a value cached onto
+/// this projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplyTo {
+    /// A reply to a message, possibly in another chat/topic.
+    Message {
+        /// The chat the replied-to message belongs to (may differ from this
+        /// message's own chat for a cross-chat/topic reply).
+        chat_id: i64,
+        /// The replied-to message's id.
+        message_id: i64,
+        /// The sender's manually-chosen quoted excerpt, if any (sanitized
+        /// like any other prose).
+        quote: Option<String>,
+    },
+    /// A reply to a story — out of scope to resolve or render; carried only
+    /// so the projection stays total over TDLib's enum, matching
+    /// [`MessageContent::Unsupported`]'s convention.
+    Unsupported(&'static str),
+}
+
+impl ReplyTo {
+    /// Project TDLib's `MessageReplyTo`.
+    #[must_use]
+    pub fn from_tdlib(reply: &TdMessageReplyTo) -> Self {
+        match reply {
+            TdMessageReplyTo::Message(m) => Self::Message {
+                chat_id: m.chat_id,
+                message_id: m.message_id,
+                quote: m
+                    .quote
+                    .as_ref()
+                    .map(|q| crate::sanitize::scrub_prose(&q.text.text)),
+            },
+            TdMessageReplyTo::Story(_) => Self::Unsupported("messageReplyToStory"),
+        }
+    }
+}
+
 /// A single message — tuigram's projection of TDLib's `Message`.
 ///
 /// Not `Eq`: a [`MessageContent::Location`] carries `f64` coordinates, so the
@@ -1846,6 +1894,8 @@ pub struct Message {
     /// Reactions added to the message, one bucket per reaction, in TDLib's
     /// order. Empty when the message has no reactions.
     pub reactions: Vec<Reaction>,
+    /// What this message replies to, if it is a reply (#210).
+    pub reply_to: Option<ReplyTo>,
 }
 
 impl Message {
@@ -1862,6 +1912,7 @@ impl Message {
             content: MessageContent::from_tdlib(&message.content),
             send_state: SendState::from_tdlib(message.sending_state.as_ref()),
             reactions: reactions_from(message.interaction_info.as_ref()),
+            reply_to: message.reply_to.as_ref().map(ReplyTo::from_tdlib),
         }
     }
 
@@ -3472,6 +3523,143 @@ mod tests {
                 count: 4,
                 is_chosen: true,
             }]
+        );
+    }
+
+    /// A message with no `reply_to` at all projects to `None` — the common
+    /// case, and what every other `td_message`-built fixture already gets.
+    #[test]
+    fn message_with_no_reply_to_projects_to_none() {
+        let bare = td_message(
+            1,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("hi", vec![]),
+            None,
+            false,
+        );
+        assert_eq!(Message::from_tdlib(&bare).reply_to, None);
+    }
+
+    /// A reply within the same chat projects its target id and no quote (#210).
+    #[test]
+    fn message_projects_a_same_chat_reply() {
+        use tdlib_rs::types::MessageReplyToMessage;
+
+        let mut replying = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("sure", vec![]),
+            None,
+            false,
+        );
+        replying.reply_to = Some(TdMessageReplyTo::Message(MessageReplyToMessage {
+            chat_id: 10,
+            message_id: 1,
+            quote: None,
+            ..Default::default()
+        }));
+        assert_eq!(
+            Message::from_tdlib(&replying).reply_to,
+            Some(ReplyTo::Message {
+                chat_id: 10,
+                message_id: 1,
+                quote: None,
+            })
+        );
+    }
+
+    /// A reply that carries an explicit, sender-chosen quote projects the
+    /// quote's (sanitized) text alongside the target.
+    #[test]
+    fn message_projects_a_reply_s_explicit_quote() {
+        use tdlib_rs::types::{MessageReplyToMessage, TextQuote};
+
+        let mut replying = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("sure", vec![]),
+            None,
+            false,
+        );
+        replying.reply_to = Some(TdMessageReplyTo::Message(MessageReplyToMessage {
+            chat_id: 10,
+            message_id: 1,
+            quote: Some(TextQuote {
+                text: TdFormattedTextT {
+                    text: "the important bit".to_owned(),
+                    entities: vec![],
+                },
+                position: 0,
+                is_manual: true,
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            Message::from_tdlib(&replying).reply_to,
+            Some(ReplyTo::Message {
+                chat_id: 10,
+                message_id: 1,
+                quote: Some("the important bit".to_owned()),
+            })
+        );
+    }
+
+    /// A cross-chat reply carries the origin chat id, distinct from the
+    /// reply's own chat — the render layer's cue that the target is not in
+    /// the currently open chat's loaded window.
+    #[test]
+    fn message_projects_a_cross_chat_reply_s_origin_chat() {
+        use tdlib_rs::types::MessageReplyToMessage;
+
+        let mut replying = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("sure", vec![]),
+            None,
+            false,
+        );
+        replying.reply_to = Some(TdMessageReplyTo::Message(MessageReplyToMessage {
+            chat_id: 99,
+            message_id: 1,
+            quote: None,
+            ..Default::default()
+        }));
+        assert_eq!(
+            Message::from_tdlib(&replying).reply_to,
+            Some(ReplyTo::Message {
+                chat_id: 99,
+                message_id: 1,
+                quote: None,
+            })
+        );
+    }
+
+    /// A reply to a story is out of scope to resolve/render, but the
+    /// projection stays total over TDLib's enum rather than silently
+    /// dropping it.
+    #[test]
+    fn message_projects_a_story_reply_as_unsupported() {
+        use tdlib_rs::types::MessageReplyToStory;
+
+        let mut replying = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("nice story", vec![]),
+            None,
+            false,
+        );
+        replying.reply_to = Some(TdMessageReplyTo::Story(MessageReplyToStory {
+            story_poster_chat_id: 5,
+            story_id: 42,
+        }));
+        assert_eq!(
+            Message::from_tdlib(&replying).reply_to,
+            Some(ReplyTo::Unsupported("messageReplyToStory"))
         );
     }
 
