@@ -2407,14 +2407,17 @@ mod tests {
         // download line's own contribution to the row count stays constant
         // across the toggle below — isolating the delta to the media box alone.
         app.project_downloads(vec![present_file(7)]);
-        let before = rendered_row_count(&render_output(&app, 80, 24), 1);
+        // Tall enough that the full media box (16 rows) never gets clipped by
+        // the pane's own truncation, which would otherwise confound the delta
+        // this test isolates.
+        let before = rendered_row_count(&render_output(&app, 80, 40), 1);
 
         app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
-        let output = render_output(&app, 80, 24);
+        let output = render_output(&app, 80, 40);
         let after = rendered_row_count(&output, 1);
 
         assert_eq!(after, before + crate::conversation::MEDIA_ROWS);
-        let text = flatten(&render(&app, 80, 24));
+        let text = flatten(&render(&app, 80, 40));
         assert!(
             text.contains("[Photo]"),
             "the placeholder stays even once the box is ready"
@@ -2504,8 +2507,10 @@ mod tests {
         );
         let mut app = app_with_history(vec![with_still, without_still]);
         app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
-        // Neither file is ever downloaded — a still needs none.
-        let output = render_output(&app, 80, 24);
+        // Neither file is ever downloaded — a still needs none. Tall enough
+        // that both messages (one with a 16-row media box) fit without
+        // truncation.
+        let output = render_output(&app, 80, 40);
 
         let placeholder_only = 1 + 1 + 1;
         assert_eq!(

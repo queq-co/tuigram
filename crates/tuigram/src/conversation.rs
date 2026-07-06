@@ -653,13 +653,20 @@ impl ConversationView {
 /// stickers, and video/animation stills are all scaled to fit this box
 /// regardless of their real aspect ratio, so height math never depends on an
 /// async decode's result, only on whether it has started.
-pub(crate) const MEDIA_ROWS: usize = 8;
+///
+/// Sized (with [`MEDIA_COLS`]) to read as an actual photo rather than an
+/// icon: at a typical terminal cell aspect (~1:2 width:height in pixels), 16
+/// rows × 48 cols works out to roughly a 3:2 landscape photo — double each
+/// dimension of this box's original 8×24 (four times the pixel area), which
+/// in practice looked avatar-bubble-sized rather than photo-sized.
+pub(crate) const MEDIA_ROWS: usize = 16;
 
 /// The inline-media box's column width (#208), a fixed target `drive_media`
 /// (`main.rs`) encodes into and the render path draws into (clamped further
 /// to the pane's actual inner width there) — the same "fixed box, not the
-/// image's real aspect" reasoning as [`MEDIA_ROWS`].
-pub(crate) const MEDIA_COLS: usize = 24;
+/// image's real aspect" reasoning as [`MEDIA_ROWS`], which also documents
+/// this size's derivation.
+pub(crate) const MEDIA_COLS: usize = 48;
 
 /// Whether a message's content has raster bytes ready to render inline
 /// (#208), mirrored independently by [`crate::ui::media_ready`] (kept as two
