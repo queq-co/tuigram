@@ -31,7 +31,8 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
   command-surface parity guard (`crates/tuigram/src/parity.rs`, #197).
 - [../settings.example.toml](../settings.example.toml) — annotated template for
   `~/.config/tuigram/settings.toml`: download-cache retention (per-kind TTLs and the
-  global size backstop). Optional; copy it into place to opt in.
+  global size backstop) and terminal-UI toggles (mouse, graphics). Optional; copy
+  it into place to opt in.
 - [branch-model.md](branch-model.md) — how we use `develop` → PR → `main`.
 - Research (Phase 1):
   - [research/ratatui.md](research/ratatui.md) — how Ratatui works and how we'll use it.

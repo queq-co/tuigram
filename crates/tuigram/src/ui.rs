@@ -498,7 +498,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
     // full, building at most one message past the boundary — never the whole
     // history. `inner` excludes the block's top and bottom borders.
     let inner_rows = area.height.saturating_sub(2) as usize;
-    let gutter_cols = app.avatar_support().gutter_cols();
+    let gutter_cols = app.avatar_gutter_cols();
     let mut lines: Vec<Line> = Vec::new();
     // Row offset (within `inner_rows`) and built protocol for each visible
     // message whose sender's avatar has already been encoded this session
@@ -937,7 +937,7 @@ fn download_line(view: &ConversationView, content: &MessageContent) -> Option<Li
 /// from `App` and file presence from the view's projected downloads, since
 /// the render path has both directly rather than a stored bool.
 fn media_ready(app: &App, view: &ConversationView, content: &MessageContent) -> bool {
-    if !app.avatar_support().is_graphics() {
+    if !app.graphics_active() {
         return false;
     }
     let file_present = |file_id: i32| view.download(file_id).is_some_and(File::is_present);
@@ -1553,11 +1553,11 @@ fn render_send_media(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// The retention settings editor (#146): a centred modal with the three per-kind
-/// TTL fields over the global cache-cap field, pre-filled with the live values. The
-/// focused field shows the caret; a rejected confirm surfaces its reason on a red
-/// line above the key hint, so an invalid value is corrected in place rather than
-/// saved.
+/// The settings editor (#146, plus the graphics toggle, #209): a centred modal
+/// with the three per-kind TTL fields, the global cache-cap field, and the
+/// graphics on/off field, pre-filled with the live values. The focused field
+/// shows the caret; a rejected confirm surfaces its reason on a red line above
+/// the key hint, so an invalid value is corrected in place rather than saved.
 fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     let settings = app.settings();
     let field_line = |field: SettingsField| {
@@ -1573,6 +1573,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         field_line(SettingsField::KeepGroups),
         field_line(SettingsField::KeepChannels),
         field_line(SettingsField::MaxCache),
+        field_line(SettingsField::Graphics),
         Line::from(""),
     ];
     if let Some(error) = settings.error() {
@@ -1582,7 +1583,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
         )));
     }
     lines.push(hint_line(
-        "Tab next field · Enter save · Esc cancel · forever/3d/1w · 2GB/unbounded",
+        "Tab next field · Enter save · Esc cancel · forever/3d/1w · 2GB/unbounded · on/off",
     ));
 
     let popup = centered_rect(OVERLAY_WIDTH, lines.len() as u16 + 2, area);
@@ -1590,7 +1591,7 @@ fn render_settings(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::bordered()
-                .title(" Cache retention ")
+                .title(" Settings ")
                 .title_alignment(Alignment::Center),
         ),
         popup,
@@ -1943,11 +1944,16 @@ mod tests {
         });
         app.dispatch(crate::app::Action::SettingsOpen);
         let text = flatten(&render(&app, 80, 24));
-        assert!(text.contains("Cache retention"), "overlay title");
+        assert!(text.contains("Settings"), "overlay title");
         assert!(text.contains("channels"), "a field label");
         assert!(
             text.contains("2GB"),
             "the live max-cache value is pre-filled"
+        );
+        assert!(text.contains("graphics"), "the graphics field label");
+        assert!(
+            text.contains("on"),
+            "graphics is pre-filled from the live setting"
         );
         assert!(text.contains("Enter save"), "the key hint");
     }
@@ -2328,6 +2334,35 @@ mod tests {
     }
 
     #[test]
+    fn graphics_setting_off_collapses_the_gutter_even_on_a_graphics_terminal() {
+        // #209: the user's `graphics` setting overrides a graphics-capable
+        // terminal — off means off, same as a non-graphics terminal (#194).
+        use ratatui_image::picker::{Picker, ProtocolType};
+
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        let mut app = app_with_history(vec![text_message(1, "hi")]);
+        app.set_avatar_support(AvatarSupport::Graphics(picker));
+        assert!(
+            app.avatar_gutter_cols() > 0,
+            "capable and enabled by default"
+        );
+
+        app.set_graphics_enabled(false);
+        assert_eq!(app.avatar_gutter_cols(), 0, "the setting forces it to zero");
+        let row: Vec<char> = row_text(&render(&app, 80, 24), 1).chars().collect();
+        let marker_pos = row
+            .iter()
+            .position(|&c| c == '▶')
+            .expect("selected marker present");
+        assert_eq!(
+            row[marker_pos - 1],
+            '│',
+            "no gutter at all: the marker sits right after the pane's border"
+        );
+    }
+
+    #[test]
     fn no_open_chat_shows_the_empty_state_placeholder() {
         // With no open chat, the pane is the empty state (#188): app identity +
         // version and a CTA naming the real binding (Enter opens the selected chat).
@@ -2545,6 +2580,32 @@ mod tests {
             rendered_row_count(&output, 1),
             1 + 1 + 1 + 1,
             "a present file with no graphics support falls back cleanly"
+        );
+    }
+
+    #[test]
+    fn a_present_file_never_grows_when_the_graphics_setting_is_off() {
+        // #209: the same fallback as a non-graphics terminal, but on a
+        // graphics-capable one with the user's setting off — off means off even
+        // though the terminal itself could render it.
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut app = app_with_history(vec![photo]);
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        app.set_graphics_enabled(false);
+        app.project_downloads(vec![present_file(7)]);
+        let output = render_output(&app, 80, 24);
+        assert_eq!(
+            rendered_row_count(&output, 1),
+            1 + 1 + 1 + 1,
+            "graphics off falls back cleanly even on a graphics-capable terminal"
         );
     }
 
@@ -3061,6 +3122,70 @@ mod tests {
                 media_rows > 0,
                 expect_ready,
                 "readiness mismatch for message {}",
+                message.id
+            );
+            assert_eq!(
+                message_lines(view, message, true, 0, media_rows).len(),
+                view.message_height(message),
+                "height drifts from the renderer for message {}",
+                message.id
+            );
+        }
+    }
+
+    #[test]
+    fn message_height_matches_the_rendered_line_count_with_graphics_setting_off() {
+        // #209: same drift guard, but graphics-capable terminal with the user's
+        // setting off — every message collapses to its placeholder height on
+        // both independent gates (`ui::media_ready`'s `app.graphics_active()`
+        // and `ConversationView.graphics_capable`, kept in sync via
+        // `App::sync_graphics_capable`), not just when the terminal itself
+        // lacks graphics support.
+        use ratatui_image::picker::{Picker, ProtocolType};
+        use tuigram_core::model::{FileRef, Photo, Video};
+
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let video = sample_message(
+            2,
+            MessageContent::Video(Video {
+                caption: FormattedText::default(),
+                file: FileRef::new(8),
+                width: 0,
+                height: 0,
+                duration: 0,
+                file_name: String::new(),
+                mime_type: "video/mp4".to_owned(),
+                minithumbnail: Some(b"jpeg bytes".to_vec()),
+            }),
+        );
+        let mut app = app_with_history(vec![photo, video]);
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        app.set_avatar_support(AvatarSupport::Graphics(picker));
+        app.set_graphics_enabled(false);
+        app.project_downloads(vec![File {
+            id: 7,
+            size: 10,
+            downloaded_size: 10,
+            is_downloading_completed: true,
+            local_path: "/tmp/7".to_owned(),
+            ..File::default()
+        }]);
+
+        let view = app.conversation();
+        for message in view.messages() {
+            let media_rows = media_rows_for(&app, view, &message.content);
+            assert_eq!(
+                media_rows, 0,
+                "graphics off: never ready, message {}",
                 message.id
             );
             assert_eq!(

@@ -428,8 +428,10 @@ pub struct App {
     /// confirmed, so reopening the editor shows the live values. `App` never touches
     /// the file — the loop persists and applies the confirmed change.
     storage: StorageSettings,
-    /// The settings editor's state (#146): the four retention inputs being edited.
-    /// Reset from [`storage`](Self::storage) each time the editor opens.
+    /// The settings editor's state (#146): the four retention inputs plus the
+    /// graphics toggle (#209) being edited. Reset from
+    /// [`storage`](Self::storage)/[`graphics_enabled`](Self::graphics_enabled)
+    /// each time the editor opens.
     settings: SettingsDraft,
     /// The core link's connection state (#88), shown in the status bar. Defaults to
     /// `Connecting`; Phase 6 folds `updateConnectionState` into it.
@@ -504,6 +506,22 @@ pub struct App {
     /// swaps its live retention (the next sweep honours it), and persists it to
     /// `settings.toml`.
     pending_settings: Option<StorageSettings>,
+    /// Whether graphics rendering is enabled by the user's `[interface]` setting
+    /// (#209) — independent of [`avatar_support`](Self::avatar_support), which is
+    /// what the *terminal* can do. The gutter/media render paths and the
+    /// encode-kickoff loop all gate on the combination of the two (see
+    /// [`avatar_gutter_cols`](Self::avatar_gutter_cols) /
+    /// [`graphics_active`](Self::graphics_active)), so a graphics-capable
+    /// terminal still renders nothing with this off. Unlike `avatar_support`
+    /// (seeded once at startup), this changes live via
+    /// [`set_graphics_enabled`](Self::set_graphics_enabled).
+    graphics_enabled: bool,
+    /// A confirmed graphics-toggle edit awaiting the loop (#209). Confirming the
+    /// settings editor applies the change in-memory immediately (via
+    /// [`set_graphics_enabled`](Self::set_graphics_enabled)) and lands the new
+    /// value here; the loop drains it via [`take_graphics`](Self::take_graphics)
+    /// and persists it to `settings.toml`. Mirrors `pending_settings`.
+    pending_graphics: Option<bool>,
     /// The delete-confirm overlay's state (#195): the message a `d` targets and the
     /// chosen scope. `Some` only while [`Overlay::DeleteConfirm`] is open.
     delete: Option<DeletePrompt>,
@@ -567,9 +585,15 @@ pub struct App {
 
 impl App {
     /// A fresh app, marked dirty so the first frame paints before any event.
+    /// `graphics_enabled` starts on — `bool`'s own `Default` is `false`, but an
+    /// unconfigured install (and every test that never calls
+    /// [`set_graphics_enabled`](Self::set_graphics_enabled)) should behave as if
+    /// graphics are on, matching [`InterfaceSettings`](tuigram_core::InterfaceSettings)'s
+    /// own default.
     pub fn new() -> Self {
         Self {
             dirty: true,
+            graphics_enabled: true,
             ..Self::default()
         }
     }
@@ -677,18 +701,64 @@ impl App {
     /// a clone of `TerminalGuard::avatar_support` (the guard keeps its own copy
     /// for the rest of the process's lifetime) — mirrors
     /// [`set_storage_settings`](Self::set_storage_settings)'s seed-once shape.
-    /// Also seeds the conversation view's copy of the same bool (#208), so its
-    /// height math knows whether to reserve rows for inline media.
+    /// Unlike that seed, this is not the whole story for graphics: see
+    /// [`sync_graphics_capable`](Self::sync_graphics_capable).
     pub fn set_avatar_support(&mut self, support: AvatarSupport) {
-        self.conversation
-            .set_graphics_capable(support.is_graphics());
         self.avatar_support = support;
+        self.sync_graphics_capable();
     }
 
     /// The graphics-protocol capability in effect, for the render path to
     /// decide whether to draw an avatar gutter at all.
     pub fn avatar_support(&self) -> &AvatarSupport {
         &self.avatar_support
+    }
+
+    /// Whether the user's `graphics` setting is on (#209) — orthogonal to
+    /// [`avatar_support`](Self::avatar_support), which is what the *terminal*
+    /// can do. Read by the settings editor to pre-fill its toggle.
+    pub fn graphics_enabled(&self) -> bool {
+        self.graphics_enabled
+    }
+
+    /// Apply a graphics-toggle edit (#209): on first seed (from `settings.toml`
+    /// at startup) and on every later live confirm from the settings editor.
+    /// Keeps the conversation view's combined capability in sync either way.
+    pub fn set_graphics_enabled(&mut self, enabled: bool) {
+        self.graphics_enabled = enabled;
+        self.sync_graphics_capable();
+    }
+
+    /// Recompute the conversation view's combined "render graphics at all"
+    /// bool from the terminal's detected capability and the user's setting —
+    /// the single place [`set_avatar_support`](Self::set_avatar_support) and
+    /// [`set_graphics_enabled`](Self::set_graphics_enabled) both funnel
+    /// through, so the two can never fall out of sync regardless of which
+    /// changes first.
+    fn sync_graphics_capable(&mut self) {
+        self.conversation
+            .set_graphics_capable(self.avatar_support.is_graphics() && self.graphics_enabled);
+    }
+
+    /// The avatar gutter width to draw: the terminal's own [`gutter_cols`
+    /// width](AvatarSupport::gutter_cols) when the user's `graphics` setting is
+    /// on, else `0` — collapsing the gutter exactly like a non-graphics
+    /// terminal, per #209's acceptance criterion that the toggle covers the
+    /// generated fallback bubble too, not just real photos.
+    pub fn avatar_gutter_cols(&self) -> usize {
+        if self.graphics_enabled {
+            self.avatar_support.gutter_cols()
+        } else {
+            0
+        }
+    }
+
+    /// Whether inline media should render at all: the terminal is
+    /// graphics-capable *and* the user's `graphics` setting is on (#209). The
+    /// single check the render path (`ui::media_ready`) and the encode-kickoff
+    /// loop (`drive_avatars`/`drive_inline_media` in `main.rs`) both gate on.
+    pub fn graphics_active(&self) -> bool {
+        self.graphics_enabled && self.avatar_support.is_graphics()
     }
 
     /// The built protocol for a sender's avatar, if already encoded this
@@ -891,6 +961,14 @@ impl App {
     /// `None` means no settings edit was confirmed since the last drain.
     pub fn take_settings(&mut self) -> Option<StorageSettings> {
         self.pending_settings.take()
+    }
+
+    /// Take the pending graphics-toggle edit, if any (#209). The loop drains this
+    /// each tick and persists it to `settings.toml`'s `[interface]` table; the
+    /// in-memory swap already happened at confirm time. `None` means no toggle
+    /// was confirmed since the last drain.
+    pub fn take_graphics(&mut self) -> Option<bool> {
+        self.pending_graphics.take()
     }
 
     /// Take the pending delete, if any (#195). The loop drains this each tick and
@@ -1792,8 +1870,9 @@ impl App {
             Action::ContactResultConfirm => self.confirm_contact_result(),
             Action::SettingsOpen => {
                 // Open the editor pre-filled with the policy in effect, so the fields
-                // show the live values a Tab-and-type edits (#146).
-                self.settings = SettingsDraft::from_settings(self.storage);
+                // show the live values a Tab-and-type edits (#146, plus the graphics
+                // toggle, #209).
+                self.settings = SettingsDraft::from_settings(self.storage, self.graphics_enabled);
                 self.overlay = Overlay::Settings;
                 self.dirty = true;
             }
@@ -1826,13 +1905,20 @@ impl App {
                 self.dirty = true;
             }
             Action::SettingsConfirm => {
-                // Validate the four fields through core's parsers. A valid edit
-                // updates the in-memory policy (so a reopen shows the new values) and
-                // lands it for the loop to apply live and persist (#146); an invalid
-                // value keeps the overlay open with the reason shown in place.
-                if let Some(updated) = self.settings.confirm() {
+                // Validate every field through core's parsers. A valid edit updates
+                // the in-memory policy (so a reopen shows the new values) and lands
+                // it for the loop to apply live and persist (#146); an invalid value
+                // keeps the overlay open with the reason shown in place. The
+                // graphics toggle (#209) applies immediately via
+                // `set_graphics_enabled` (so the very next frame reflects it) and is
+                // only recorded for the loop to persist when it actually changed.
+                if let Some((updated, graphics)) = self.settings.confirm() {
                     self.storage = updated;
                     self.pending_settings = Some(updated);
+                    if graphics != self.graphics_enabled {
+                        self.set_graphics_enabled(graphics);
+                        self.pending_graphics = Some(graphics);
+                    }
                     self.overlay = Overlay::None;
                 }
                 self.dirty = true;
@@ -3526,6 +3612,46 @@ mod tests {
         // The live policy is untouched — reopening shows the original default.
         app.dispatch(Action::SettingsOpen);
         assert_eq!(app.settings().value(SettingsField::KeepPrivate), "forever");
+    }
+
+    #[test]
+    fn confirming_a_graphics_toggle_applies_it_live_and_hands_it_to_the_loop() {
+        let mut app = App::new();
+        assert!(app.graphics_enabled(), "on by default");
+        app.dispatch(Action::SettingsOpen);
+        app.dispatch(Action::SettingsToggleField); // groups
+        app.dispatch(Action::SettingsToggleField); // channels
+        app.dispatch(Action::SettingsToggleField); // max cache
+        app.dispatch(Action::SettingsToggleField); // graphics
+        clear_field(&mut app);
+        for c in "off".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(
+            !app.graphics_enabled(),
+            "applied live the instant it is confirmed, no restart"
+        );
+        assert_eq!(
+            app.take_graphics(),
+            Some(false),
+            "handed to the loop to persist"
+        );
+        assert!(app.take_graphics().is_none(), "drained once");
+    }
+
+    #[test]
+    fn confirming_settings_with_graphics_unchanged_records_nothing_to_persist() {
+        let mut app = App::new();
+        app.dispatch(Action::SettingsOpen);
+        // Leave every field, including graphics, at its pre-filled value.
+        app.dispatch(Action::SettingsConfirm);
+        assert!(app.graphics_enabled(), "unchanged");
+        assert!(
+            app.take_graphics().is_none(),
+            "nothing changed, nothing to persist"
+        );
     }
 
     // --- secret chats & chat-action indicators (#87) ---

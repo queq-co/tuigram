@@ -200,14 +200,13 @@ pub struct ConversationView {
     /// re-open (see `fresh_open` on [`project`](Self::project)) resets it to
     /// pending so reopening a now-fully-read chat correctly shows no rule.
     unread_separator: Option<Option<i64>>,
-    /// Whether the terminal speaks a graphics protocol (#208), seeded once via
-    /// [`set_graphics_capable`](Self::set_graphics_capable) from `App`'s own
-    /// one-time [`set_avatar_support`](crate::app::App::set_avatar_support)
-    /// seed — kept here (rather than read from `App` at render time) so
-    /// [`message_height`](Self::message_height) stays a pure function of this
-    /// view's own state, computable in tests with no real `Picker`. Carried
-    /// across a chat switch in [`project`](Self::project) the same way
-    /// `viewport` is: it is a terminal-level fact, not per-chat state.
+    /// Whether graphics are capable *and* enabled (#208, live since #209), set
+    /// via [`set_graphics_capable`](Self::set_graphics_capable) from `App`'s
+    /// combined terminal-capability-and-setting check — kept here (rather than
+    /// read from `App` at render time) so [`message_height`](Self::message_height)
+    /// stays a pure function of this view's own state, computable in tests with
+    /// no real `Picker`. Carried across a chat switch in [`project`](Self::project)
+    /// the same way `viewport` is: it is session-level state, not per-chat.
     graphics_capable: bool,
 }
 
@@ -641,15 +640,26 @@ impl ConversationView {
         false
     }
 
-    /// Seed the terminal's graphics-protocol capability (#208), so
+    /// Set whether graphics are capable *and* enabled (#201/#208, live since
+    /// #209 — `App` combines the terminal's detected capability with the user's
+    /// `graphics` setting before calling this), so
     /// [`message_height`](Self::message_height) knows whether to reserve rows
-    /// for inline media. `App::set_avatar_support` calls this once, the same
-    /// moment it seeds `AvatarSupport` itself — this never changes again
-    /// within a run today (pre-#209's live toggle), so unlike
-    /// [`set_viewport_height`](Self::set_viewport_height) there is no
-    /// re-anchoring to do here.
-    pub fn set_graphics_capable(&mut self, capable: bool) {
+    /// for inline media. Toggling this while pinned to the newest message
+    /// re-anchors the same way [`set_viewport_height`](Self::set_viewport_height)
+    /// does, since every message's height changes at once. Returns whether the
+    /// offset moved, so the caller can repaint the corrected frame.
+    pub fn set_graphics_capable(&mut self, capable: bool) -> bool {
+        if capable == self.graphics_capable {
+            return false;
+        }
+        let following = self.is_at_newest();
         self.graphics_capable = capable;
+        if following {
+            let previous = (self.offset, self.row_skip);
+            (self.offset, self.row_skip) = self.newest_anchor();
+            return (self.offset, self.row_skip) != previous;
+        }
+        false
     }
 
     /// The `(message index, row skip)` that pins the newest message to the
@@ -1548,6 +1558,43 @@ mod tests {
         assert!(view.is_at_newest());
         // An unchanged height is a no-op that reports no move.
         assert!(!view.set_viewport_height(9));
+    }
+
+    #[test]
+    fn toggling_graphics_while_following_re_anchors_to_the_newest() {
+        // #209: a live toggle changes every media message's height at once, the
+        // same shape of change a pane resize causes — so it re-anchors the same
+        // way `set_viewport_height` does.
+        let mut view = view_fitting(3);
+        // A video's still needs only its embedded minithumbnail (#208) — no
+        // download involved — so its readiness, and thus its height, depends on
+        // nothing but `graphics_capable`, isolating the toggle's effect on the
+        // anchor from any other height-affecting state.
+        view.project(
+            10,
+            vec![
+                text(1, "a"),
+                text(2, "b"),
+                video_with_minithumbnail(3, 42, Some(b"jpeg bytes".to_vec())),
+            ],
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        assert!(view.is_at_newest());
+        let before = (view.offset(), view.row_skip());
+        // Turning graphics on grows the video's still by its media box, so less
+        // of the earlier history now fits above the newest — following re-anchors.
+        assert!(
+            view.set_graphics_capable(true),
+            "re-anchored while following"
+        );
+        assert!(view.is_at_newest());
+        assert_ne!((view.offset(), view.row_skip()), before);
+        // Setting the same value again is a no-op that reports no move.
+        assert!(!view.set_graphics_capable(true));
     }
 
     #[test]

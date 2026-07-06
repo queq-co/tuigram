@@ -1,5 +1,6 @@
 //! User preferences read from `~/.config/tuigram/settings.toml` — the download-cache
-//! retention policy (#120) and the terminal-UI toggles (`[interface]`, #161/#162).
+//! retention policy (#120) and the terminal-UI toggles (`[interface]`, #161/#162,
+//! plus the graphics toggle, #209).
 //!
 //! Distinct from [`credentials`](crate::credentials): credentials are secrets the
 //! onboarding flow writes (mode `600`), whereas settings are plain preferences the
@@ -448,14 +449,25 @@ pub struct InterfaceSettings {
     /// off hands the terminal's native text selection back to the user, since
     /// mouse capture otherwise intercepts drag-to-select in most emulators.
     pub mouse: bool,
+    /// Whether graphics rendering is enabled (#209): sender avatars (#201) and
+    /// inline media (#208) draw as images on a graphics-capable terminal. On by
+    /// default. Turning it off forces the plain-text layout that predates both —
+    /// no avatar gutter (not even the generated fallback bubble) and text
+    /// placeholders for photos/stickers/GIFs/videos — even though the terminal
+    /// itself can still do graphics. Unlike `mouse`, this takes effect live: the
+    /// in-app editor (#146 pattern) can flip it without a restart.
+    pub graphics: bool,
 }
 
 impl Default for InterfaceSettings {
-    /// Mouse on — the common case. (Serde's `#[serde(default)]` uses this, so a
-    /// file that omits `[interface]` or the `mouse` key lands here, not on
-    /// `bool`'s `false`.)
+    /// Mouse and graphics both on — the common case. (Serde's `#[serde(default)]`
+    /// uses this, so a file that omits `[interface]` or either key lands here,
+    /// not on `bool`'s `false`.)
     fn default() -> Self {
-        Self { mouse: true }
+        Self {
+            mouse: true,
+            graphics: true,
+        }
     }
 }
 
@@ -493,11 +505,38 @@ impl InterfaceSettings {
              #         takes over the terminal's native text selection, so set false to\n\
              #         keep drag-to-select (Shift/Option-drag also bypasses it on most\n\
              #         emulators).\n\
+             # graphics : true (default) or false. When on, sender avatars and inline\n\
+             #            media (photos/stickers/GIF+video stills) render as images on a\n\
+             #            graphics-capable terminal. false forces the plain-text layout\n\
+             #            from before that, with no avatar gutter and text placeholders\n\
+             #            for media, even on a graphics-capable terminal.\n\
              \n\
              [interface]\n\
-             mouse = {}\n",
-            self.mouse
+             mouse = {}\n\
+             graphics = {}\n",
+            self.mouse, self.graphics
         )
+    }
+
+    /// Persist this section to `~/.config/tuigram/settings.toml`, replacing any
+    /// existing file. The deliberate save behind the in-app graphics toggle
+    /// (#209) — mirrors [`StorageSettings::save`] but in the other direction: it
+    /// re-reads the current `[storage]` table from disk and re-emits it
+    /// unchanged, so persisting an interface edit never clobbers a retention
+    /// policy the user (or `StorageSettings::save`) already wrote.
+    pub fn save(&self) -> io::Result<()> {
+        let path = settings_path().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no config directory (set HOME or XDG_CONFIG_HOME)",
+            )
+        })?;
+        let contents = format!(
+            "{}{}",
+            StorageSettings::load().render(),
+            self.render_section()
+        );
+        write_settings_file(&path, &contents)
     }
 }
 
@@ -606,34 +645,56 @@ mod tests {
     }
 
     #[test]
-    fn interface_defaults_to_mouse_on() {
-        // `bool`'s own default is `false`; the section's is `true`, so an
-        // unconfigured install gets mouse support.
+    fn interface_defaults_to_mouse_and_graphics_on() {
+        // `bool`'s own default is `false`; the section's is `true` for both, so an
+        // unconfigured install gets mouse support and graphics rendering.
         assert!(InterfaceSettings::default().mouse);
+        assert!(InterfaceSettings::default().graphics);
     }
 
     #[test]
-    fn a_file_without_an_interface_section_keeps_mouse_on() {
+    fn a_file_without_an_interface_section_keeps_mouse_and_graphics_on() {
         // The common case: a storage-only file (or the pre-#161 default template)
-        // still yields mouse-on because `#[serde(default)]` fills the missing table.
+        // still yields both on because `#[serde(default)]` fills the missing table.
         let file: SettingsFile = toml::from_str("[storage]\n").unwrap();
         assert!(file.interface.mouse);
+        assert!(file.interface.graphics);
     }
 
     #[test]
     fn interface_mouse_can_be_disabled() {
         let file: SettingsFile = toml::from_str("[interface]\nmouse = false\n").unwrap();
         assert!(!file.interface.mouse);
+        // Unset in this partial table, so it still falls back to on.
+        assert!(file.interface.graphics);
+    }
+
+    #[test]
+    fn interface_graphics_can_be_disabled() {
+        let file: SettingsFile = toml::from_str("[interface]\ngraphics = false\n").unwrap();
+        assert!(!file.interface.graphics);
+        assert!(file.interface.mouse, "unset in this partial table");
     }
 
     #[test]
     fn interface_section_round_trips_through_load() {
         // The rendered `[interface]` block, appended after `[storage]`, parses back
-        // to the exact toggles — for both the default (on) and the off case — so a
-        // save is lossless.
+        // to the exact toggles — the default (both on), and each knob disabled on
+        // its own — so a save is lossless.
         for original in [
             InterfaceSettings::default(),
-            InterfaceSettings { mouse: false },
+            InterfaceSettings {
+                mouse: false,
+                graphics: true,
+            },
+            InterfaceSettings {
+                mouse: true,
+                graphics: false,
+            },
+            InterfaceSettings {
+                mouse: false,
+                graphics: false,
+            },
         ] {
             let text = format!(
                 "{}{}",
@@ -648,16 +709,21 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_storage_edit_preserves_a_disabled_mouse_toggle() {
-        // Saving a retention edit rewrites the whole file; the on-disk `mouse =
-        // false` must survive rather than reset to the default (#161).
+    fn a_saved_storage_edit_preserves_disabled_interface_toggles() {
+        // Saving a retention edit rewrites the whole file; on-disk `mouse = false`
+        // and `graphics = false` must both survive rather than reset to defaults
+        // (#161, #209).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tuigram").join("settings.toml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let contents = format!(
             "{}{}",
             StorageSettings::default().render(),
-            InterfaceSettings { mouse: false }.render_section()
+            InterfaceSettings {
+                mouse: false,
+                graphics: false,
+            }
+            .render_section()
         );
         write_settings_file(&path, &contents).unwrap();
 
@@ -668,6 +734,7 @@ mod tests {
             toml::from_str::<SettingsFile>(&text).unwrap().interface
         };
         assert!(!interface.mouse, "the disabled toggle must be read back");
+        assert!(!interface.graphics, "the disabled toggle must be read back");
         let edited = StorageSettings {
             keep_groups: KeepMedia::Days(7),
             ..StorageSettings::default()
@@ -681,6 +748,51 @@ mod tests {
             !file.interface.mouse,
             "mouse=false survived the storage save"
         );
+        assert!(
+            !file.interface.graphics,
+            "graphics=false survived the storage save"
+        );
+    }
+
+    #[test]
+    fn a_saved_interface_edit_preserves_the_storage_policy_on_disk() {
+        // The inverse direction (#209): confirming the graphics toggle rewrites the
+        // whole file through `InterfaceSettings::save`'s composition, which must
+        // not clobber a non-default retention policy already on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tuigram").join("settings.toml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let storage = StorageSettings {
+            keep_channels: KeepMedia::Days(3),
+            ..StorageSettings::default()
+        };
+        let contents = format!(
+            "{}{}",
+            storage.render(),
+            InterfaceSettings::default().render_section()
+        );
+        write_settings_file(&path, &contents).unwrap();
+
+        // Emulate `InterfaceSettings::save`'s composition: re-read the current
+        // storage section and re-emit it after the edited interface toggles.
+        let on_disk_storage: StorageSettings = {
+            let text = std::fs::read_to_string(&path).unwrap();
+            toml::from_str::<SettingsFile>(&text).unwrap().storage
+        };
+        let edited_interface = InterfaceSettings {
+            mouse: true,
+            graphics: false,
+        };
+        let rewritten = format!(
+            "{}{}",
+            on_disk_storage.render(),
+            edited_interface.render_section()
+        );
+        write_settings_file(&path, &rewritten).unwrap();
+
+        let file: SettingsFile = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(file.storage, storage, "the retention policy survived");
+        assert_eq!(file.interface, edited_interface);
     }
 
     #[test]

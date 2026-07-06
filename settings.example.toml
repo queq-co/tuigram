@@ -43,3 +43,11 @@ max_cache = "unbounded"
 # terminal's native text selection, so set this to false if you'd rather keep
 # drag-to-select (on most emulators Shift/Option-drag bypasses capture anyway).
 mouse = true
+
+# Graphics rendering: when on (the default), sender avatars and inline media
+# (photos, stickers, GIF/video stills) draw as images on a graphics-capable
+# terminal (Sixel/Kitty/iTerm2). Set this to false for a purist, text-only TUI —
+# no avatar gutter (not even the generated fallback bubble) and text
+# placeholders for media — even on a terminal that could otherwise show them.
+# Takes effect live; the in-app editor can flip it without a restart.
+graphics = true
