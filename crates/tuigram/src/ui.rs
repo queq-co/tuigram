@@ -492,6 +492,11 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
     // is off) simply renders a blank gutter — [`drive_avatars`] in `main.rs`
     // kicks off the encode and a later frame draws it once cached.
     let mut avatars: Vec<(usize, &Protocol)> = Vec::new();
+    // Row offset and built protocol for each visible message whose inline
+    // media has already been decoded this session (#208) — same shape as
+    // `avatars` above, placed at the row `message_lines` reserved right after
+    // the placeholder/caption rather than the header.
+    let mut media: Vec<(usize, &Protocol)> = Vec::new();
     // Row range (within `inner_rows`) each visible message occupies, alongside
     // its id, so a click on any of its rows (header, body, or reaction line)
     // resolves to that message rather than just the header row.
@@ -512,7 +517,20 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
         {
             avatars.push((row, protocol));
         }
-        let rendered = message_lines(view, message, i == 0, gutter_cols);
+        let media_rows = media_rows_for(app, view, &message.content);
+        if media_rows > 0
+            && let Some(protocol) = app.cached_media(message.id)
+        {
+            let media_row = row + 1 + content_lines(&message.content).len();
+            // A long caption can push the media box past the truncated view's
+            // bottom edge — skip the overlay rather than underflow the height
+            // clip below (mirrors the avatar overlay's own edge clipping, which
+            // never needs this guard since its row is always the header row).
+            if media_row < inner_rows {
+                media.push((media_row, protocol));
+            }
+        }
+        let rendered = message_lines(view, message, i == 0, gutter_cols, media_rows);
         message_rows.push((row, row + rendered.len(), message.id));
         lines.extend(rendered);
     }
@@ -539,6 +557,27 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
             y: area.y + 1 + row as u16,
             width: gutter_cols as u16,
             height: 2.min((inner_rows - row) as u16),
+        };
+        frame.render_widget(Image::new(protocol), rect);
+    }
+
+    // Second pass (#208): overlay one inline-media `Image` per visible,
+    // already-decoded message, in the fixed-size box its own row reservation
+    // above made room for — same clip-to-truncated-view treatment as avatars.
+    // Bounded to a fraction of the pane's own width (never wider than the body
+    // column left after the gutter), not just `MEDIA_COLS`, so a narrow
+    // terminal never draws past its own border.
+    let media_cols = crate::conversation::MEDIA_COLS.min(
+        (area.width as usize)
+            .saturating_sub(2)
+            .saturating_sub(gutter_cols),
+    );
+    for (row, protocol) in media {
+        let rect = Rect {
+            x: area.x + 1 + gutter_cols as u16,
+            y: area.y + 1 + row as u16,
+            width: media_cols as u16,
+            height: (crate::conversation::MEDIA_ROWS).min(inner_rows - row) as u16,
         };
         frame.render_widget(Image::new(protocol), rect);
     }
@@ -747,6 +786,7 @@ fn message_lines(
     message: &Message,
     selected: bool,
     gutter_cols: usize,
+    media_rows: usize,
 ) -> Vec<Line<'static>> {
     let mut prefix = String::new();
     if selected {
@@ -782,6 +822,13 @@ fn message_lines(
             .into_iter()
             .map(|line| indent_line(line, gutter_cols)),
     );
+    // The inline-media box (#208): `media_rows` blank lines reserved right after
+    // the placeholder/caption — additive, not a replacement, so a pending,
+    // failed, or non-graphics render's placeholder is unchanged. The second
+    // render pass in `render_conversation` overlays the actual `Image` here once
+    // decoded; until then (or if it never decodes) the reserved rows just stay
+    // blank, same as an avatar's uncached gutter.
+    lines.extend((0..media_rows).map(|_| indent_line(Line::from(""), gutter_cols)));
     if let Some(progress) = download_line(view, &message.content) {
         lines.push(indent_line(progress, gutter_cols));
     }
@@ -833,6 +880,35 @@ fn download_line(view: &ConversationView, content: &MessageContent) -> Option<Li
         text,
         Style::new().add_modifier(Modifier::DIM),
     )))
+}
+
+/// Whether a message's content has raster bytes ready to render inline
+/// (#208). Mirrors [`crate::conversation::media_ready`] independently — same
+/// convention as `content_rows`/`content_lines` — reading graphics capability
+/// from `App` and file presence from the view's projected downloads, since
+/// the render path has both directly rather than a stored bool.
+fn media_ready(app: &App, view: &ConversationView, content: &MessageContent) -> bool {
+    if !app.avatar_support().is_graphics() {
+        return false;
+    }
+    let file_present = |file_id: i32| view.download(file_id).is_some_and(File::is_present);
+    match content {
+        MessageContent::Photo(p) => file_present(p.file.id),
+        MessageContent::Sticker(s) => s.is_static && file_present(s.file.id),
+        MessageContent::Video(v) => v.minithumbnail.is_some(),
+        MessageContent::Animation(a) => a.minithumbnail.is_some(),
+        _ => false,
+    }
+}
+
+/// The rows [`message_lines`] should reserve for a message's inline-media box
+/// (#208): [`crate::conversation::MEDIA_ROWS`] when [`media_ready`], else `0`.
+fn media_rows_for(app: &App, view: &ConversationView, content: &MessageContent) -> usize {
+    if media_ready(app, view, content) {
+        crate::conversation::MEDIA_ROWS
+    } else {
+        0
+    }
 }
 
 /// The unread-messages rule (#164): drawn once, immediately above the first
@@ -907,7 +983,7 @@ fn content_lines(content: &MessageContent) -> Vec<Line<'static>> {
     match content {
         MessageContent::Text(text) => text_lines(text),
         MessageContent::Photo(p) => placeholder_lines("[Photo]", &p.caption),
-        MessageContent::Video(v) => placeholder_lines("[Video]", &v.caption),
+        MessageContent::Video(v) => placeholder_lines("[▶ video]", &v.caption),
         MessageContent::Document(d) => placeholder_lines(
             &format!("[Document {}]", trimmed_name(&d.file_name)),
             &d.caption,
@@ -2285,6 +2361,231 @@ mod tests {
         assert!(text.contains("[Photo]"), "photo placeholder");
     }
 
+    /// The number of frame rows [`HistoryRows`] maps to `message_id` — the
+    /// render-level counterpart to [`ConversationView::message_height`], used
+    /// below to check the inline-media box's row growth without inspecting an
+    /// `Image` widget's actual pixel content (which `TestBackend` cannot
+    /// meaningfully snapshot; see `graphics_avatar_support_indents_the_header_by_
+    /// the_gutter_width` for the same limitation on the avatar path).
+    fn rendered_row_count(output: &RenderOutput, message_id: i64) -> usize {
+        (0..u16::MAX)
+            .filter(|&row| output.history_rows.message_at(row) == Some(message_id))
+            .count()
+    }
+
+    fn graphics_picker() -> ratatui_image::picker::Picker {
+        use ratatui_image::picker::{Picker, ProtocolType};
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        picker
+    }
+
+    fn present_file(id: i32) -> File {
+        File {
+            id,
+            size: 10,
+            downloaded_size: 10,
+            is_downloading_completed: true,
+            local_path: format!("/tmp/{id}"),
+            ..File::default()
+        }
+    }
+
+    #[test]
+    fn a_ready_photo_grows_by_the_media_box_and_keeps_its_placeholder() {
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut app = app_with_history(vec![photo]);
+        // The file is present from the start, so the pre-existing "✓ saved"
+        // download line's own contribution to the row count stays constant
+        // across the toggle below — isolating the delta to the media box alone.
+        app.project_downloads(vec![present_file(7)]);
+        let before = rendered_row_count(&render_output(&app, 80, 24), 1);
+
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        let output = render_output(&app, 80, 24);
+        let after = rendered_row_count(&output, 1);
+
+        assert_eq!(after, before + crate::conversation::MEDIA_ROWS);
+        let text = flatten(&render(&app, 80, 24));
+        assert!(
+            text.contains("[Photo]"),
+            "the placeholder stays even once the box is ready"
+        );
+    }
+
+    #[test]
+    fn a_pending_photo_on_a_graphics_terminal_stays_at_the_placeholder_height() {
+        // Graphics-capable, but the file has not finished downloading yet.
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut app = app_with_history(vec![photo]);
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        app.project_downloads(vec![File {
+            id: 7,
+            size: 100,
+            downloaded_size: 40,
+            is_downloading_active: true,
+            ..File::default()
+        }]);
+        let output = render_output(&app, 80, 24);
+        assert_eq!(
+            rendered_row_count(&output, 1),
+            1 + 1 + 1 + 1,
+            "header + placeholder + download line + trailing blank, no media box"
+        );
+    }
+
+    #[test]
+    fn a_present_file_on_a_non_graphics_terminal_never_grows() {
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut app = app_with_history(vec![photo]);
+        // No `set_avatar_support` call: `AvatarSupport::None`, today's default.
+        app.project_downloads(vec![present_file(7)]);
+        let output = render_output(&app, 80, 24);
+        assert_eq!(
+            rendered_row_count(&output, 1),
+            1 + 1 + 1 + 1,
+            "a present file with no graphics support falls back cleanly"
+        );
+    }
+
+    #[test]
+    fn a_video_still_needs_only_a_minithumbnail_no_download() {
+        use tuigram_core::model::Video;
+
+        let with_still = sample_message(
+            1,
+            MessageContent::Video(Video {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+                duration: 0,
+                file_name: String::new(),
+                mime_type: "video/mp4".to_owned(),
+                minithumbnail: Some(b"jpeg bytes".to_vec()),
+            }),
+        );
+        let without_still = sample_message(
+            2,
+            MessageContent::Video(Video {
+                caption: FormattedText::default(),
+                file: FileRef::new(8),
+                width: 0,
+                height: 0,
+                duration: 0,
+                file_name: String::new(),
+                mime_type: "video/mp4".to_owned(),
+                minithumbnail: None,
+            }),
+        );
+        let mut app = app_with_history(vec![with_still, without_still]);
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        // Neither file is ever downloaded — a still needs none.
+        let output = render_output(&app, 80, 24);
+
+        let placeholder_only = 1 + 1 + 1;
+        assert_eq!(
+            rendered_row_count(&output, 1),
+            placeholder_only + crate::conversation::MEDIA_ROWS,
+            "a minithumbnail alone is enough, no download required"
+        );
+        assert_eq!(
+            rendered_row_count(&output, 2),
+            placeholder_only,
+            "no minithumbnail means no still, regardless of graphics support"
+        );
+        let text = flatten(&render(&app, 80, 24));
+        assert!(text.contains("[▶ video]"), "the video badge");
+    }
+
+    #[test]
+    fn an_animated_sticker_never_gets_a_still() {
+        use tuigram_core::model::Sticker;
+
+        let animated = sample_message(
+            1,
+            MessageContent::Sticker(Sticker {
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+                emoji: "😀".to_owned(),
+                is_static: false,
+            }),
+        );
+        let mut app = app_with_history(vec![animated]);
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        // Even with its file fully downloaded, TDLib gives an animated sticker no
+        // minithumbnail — #208 scopes a real still for it out (see conversation::media_ready).
+        app.project_downloads(vec![present_file(7)]);
+        let output = render_output(&app, 80, 24);
+        assert_eq!(
+            rendered_row_count(&output, 1),
+            1 + 1 + 1 + 1,
+            "header + placeholder + \"✓ saved\" line + trailing blank, no media box"
+        );
+    }
+
+    #[test]
+    fn a_ready_media_box_overlays_the_image_without_panicking() {
+        // Exercises the second render pass's `Image` overlay itself (not just the
+        // row reservation the tests above check), with a real (if trivial)
+        // decoded `Protocol` — same stubbed-picker technique as the avatar tests,
+        // since `TestBackend` cannot meaningfully snapshot graphics protocol
+        // pixel content either way.
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut app = app_with_history(vec![photo]);
+        let picker = graphics_picker();
+        app.set_avatar_support(AvatarSupport::Graphics(picker.clone()));
+        app.project_downloads(vec![present_file(7)]);
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4));
+        let protocol = picker
+            .new_protocol(
+                image,
+                ratatui::layout::Size::new(4, 4),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("halfblocks protocol always encodes");
+        app.cache_media(1, protocol);
+
+        let text = flatten(&render(&app, 80, 24));
+        assert!(
+            text.contains("[Photo]"),
+            "placeholder still present alongside the decoded image"
+        );
+    }
+
     #[test]
     fn a_pinned_message_shows_the_pin_marker() {
         let view =
@@ -2549,11 +2850,14 @@ mod tests {
             // The pane never wraps, so height is width-independent; the selection
             // marker only prefixes the header and never changes the row count.
             // Neither does a non-zero gutter (#201) — it only prepends a span to
-            // existing lines, never adds one — so both are checked here.
+            // existing lines, never adds one — so both are checked here. No
+            // graphics support is seeded, so every message's media_rows is `0`
+            // here; the ready-media case gets its own test below, since it needs
+            // an `App` (graphics capability lives there, not on the bare view).
             for selected in [false, true] {
                 for gutter_cols in [0, 4] {
                     assert_eq!(
-                        message_lines(&view, message, selected, gutter_cols).len(),
+                        message_lines(&view, message, selected, gutter_cols, 0).len(),
                         view.message_height(message),
                         "height drifts from the renderer for message {}",
                         message.id
@@ -2561,6 +2865,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn message_height_matches_the_rendered_line_count_with_a_ready_media_box() {
+        // Same drift guard as above, but for the one case that changes a
+        // message's height at all (#208): graphics-capable *and* the photo's
+        // file already present. Stubbed picker, same technique as
+        // `graphics_avatar_support_indents_the_header_by_the_gutter_width`.
+        use ratatui_image::picker::{Picker, ProtocolType};
+        use tuigram_core::model::{FileRef, Photo};
+
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut app = app_with_history(vec![photo]);
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        app.set_avatar_support(AvatarSupport::Graphics(picker));
+        app.project_downloads(vec![File {
+            id: 7,
+            size: 10,
+            downloaded_size: 10,
+            is_downloading_completed: true,
+            local_path: "/tmp/7".to_owned(),
+            ..File::default()
+        }]);
+
+        let view = app.conversation();
+        let message = &view.messages()[0];
+        let media_rows = media_rows_for(&app, view, &message.content);
+        assert_eq!(
+            media_rows,
+            crate::conversation::MEDIA_ROWS,
+            "sanity: box is reserved"
+        );
+        assert_eq!(
+            message_lines(view, message, true, 0, media_rows).len(),
+            view.message_height(message),
+            "height drifts from the renderer once the media box is ready"
+        );
     }
 
     #[test]
