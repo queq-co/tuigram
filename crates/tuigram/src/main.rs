@@ -265,6 +265,12 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // editor opens pre-filled with the values in effect.
     let mut storage_settings = StorageSettings::load();
     app.set_storage_settings(storage_settings);
+    // The graphics toggle (#209): same "mutable local, live-swappable via the
+    // in-app editor" shape as `storage_settings` above, read fresh here (rather
+    // than reusing `main`'s pre-login `interface` read) since a user could edit
+    // the file by hand between that read and here.
+    let mut interface_settings = InterfaceSettings::load();
+    app.set_graphics_enabled(interface_settings.graphics);
     let mut sweep_tick = tokio::time::interval(STORAGE_SWEEP_INTERVAL);
     // The lists whose `loadChats` paging has been kicked off, so each is loaded
     // at most once per run. A handful of entries (Main, Archive, a few folders),
@@ -495,6 +501,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // A confirmed retention edit swaps the live sweep policy and writes it back to
         // settings.toml, taking effect on the next sweep with no restart (#146).
         drive_settings(&mut app, &mut storage_settings);
+        // A confirmed graphics toggle already took effect in-memory (the reducer
+        // applies it on confirm); this only persists it to settings.toml (#209).
+        drive_graphics_setting(&mut app, &mut interface_settings);
         // Pull down the open chat's incoming media, each file once, so the progress
         // lines and saved markers resolve as `updateFile` folds (#120).
         drive_downloads(client, &history, &mut downloading);
@@ -1075,6 +1084,21 @@ fn drive_settings(app: &mut App, storage_settings: &mut StorageSettings) {
     }
 }
 
+/// Persist a confirmed graphics-toggle edit from the in-app editor (#209). Unlike
+/// [`drive_settings`], the in-memory swap already happened at confirm time
+/// (`App::set_graphics_enabled`, so the very next frame reflects it with no
+/// restart) — this only writes the local mirror through to `settings.toml`,
+/// mirroring `drive_settings`'s error handling.
+fn drive_graphics_setting(app: &mut App, interface_settings: &mut InterfaceSettings) {
+    let Some(enabled) = app.take_graphics() else {
+        return;
+    };
+    interface_settings.graphics = enabled;
+    if interface_settings.save().is_err() {
+        app.notify(Notice::error("settings save", None));
+    }
+}
+
 /// Re-read the folded chat lists from the client and re-project the pane (#113),
 /// resolving in the same read which private chats have a **bot** peer (#160) so
 /// their rows can carry the 🤖 marker — the chat's [`ChatKind`] says "private", only
@@ -1182,7 +1206,8 @@ enum AvatarSource {
 /// minithumbnail if the sender has one, else a generated fallback bubble
 /// (Stage 4) — off the render thread, reporting it back on `avatar_tx`. A
 /// no-op with graphics support off (#201's scope decision — nowhere to draw
-/// the result) or no chat open.
+/// the result), the user's `graphics` setting off (#209 — same reasoning,
+/// nothing will render even though the terminal could), or no chat open.
 ///
 /// Like [`drive_downloads`], this dedups per-run via `encoding`; unlike it, a
 /// decode/encode failure still reports back (as `None`) so its in-flight
@@ -1194,11 +1219,14 @@ fn drive_avatars(
     encoding: &mut HashSet<i64>,
     avatar_tx: &mpsc::Sender<(i64, Option<Protocol>)>,
 ) {
+    if !app.graphics_enabled() {
+        return;
+    }
     let AvatarSupport::Graphics(picker) = app.avatar_support() else {
         return;
     };
     let font_size = picker.font_size();
-    let gutter_cols = app.avatar_support().gutter_cols();
+    let gutter_cols = app.avatar_gutter_cols();
     // The exact cell area the render path reserves for the bubble (#201) — the
     // same `gutter_cols()` the header's leading span is sized to — so the
     // encoded image fills the gutter rather than a fixed, possibly-mismatched
@@ -1271,10 +1299,10 @@ enum MediaSource {
 /// (#208): for each message not yet cached on `App` and not already in flight
 /// this run, whose content is [`media_ready`](crate::conversation::media_ready),
 /// decode its bytes and build a [`Protocol`] off the render thread, reporting
-/// it back on `media_tx`. A no-op with graphics support off (nowhere to draw
-/// the result) or no chat open — same shape as [`drive_avatars`], deduping
-/// per-run via `encoding` and reporting a decode failure back as `None` so its
-/// in-flight marker still clears.
+/// it back on `media_tx`. A no-op with graphics support off, the user's
+/// `graphics` setting off (#209), or no chat open — same shape as
+/// [`drive_avatars`], deduping per-run via `encoding` and reporting a decode
+/// failure back as `None` so its in-flight marker still clears.
 ///
 /// Unlike `drive_avatars`, this never triggers a new download itself: a
 /// `Photo`/static `Sticker`'s file is already fetched by [`drive_downloads`]
@@ -1290,6 +1318,9 @@ fn drive_inline_media(
     encoding: &mut HashSet<i64>,
     media_tx: &mpsc::Sender<(i64, Option<Protocol>)>,
 ) {
+    if !app.graphics_enabled() {
+        return;
+    }
     let AvatarSupport::Graphics(picker) = app.avatar_support() else {
         return;
     };
@@ -1299,7 +1330,7 @@ fn drive_inline_media(
     // that (a common width, not an edge case) gets its media's right edge
     // silently, permanently cropped by `allow_clipping` (#222) at render time
     // regardless of scroll position (#226).
-    let gutter_cols = app.avatar_support().gutter_cols();
+    let gutter_cols = app.avatar_gutter_cols();
     let media_cols = crate::ui::media_cols(app.pane_layout().history.width, gutter_cols);
     let size = Size::new(media_cols as u16, crate::conversation::MEDIA_ROWS as u16);
     let Some(chat_id) = history.open else { return };

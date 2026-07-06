@@ -80,8 +80,9 @@ pub enum Overlay {
     /// The contact-search results list (#197): navigate hits, Enter opens the
     /// secret-chat confirm for the selected contact, or close.
     ContactSearchResults,
-    /// The retention settings editor (#146): edit the four download-cache knobs,
-    /// applied live and written back to `settings.toml` on confirm.
+    /// The settings editor (#146): edit the four download-cache knobs plus the
+    /// graphics toggle (#209), applied live and written back to `settings.toml`
+    /// on confirm.
     Settings,
     /// The delete-message confirm (#195): pick the scope (for me / for everyone)
     /// and confirm, or cancel. Gates the destructive delete behind an explicit step.
@@ -429,7 +430,7 @@ const BINDINGS: &[Binding] = &[
         trigger: Trigger::Plain(&[KeyCode::Char(',')]),
         action: Action::SettingsOpen,
         keys: ",",
-        description: "cache-retention settings",
+        description: "settings (cache retention, graphics)",
     },
     Binding {
         context: Context::Nav,
@@ -624,10 +625,10 @@ fn resolve_send_media(key: &KeyEvent) -> Action {
     }
 }
 
-/// The retention settings editor (#146): typing edits the focused knob, Tab moves
-/// between the four fields, Enter validates and saves (a bad value is rejected in
-/// place, keeping the overlay open), Esc cancels. Mirrors the send-media prompt's
-/// multi-field editing.
+/// The settings editor (#146, plus the graphics toggle, #209): typing edits the
+/// focused knob, Tab moves between the five fields, Enter validates and saves (a
+/// bad value is rejected in place, keeping the overlay open), Esc cancels.
+/// Mirrors the send-media prompt's multi-field editing.
 fn resolve_settings(key: &KeyEvent) -> Action {
     if is_quit(key) {
         return Action::Quit;
