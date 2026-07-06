@@ -1294,10 +1294,14 @@ fn drive_inline_media(
         return;
     };
     let picker = picker.clone();
-    let size = Size::new(
-        crate::conversation::MEDIA_COLS as u16,
-        crate::conversation::MEDIA_ROWS as u16,
-    );
+    // Match `render_conversation`'s own clamp (`ui.rs`) rather than always
+    // encoding at the fixed `MEDIA_COLS` — otherwise a terminal narrower than
+    // that (a common width, not an edge case) gets its media's right edge
+    // silently, permanently cropped by `allow_clipping` (#222) at render time
+    // regardless of scroll position (#226).
+    let gutter_cols = app.avatar_support().gutter_cols();
+    let media_cols = crate::ui::media_cols(app.pane_layout().history.width, gutter_cols);
+    let size = Size::new(media_cols as u16, crate::conversation::MEDIA_ROWS as u16);
     let Some(chat_id) = history.open else { return };
 
     let to_start: Vec<(i64, MediaSource)> = client.read(|s| {

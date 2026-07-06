@@ -972,6 +972,14 @@ impl App {
         self.pane_layout = panes;
     }
 
+    /// The pane rectangles the last render drew into (#161/#162). Read by
+    /// `drive_inline_media` (#226) so inline media is encoded at the history
+    /// pane's actual width instead of a fixed guess.
+    #[must_use]
+    pub fn pane_layout(&self) -> crate::ui::PaneLayout {
+        self.pane_layout
+    }
+
     /// Record the chat-list row map the last render drew, so the next mouse
     /// click on a chat row can open it directly. The loop calls this after each
     /// `draw` with the [`RenderOutput::chat_rows`](crate::ui::RenderOutput) it
