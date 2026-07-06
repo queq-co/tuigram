@@ -22,7 +22,7 @@ use ratatui_image::protocol::Protocol;
 
 use tuigram_core::model::{
     Chat, ChatAction, ChatKind, File, FormattedText, Message, MessageContent, ReactionKind,
-    SecretChatState, SendState, Sender,
+    SecretChatState, SendState, Sender, TextEntity,
 };
 
 use crate::chat_list::ChatListView;
@@ -538,7 +538,8 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
         }
         let header_row_in_block = block.len();
         let media_rows = media_rows_for(app, view, &message.content);
-        let media_row_in_block = header_row_in_block + 1 + content_lines(&message.content).len();
+        let media_row_in_block =
+            header_row_in_block + 1 + content_lines(&message.content, i == 0).len();
         block.extend(message_lines(
             view,
             message,
@@ -867,7 +868,7 @@ fn message_lines(
 
     let mut lines = vec![Line::from(header)];
     lines.extend(
-        content_lines(&message.content)
+        content_lines(&message.content, selected)
             .into_iter()
             .map(|line| indent_line(line, gutter_cols)),
     );
@@ -1028,19 +1029,20 @@ where
 /// `[Kind]` placeholder for media (with its caption, when set, on the lines
 /// below). Media bytes are not rendered in a terminal; the placeholder names what
 /// the message carries.
-fn content_lines(content: &MessageContent) -> Vec<Line<'static>> {
+fn content_lines(content: &MessageContent, selected: bool) -> Vec<Line<'static>> {
     match content {
-        MessageContent::Text(text) => text_lines(text),
-        MessageContent::Photo(p) => placeholder_lines("[Photo]", &p.caption),
-        MessageContent::Video(v) => placeholder_lines("[▶ video]", &v.caption),
+        MessageContent::Text(text) => text_lines(text, selected),
+        MessageContent::Photo(p) => placeholder_lines("[Photo]", &p.caption, selected),
+        MessageContent::Video(v) => placeholder_lines("[▶ video]", &v.caption, selected),
         MessageContent::Document(d) => placeholder_lines(
             &format!("[Document {}]", trimmed_name(&d.file_name)),
             &d.caption,
+            selected,
         ),
-        MessageContent::Audio(a) => placeholder_lines("[Audio]", &a.caption),
-        MessageContent::Voice(v) => placeholder_lines("[Voice]", &v.caption),
+        MessageContent::Audio(a) => placeholder_lines("[Audio]", &a.caption, selected),
+        MessageContent::Voice(v) => placeholder_lines("[Voice]", &v.caption, selected),
         MessageContent::Sticker(s) => one_line(format!("[Sticker {}]", s.emoji).trim_end()),
-        MessageContent::Animation(a) => placeholder_lines("[GIF]", &a.caption),
+        MessageContent::Animation(a) => placeholder_lines("[GIF]", &a.caption, selected),
         MessageContent::Location(_) => one_line("[Location]"),
         MessageContent::Venue(v) => one_line(format!("[Venue {}]", v.title).trim_end()),
         MessageContent::Contact(c) => {
@@ -1051,20 +1053,51 @@ fn content_lines(content: &MessageContent) -> Vec<Line<'static>> {
     }
 }
 
-/// The lines of a text body, preserving its own line breaks. Empty text still
-/// yields one (empty) line so the header is not left bodyless.
-fn text_lines(text: &FormattedText) -> Vec<Line<'static>> {
+/// The lines of a text body, preserving its own line breaks and rendering its
+/// formatting entities (#211) — bold/italic/code/strikethrough/spoiler, with
+/// overlapping entities composed rather than one silently overwriting
+/// another (see [`crate::richtext::styled_spans`]). `selected` gates spoiler
+/// reveal. Empty text still yields one (empty) line so the header is not left
+/// bodyless.
+fn text_lines(text: &FormattedText, selected: bool) -> Vec<Line<'static>> {
+    // Entity offsets are UTF-16 code units into the *whole* `text.text`
+    // (TDLib's convention); track each split-out line's UTF-16 span so every
+    // entity can be intersected against it and re-offset to be line-local —
+    // `styled_spans` then treats each line as a standalone string.
+    let mut utf16_pos: i32 = 0;
     text.text
         .split('\n')
-        .map(|line| Line::from(line.to_owned()))
+        .map(|line| {
+            let line_start = utf16_pos;
+            let line_end = utf16_pos + line.encode_utf16().count() as i32;
+            let local_entities: Vec<TextEntity> = text
+                .entities
+                .iter()
+                .filter_map(|e| {
+                    let start = e.offset.max(line_start);
+                    let end = (e.offset + e.length).min(line_end);
+                    (start < end).then(|| TextEntity {
+                        offset: start - line_start,
+                        length: end - start,
+                        kind: e.kind.clone(),
+                    })
+                })
+                .collect();
+            utf16_pos = line_end + 1; // the '\n' consumed by `split` is one UTF-16 unit
+            Line::from(crate::richtext::styled_spans(
+                line,
+                &local_entities,
+                selected,
+            ))
+        })
         .collect()
 }
 
 /// A media placeholder line, with the caption's lines below it when non-empty.
-fn placeholder_lines(label: &str, caption: &FormattedText) -> Vec<Line<'static>> {
+fn placeholder_lines(label: &str, caption: &FormattedText, selected: bool) -> Vec<Line<'static>> {
     let mut lines = one_line(label);
     if !caption.text.is_empty() {
-        lines.extend(text_lines(caption));
+        lines.extend(text_lines(caption, selected));
     }
     lines
 }
@@ -1885,7 +1918,7 @@ mod tests {
             text: tuigram_core::scrub_prose(hostile),
             entities: Vec::new(),
         });
-        let rendered: String = content_lines(&content)
+        let rendered: String = content_lines(&content, false)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
@@ -1896,6 +1929,70 @@ mod tests {
         );
         assert!(rendered.contains('\u{fffd}'), "tampering is marked");
         assert!(rendered.contains("hello") && rendered.contains("world"));
+    }
+
+    /// #211: a bold entity styles only its own span, leaving the rest of the
+    /// line plain — the render half of `richtext::styled_spans`'s unit
+    /// coverage, exercised through the real `content_lines` seam.
+    #[test]
+    fn formatting_entities_style_the_conversation_pane() {
+        use tuigram_core::model::EntityKind;
+
+        let content = MessageContent::Text(FormattedText {
+            text: "bold text".to_owned(),
+            entities: vec![TextEntity {
+                offset: 0,
+                length: 4,
+                kind: EntityKind::Bold,
+            }],
+        });
+        let spans: Vec<Span> = content_lines(&content, false)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .collect();
+        let bold = spans
+            .iter()
+            .find(|s| s.content.as_ref() == "bold")
+            .expect("bold span");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+        let rest = spans
+            .iter()
+            .find(|s| s.content.as_ref() == " text")
+            .expect("plain span");
+        assert!(!rest.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// #211: a spoiler stays concealed while its message is not selected, and
+    /// reveals once it is — rendering depends on UI selection state, not just
+    /// the message's own content.
+    #[test]
+    fn a_spoiler_conceals_by_default_and_reveals_when_selected() {
+        use tuigram_core::model::EntityKind;
+
+        let content = MessageContent::Text(FormattedText {
+            text: "secret".to_owned(),
+            entities: vec![TextEntity {
+                offset: 0,
+                length: 6,
+                kind: EntityKind::Spoiler,
+            }],
+        });
+        let concealed: String = content_lines(&content, false)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .map(|s| s.content.into_owned())
+            .collect();
+        assert!(!concealed.contains("secret"), "concealed: {concealed:?}");
+
+        let revealed: String = content_lines(&content, true)
+            .into_iter()
+            .flat_map(|line| line.spans.into_iter())
+            .map(|s| s.content.into_owned())
+            .collect();
+        assert!(
+            revealed.contains("secret"),
+            "revealed on selection: {revealed:?}"
+        );
     }
 
     #[test]

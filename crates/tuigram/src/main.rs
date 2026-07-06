@@ -50,6 +50,7 @@ mod mediaform;
 #[cfg(test)]
 mod parity;
 mod reactions;
+mod richtext;
 mod search;
 mod secret;
 mod settingsform;
