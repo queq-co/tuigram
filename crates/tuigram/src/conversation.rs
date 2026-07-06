@@ -655,6 +655,12 @@ impl ConversationView {
 /// async decode's result, only on whether it has started.
 pub(crate) const MEDIA_ROWS: usize = 8;
 
+/// The inline-media box's column width (#208), a fixed target `drive_media`
+/// (`main.rs`) encodes into and the render path draws into (clamped further
+/// to the pane's actual inner width there) — the same "fixed box, not the
+/// image's real aspect" reasoning as [`MEDIA_ROWS`].
+pub(crate) const MEDIA_COLS: usize = 24;
+
 /// Whether a message's content has raster bytes ready to render inline
 /// (#208), mirrored independently by [`crate::ui::media_ready`] (kept as two
 /// separate implementations, guarded by a drift-guard test, the same

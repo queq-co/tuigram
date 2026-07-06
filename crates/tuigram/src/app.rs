@@ -56,6 +56,38 @@ impl fmt::Debug for AvatarCache {
     }
 }
 
+/// Built inline-media protocols, keyed by message id (#208) — a message's own
+/// id rather than its backing file id, since a `Video`/`Animation` still comes
+/// from an embedded minithumbnail with no file id of its own, and keying
+/// uniformly by message id keeps `drive_inline_media`/the render path simple at the
+/// cost of not de-duplicating decodes across duplicate forwards of the same
+/// file (accepted; not worth the complexity here). Same shape as
+/// [`AvatarCache`], including the hand-written `Debug` for the same reason.
+#[derive(Default)]
+pub struct MediaCache(HashMap<i64, Protocol>);
+
+impl MediaCache {
+    /// The built protocol for a message's media, if already encoded this
+    /// session.
+    pub fn get(&self, message_id: i64) -> Option<&Protocol> {
+        self.0.get(&message_id)
+    }
+
+    /// Record a newly built protocol for a message's media, replacing any
+    /// previous one.
+    pub fn insert(&mut self, message_id: i64, protocol: Protocol) {
+        self.0.insert(message_id, protocol);
+    }
+}
+
+impl fmt::Debug for MediaCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaCache")
+            .field("cached_media", &self.0.len())
+            .finish()
+    }
+}
+
 /// A single, already-interpreted intent. Every event source (terminal input, the
 /// render tick, core updates) is funnelled through this enum before it touches
 /// `App`, so all state changes share one code path.
@@ -495,6 +527,10 @@ pub struct App {
     /// the render path via [`cache_avatar`](Self::cache_avatar) as `drive_avatars`
     /// finishes encoding each sender's photo.
     avatar_cache: AvatarCache,
+    /// Built inline-media protocols for messages seen this session (#208),
+    /// populated via [`cache_media`](Self::cache_media) as `drive_inline_media`
+    /// finishes decoding each message's photo/sticker/still.
+    media_cache: MediaCache,
     /// The pane rectangles the last render drew into (#161/#162), recorded by the
     /// loop after each `draw` via [`set_pane_layout`](Self::set_pane_layout) so a
     /// mouse event can be hit-tested to a pane without re-running layout. Default
@@ -654,6 +690,21 @@ impl App {
     /// #201), so the next render draws it instead of a blank gutter.
     pub fn cache_avatar(&mut self, user_id: i64, protocol: Protocol) {
         self.avatar_cache.insert(user_id, protocol);
+        self.dirty = true;
+    }
+
+    /// The built protocol for a message's inline media, if already decoded
+    /// this session.
+    pub fn cached_media(&self, message_id: i64) -> Option<&Protocol> {
+        self.media_cache.get(message_id)
+    }
+
+    /// Record a newly built media protocol for a message (`drive_inline_media`,
+    /// #208), so the next render draws it in the space `message_height`
+    /// already reserved once the backing file/minithumbnail became ready — no
+    /// reproject needed here, only a repaint.
+    pub fn cache_media(&mut self, message_id: i64, protocol: Protocol) {
+        self.media_cache.insert(message_id, protocol);
         self.dirty = true;
     }
 
