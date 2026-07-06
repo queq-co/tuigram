@@ -630,7 +630,11 @@ impl App {
     /// a clone of `TerminalGuard::avatar_support` (the guard keeps its own copy
     /// for the rest of the process's lifetime) — mirrors
     /// [`set_storage_settings`](Self::set_storage_settings)'s seed-once shape.
+    /// Also seeds the conversation view's copy of the same bool (#208), so its
+    /// height math knows whether to reserve rows for inline media.
     pub fn set_avatar_support(&mut self, support: AvatarSupport) {
+        self.conversation
+            .set_graphics_capable(support.is_graphics());
         self.avatar_support = support;
     }
 

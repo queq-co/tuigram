@@ -192,6 +192,15 @@ pub struct ConversationView {
     /// re-open (see `fresh_open` on [`project`](Self::project)) resets it to
     /// pending so reopening a now-fully-read chat correctly shows no rule.
     unread_separator: Option<Option<i64>>,
+    /// Whether the terminal speaks a graphics protocol (#208), seeded once via
+    /// [`set_graphics_capable`](Self::set_graphics_capable) from `App`'s own
+    /// one-time [`set_avatar_support`](crate::app::App::set_avatar_support)
+    /// seed — kept here (rather than read from `App` at render time) so
+    /// [`message_height`](Self::message_height) stays a pure function of this
+    /// view's own state, computable in tests with no real `Picker`. Carried
+    /// across a chat switch in [`project`](Self::project) the same way
+    /// `viewport` is: it is a terminal-level fact, not per-chat state.
+    graphics_capable: bool,
 }
 
 impl ConversationView {
@@ -217,6 +226,7 @@ impl ConversationView {
             senders: HashMap::new(),
             last_read_outbox: 0,
             unread_separator: None,
+            graphics_capable: false,
         }
     }
 
@@ -283,9 +293,12 @@ impl ConversationView {
         } else {
             // A different chat opened: a fresh view, dropping the previous chat's
             // per-message state (downloads, typing indicator), bottom-anchored at the
-            // newest message. Carry the measured viewport so the anchor is not the
-            // one-frame fallback on every chat switch.
+            // newest message. Carry the measured viewport and the terminal's graphics
+            // capability (#208) — neither is per-chat state — so neither the anchor
+            // nor the media-row math falls back to its startup default on every
+            // chat switch.
             let viewport = self.viewport;
+            let graphics_capable = self.graphics_capable;
             *self = Self {
                 chat_id: Some(chat_id),
                 messages,
@@ -293,6 +306,7 @@ impl ConversationView {
                 viewport,
                 senders,
                 last_read_outbox,
+                graphics_capable,
                 ..Self::default()
             };
             self.offset = self.newest_anchor_offset();
@@ -557,6 +571,17 @@ impl ConversationView {
         false
     }
 
+    /// Seed the terminal's graphics-protocol capability (#208), so
+    /// [`message_height`](Self::message_height) knows whether to reserve rows
+    /// for inline media. `App::set_avatar_support` calls this once, the same
+    /// moment it seeds `AvatarSupport` itself — this never changes again
+    /// within a run today (pre-#209's live toggle), so unlike
+    /// [`set_viewport_height`](Self::set_viewport_height) there is no
+    /// re-anchoring to do here.
+    pub fn set_graphics_capable(&mut self, capable: bool) {
+        self.graphics_capable = capable;
+    }
+
     /// The offset that pins the newest message to the bottom of the viewport: walk
     /// back from the last message summing [`message_height`](Self::message_height),
     /// stopping at the oldest message that still fits whole. Returns `0` on an empty
@@ -588,9 +613,11 @@ impl ConversationView {
     /// (each `Line` is one row, so the height is width-independent). A drift-guard
     /// test in `ui.rs` keeps this in lockstep with the renderer.
     pub(crate) fn message_height(&self, message: &Message) -> usize {
-        // A bold header, the body, an optional download-progress line, an optional
-        // reaction line, and a blank separator below.
+        // A bold header, the body, an optional inline-media box, an optional
+        // download-progress line, an optional reaction line, and a blank separator
+        // below.
         1 + content_rows(&message.content)
+            + self.media_rows(&message.content)
             + usize::from(self.has_download_line(&message.content))
             + usize::from(!message.reactions.is_empty())
             + 1
@@ -604,6 +631,49 @@ impl ConversationView {
             .file()
             .and_then(|file| self.downloads.get(&file.id))
             .is_some_and(|file| file.is_downloading_active || file.is_present())
+    }
+
+    /// The rows an inline-media box adds below a message's placeholder/caption
+    /// lines (#208): [`MEDIA_ROWS`] when the terminal is graphics-capable and the
+    /// content is media whose bytes are already available, `0` otherwise — the
+    /// same fixed-height reservation regardless of the source image's real aspect
+    /// ratio, mirroring the avatar gutter's fixed 2 rows. Additive to (never a
+    /// replacement for) `content_rows`'s placeholder/caption lines, so a pending,
+    /// failed, or non-graphics render is byte-identical to before #208.
+    fn media_rows(&self, content: &MessageContent) -> usize {
+        if self.graphics_capable && media_ready(content, &self.downloads) {
+            MEDIA_ROWS
+        } else {
+            0
+        }
+    }
+}
+
+/// The fixed row height of an inline-media box (#208) — photos, static
+/// stickers, and video/animation stills are all scaled to fit this box
+/// regardless of their real aspect ratio, so height math never depends on an
+/// async decode's result, only on whether it has started.
+pub(crate) const MEDIA_ROWS: usize = 8;
+
+/// Whether a message's content has raster bytes ready to render inline
+/// (#208), mirrored independently by [`crate::ui::media_ready`] (kept as two
+/// separate implementations, guarded by a drift-guard test, the same
+/// convention `content_rows`/`content_lines` already follow):
+/// - `Photo` and a static `Sticker` are ready once the backing file the
+///   existing download driver already fetches is present.
+/// - `Video` and `Animation` are ready as soon as they carry a minithumbnail —
+///   embedded with the message, no download needed.
+/// - Everything else (animated stickers included — TDLib gives those no
+///   minithumbnail, and rendering their `thumbnail` would need a new
+///   download-trigger path out of scope for #208) is never ready.
+pub(crate) fn media_ready(content: &MessageContent, downloads: &HashMap<i32, File>) -> bool {
+    let file_present = |file_id: i32| downloads.get(&file_id).is_some_and(File::is_present);
+    match content {
+        MessageContent::Photo(p) => file_present(p.file.id),
+        MessageContent::Sticker(s) => s.is_static && file_present(s.file.id),
+        MessageContent::Video(v) => v.minithumbnail.is_some(),
+        MessageContent::Animation(a) => a.minithumbnail.is_some(),
+        _ => false,
     }
 }
 
@@ -716,7 +786,8 @@ pub(crate) use tests::sample_message;
 mod tests {
     use super::*;
     use tuigram_core::model::{
-        FormattedText, Message, MessageContent, Presence, SendState, Sender, UserKind,
+        Animation, FileRef, FormattedText, Message, MessageContent, Photo, Presence, SendState,
+        Sender, Sticker, UserKind, Video,
     };
 
     /// A minimal incoming [`Message`] for view tests: an id and content, every
@@ -1311,6 +1382,26 @@ mod tests {
     }
 
     #[test]
+    fn graphics_capability_survives_a_chat_switch() {
+        // Like the measured viewport, this is a terminal-level fact, not per-chat
+        // state — a chat switch must not silently fall back to its startup default.
+        let mut view = view_fitting(2);
+        view.set_graphics_capable(true);
+        view.project(
+            20,
+            (7..=9).map(|i| text(i, "z")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.set_downloads(vec![present_file(42)]);
+        let with_media = photo(1, 42);
+        assert_eq!(view.media_rows(&with_media.content), MEDIA_ROWS);
+    }
+
+    #[test]
     fn a_chat_action_is_recorded_then_cleared() {
         let mut view = ConversationView::default();
         assert!(view.chat_action().is_none(), "no one acting by default");
@@ -1354,6 +1445,169 @@ mod tests {
         }]);
         assert!(view.download(42).is_none(), "prior snapshot cleared");
         assert!(view.download(99).is_some());
+    }
+
+    fn photo(id: i64, file_id: i32) -> Message {
+        sample_message(
+            id,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(file_id),
+                width: 100,
+                height: 100,
+            }),
+        )
+    }
+
+    fn static_sticker(id: i64, file_id: i32) -> Message {
+        sample_message(
+            id,
+            MessageContent::Sticker(Sticker {
+                file: FileRef::new(file_id),
+                width: 100,
+                height: 100,
+                emoji: "😀".to_owned(),
+                is_static: true,
+            }),
+        )
+    }
+
+    fn animated_sticker(id: i64, file_id: i32) -> Message {
+        sample_message(
+            id,
+            MessageContent::Sticker(Sticker {
+                file: FileRef::new(file_id),
+                width: 100,
+                height: 100,
+                emoji: "😀".to_owned(),
+                is_static: false,
+            }),
+        )
+    }
+
+    fn video_with_minithumbnail(id: i64, file_id: i32, minithumbnail: Option<Vec<u8>>) -> Message {
+        sample_message(
+            id,
+            MessageContent::Video(Video {
+                caption: FormattedText::default(),
+                file: FileRef::new(file_id),
+                width: 100,
+                height: 100,
+                duration: 5,
+                file_name: String::new(),
+                mime_type: "video/mp4".to_owned(),
+                minithumbnail,
+            }),
+        )
+    }
+
+    fn animation_with_minithumbnail(
+        id: i64,
+        file_id: i32,
+        minithumbnail: Option<Vec<u8>>,
+    ) -> Message {
+        sample_message(
+            id,
+            MessageContent::Animation(Animation {
+                caption: FormattedText::default(),
+                file: FileRef::new(file_id),
+                width: 100,
+                height: 100,
+                duration: 5,
+                file_name: String::new(),
+                mime_type: "video/mp4".to_owned(),
+                minithumbnail,
+            }),
+        )
+    }
+
+    fn present_file(id: i32) -> File {
+        File {
+            id,
+            size: 10,
+            downloaded_size: 10,
+            is_downloading_completed: true,
+            local_path: format!("/tmp/{id}"),
+            ..File::default()
+        }
+    }
+
+    #[test]
+    fn media_rows_are_reserved_only_when_graphics_capable_and_ready() {
+        let mut view = ConversationView::from_messages(vec![photo(1, 42)], HashSet::new());
+        let message = &view.messages()[0].clone();
+
+        // Not graphics-capable, file present: no media rows.
+        view.set_downloads(vec![present_file(42)]);
+        assert_eq!(view.media_rows(&message.content), 0);
+
+        // Graphics-capable, file not yet present: still no media rows.
+        view.set_graphics_capable(true);
+        view.set_downloads(vec![]);
+        assert_eq!(view.media_rows(&message.content), 0);
+
+        // Graphics-capable and the file is present: the fixed media box.
+        view.set_downloads(vec![present_file(42)]);
+        assert_eq!(view.media_rows(&message.content), MEDIA_ROWS);
+    }
+
+    #[test]
+    fn static_stickers_are_ready_once_present_animated_ones_never_are() {
+        let mut view = ConversationView::from_messages(
+            vec![static_sticker(1, 1), animated_sticker(2, 2)],
+            HashSet::new(),
+        );
+        view.set_graphics_capable(true);
+        view.set_downloads(vec![present_file(1), present_file(2)]);
+        assert_eq!(
+            view.media_rows(&view.messages()[0].content.clone()),
+            MEDIA_ROWS
+        );
+        assert_eq!(
+            view.media_rows(&view.messages()[1].content.clone()),
+            0,
+            "an animated sticker has no minithumbnail and is out of #208's scope"
+        );
+    }
+
+    #[test]
+    fn video_and_animation_stills_need_no_download_just_a_minithumbnail() {
+        let raw = Some(b"jpeg bytes".to_vec());
+        let mut view = ConversationView::from_messages(
+            vec![
+                video_with_minithumbnail(1, 1, raw.clone()),
+                animation_with_minithumbnail(2, 2, None),
+            ],
+            HashSet::new(),
+        );
+        view.set_graphics_capable(true);
+        // No downloads projected at all — these never need one.
+        assert_eq!(
+            view.media_rows(&view.messages()[0].content.clone()),
+            MEDIA_ROWS,
+            "a video with a minithumbnail is ready with no download"
+        );
+        assert_eq!(
+            view.media_rows(&view.messages()[1].content.clone()),
+            0,
+            "an animation with no minithumbnail stays a placeholder"
+        );
+    }
+
+    #[test]
+    fn message_height_grows_by_media_rows_only_while_ready() {
+        // The file is present from the start, so the pre-existing "✓ saved"
+        // download line's own contribution to the height stays constant across
+        // the toggle below — isolating the height delta to the media box alone.
+        let mut view = ConversationView::from_messages(vec![photo(1, 42)], HashSet::new());
+        view.set_downloads(vec![present_file(42)]);
+        let message = view.messages()[0].clone();
+        let before = view.message_height(&message);
+
+        view.set_graphics_capable(true);
+        let after = view.message_height(&message);
+
+        assert_eq!(after, before + MEDIA_ROWS);
     }
 
     /// A [`User`] with the given name and usernames; every other field inert. `kind`

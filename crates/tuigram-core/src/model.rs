@@ -25,7 +25,8 @@ use tdlib_rs::enums::{
     InputMessageReplyTo as TdInputMessageReplyTo, MessageContent as TdMessageContent,
     MessageSender as TdMessageSender, MessageSendingState as TdMessageSendingState,
     PollType as TdPollType, ReactionType as TdReactionType, SecretChatState as TdSecretChatState,
-    TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
+    StickerFormat as TdStickerFormat, TextEntityType as TdTextEntityType,
+    UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
     Chat as TdChat, ChatFolderInfo as TdChatFolderInfo, ChatListFolder,
@@ -257,6 +258,19 @@ impl UserKind {
     }
 }
 
+/// Decode a TDLib `Minithumbnail`'s base64 JPEG payload to raw bytes (#201,
+/// #208). Shared by every content type that carries one (`User`'s profile
+/// photo, `Video`, `Animation`) so the base64 handling lives in one place.
+/// `None` when there is no minithumbnail, or its payload fails to decode.
+fn decode_minithumbnail(thumb: Option<&tdlib_rs::types::Minithumbnail>) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    thumb.and_then(|thumb| {
+        base64::engine::general_purpose::STANDARD
+            .decode(&thumb.data)
+            .ok()
+    })
+}
+
 /// A user — tuigram's projection of TDLib's `User`, carrying what a sender line
 /// and a private-chat header need to read as a name instead of a bare id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,13 +330,7 @@ impl User {
             avatar_minithumbnail: user
                 .profile_photo
                 .as_ref()
-                .and_then(|photo| photo.minithumbnail.as_ref())
-                .and_then(|thumb| {
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD
-                        .decode(&thumb.data)
-                        .ok()
-                }),
+                .and_then(|photo| decode_minithumbnail(photo.minithumbnail.as_ref())),
         }
     }
 
@@ -950,6 +958,11 @@ pub struct Video {
     pub file_name: String,
     /// MIME type, as given by the sender (may be empty).
     pub mime_type: String,
+    /// The video's minithumbnail, decoded to raw JPEG bytes (#208): a small
+    /// inline preview TDLib delivers with the video itself, needing no
+    /// `downloadFile` round trip — used as the video's static still. `None`
+    /// when TDLib attached none.
+    pub minithumbnail: Option<Vec<u8>>,
 }
 
 impl Video {
@@ -964,6 +977,7 @@ impl Video {
             duration: m.video.duration,
             file_name: crate::sanitize::scrub_line(&m.video.file_name),
             mime_type: crate::sanitize::scrub_line(&m.video.mime_type),
+            minithumbnail: decode_minithumbnail(m.video.minithumbnail.as_ref()),
         }
     }
 }
@@ -1067,6 +1081,12 @@ pub struct Sticker {
     pub height: i32,
     /// The emoji the sticker corresponds to (may be empty if unknown).
     pub emoji: String,
+    /// Whether the sticker is a static WEBP image (#208) — `false` for the
+    /// animated TGS (Lottie vector) and WEBM (video) formats, neither of
+    /// which the `image` crate can raster-decode. Kept as a plain bool rather
+    /// than exposing TDLib's own `StickerFormat` enum, consistent with this
+    /// module's insulation from `tdlib_rs` shapes.
+    pub is_static: bool,
 }
 
 impl Sticker {
@@ -1078,6 +1098,7 @@ impl Sticker {
             width: m.sticker.width,
             height: m.sticker.height,
             emoji: crate::sanitize::scrub_line(&m.sticker.emoji),
+            is_static: matches!(m.sticker.format, TdStickerFormat::Webp),
         }
     }
 }
@@ -1099,6 +1120,11 @@ pub struct Animation {
     pub file_name: String,
     /// MIME type, as given by the sender (e.g. `video/mp4`; may be empty).
     pub mime_type: String,
+    /// The animation's minithumbnail, decoded to raw JPEG bytes (#208): a
+    /// small inline preview TDLib delivers with the animation itself, needing
+    /// no `downloadFile` round trip — used as the animation's static still.
+    /// `None` when TDLib attached none.
+    pub minithumbnail: Option<Vec<u8>>,
 }
 
 impl Animation {
@@ -1113,6 +1139,7 @@ impl Animation {
             duration: m.animation.duration,
             file_name: crate::sanitize::scrub_line(&m.animation.file_name),
             mime_type: crate::sanitize::scrub_line(&m.animation.mime_type),
+            minithumbnail: decode_minithumbnail(m.animation.minithumbnail.as_ref()),
         }
     }
 }
@@ -2291,6 +2318,7 @@ mod tests {
                 duration: 12,
                 file_name: "clip.mp4".to_owned(),
                 mime_type: "video/mp4".to_owned(),
+                minithumbnail: None,
             })
         );
     }
@@ -2433,8 +2461,33 @@ mod tests {
                 width: 512,
                 height: 512,
                 emoji: "😀".to_owned(),
+                is_static: true,
             })
         );
+    }
+
+    #[test]
+    fn animated_sticker_projects_as_not_static() {
+        let content = TdMessageContent::MessageSticker(TdMessageSticker {
+            sticker: tdlib_rs::types::Sticker {
+                id: 0,
+                set_id: 0,
+                width: 512,
+                height: 512,
+                emoji: "😀".to_owned(),
+                format: tdlib_rs::enums::StickerFormat::Tgs,
+                full_type: tdlib_rs::enums::StickerFullType::Regular(
+                    tdlib_rs::types::StickerFullTypeRegular::default(),
+                ),
+                thumbnail: None,
+                sticker: td_file(4),
+            },
+            is_premium: false,
+        });
+        let MessageContent::Sticker(sticker) = MessageContent::from_tdlib(&content) else {
+            panic!("expected Sticker content");
+        };
+        assert!(!sticker.is_static);
     }
 
     #[test]
@@ -2466,8 +2519,71 @@ mod tests {
                 duration: 3,
                 file_name: "loop.gif".to_owned(),
                 mime_type: "video/mp4".to_owned(),
+                minithumbnail: None,
             })
         );
+    }
+
+    #[test]
+    fn video_and_animation_decode_their_minithumbnail_when_present() {
+        use base64::Engine as _;
+        let raw = b"not really a jpeg, just test bytes".to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let minithumbnail = Some(tdlib_rs::types::Minithumbnail {
+            width: 8,
+            height: 8,
+            data: encoded,
+        });
+
+        let video_content = TdMessageContent::MessageVideo(TdMessageVideo {
+            video: tdlib_rs::types::Video {
+                duration: 12,
+                width: 640,
+                height: 480,
+                file_name: "clip.mp4".to_owned(),
+                mime_type: "video/mp4".to_owned(),
+                has_stickers: false,
+                supports_streaming: true,
+                minithumbnail: minithumbnail.clone(),
+                thumbnail: None,
+                video: td_file(7),
+            },
+            alternative_videos: vec![],
+            storyboards: vec![],
+            cover: None,
+            start_timestamp: 0,
+            caption: TdFormattedTextT::default(),
+            show_caption_above_media: false,
+            has_spoiler: false,
+            is_secret: false,
+        });
+        let MessageContent::Video(video) = MessageContent::from_tdlib(&video_content) else {
+            panic!("expected Video content");
+        };
+        assert_eq!(video.minithumbnail, Some(raw.clone()));
+
+        let animation_content = TdMessageContent::MessageAnimation(TdMessageAnimation {
+            animation: tdlib_rs::types::Animation {
+                duration: 3,
+                width: 320,
+                height: 240,
+                file_name: "loop.gif".to_owned(),
+                mime_type: "video/mp4".to_owned(),
+                has_stickers: false,
+                minithumbnail,
+                thumbnail: None,
+                animation: td_file(6),
+            },
+            caption: TdFormattedTextT::default(),
+            show_caption_above_media: false,
+            has_spoiler: false,
+            is_secret: false,
+        });
+        let MessageContent::Animation(animation) = MessageContent::from_tdlib(&animation_content)
+        else {
+            panic!("expected Animation content");
+        };
+        assert_eq!(animation.minithumbnail, Some(raw));
     }
 
     #[test]
