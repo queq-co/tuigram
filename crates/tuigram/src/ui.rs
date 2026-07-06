@@ -915,14 +915,20 @@ fn quote_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>>
     };
     let style = Style::new().fg(Color::Green).add_modifier(Modifier::DIM);
     let text = match reply {
+        // TDLib documents `chat_id` as "may be 0 if the replied message is in
+        // unknown chat" — so `0` is treated as same-chat (not a cross-chat
+        // reply) rather than a mismatch, or an ordinary same-chat reply could
+        // silently never resolve depending on whether TDLib actually fills in
+        // the real id here. A genuinely different, known chat id is still
+        // cross-chat and never in `view`'s single-chat window anyway.
         ReplyTo::Message {
             chat_id,
             message_id,
             ..
-        } => view
+        } if *chat_id == 0 || *chat_id == message.chat_id => view
             .messages()
             .iter()
-            .find(|m| m.id == *message_id && m.chat_id == *chat_id)
+            .find(|m| m.id == *message_id)
             .map(|quoted| {
                 let sender = view.sender_label(quoted).label;
                 format!(
@@ -931,7 +937,7 @@ fn quote_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>>
                 )
             })
             .unwrap_or_else(|| ">reply".to_owned()),
-        ReplyTo::Unsupported(_) => ">reply".to_owned(),
+        ReplyTo::Message { .. } | ReplyTo::Unsupported(_) => ">reply".to_owned(),
     };
     vec![Line::from(Span::styled(text, style))]
 }
@@ -2182,6 +2188,42 @@ mod tests {
         );
         let view = ConversationView::from_messages(vec![message.clone()], HashSet::new());
         assert!(quote_lines(&view, &message).is_empty());
+    }
+
+    /// #210: TDLib documents `MessageReplyToMessage.chat_id` as "may be 0 if
+    /// the replied message is in unknown chat" — a same-chat reply must still
+    /// resolve rather than always falling back to bare `>reply` if TDLib
+    /// reports `0` here instead of the real (matching) chat id.
+    #[test]
+    fn quote_lines_resolves_a_reply_whose_chat_id_is_reported_as_zero() {
+        use crate::conversation::sample_message;
+        use std::collections::HashSet;
+        use tuigram_core::model::ReplyTo;
+
+        let original = sample_message(
+            1,
+            MessageContent::Text(FormattedText {
+                text: "original message".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        let mut reply = sample_message(
+            2,
+            MessageContent::Text(FormattedText {
+                text: "sure thing".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: 0,
+            message_id: 1,
+            quote: None,
+        });
+        let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
+
+        let lines = quote_lines(&view, &reply);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("original message"), "snippet: {text:?}");
     }
 
     #[test]

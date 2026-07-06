@@ -1989,7 +1989,10 @@ impl App {
                     else {
                         return None;
                     };
-                    (*chat_id == m.chat_id).then_some(*message_id)
+                    // TDLib documents `chat_id` as "may be 0 if the replied message is
+                    // in unknown chat" — treat that as same-chat too, same reasoning as
+                    // `ui::quote_lines`.
+                    (*chat_id == 0 || *chat_id == m.chat_id).then_some(*message_id)
                 });
                 if let Some(message_id) = target
                     && self.conversation.select_message(message_id)
@@ -4066,6 +4069,28 @@ mod tests {
         });
         let target = text_message(1, "original message", false);
         // `reply` at offset 0 so it starts out selected.
+        let mut app = App::with_conversation(ConversationView::from_messages(
+            vec![reply, target],
+            HashSet::new(),
+        ));
+        app.dispatch(Action::JumpToQuoted);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    /// #210: TDLib documents `chat_id` as "may be 0 if the replied message is
+    /// in unknown chat" — a same-chat reply must still jump rather than
+    /// always no-op if TDLib reports `0` instead of the real chat id here.
+    #[test]
+    fn jump_to_quoted_resolves_a_reply_whose_chat_id_is_reported_as_zero() {
+        use crate::conversation::ConversationView;
+
+        let mut reply = text_message(2, "sure thing", false);
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: 0,
+            message_id: 1,
+            quote: None,
+        });
+        let target = text_message(1, "original message", false);
         let mut app = App::with_conversation(ConversationView::from_messages(
             vec![reply, target],
             HashSet::new(),
