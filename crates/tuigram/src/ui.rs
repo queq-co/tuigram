@@ -503,36 +503,65 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
     let mut message_rows: Vec<(usize, usize, i64)> = Vec::new();
     // The message at the offset (the first built) is the selected one — the
     // cursor the reaction/pin affordances act on — so it carries the marker.
+    //
+    // Row-granular scrolling (#222): only the first message can be showing a
+    // partial view — `view.row_skip()` rows already scrolled past its own
+    // top. Everything (the unread separator, the header, media) is built into
+    // one block first, then that many lines are dropped from its front before
+    // it joins `lines` — the header/marker/avatar/media simply fall out of
+    // the slice once scrolled past, with no separate "hide it" special case.
     for (i, message) in view.messages().iter().skip(view.offset()).enumerate() {
         if lines.len() >= inner_rows {
             break;
         }
+        let row_skip = if i == 0 { view.row_skip() } else { 0 };
+
+        let mut block: Vec<Line> = Vec::new();
         if view.unread_separator_before(message.id) {
-            lines.push(indent_line(unread_separator_line(), gutter_cols));
+            block.push(indent_line(unread_separator_line(), gutter_cols));
         }
+        let header_row_in_block = block.len();
+        let media_rows = media_rows_for(app, view, &message.content);
+        let media_row_in_block = header_row_in_block + 1 + content_lines(&message.content).len();
+        block.extend(message_lines(
+            view,
+            message,
+            i == 0,
+            gutter_cols,
+            media_rows,
+        ));
+
         let row = lines.len();
         if gutter_cols > 0
             && let Sender::User(user_id) = message.sender
             && let Some(protocol) = app.cached_avatar(user_id)
+            && header_row_in_block >= row_skip
         {
-            avatars.push((row, protocol));
+            avatars.push((row + (header_row_in_block - row_skip), protocol));
         }
-        let media_rows = media_rows_for(app, view, &message.content);
         if media_rows > 0
             && let Some(protocol) = app.cached_media(message.id)
+            && media_row_in_block >= row_skip
         {
-            let media_row = row + 1 + content_lines(&message.content).len();
+            let media_row = row + (media_row_in_block - row_skip);
             // A long caption can push the media box past the truncated view's
             // bottom edge — skip the overlay rather than underflow the height
-            // clip below (mirrors the avatar overlay's own edge clipping, which
-            // never needs this guard since its row is always the header row).
+            // clip below.
             if media_row < inner_rows {
                 media.push((media_row, protocol));
             }
         }
-        let rendered = message_lines(view, message, i == 0, gutter_cols, media_rows);
-        message_rows.push((row, row + rendered.len(), message.id));
-        lines.extend(rendered);
+        // `media_row_in_block < row_skip` (the box's top already scrolled
+        // past the fold) and the header/avatar's symmetric case are handled
+        // by the two guards above — the box is hidden rather than faked as a
+        // top-crop, which ratatui-image's fixed-raster `Image` widget cannot
+        // do without re-encoding on every scroll tick (too slow to be
+        // interactive). A bottom-edge partial (scrolling up, box growing from
+        // the pane's bottom) still renders correctly via the height-clipped
+        // rect below.
+        let visible: Vec<Line> = block.into_iter().skip(row_skip).collect();
+        message_rows.push((row, row + visible.len(), message.id));
+        lines.extend(visible);
     }
     lines.truncate(inner_rows);
 
@@ -558,7 +587,11 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
             width: gutter_cols as u16,
             height: 2.min((inner_rows - row) as u16),
         };
-        frame.render_widget(Image::new(protocol), rect);
+        // `allow_clipping` (#222): without it, `Image` silently renders
+        // nothing at all whenever the rect is shorter than the encoded
+        // protocol's own size — which the reduced `height` above already
+        // asks for whenever a bubble sits at the pane's edge.
+        frame.render_widget(Image::new(protocol).allow_clipping(true), rect);
     }
 
     // Second pass (#208): overlay one inline-media `Image` per visible,
@@ -579,7 +612,11 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
             width: media_cols as u16,
             height: (crate::conversation::MEDIA_ROWS).min(inner_rows - row) as u16,
         };
-        frame.render_widget(Image::new(protocol), rect);
+        // `allow_clipping` (#222): required for the bottom-edge partial
+        // visibility this reduced `height` computes — only Kitty/Halfblocks
+        // protocols actually honor it (upstream limitation); Sixel/iTerm2
+        // still render all-or-nothing.
+        frame.render_widget(Image::new(protocol).allow_clipping(true), rect);
     }
 
     // The scrollbar tracks the message offset, inset one row so it rides the
@@ -2321,7 +2358,10 @@ mod tests {
             .map(|i| text_message(i, &format!("msg-{i}")))
             .collect();
         let mut app = app_with_history(messages);
-        for _ in 0..40 {
+        // #222: ScrollDown is now a row step, not a message step. Each
+        // message here is 3 rows (header, body, blank separator), so 120
+        // steps advance exactly 40 messages.
+        for _ in 0..120 {
             app.dispatch(Action::ScrollDown);
         }
         let text = flatten(&render(&app, 40, 10));
@@ -2588,6 +2628,43 @@ mod tests {
         assert!(
             text.contains("[Photo]"),
             "placeholder still present alongside the decoded image"
+        );
+    }
+
+    #[test]
+    fn scrolling_into_a_media_message_shrinks_its_visible_row_count() {
+        // #222: row-granular scrolling should show fewer of a message's own
+        // rows as its header scrolls past the top, not jump it in/out all at
+        // once — the bug this issue fixes, checked at the render level (the
+        // conversation.rs tests already check the offset/row_skip math
+        // itself).
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut app = app_with_history(vec![photo, text_message(2, "after")]);
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        app.project_downloads(vec![present_file(7)]);
+
+        let full = rendered_row_count(&render_output(&app, 80, 40), 1);
+        assert!(
+            full > crate::conversation::MEDIA_ROWS,
+            "the ready photo's own block is taller than just the media box"
+        );
+
+        for _ in 0..5 {
+            app.dispatch(Action::ScrollDown);
+        }
+        let partial = rendered_row_count(&render_output(&app, 80, 40), 1);
+        assert_eq!(
+            partial,
+            full - 5,
+            "5 row-steps shows exactly 5 fewer of message 1's rows"
         );
     }
 

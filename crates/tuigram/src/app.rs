@@ -141,10 +141,21 @@ pub enum Action {
     NextList,
     /// Switch to the previous chat list, wrapping.
     PrevList,
-    /// Scroll the conversation history one message toward the newest.
+    /// Scroll the conversation history one row toward the newest (#222) —
+    /// `j` / ↓ / the mouse wheel. A small, fixed step regardless of the
+    /// message it crosses, unlike [`PageDown`](Action::PageDown).
     ScrollDown,
-    /// Scroll the conversation history one message toward the oldest.
+    /// Scroll the conversation history one row toward the oldest (#222) —
+    /// `k` / ↑ / the mouse wheel.
     ScrollUp,
+    /// Scroll the conversation history a full viewport toward the newest
+    /// (#222) — `PageDown`, meaningfully bigger than
+    /// [`ScrollDown`](Action::ScrollDown)'s single-row step now that the
+    /// distinction is possible.
+    PageDown,
+    /// Scroll the conversation history a full viewport toward the oldest
+    /// (#222) — `PageUp`.
+    PageUp,
     /// Jump the conversation history to the bottom-anchored newest message (`G` /
     /// `End`), the way a chat client's "go to bottom" does (#158). Also re-arms
     /// auto-follow, since it lands the view back on the newest anchor (#159).
@@ -1373,12 +1384,34 @@ impl App {
                 self.dirty = true;
             }
             Action::ScrollUp => {
-                // A scroll-up that can't move (already at the oldest loaded message)
-                // is the request to page older history; the loop services it (#114).
-                if self.conversation.offset() == 0 && !self.conversation.is_empty() {
+                // A scroll-up that can't move (already at the oldest loaded row)
+                // is the request to page older history; the loop services it
+                // (#114). #222: "can't move" now means offset 0 *and* row_skip 0 —
+                // a scroll-up while still partway into the oldest message's own
+                // rows has somewhere to go first.
+                if self.conversation.offset() == 0
+                    && self.conversation.row_skip() == 0
+                    && !self.conversation.is_empty()
+                {
                     self.wants_older_history = true;
                 }
                 self.conversation.scroll_up();
+                self.dirty = true;
+            }
+            Action::PageDown => {
+                self.conversation.page_down();
+                self.dirty = true;
+            }
+            Action::PageUp => {
+                // Same "reached the oldest loaded row, request more" signal as
+                // ScrollUp (#222) — PageUp can reach it too.
+                if self.conversation.offset() == 0
+                    && self.conversation.row_skip() == 0
+                    && !self.conversation.is_empty()
+                {
+                    self.wants_older_history = true;
+                }
+                self.conversation.page_up();
                 self.dirty = true;
             }
             Action::JumpToNewest => {
@@ -2457,7 +2490,12 @@ mod tests {
             App::with_conversation(ConversationView::from_messages(messages, HashSet::new()));
         app.clear_dirty();
 
-        app.dispatch(Action::ScrollDown);
+        // #222: ScrollDown is now a row step; each plain-text message here is
+        // 3 rows (header, body, blank separator), so 3 steps advance the
+        // offset by exactly one message.
+        for _ in 0..3 {
+            app.dispatch(Action::ScrollDown);
+        }
         assert_eq!(app.conversation().offset(), 1);
         assert!(app.is_dirty());
     }
