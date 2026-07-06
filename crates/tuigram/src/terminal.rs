@@ -69,6 +69,15 @@ impl AvatarSupport {
         let cols = (2.0 * f64::from(font.height) / f64::from(font.width)).round() as usize;
         cols.max(GUTTER_MIN_COLS)
     }
+
+    /// Whether this terminal speaks a real graphics protocol — the single
+    /// capability check shared by both the avatar gutter and inline media
+    /// (#208), so a future settings toggle (#209) can gate both from one
+    /// place.
+    #[must_use]
+    pub fn is_graphics(&self) -> bool {
+        matches!(self, Self::Graphics(_))
+    }
 }
 
 /// Owns raw mode + the alternate screen for the lifetime of the app. Building it

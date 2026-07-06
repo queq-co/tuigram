@@ -71,7 +71,9 @@ use ratatui_image::protocol::Protocol;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::{ChatAction, ChatKind, ChatListKind, Message, Sender, User, UserKind};
+use tuigram_core::model::{
+    ChatAction, ChatKind, ChatListKind, Message, MessageContent, Sender, User, UserKind,
+};
 use tuigram_core::{
     AuthRequests, ChatActionRequests, ChatLifecycleRequests, Client, ContactRequests,
     DOWNLOAD_PRIORITY, DeleteRequests, EditRequests, FileRequests, FormattedText, ForwardRequests,
@@ -155,6 +157,12 @@ const CONTACT_SEARCH_CHANNEL_DEPTH: usize = 8;
 /// sender is encoded at most once per `AvatarCache` lifetime (or once more on
 /// a decode/encode failure's retry), so a shallow channel suffices.
 const AVATAR_CHANNEL_DEPTH: usize = 16;
+
+/// Depth of the inline-media-encode → loop completion channel (#208). Same
+/// shape as [`AVATAR_CHANNEL_DEPTH`]: each message's media is encoded at most
+/// once per `MediaCache` lifetime (or once more on a decode/encode failure's
+/// retry).
+const MEDIA_CHANNEL_DEPTH: usize = 16;
 
 /// How often the outbound typing action is re-broadcast while composing (#197).
 /// TDLib/Telegram's `typing` action expires on its own a few seconds after the
@@ -275,6 +283,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // thread this run (#201), so a re-scan of the open chat never spawns a
     // second encode for the same sender while one is already in flight.
     let mut avatar_encoding: HashSet<i64> = HashSet::new();
+    // The message ids whose inline media is being decoded+encoded off the
+    // render thread this run (#208), same dedup shape as `avatar_encoding`.
+    let mut media_encoding: HashSet<i64> = HashSet::new();
     let (history_tx, mut history_rx) = mpsc::channel::<HistoryPage>(HISTORY_CHANNEL_DEPTH);
     // A spawned send/edit (#116) reports a seam-level rejection back here as a toast;
     // the loop surfaces it through the notification queue.
@@ -291,6 +302,11 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // `None` on a decode/encode failure); the loop caches it and clears the
     // sender's in-flight marker either way.
     let (avatar_tx, mut avatar_rx) = mpsc::channel::<(i64, Option<Protocol>)>(AVATAR_CHANNEL_DEPTH);
+    // A spawned inline-media encode (#208) reports the built protocol back here
+    // (or `None` on a decode/encode failure); the loop caches it and clears the
+    // message's in-flight marker either way. No reproject needed on receipt —
+    // see `drive_inline_media`'s doc for why.
+    let (media_tx, mut media_rx) = mpsc::channel::<(i64, Option<Protocol>)>(MEDIA_CHANNEL_DEPTH);
 
     // Kick off the landing list (Main) before the first frame; the rest load on
     // demand as the user switches to them.
@@ -435,6 +451,19 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                     }
                 }
             }
+            // A spawned inline-media encode finished (#208): clear its in-flight
+            // marker and cache the protocol so the next frame draws it in the
+            // space `message_height` already reserved. `None` (a decode/encode
+            // failure) just clears the marker — that message keeps its
+            // placeholder this run.
+            maybe_media = media_rx.recv() => {
+                if let Some((message_id, protocol)) = maybe_media {
+                    media_encoding.remove(&message_id);
+                    if let Some(protocol) = protocol {
+                        app.cache_media(message_id, protocol);
+                    }
+                }
+            }
         }
 
         // A list switch may have moved onto a list we have not paged yet — load it.
@@ -472,6 +501,10 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // Encode the open chat's sender avatars, each user once, so the gutter
         // fills in as `Picker::new_protocol` finishes off the render thread (#201).
         drive_avatars(&app, client, &history, &mut avatar_encoding, &avatar_tx);
+        // Encode the open chat's ready inline media, each message once, so the
+        // media box fills in as `Picker::new_protocol` finishes off the render
+        // thread (#208).
+        drive_inline_media(&app, client, &history, &mut media_encoding, &media_tx);
         // A confirmed delete removes the message for us or everyone; the real
         // `updateDeleteMessages` folds and re-projects the history (#195).
         drive_delete(&mut app, client, &outbound_tx);
@@ -1097,17 +1130,29 @@ fn reproject_secret_states(app: &mut App, client: &Arc<Client>) {
 /// fetch.
 fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &mut HashSet<i32>) {
     let Some(chat_id) = history.open else { return };
-    // The ids to start: files the history references that the store knows, are not
-    // yet present or active, and have not been requested this run. Photos with no
-    // sizes carry a 0 ref, which is not downloadable — skip it.
+    // The ids to start: files the history references that are not already present
+    // or actively transferring, and have not been requested this run. Photos with
+    // no sizes carry a 0 ref, which is not downloadable — skip it.
+    //
+    // A file the store has not folded an `updateFile` for yet reads as "unknown",
+    // not "definitely fine" — TDLib does not proactively announce every file a
+    // loaded history references, only ones a client has shown interest in, so an
+    // unknown file must still be attempted or it would never be requested at all
+    // (a chicken-and-egg gap: the first `updateFile` only arrives *because* a
+    // download started). `is_none_or` treats "unknown" the same as "not present,
+    // not active" — attempt it — while a *known* file still skips correctly once
+    // it settles into present or actively downloading.
     let to_start: Vec<i32> = client.read(|s| {
         s.messages()
             .history(chat_id)
             .into_iter()
             .filter_map(|m| m.content.file())
             .filter(|file| file.id != 0 && !downloading.contains(&file.id))
-            .filter_map(|file| s.files().get(file.id))
-            .filter(|file| !file.is_present() && !file.is_downloading_active)
+            .filter(|file| {
+                s.files()
+                    .get(file.id)
+                    .is_none_or(|f| !f.is_present() && !f.is_downloading_active)
+            })
             .map(|file| file.id)
             .collect()
     });
@@ -1209,6 +1254,98 @@ fn drive_avatars(
             .await
             .unwrap_or(None);
             let _ = avatar_tx.send((user_id, protocol)).await;
+        });
+    }
+}
+
+/// The source bytes for one message's inline-media still (#208): a downloaded
+/// file's local path (`Photo`, a static `Sticker` — read once decoding starts,
+/// off the render thread), or an embedded minithumbnail needing no download at
+/// all (`Video`, `Animation`).
+enum MediaSource {
+    File(String),
+    Bytes(Vec<u8>),
+}
+
+/// Kick off inline-media encoding for the open chat's visible messages
+/// (#208): for each message not yet cached on `App` and not already in flight
+/// this run, whose content is [`media_ready`](crate::conversation::media_ready),
+/// decode its bytes and build a [`Protocol`] off the render thread, reporting
+/// it back on `media_tx`. A no-op with graphics support off (nowhere to draw
+/// the result) or no chat open — same shape as [`drive_avatars`], deduping
+/// per-run via `encoding` and reporting a decode failure back as `None` so its
+/// in-flight marker still clears.
+///
+/// Unlike `drive_avatars`, this never triggers a new download itself: a
+/// `Photo`/static `Sticker`'s file is already fetched by [`drive_downloads`]
+/// (the same file `message_height`'s readiness check already watches), and a
+/// `Video`/`Animation` still needs none. So there is no reproject call in the
+/// receiving loop arm either — the row space was already reserved the moment
+/// the file became present (which itself already triggers a reproject via
+/// `AppEvent::File`); this only fills in the pixels.
+fn drive_inline_media(
+    app: &App,
+    client: &Arc<Client>,
+    history: &HistoryState,
+    encoding: &mut HashSet<i64>,
+    media_tx: &mpsc::Sender<(i64, Option<Protocol>)>,
+) {
+    let AvatarSupport::Graphics(picker) = app.avatar_support() else {
+        return;
+    };
+    let picker = picker.clone();
+    let size = Size::new(
+        crate::conversation::MEDIA_COLS as u16,
+        crate::conversation::MEDIA_ROWS as u16,
+    );
+    let Some(chat_id) = history.open else { return };
+
+    let to_start: Vec<(i64, MediaSource)> = client.read(|s| {
+        s.messages()
+            .history(chat_id)
+            .into_iter()
+            .filter(|m| app.cached_media(m.id).is_none() && !encoding.contains(&m.id))
+            .filter_map(|m| {
+                let source = match &m.content {
+                    MessageContent::Photo(p) => {
+                        let file = s.files().get(p.file.id)?;
+                        file.is_present()
+                            .then(|| MediaSource::File(file.local_path.clone()))?
+                    }
+                    MessageContent::Sticker(sticker) if sticker.is_static => {
+                        let file = s.files().get(sticker.file.id)?;
+                        file.is_present()
+                            .then(|| MediaSource::File(file.local_path.clone()))?
+                    }
+                    MessageContent::Video(v) => MediaSource::Bytes(v.minithumbnail.clone()?),
+                    MessageContent::Animation(a) => MediaSource::Bytes(a.minithumbnail.clone()?),
+                    _ => return None,
+                };
+                Some((m.id, source))
+            })
+            .collect()
+    });
+
+    for (message_id, source) in to_start {
+        encoding.insert(message_id);
+        let picker = picker.clone();
+        let media_tx = media_tx.clone();
+        tokio::spawn(async move {
+            let protocol = tokio::task::spawn_blocking(move || {
+                let bytes = match source {
+                    MediaSource::File(path) => std::fs::read(path).ok()?,
+                    MediaSource::Bytes(bytes) => bytes,
+                };
+                let image = image::load_from_memory(&bytes).ok()?;
+                // `Fit` only ever shrinks (unlike the avatar path's `Scale`,
+                // which deliberately upscales a tiny minithumbnail): these
+                // images are normal-or-larger, so shrink-to-fit into the box
+                // rather than stretching past their real size.
+                picker.new_protocol(image, size, Resize::Fit(None)).ok()
+            })
+            .await
+            .unwrap_or(None);
+            let _ = media_tx.send((message_id, protocol)).await;
         });
     }
 }
