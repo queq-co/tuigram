@@ -318,8 +318,41 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // demand as the user switches to them.
     ensure_active_list_loaded(&app, client, &mut requested);
 
+    // The open chat and overlay as of the last drawn frame (#229), so a change in
+    // either can be detected before the next `draw` — see `should_clear_for_graphics`.
+    let mut last_open_chat: Option<i64> = None;
+    let mut last_overlay = app.overlay();
+
     while !app.should_quit() {
         if app.is_dirty() {
+            // UNVERIFIED mitigation (#229): reported as leftover/garbled
+            // characters on a chat switch or overlay open. `Kitty::render`'s
+            // cell-level `Skip` marking turned out NOT to be the mechanism — a
+            // `TestBackend` regression test proved ratatui's own cell-diffing
+            // (`Cell::eq` compares `diff_option`, so a cell reverting from
+            // `Skip` to ordinary content is always detected as changed) already
+            // repaints correctly for Kitty. What's actually documented upstream
+            // is real-terminal-side: some Sixel and iTerm2 protocol
+            // implementations don't reliably clear previously-painted pixels
+            // even when ratatui rewrites the underlying cell, since those
+            // protocols paint raw pixels with no cell-level linkage (unlike
+            // Kitty's unicode-placeholder trick). A real `clear()` (`ClearType::All`
+            // + resetting ratatui's own back-buffer, the same thing ratatui
+            // already does internally on a resize) is the standard workaround
+            // for that class of issue, but isn't guaranteed on every terminal
+            // (e.g. Contour+Sixel is reported not to clear even then) — this
+            // is a best-effort mitigation pending real-terminal confirmation,
+            // not a verified fix.
+            if should_clear_for_graphics(
+                app.graphics_active(),
+                history.open != last_open_chat,
+                app.overlay() != last_overlay,
+            ) {
+                guard.terminal_mut().clear()?;
+            }
+            last_open_chat = history.open;
+            last_overlay = app.overlay();
+
             // The draw reports the history pane's inner height; record it on the view
             // so an open/`G`/tail-follow can bottom-anchor against the real number of
             // visible rows (#158). A first measurement or a resize while following
@@ -1058,6 +1091,20 @@ fn drive_secret(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<
                 .await;
         }
     });
+}
+
+/// Whether the loop should force a full terminal repaint before the next
+/// `draw` (#229): only when graphics are actually in play (a graphics-capable
+/// terminal *and* the user's setting on, [`App::graphics_active`]) and the
+/// open chat or overlay just changed. Pure and independent of the tokio loop
+/// so the decision itself is unit-testable without a real terminal — see
+/// `run`'s call site for the full (and still not fully confirmed) rationale.
+fn should_clear_for_graphics(
+    graphics_active: bool,
+    chat_changed: bool,
+    overlay_changed: bool,
+) -> bool {
+    graphics_active && (chat_changed || overlay_changed)
 }
 
 /// Apply a confirmed retention edit from the in-app editor (#146). The editor
@@ -1841,5 +1888,37 @@ mod tests {
         assert!(groups.private.is_empty());
         assert!(groups.groups.is_empty());
         assert!(groups.channels.is_empty());
+    }
+
+    // --- ghosting-fix clear decision (#229) ---
+
+    #[test]
+    fn never_clears_when_graphics_are_not_active() {
+        // No images were ever drawn, so there is nothing to ghost — regardless of
+        // whether the chat or overlay changed.
+        assert!(!should_clear_for_graphics(false, false, false));
+        assert!(!should_clear_for_graphics(false, true, false));
+        assert!(!should_clear_for_graphics(false, false, true));
+        assert!(!should_clear_for_graphics(false, true, true));
+    }
+
+    #[test]
+    fn never_clears_when_graphics_are_active_but_nothing_changed() {
+        // No structural transition happened, so nothing could have been left
+        // behind since the last frame.
+        assert!(!should_clear_for_graphics(true, false, false));
+    }
+
+    #[test]
+    fn clears_when_graphics_are_active_and_the_chat_or_overlay_changed() {
+        assert!(should_clear_for_graphics(true, true, false), "chat changed");
+        assert!(
+            should_clear_for_graphics(true, false, true),
+            "overlay changed"
+        );
+        assert!(
+            should_clear_for_graphics(true, true, true),
+            "both changed at once"
+        );
     }
 }
