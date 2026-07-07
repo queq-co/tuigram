@@ -64,3 +64,5 @@ image = { workspace = true }
 # Generated fallback avatar bubble for senders with no profile photo (#201).
 imageproc = { workspace = true }
 ab_glyph = { workspace = true }
+# Display-column measurement for word-wrapping (#214, #215).
+unicode-width = { workspace = true }

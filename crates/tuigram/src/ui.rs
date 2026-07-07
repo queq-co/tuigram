@@ -199,6 +199,9 @@ pub struct RenderOutput {
     /// The history pane's inner height (rows) — the number of visible message rows
     /// the bottom-anchoring walk (#158) sums against.
     pub convo_viewport: usize,
+    /// The history pane's inner body width (columns, #214) — see
+    /// [`convo_body_width`] — the budget message bodies wrap against.
+    pub convo_width: usize,
     /// The pane rectangles this frame was drawn into.
     pub panes: PaneLayout,
     /// Row → chat id map this frame drew.
@@ -279,6 +282,7 @@ pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
         // The history pane's inner height (excluding the block's top and bottom
         // borders) — the row budget the bottom-anchoring walk (#158) fits messages into.
         convo_viewport: panes.history.height.saturating_sub(2) as usize,
+        convo_width: convo_body_width(panes.history, app.avatar_gutter_cols()),
         panes,
         chat_rows,
         history_rows,
@@ -482,6 +486,18 @@ pub(crate) fn media_cols(area_width: u16, gutter_cols: usize) -> usize {
     )
 }
 
+/// The conversation body's available column width (#214): the history pane's
+/// `area` (borders included, same convention as `inner_rows` above) minus the
+/// block's left/right borders and the avatar gutter, floored at `1` so a
+/// pathologically narrow terminal still makes wrapping progress rather than
+/// wrapping at `0`. `render_conversation` wraps message bodies against this,
+/// and [`ui`] records the same value back onto `App` via
+/// [`RenderOutput::convo_width`] — both call this one formula so the two can
+/// never drift.
+fn convo_body_width(area: Rect, gutter_cols: usize) -> usize {
+    (area.width.saturating_sub(2 + gutter_cols as u16)).max(1) as usize
+}
+
 /// Right/top pane: the conversation history (#81). Renders the open chat's
 /// messages — each a sender/timestamp header, a body or media placeholder, and a
 /// reaction line — windowed forward from the scroll offset so a long history never
@@ -499,6 +515,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
     // history. `inner` excludes the block's top and bottom borders.
     let inner_rows = area.height.saturating_sub(2) as usize;
     let gutter_cols = app.avatar_gutter_cols();
+    let width = convo_body_width(area, gutter_cols);
     let mut lines: Vec<Line> = Vec::new();
     // Row offset (within `inner_rows`) and built protocol for each visible
     // message whose sender's avatar has already been encoded this session
@@ -538,15 +555,18 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
         }
         let header_row_in_block = block.len();
         let media_rows = media_rows_for(app, view, &message.content);
-        let quote_rows = usize::from(message.reply_to.is_some());
-        let media_row_in_block =
-            header_row_in_block + quote_rows + 1 + content_lines(&message.content, i == 0).len();
+        let quote_rows = quote_lines(view, message, width).len();
+        let media_row_in_block = header_row_in_block
+            + quote_rows
+            + 1
+            + content_lines(&message.content, i == 0, width).len();
         block.extend(message_lines(
             view,
             message,
             i == 0,
             gutter_cols,
             media_rows,
+            width,
         ));
 
         let row = lines.len();
@@ -838,6 +858,7 @@ fn message_lines(
     selected: bool,
     gutter_cols: usize,
     media_rows: usize,
+    width: usize,
 ) -> Vec<Line<'static>> {
     let mut prefix = String::new();
     if selected {
@@ -869,12 +890,12 @@ fn message_lines(
 
     let mut lines = vec![Line::from(header)];
     lines.extend(
-        quote_lines(view, message)
+        quote_lines(view, message, width)
             .into_iter()
             .map(|line| indent_line(line, gutter_cols)),
     );
     lines.extend(
-        content_lines(&message.content, selected)
+        content_lines(&message.content, selected, width)
             .into_iter()
             .map(|line| indent_line(line, gutter_cols)),
     );
@@ -898,9 +919,12 @@ fn message_lines(
     lines
 }
 
-/// The greentext quote line above a reply's body (#210) — one line for a
-/// reply, none for a plain message; `message_lines` and the media-row offset
-/// math both rely on this being 0 or 1 line, never more.
+/// The greentext quote line(s) above a reply's body (#210, word-wrapped at
+/// `width` since #214) — none for a plain message, otherwise the preview
+/// text word-wrapped the same way a message body is (`width == 0` skips
+/// wrapping, one line, matching pre-#214 behavior).
+/// [`ConversationView::message_height`] adds the same row count via its own
+/// independent `quote_rows`, guarded by a drift-guard test below.
 ///
 /// Resolution is **render-time**, not cached on the model: it looks up the
 /// quoted message in `view`'s currently loaded history, so a target that
@@ -909,7 +933,7 @@ fn message_lines(
 /// for exactly this kind of live catch-up. A target in another chat, one
 /// deleted or outside the loaded window, or a reply to a story all fall back
 /// to a bare `>reply`.
-fn quote_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>> {
+fn quote_lines(view: &ConversationView, message: &Message, width: usize) -> Vec<Line<'static>> {
     let Some(reply) = &message.reply_to else {
         return Vec::new();
     };
@@ -939,7 +963,18 @@ fn quote_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>>
             .unwrap_or_else(|| ">reply".to_owned()),
         ReplyTo::Message { .. } | ReplyTo::Unsupported(_) => ">reply".to_owned(),
     };
-    vec![Line::from(Span::styled(text, style))]
+    if width == 0 {
+        return vec![Line::from(Span::styled(text, style))];
+    }
+    let breaks = crate::wrap::wrap_breaks(&text, width);
+    breaks
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = breaks.get(i + 1).copied().unwrap_or(text.len());
+            Line::from(Span::styled(text[start..end].to_owned(), style))
+        })
+        .collect()
 }
 
 /// A one-line, unstyled snippet of a message's content — its text's first
@@ -948,7 +983,9 @@ fn quote_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>>
 /// snippet always matches what the quoted message would show as its own
 /// first body line.
 fn content_snippet(content: &MessageContent) -> String {
-    content_lines(content, false)
+    // width=0: the quote line is a one-line, 60-char-truncated preview (see
+    // `quote_lines`), never itself wrapped.
+    content_lines(content, false, 0)
         .into_iter()
         .next()
         .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -1092,20 +1129,21 @@ where
 /// `[Kind]` placeholder for media (with its caption, when set, on the lines
 /// below). Media bytes are not rendered in a terminal; the placeholder names what
 /// the message carries.
-fn content_lines(content: &MessageContent, selected: bool) -> Vec<Line<'static>> {
+fn content_lines(content: &MessageContent, selected: bool, width: usize) -> Vec<Line<'static>> {
     match content {
-        MessageContent::Text(text) => text_lines(text, selected),
-        MessageContent::Photo(p) => placeholder_lines("[Photo]", &p.caption, selected),
-        MessageContent::Video(v) => placeholder_lines("[▶ video]", &v.caption, selected),
+        MessageContent::Text(text) => text_lines(text, selected, width),
+        MessageContent::Photo(p) => placeholder_lines("[Photo]", &p.caption, selected, width),
+        MessageContent::Video(v) => placeholder_lines("[▶ video]", &v.caption, selected, width),
         MessageContent::Document(d) => placeholder_lines(
             &format!("[Document {}]", trimmed_name(&d.file_name)),
             &d.caption,
             selected,
+            width,
         ),
-        MessageContent::Audio(a) => placeholder_lines("[Audio]", &a.caption, selected),
-        MessageContent::Voice(v) => placeholder_lines("[Voice]", &v.caption, selected),
+        MessageContent::Audio(a) => placeholder_lines("[Audio]", &a.caption, selected, width),
+        MessageContent::Voice(v) => placeholder_lines("[Voice]", &v.caption, selected, width),
         MessageContent::Sticker(s) => one_line(format!("[Sticker {}]", s.emoji).trim_end()),
-        MessageContent::Animation(a) => placeholder_lines("[GIF]", &a.caption, selected),
+        MessageContent::Animation(a) => placeholder_lines("[GIF]", &a.caption, selected, width),
         MessageContent::Location(_) => one_line("[Location]"),
         MessageContent::Venue(v) => one_line(format!("[Venue {}]", v.title).trim_end()),
         MessageContent::Contact(c) => {
@@ -1116,51 +1154,109 @@ fn content_lines(content: &MessageContent, selected: bool) -> Vec<Line<'static>>
     }
 }
 
-/// The lines of a text body, preserving its own line breaks and rendering its
-/// formatting entities (#211) — bold/italic/code/strikethrough/spoiler, with
-/// overlapping entities composed rather than one silently overwriting
-/// another (see [`crate::richtext::styled_spans`]). `selected` gates spoiler
-/// reveal. Empty text still yields one (empty) line so the header is not left
-/// bodyless.
-fn text_lines(text: &FormattedText, selected: bool) -> Vec<Line<'static>> {
+/// The lines of a text body, preserving its own line breaks, word-wrapping
+/// each of those logical lines at `width` (#214; `width == 0` skips wrapping
+/// — see [`crate::conversation::message_height`]), and rendering formatting
+/// entities (#211) — bold/italic/code/strikethrough/spoiler, with overlapping
+/// entities composed rather than one silently overwriting another (see
+/// [`crate::richtext::styled_spans`]). `selected` gates spoiler reveal. Empty
+/// text still yields one (empty) line so the header is not left bodyless.
+///
+/// Wraps each logical line's *raw* text first (via [`crate::wrap::wrap_breaks`]
+/// — the exact same call [`crate::conversation::message_height`] makes for its
+/// row count) and only then re-derives that row's entities and hands the raw
+/// row substring to `styled_spans`. Deliberately never wraps the
+/// already-selection-substituted spoiler glyphs — doing so would let this
+/// pick different break points from `message_height`'s raw-text count
+/// whenever a spoiler's glyph substitution doesn't preserve display width
+/// (e.g. concealing a wide CJK/emoji character behind a narrow glyph).
+/// Wrapping the raw text first, unconditionally, keeps the two in lockstep
+/// regardless of selection state or spoiler content.
+fn text_lines(text: &FormattedText, selected: bool, width: usize) -> Vec<Line<'static>> {
     // Entity offsets are UTF-16 code units into the *whole* `text.text`
     // (TDLib's convention); track each split-out line's UTF-16 span so every
     // entity can be intersected against it and re-offset to be line-local —
-    // `styled_spans` then treats each line as a standalone string.
+    // `styled_spans` then treats each line (or, once wrapped, each row of a
+    // line) as a standalone string.
     let mut utf16_pos: i32 = 0;
-    text.text
-        .split('\n')
-        .map(|line| {
-            let line_start = utf16_pos;
-            let line_end = utf16_pos + line.encode_utf16().count() as i32;
-            let local_entities: Vec<TextEntity> = text
-                .entities
+    let mut lines = Vec::new();
+    for line in text.text.split('\n') {
+        let line_start = utf16_pos;
+        let line_end = utf16_pos + line.encode_utf16().count() as i32;
+        let local_entities: Vec<TextEntity> = text
+            .entities
+            .iter()
+            .filter_map(|e| {
+                let start = e.offset.max(line_start);
+                let end = (e.offset + e.length).min(line_end);
+                (start < end).then(|| TextEntity {
+                    offset: start - line_start,
+                    length: end - start,
+                    kind: e.kind.clone(),
+                })
+            })
+            .collect();
+        utf16_pos = line_end + 1; // the '\n' consumed by `split` is one UTF-16 unit
+
+        if width == 0 {
+            lines.push(Line::from(crate::richtext::styled_spans(
+                line,
+                &local_entities,
+                selected,
+            )));
+            continue;
+        }
+
+        let breaks = crate::wrap::wrap_breaks(line, width);
+        for (i, &row_start) in breaks.iter().enumerate() {
+            let row_end = breaks.get(i + 1).copied().unwrap_or(line.len());
+            let row_text = &line[row_start..row_end];
+            let row_start_u16 = byte_to_utf16(line, row_start);
+            let row_end_u16 = byte_to_utf16(line, row_end);
+            let row_entities: Vec<TextEntity> = local_entities
                 .iter()
                 .filter_map(|e| {
-                    let start = e.offset.max(line_start);
-                    let end = (e.offset + e.length).min(line_end);
+                    let start = e.offset.max(row_start_u16);
+                    let end = (e.offset + e.length).min(row_end_u16);
                     (start < end).then(|| TextEntity {
-                        offset: start - line_start,
+                        offset: start - row_start_u16,
                         length: end - start,
                         kind: e.kind.clone(),
                     })
                 })
                 .collect();
-            utf16_pos = line_end + 1; // the '\n' consumed by `split` is one UTF-16 unit
-            Line::from(crate::richtext::styled_spans(
-                line,
-                &local_entities,
+            lines.push(Line::from(crate::richtext::styled_spans(
+                row_text,
+                &row_entities,
                 selected,
-            ))
-        })
-        .collect()
+            )));
+        }
+    }
+    lines
 }
 
-/// A media placeholder line, with the caption's lines below it when non-empty.
-fn placeholder_lines(label: &str, caption: &FormattedText, selected: bool) -> Vec<Line<'static>> {
+/// The UTF-16 code-unit offset in `s` corresponding to byte offset
+/// `byte_offset` — the inverse of `richtext`'s UTF-16→byte conversion, needed
+/// to re-clip a logical line's UTF-16-offset entities to a wrapped row's byte
+/// range (from [`crate::wrap::wrap_breaks`]). `byte_offset` must land on a
+/// char boundary — true of every offset `wrap_breaks` returns.
+fn byte_to_utf16(s: &str, byte_offset: usize) -> i32 {
+    s[..byte_offset].encode_utf16().count() as i32
+}
+
+/// A media placeholder line, with the caption's (wrapped, #214) lines below it
+/// when non-empty. The label itself never wraps — only the caption text does
+/// — so [`crate::conversation::content_rows`]'s `1 + caption_rows` stays exact
+/// even for a long document filename.
+fn placeholder_lines(
+    label: &str,
+    caption: &FormattedText,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let mut lines = one_line(label);
     if !caption.text.is_empty() {
-        lines.extend(text_lines(caption, selected));
+        lines.extend(text_lines(caption, selected, width));
     }
     lines
 }
@@ -1981,7 +2077,7 @@ mod tests {
             text: tuigram_core::scrub_prose(hostile),
             entities: Vec::new(),
         });
-        let rendered: String = content_lines(&content, false)
+        let rendered: String = content_lines(&content, false, 0)
             .iter()
             .flat_map(|line| line.spans.iter())
             .map(|span| span.content.as_ref())
@@ -2009,7 +2105,7 @@ mod tests {
                 kind: EntityKind::Bold,
             }],
         });
-        let spans: Vec<Span> = content_lines(&content, false)
+        let spans: Vec<Span> = content_lines(&content, false, 0)
             .into_iter()
             .flat_map(|line| line.spans.into_iter())
             .collect();
@@ -2040,14 +2136,14 @@ mod tests {
                 kind: EntityKind::Spoiler,
             }],
         });
-        let concealed: String = content_lines(&content, false)
+        let concealed: String = content_lines(&content, false, 0)
             .into_iter()
             .flat_map(|line| line.spans.into_iter())
             .map(|s| s.content.into_owned())
             .collect();
         assert!(!concealed.contains("secret"), "concealed: {concealed:?}");
 
-        let revealed: String = content_lines(&content, true)
+        let revealed: String = content_lines(&content, true, 0)
             .into_iter()
             .flat_map(|line| line.spans.into_iter())
             .map(|s| s.content.into_owned())
@@ -2056,6 +2152,40 @@ mod tests {
             revealed.contains("secret"),
             "revealed on selection: {revealed:?}"
         );
+    }
+
+    /// #214 drift-guard: a spoiler's concealed glyph substitution
+    /// (`richtext::SPOILER_GLYPH`, one per hidden character) doesn't
+    /// necessarily preserve a wide source character's display width — but
+    /// `text_lines` wraps the *raw* text before substituting, the same raw
+    /// text `ConversationView::message_height` wraps, so the two stay in
+    /// lockstep regardless. Exercised at a narrow width, in both selection
+    /// states, with wide CJK characters as the spoiler's content.
+    #[test]
+    fn a_spoiler_wrapping_wide_characters_does_not_drift_the_height() {
+        use tuigram_core::model::EntityKind;
+
+        let content = MessageContent::Text(FormattedText {
+            text: "中中中中中中".to_owned(),
+            entities: vec![TextEntity {
+                offset: 0,
+                length: 6,
+                kind: EntityKind::Spoiler,
+            }],
+        });
+        let mut view =
+            ConversationView::from_messages(vec![sample_message(1, content)], HashSet::new());
+        view.set_viewport_width(4);
+
+        for message in view.messages() {
+            for selected in [false, true] {
+                assert_eq!(
+                    message_lines(&view, message, selected, 0, 0, 4).len(),
+                    view.message_height(message),
+                    "height drifts from the renderer, selected={selected}"
+                );
+            }
+        }
     }
 
     /// #210: a reply to a message loaded in the same chat resolves its
@@ -2087,7 +2217,7 @@ mod tests {
         });
         let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
 
-        let lines = quote_lines(&view, &reply);
+        let lines = quote_lines(&view, &reply, 0);
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("original message"), "snippet: {text:?}");
@@ -2117,7 +2247,7 @@ mod tests {
         });
         let view = ConversationView::from_messages(vec![reply.clone()], HashSet::new());
 
-        let lines = quote_lines(&view, &reply);
+        let lines = quote_lines(&view, &reply, 0);
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, ">reply");
@@ -2147,7 +2277,7 @@ mod tests {
         });
 
         let before = ConversationView::from_messages(vec![reply.clone()], HashSet::new());
-        let before_text: String = quote_lines(&before, &reply)[0]
+        let before_text: String = quote_lines(&before, &reply, 0)[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -2162,7 +2292,7 @@ mod tests {
             }),
         );
         let after = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
-        let after_text: String = quote_lines(&after, &reply)[0]
+        let after_text: String = quote_lines(&after, &reply, 0)[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -2187,7 +2317,7 @@ mod tests {
             }),
         );
         let view = ConversationView::from_messages(vec![message.clone()], HashSet::new());
-        assert!(quote_lines(&view, &message).is_empty());
+        assert!(quote_lines(&view, &message, 0).is_empty());
     }
 
     /// #210: TDLib documents `MessageReplyToMessage.chat_id` as "may be 0 if
@@ -2221,9 +2351,60 @@ mod tests {
         });
         let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
 
-        let lines = quote_lines(&view, &reply);
+        let lines = quote_lines(&view, &reply, 0);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("original message"), "snippet: {text:?}");
+    }
+
+    /// #214: a narrow pane wraps the greentext preview across multiple rows
+    /// instead of letting ratatui silently clip it — the bug report that
+    /// motivated giving `quote_lines` a `width` at all.
+    #[test]
+    fn quote_lines_wraps_a_long_preview_at_a_narrow_width() {
+        use crate::conversation::sample_message;
+        use std::collections::HashSet;
+        use tuigram_core::model::ReplyTo;
+
+        let original = sample_message(
+            1,
+            MessageContent::Text(FormattedText {
+                text: "a fairly long original message that will need to wrap".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        let mut reply = sample_message(
+            2,
+            MessageContent::Text(FormattedText {
+                text: "sure thing".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: original.chat_id,
+            message_id: 1,
+            quote: None,
+        });
+        let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
+
+        let lines = quote_lines(&view, &reply, 10);
+        assert!(
+            lines.len() > 1,
+            "expected the preview to wrap across multiple rows, got {}",
+            lines.len()
+        );
+        // Nothing is dropped — every wrapped row's content, joined back
+        // together, reconstructs the original unwrapped preview text.
+        let unwrapped: String = quote_lines(&view, &reply, 0)[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let rewrapped: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(rewrapped, unwrapped);
     }
 
     #[test]
@@ -3314,7 +3495,7 @@ mod tests {
         // The bottom-anchoring walk (#158) sums `ConversationView::message_height`;
         // this guards it against drifting from what `message_lines` actually renders —
         // the two are a single source split across the view model and the renderer.
-        use tuigram_core::model::{FileRef, Photo, ReactionKind};
+        use tuigram_core::model::{FileRef, Photo, ReactionKind, ReplyTo};
 
         let mut reacted = text_message(4, "nice");
         reacted.reactions = vec![Reaction {
@@ -3334,11 +3515,21 @@ mod tests {
                 height: 0,
             }),
         );
+        // A reply (#210/#214): its greentext preview line is another row
+        // `message_height` must count, on top of the header/body/separator —
+        // the gap this drift guard is here to catch.
+        let mut replying = text_message(5, "sure thing");
+        replying.reply_to = Some(ReplyTo::Message {
+            chat_id: replying.chat_id,
+            message_id: 1,
+            quote: None,
+        });
         let messages = vec![
             text_message(1, "single line"),
             text_message(2, "line one\nline two\nline three"),
             photo,
             reacted,
+            replying,
         ];
         // One pin (height-neutral) and an active download that adds a progress line.
         let mut view = ConversationView::from_messages(messages, HashSet::from([1]));
@@ -3350,22 +3541,29 @@ mod tests {
             ..File::default()
         }]);
 
-        for message in view.messages() {
-            // The pane never wraps, so height is width-independent; the selection
-            // marker only prefixes the header and never changes the row count.
-            // Neither does a non-zero gutter (#201) — it only prepends a span to
-            // existing lines, never adds one — so both are checked here. No
-            // graphics support is seeded, so every message's media_rows is `0`
-            // here; the ready-media case gets its own test below, since it needs
-            // an `App` (graphics capability lives there, not on the bare view).
-            for selected in [false, true] {
-                for gutter_cols in [0, 4] {
-                    assert_eq!(
-                        message_lines(&view, message, selected, gutter_cols, 0).len(),
-                        view.message_height(message),
-                        "height drifts from the renderer for message {}",
-                        message.id
-                    );
+        // Width `0` is the pre-#214 unwrapped case; `40` fits every message's
+        // longest line unwrapped too (a width-independence sanity check); `5`
+        // is narrow enough to force real wrapping on the multi-word text and
+        // the two-line caption, exercising the actual drift guard #214 adds.
+        for width in [0, 40, 5] {
+            view.set_viewport_width(width);
+            for message in view.messages() {
+                // The selection marker only prefixes the header and never
+                // changes the row count. Neither does a non-zero gutter
+                // (#201) — it only prepends a span to existing lines, never
+                // adds one — so both are checked here. No graphics support is
+                // seeded, so every message's media_rows is `0` here; the
+                // ready-media case gets its own test below, since it needs an
+                // `App` (graphics capability lives there, not on the bare view).
+                for selected in [false, true] {
+                    for gutter_cols in [0, 4] {
+                        assert_eq!(
+                            message_lines(&view, message, selected, gutter_cols, 0, width).len(),
+                            view.message_height(message),
+                            "height drifts from the renderer for message {} at width {width}",
+                            message.id
+                        );
+                    }
                 }
             }
         }
@@ -3453,7 +3651,7 @@ mod tests {
                 message.id
             );
             assert_eq!(
-                message_lines(view, message, true, 0, media_rows).len(),
+                message_lines(view, message, true, 0, media_rows, 0).len(),
                 view.message_height(message),
                 "height drifts from the renderer for message {}",
                 message.id
@@ -3517,12 +3715,45 @@ mod tests {
                 message.id
             );
             assert_eq!(
-                message_lines(view, message, true, 0, media_rows).len(),
+                message_lines(view, message, true, 0, media_rows, 0).len(),
                 view.message_height(message),
                 "height drifts from the renderer for message {}",
                 message.id
             );
         }
+    }
+
+    #[test]
+    fn a_long_message_wraps_across_multiple_rows_in_the_render() {
+        // #214 end-to-end: a message body too long for the pane's width
+        // actually wraps when rendered, rather than being cut off by
+        // ratatui's default paragraph behavior — the render-level complement
+        // to the height/drift unit tests above. A live loop feeds the real
+        // measured width back through `App::set_conversation_width`, so an
+        // `App` built directly (as here) never wraps on its very first,
+        // never-yet-measured render — seed the width the way the loop would
+        // after one frame.
+        let long = "wraps across several rows because it is much longer than the pane";
+        let mut app = app_with_history(vec![text_message(1, long)]);
+        let output = render_output(&app, 40, 20);
+        app.set_conversation_width(output.convo_width);
+        let buffer = render(&app, 40, 20);
+        let text = flatten(&buffer);
+        // Every word survives the wrap (nothing silently dropped or truncated).
+        for word in long.split(' ') {
+            assert!(text.contains(word), "word {word:?} missing from the render");
+        }
+        // The body spans at least two distinct rows of the pane.
+        let body_rows = (0..buffer.area.height)
+            .filter(|&y| {
+                long.split(' ')
+                    .any(|word| row_text(&buffer, y).contains(word))
+            })
+            .count();
+        assert!(
+            body_rows >= 2,
+            "body should wrap across multiple rows, got {body_rows}"
+        );
     }
 
     #[test]
