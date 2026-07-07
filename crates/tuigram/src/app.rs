@@ -1048,6 +1048,17 @@ impl App {
         }
     }
 
+    /// Record the conversation pane's inner body width measured by the last
+    /// render (#214), so message bodies wrap against the real column budget
+    /// and a resize re-anchors the same way a height change does. The loop
+    /// calls this after each `draw`, alongside
+    /// [`set_conversation_viewport`](Self::set_conversation_viewport).
+    pub fn set_conversation_width(&mut self, width: usize) {
+        if self.conversation.set_viewport_width(width) {
+            self.dirty = true;
+        }
+    }
+
     /// Record the pane rectangles the last render drew into (#161/#162), so the
     /// next mouse event can be hit-tested to a pane. The loop calls this after each
     /// `draw` with the [`RenderOutput::panes`](crate::ui::RenderOutput) it measured.

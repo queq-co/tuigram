@@ -208,6 +208,15 @@ pub struct ConversationView {
     /// no real `Picker`. Carried across a chat switch in [`project`](Self::project)
     /// the same way `viewport` is: it is session-level state, not per-chat.
     graphics_capable: bool,
+    /// The history pane's inner body width (columns) from the last render, set
+    /// via [`set_viewport_width`](Self::set_viewport_width) (#214) — the budget
+    /// [`content_rows`] wraps message bodies against. `0` until the first frame
+    /// measures it, the same "not yet measured" convention `viewport` uses:
+    /// [`content_rows`] treats `0` as "don't wrap" (today's plain `\n`-split
+    /// behavior), so a view built without ever setting a width behaves exactly
+    /// as it did before #214. Carried across a chat switch the same way
+    /// `viewport`/`graphics_capable` are, for the same reason.
+    width: usize,
 }
 
 impl ConversationView {
@@ -235,6 +244,7 @@ impl ConversationView {
             last_read_outbox: 0,
             unread_separator: None,
             graphics_capable: false,
+            width: 0,
         }
     }
 
@@ -311,11 +321,13 @@ impl ConversationView {
             // chat switch.
             let viewport = self.viewport;
             let graphics_capable = self.graphics_capable;
+            let width = self.width;
             *self = Self {
                 chat_id: Some(chat_id),
                 messages,
                 pinned,
                 viewport,
+                width,
                 senders,
                 last_read_outbox,
                 graphics_capable,
@@ -662,6 +674,27 @@ impl ConversationView {
         false
     }
 
+    /// Record the history pane's measured body width (#214) — the column
+    /// budget [`content_rows`] wraps message bodies against. Re-anchors while
+    /// pinned to the newest message the same way
+    /// [`set_viewport_height`](Self::set_viewport_height) does, since a width
+    /// change (a resize) changes every wrapped message's height at once.
+    /// Returns whether the offset moved, so the caller can repaint the
+    /// corrected frame.
+    pub fn set_viewport_width(&mut self, width: usize) -> bool {
+        if width == self.width {
+            return false;
+        }
+        let following = self.is_at_newest();
+        self.width = width;
+        if following {
+            let previous = (self.offset, self.row_skip);
+            (self.offset, self.row_skip) = self.newest_anchor();
+            return (self.offset, self.row_skip) != previous;
+        }
+        false
+    }
+
     /// The `(message index, row skip)` that pins the newest message to the
     /// bottom of the viewport (#158, row-granular since #222): walk back from
     /// the last message summing [`message_height`](Self::message_height); the
@@ -692,15 +725,17 @@ impl ConversationView {
         (0, 0)
     }
 
-    /// The number of terminal rows one message occupies in the history pane — the
-    /// same count [`crate::ui::message_lines`] renders, since that pane does not wrap
-    /// (each `Line` is one row, so the height is width-independent). A drift-guard
-    /// test in `ui.rs` keeps this in lockstep with the renderer.
+    /// The number of terminal rows one message occupies in the history pane at
+    /// this view's current [`width`](Self::width) — the same count
+    /// [`crate::ui::message_lines`] renders, word-wrapped the same way via
+    /// [`crate::wrap`] (or unwrapped, matching pre-#214 behavior, while `width`
+    /// is `0` — not yet measured). A drift-guard test in `ui.rs` keeps this in
+    /// lockstep with the renderer.
     pub(crate) fn message_height(&self, message: &Message) -> usize {
         // A bold header, the body, an optional inline-media box, an optional
         // download-progress line, an optional reaction line, and a blank separator
         // below.
-        1 + content_rows(&message.content)
+        1 + content_rows(&message.content, self.width)
             + self.media_rows(&message.content)
             + usize::from(self.has_download_line(&message.content))
             + usize::from(!message.reactions.is_empty())
@@ -774,28 +809,48 @@ pub(crate) fn media_ready(content: &MessageContent, downloads: &HashMap<i32, Fil
     }
 }
 
-/// The row count of a message body, mirroring [`crate::ui::content_lines`]: text
-/// bodies and captions keep their own line breaks (an empty text still takes one
-/// line), and media placeholders add a single label line above any caption.
-fn content_rows(content: &MessageContent) -> usize {
-    fn text_rows(text: &FormattedText) -> usize {
-        text.text.split('\n').count()
+/// The row count of a message body at a given pane `width`, mirroring
+/// [`crate::ui::content_lines`]: text bodies and captions keep their own line
+/// breaks and word-wrap each of those logical lines via [`crate::wrap`] (an
+/// empty text still takes one line), and media placeholders add a single
+/// unwrapped label line above any (wrapped) caption. `width == 0` skips
+/// wrapping entirely — the pre-#214 plain `\n`-split behavior — so a view
+/// that never measures a width (every existing test that doesn't call
+/// [`ConversationView::set_viewport_width`]) is unaffected.
+///
+/// Wrapping only ever looks at each logical line's *raw* text, never at
+/// `crate::richtext`'s selection-dependent spoiler-glyph substitution — so
+/// this always agrees with [`crate::ui::text_lines`], which wraps the same
+/// raw text first and re-derives (and re-substitutes) styling per resulting
+/// row, rather than wrapping already-substituted text. That ordering is what
+/// keeps the two in lockstep regardless of selection state or spoiler
+/// content; a drift-guard test in `ui.rs` also covers this directly.
+fn content_rows(content: &MessageContent, width: usize) -> usize {
+    fn text_rows(text: &FormattedText, width: usize) -> usize {
+        if width == 0 {
+            text.text.split('\n').count()
+        } else {
+            text.text
+                .split('\n')
+                .map(|line| crate::wrap::row_count(line, width))
+                .sum()
+        }
     }
-    fn caption_rows(caption: &FormattedText) -> usize {
+    fn caption_rows(caption: &FormattedText, width: usize) -> usize {
         if caption.text.is_empty() {
             0
         } else {
-            text_rows(caption)
+            text_rows(caption, width)
         }
     }
     match content {
-        MessageContent::Text(text) => text_rows(text),
-        MessageContent::Photo(p) => 1 + caption_rows(&p.caption),
-        MessageContent::Video(v) => 1 + caption_rows(&v.caption),
-        MessageContent::Document(d) => 1 + caption_rows(&d.caption),
-        MessageContent::Audio(a) => 1 + caption_rows(&a.caption),
-        MessageContent::Voice(v) => 1 + caption_rows(&v.caption),
-        MessageContent::Animation(a) => 1 + caption_rows(&a.caption),
+        MessageContent::Text(text) => text_rows(text, width),
+        MessageContent::Photo(p) => 1 + caption_rows(&p.caption, width),
+        MessageContent::Video(v) => 1 + caption_rows(&v.caption, width),
+        MessageContent::Document(d) => 1 + caption_rows(&d.caption, width),
+        MessageContent::Audio(a) => 1 + caption_rows(&a.caption, width),
+        MessageContent::Voice(v) => 1 + caption_rows(&v.caption, width),
+        MessageContent::Animation(a) => 1 + caption_rows(&a.caption, width),
         MessageContent::Sticker(_)
         | MessageContent::Location(_)
         | MessageContent::Venue(_)
@@ -1559,6 +1614,36 @@ mod tests {
         assert!(view.is_at_newest());
         // An unchanged height is a no-op that reports no move.
         assert!(!view.set_viewport_height(9));
+    }
+
+    #[test]
+    fn a_narrower_width_while_following_re_anchors_to_the_newest() {
+        // #214: narrowing the pane wraps a message's body onto more rows, the
+        // same shape of height change a vertical resize causes — so it
+        // re-anchors the same way `set_viewport_height` does.
+        let mut view = ConversationView::default();
+        view.set_viewport_height(9);
+        view.set_viewport_width(40); // wide enough that every message fits unwrapped
+        view.project(
+            10,
+            (1..=5)
+                .map(|i| text(i, "one two three four five"))
+                .collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        assert!(view.is_at_newest());
+        let before = (view.offset(), view.row_skip());
+        // Narrow enough to force the body to wrap onto several rows, growing
+        // every message's height — following re-anchors.
+        assert!(view.set_viewport_width(5), "re-anchored while following");
+        assert!(view.is_at_newest());
+        assert_ne!((view.offset(), view.row_skip()), before);
+        // Setting the same value again is a no-op that reports no move.
+        assert!(!view.set_viewport_width(5));
     }
 
     #[test]

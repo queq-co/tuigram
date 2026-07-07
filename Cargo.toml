@@ -84,6 +84,10 @@ image = { version = "0.25" }
 # `RgbImage` + text drawing, `ab_glyph` as its font-rasterizing backend.
 imageproc = { version = "0.25", default-features = false }
 ab_glyph = { version = "0.2" }
+# Column-width measurement for word-wrapping message bodies and the composer
+# (#214, #215) — already in the graph transitively via ratatui; promoted to
+# direct since `wrap.rs` calls it to measure display width, not byte/char count.
+unicode-width = { version = "0.2" }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.

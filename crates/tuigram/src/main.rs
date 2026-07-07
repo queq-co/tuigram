@@ -58,6 +58,7 @@ mod status;
 mod terminal;
 mod textinput;
 mod ui;
+mod wrap;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -365,6 +366,9 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                 .draw(|frame| render_out = ui::ui(frame, &app))?;
             app.clear_dirty();
             app.set_conversation_viewport(render_out.convo_viewport);
+            // Record the history pane's measured body width too (#214), so message
+            // bodies wrap against the real column budget and a resize re-anchors.
+            app.set_conversation_width(render_out.convo_width);
             // Record the pane rectangles this frame drew into, so a mouse event can
             // be hit-tested to a pane without re-running layout (#161/#162).
             app.set_pane_layout(render_out.panes);
