@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 
 use ratatui::style::Color;
 use tuigram_core::model::{
-    ChatAction, File, FormattedText, Message, MessageContent, Reaction, ReactionKind, Sender, User,
+    ChatAction, File, FormattedText, Message, MessageContent, Reaction, ReactionKind, ReplyTo,
+    Sender, User,
 };
 
 /// A confirmed pin toggle, recorded by `App` as a pure intent for the loop to
@@ -732,14 +733,56 @@ impl ConversationView {
     /// is `0` — not yet measured). A drift-guard test in `ui.rs` keeps this in
     /// lockstep with the renderer.
     pub(crate) fn message_height(&self, message: &Message) -> usize {
-        // A bold header, the body, an optional inline-media box, an optional
-        // download-progress line, an optional reaction line, and a blank separator
-        // below.
-        1 + content_rows(&message.content, self.width)
+        // A bold header, an optional reply-quote line, the body, an optional
+        // inline-media box, an optional download-progress line, an optional
+        // reaction line, and a blank separator below.
+        1 + self.quote_rows(message)
+            + content_rows(&message.content, self.width)
             + self.media_rows(&message.content)
             + usize::from(self.has_download_line(&message.content))
             + usize::from(!message.reactions.is_empty())
             + 1
+    }
+
+    /// The rows [`crate::ui::quote_lines`] renders above a reply's body (#210,
+    /// word-wrapped since #214): `0` for a plain message, otherwise the wrapped
+    /// row count of the same greentext preview text the renderer builds —
+    /// `">{sender}: {snippet}"` for a reply resolved against this view's
+    /// currently loaded history, or the bare `">reply"` fallback for a
+    /// cross-chat, unloaded, or unsupported reply target.
+    ///
+    /// Mirrors [`crate::ui::quote_lines`] independently — same convention as
+    /// [`content_rows`]/`crate::ui::content_lines` — so this stays a pure
+    /// `&str`-only computation with no `ratatui` dependency; a drift-guard
+    /// test in `ui.rs` keeps the two in lockstep.
+    fn quote_rows(&self, message: &Message) -> usize {
+        let Some(reply) = &message.reply_to else {
+            return 0;
+        };
+        let text = match reply {
+            ReplyTo::Message {
+                chat_id,
+                message_id,
+                ..
+            } if *chat_id == 0 || *chat_id == message.chat_id => self
+                .messages
+                .iter()
+                .find(|m| m.id == *message_id)
+                .map(|quoted| {
+                    let sender = self.sender_label(quoted).label;
+                    format!(
+                        ">{sender}: {}",
+                        truncate(&content_snippet(&quoted.content), 60)
+                    )
+                })
+                .unwrap_or_else(|| ">reply".to_owned()),
+            ReplyTo::Message { .. } | ReplyTo::Unsupported(_) => ">reply".to_owned(),
+        };
+        if self.width == 0 {
+            1
+        } else {
+            crate::wrap::row_count(&text, self.width)
+        }
     }
 
     /// Whether a message's content draws a download-progress line — mirroring
@@ -858,6 +901,45 @@ fn content_rows(content: &MessageContent, width: usize) -> usize {
         | MessageContent::Poll(_)
         | MessageContent::Unsupported(_) => 1,
     }
+}
+
+/// A message body's one-line preview text, used by [`ConversationView::quote_rows`]
+/// to build the same greentext preview text
+/// [`crate::ui::quote_lines`]/`crate::ui::content_snippet` render. Mirrors
+/// `crate::ui::content_snippet` independently (same convention as
+/// [`content_rows`] above): a text message's first line, or a media
+/// placeholder's fixed label — never its caption, matching
+/// `crate::ui::content_lines`'s label-then-caption line order, where the
+/// label is always line `0`.
+fn content_snippet(content: &MessageContent) -> String {
+    match content {
+        MessageContent::Text(text) => text.text.split('\n').next().unwrap_or_default().to_owned(),
+        MessageContent::Photo(_) => "[Photo]".to_owned(),
+        MessageContent::Video(_) => "[▶ video]".to_owned(),
+        MessageContent::Document(d) => format!("[Document {}]", d.file_name.trim()),
+        MessageContent::Audio(_) => "[Audio]".to_owned(),
+        MessageContent::Voice(_) => "[Voice]".to_owned(),
+        MessageContent::Sticker(s) => format!("[Sticker {}]", s.emoji).trim_end().to_owned(),
+        MessageContent::Animation(_) => "[GIF]".to_owned(),
+        MessageContent::Location(_) => "[Location]".to_owned(),
+        MessageContent::Venue(v) => format!("[Venue {}]", v.title).trim_end().to_owned(),
+        MessageContent::Contact(c) => format!("[Contact {} {}]", c.first_name, c.last_name)
+            .trim_end()
+            .to_owned(),
+        MessageContent::Poll(p) => format!("[Poll] {}", p.question.text),
+        MessageContent::Unsupported(name) => format!("[{name}]"),
+    }
+}
+
+/// Shorten `s` to at most `max` characters, ending in an ellipsis when
+/// clipped. Mirrors `crate::ui::truncate` independently (same convention as
+/// [`content_snippet`] above).
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// A sender's resolved header text plus the accent color to tint it with

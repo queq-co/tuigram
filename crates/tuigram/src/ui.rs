@@ -555,7 +555,7 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
         }
         let header_row_in_block = block.len();
         let media_rows = media_rows_for(app, view, &message.content);
-        let quote_rows = usize::from(message.reply_to.is_some());
+        let quote_rows = quote_lines(view, message, width).len();
         let media_row_in_block = header_row_in_block
             + quote_rows
             + 1
@@ -890,7 +890,7 @@ fn message_lines(
 
     let mut lines = vec![Line::from(header)];
     lines.extend(
-        quote_lines(view, message)
+        quote_lines(view, message, width)
             .into_iter()
             .map(|line| indent_line(line, gutter_cols)),
     );
@@ -919,9 +919,12 @@ fn message_lines(
     lines
 }
 
-/// The greentext quote line above a reply's body (#210) — one line for a
-/// reply, none for a plain message; `message_lines` and the media-row offset
-/// math both rely on this being 0 or 1 line, never more.
+/// The greentext quote line(s) above a reply's body (#210, word-wrapped at
+/// `width` since #214) — none for a plain message, otherwise the preview
+/// text word-wrapped the same way a message body is (`width == 0` skips
+/// wrapping, one line, matching pre-#214 behavior).
+/// [`ConversationView::message_height`] adds the same row count via its own
+/// independent `quote_rows`, guarded by a drift-guard test below.
 ///
 /// Resolution is **render-time**, not cached on the model: it looks up the
 /// quoted message in `view`'s currently loaded history, so a target that
@@ -930,7 +933,7 @@ fn message_lines(
 /// for exactly this kind of live catch-up. A target in another chat, one
 /// deleted or outside the loaded window, or a reply to a story all fall back
 /// to a bare `>reply`.
-fn quote_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>> {
+fn quote_lines(view: &ConversationView, message: &Message, width: usize) -> Vec<Line<'static>> {
     let Some(reply) = &message.reply_to else {
         return Vec::new();
     };
@@ -960,7 +963,18 @@ fn quote_lines(view: &ConversationView, message: &Message) -> Vec<Line<'static>>
             .unwrap_or_else(|| ">reply".to_owned()),
         ReplyTo::Message { .. } | ReplyTo::Unsupported(_) => ">reply".to_owned(),
     };
-    vec![Line::from(Span::styled(text, style))]
+    if width == 0 {
+        return vec![Line::from(Span::styled(text, style))];
+    }
+    let breaks = crate::wrap::wrap_breaks(&text, width);
+    breaks
+        .iter()
+        .enumerate()
+        .map(|(i, &start)| {
+            let end = breaks.get(i + 1).copied().unwrap_or(text.len());
+            Line::from(Span::styled(text[start..end].to_owned(), style))
+        })
+        .collect()
 }
 
 /// A one-line, unstyled snippet of a message's content — its text's first
@@ -2203,7 +2217,7 @@ mod tests {
         });
         let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
 
-        let lines = quote_lines(&view, &reply);
+        let lines = quote_lines(&view, &reply, 0);
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("original message"), "snippet: {text:?}");
@@ -2233,7 +2247,7 @@ mod tests {
         });
         let view = ConversationView::from_messages(vec![reply.clone()], HashSet::new());
 
-        let lines = quote_lines(&view, &reply);
+        let lines = quote_lines(&view, &reply, 0);
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, ">reply");
@@ -2263,7 +2277,7 @@ mod tests {
         });
 
         let before = ConversationView::from_messages(vec![reply.clone()], HashSet::new());
-        let before_text: String = quote_lines(&before, &reply)[0]
+        let before_text: String = quote_lines(&before, &reply, 0)[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -2278,7 +2292,7 @@ mod tests {
             }),
         );
         let after = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
-        let after_text: String = quote_lines(&after, &reply)[0]
+        let after_text: String = quote_lines(&after, &reply, 0)[0]
             .spans
             .iter()
             .map(|s| s.content.as_ref())
@@ -2303,7 +2317,7 @@ mod tests {
             }),
         );
         let view = ConversationView::from_messages(vec![message.clone()], HashSet::new());
-        assert!(quote_lines(&view, &message).is_empty());
+        assert!(quote_lines(&view, &message, 0).is_empty());
     }
 
     /// #210: TDLib documents `MessageReplyToMessage.chat_id` as "may be 0 if
@@ -2337,9 +2351,60 @@ mod tests {
         });
         let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
 
-        let lines = quote_lines(&view, &reply);
+        let lines = quote_lines(&view, &reply, 0);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("original message"), "snippet: {text:?}");
+    }
+
+    /// #214: a narrow pane wraps the greentext preview across multiple rows
+    /// instead of letting ratatui silently clip it — the bug report that
+    /// motivated giving `quote_lines` a `width` at all.
+    #[test]
+    fn quote_lines_wraps_a_long_preview_at_a_narrow_width() {
+        use crate::conversation::sample_message;
+        use std::collections::HashSet;
+        use tuigram_core::model::ReplyTo;
+
+        let original = sample_message(
+            1,
+            MessageContent::Text(FormattedText {
+                text: "a fairly long original message that will need to wrap".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        let mut reply = sample_message(
+            2,
+            MessageContent::Text(FormattedText {
+                text: "sure thing".to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: original.chat_id,
+            message_id: 1,
+            quote: None,
+        });
+        let view = ConversationView::from_messages(vec![original, reply.clone()], HashSet::new());
+
+        let lines = quote_lines(&view, &reply, 10);
+        assert!(
+            lines.len() > 1,
+            "expected the preview to wrap across multiple rows, got {}",
+            lines.len()
+        );
+        // Nothing is dropped — every wrapped row's content, joined back
+        // together, reconstructs the original unwrapped preview text.
+        let unwrapped: String = quote_lines(&view, &reply, 0)[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        let rewrapped: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(rewrapped, unwrapped);
     }
 
     #[test]
@@ -3430,7 +3495,7 @@ mod tests {
         // The bottom-anchoring walk (#158) sums `ConversationView::message_height`;
         // this guards it against drifting from what `message_lines` actually renders —
         // the two are a single source split across the view model and the renderer.
-        use tuigram_core::model::{FileRef, Photo, ReactionKind};
+        use tuigram_core::model::{FileRef, Photo, ReactionKind, ReplyTo};
 
         let mut reacted = text_message(4, "nice");
         reacted.reactions = vec![Reaction {
@@ -3450,11 +3515,21 @@ mod tests {
                 height: 0,
             }),
         );
+        // A reply (#210/#214): its greentext preview line is another row
+        // `message_height` must count, on top of the header/body/separator —
+        // the gap this drift guard is here to catch.
+        let mut replying = text_message(5, "sure thing");
+        replying.reply_to = Some(ReplyTo::Message {
+            chat_id: replying.chat_id,
+            message_id: 1,
+            quote: None,
+        });
         let messages = vec![
             text_message(1, "single line"),
             text_message(2, "line one\nline two\nline three"),
             photo,
             reacted,
+            replying,
         ];
         // One pin (height-neutral) and an active download that adds a progress line.
         let mut view = ConversationView::from_messages(messages, HashSet::from([1]));
