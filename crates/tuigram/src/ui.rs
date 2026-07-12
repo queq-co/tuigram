@@ -101,17 +101,24 @@ impl PaneLayout {
 /// layout is defined: [`ui`] renders into these rects and the loop records the same
 /// ones on `App` (via [`RenderOutput`]) for mouse hit-testing, so what was drawn and
 /// what is hit-tested can never drift.
-pub fn pane_layout(area: Rect, composer_text: &str) -> PaneLayout {
+///
+/// `chat_list_collapsed` (#213) zeroes the list column so the conversation side
+/// takes the full width; `Rect::contains` on a zero-area rect is always `false`,
+/// so mouse hit-testing and rendering into that rect both fall out for free —
+/// no separate handling needed elsewhere.
+pub fn pane_layout(area: Rect, composer_text: &str, chat_list_collapsed: bool) -> PaneLayout {
     // Outer split: the three panes over a one-row status bar pinned to the bottom.
     let [content_area, status] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(area);
 
     // Content split: chat list | conversation (fills the rest).
-    let [list, convo_area] = Layout::horizontal([
-        Constraint::Percentage(CHAT_LIST_PERCENT),
-        Constraint::Min(0),
-    ])
-    .areas(content_area);
+    let list_constraint = if chat_list_collapsed {
+        Constraint::Length(0)
+    } else {
+        Constraint::Percentage(CHAT_LIST_PERCENT)
+    };
+    let [list, convo_area] =
+        Layout::horizontal([list_constraint, Constraint::Min(0)]).areas(content_area);
 
     // Conversation split: message history over the composer, whose height
     // grows with its draft's wrapped row count (1..=MAX_COMPOSER_ROWS) plus
@@ -233,7 +240,11 @@ pub struct RenderOutput {
 /// Render the whole UI for one frame from the current `App` state, returning what
 /// the loop records back onto `App` (see [`RenderOutput`]).
 pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
-    let panes = pane_layout(frame.area(), app.composer().text());
+    let panes = pane_layout(
+        frame.area(),
+        app.composer().text(),
+        app.chat_list_collapsed(),
+    );
 
     let chat_rows = render_chat_list(frame, panes.list, app);
     let history_rows = render_conversation(frame, panes.history, app);
@@ -2087,7 +2098,7 @@ mod tests {
         // The same 80×24 geometry the skeleton renders at, so this exercises the
         // exact rects `ui` draws into. A point lands in the pane whose rect holds
         // it; the status strip and out-of-bounds are not focus targets (#161).
-        let panes = pane_layout(Rect::new(0, 0, 80, 24), "");
+        let panes = pane_layout(Rect::new(0, 0, 80, 24), "", false);
         // Chat list is the left column.
         assert_eq!(panes.focus_at(1, 1), Some(Focus::ChatList));
         // History fills the right column above the composer.
@@ -2101,33 +2112,67 @@ mod tests {
     }
 
     #[test]
+    fn pane_layout_collapses_the_chat_list_to_zero_width() {
+        // #213: collapsing zeroes the list column; the conversation side's
+        // `Constraint::Min(0)` absorbs the freed width, so history alone now
+        // spans the full content width.
+        let expanded = pane_layout(Rect::new(0, 0, 80, 24), "", false);
+        let collapsed = pane_layout(Rect::new(0, 0, 80, 24), "", true);
+
+        assert_eq!(collapsed.list.width, 0);
+        assert_eq!(collapsed.history.x, 0);
+        assert_eq!(
+            collapsed.history.width,
+            expanded.list.width + expanded.history.width
+        );
+        // Composer/status geometry is untouched by the horizontal split.
+        assert_eq!(collapsed.composer.height, expanded.composer.height);
+        assert_eq!(collapsed.status, expanded.status);
+    }
+
+    #[test]
+    fn pane_layout_hit_tests_route_around_the_collapsed_chat_list() {
+        // Same point that hit the chat list when expanded (#213) now falls
+        // inside history, which has grown to cover that column; nothing
+        // resolves to `ChatList` while collapsed.
+        let panes = pane_layout(Rect::new(0, 0, 80, 24), "", true);
+        assert_eq!(panes.focus_at(1, 1), Some(Focus::History));
+        assert_ne!(panes.focus_at(1, 1), Some(Focus::ChatList));
+    }
+
+    #[test]
     fn composer_height_grows_with_wrapped_rows_up_to_the_cap() {
         // A drift-guard against `wrap::layout_rows`, mirroring `content_rows`'s
         // own drift-guard tests: each expected row count is computed
         // independently (a hard-broken run of exactly `width` chars per row,
         // per `wrap.rs`'s own tests) rather than re-deriving `pane_layout`'s math.
-        let width = pane_layout(Rect::new(0, 0, 80, 24), "").composer.width as usize - 2;
+        let width = pane_layout(Rect::new(0, 0, 80, 24), "", false)
+            .composer
+            .width as usize
+            - 2;
         let row = "x".repeat(width);
 
         assert_eq!(
-            pane_layout(Rect::new(0, 0, 80, 24), "hi").composer.height,
+            pane_layout(Rect::new(0, 0, 80, 24), "hi", false)
+                .composer
+                .height,
             3
         );
         assert_eq!(
-            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(3))
+            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(3), false)
                 .composer
                 .height,
             5
         );
         assert_eq!(
-            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(5))
+            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(5), false)
                 .composer
                 .height,
             7
         );
         // Capped at MAX_COMPOSER_ROWS: far beyond it, height stops growing.
         assert_eq!(
-            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(8))
+            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(8), false)
                 .composer
                 .height,
             7
@@ -3460,7 +3505,10 @@ mod tests {
     fn a_long_draft_wraps_and_grows_the_composer_up_to_the_cap() {
         // A draft wider than the pane wraps onto more than one row; the
         // composer pane grows to fit it (#215).
-        let width = pane_layout(Rect::new(0, 0, 80, 24), "").composer.width as usize - 2;
+        let width = pane_layout(Rect::new(0, 0, 80, 24), "", false)
+            .composer
+            .width as usize
+            - 2;
         let composer = typed_composer(&"x".repeat(width * 3));
         let output = render_output(&App::with_composer(composer), 80, 24);
         assert_eq!(output.panes.composer.height, 5); // 3 rows + 2 border

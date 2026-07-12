@@ -877,10 +877,24 @@ mod tests {
 
     #[test]
     fn log_file_path_sits_beside_the_database_directory() {
-        assert_eq!(log_file_path("/tmp/db"), "/tmp/tdlib.log");
+        // Expected values are built through the same `Path::join`, not a
+        // hardcoded `/`-joined literal: `PathBuf`'s `Display` renders with the
+        // platform's native separator (`\` on Windows), so a literal forward
+        // slash here would mismatch off this crate's own output on Windows
+        // even though the path is otherwise correct.
+        let expect = |dir: &str| {
+            std::path::Path::new(dir)
+                .parent()
+                .unwrap()
+                .join("tdlib.log")
+        };
+        assert_eq!(
+            log_file_path("/tmp/db"),
+            expect("/tmp/db").to_string_lossy()
+        );
         assert_eq!(
             log_file_path("/home/user/.local/share/tuigram/database"),
-            "/home/user/.local/share/tuigram/tdlib.log"
+            expect("/home/user/.local/share/tuigram/database").to_string_lossy()
         );
     }
 
@@ -946,10 +960,17 @@ mod tests {
 
         // Logging is silenced before the very first request — ahead of any
         // credential, including the api_id/api_hash in setTdlibParameters.
+        // The expected log path is built via `log_file_path` itself (already
+        // covered on its own by `log_file_path_sits_beside_the_database_directory`)
+        // rather than a hardcoded `/`-joined literal, so this assertion isn't
+        // sensitive to the platform's native path separator.
         assert_eq!(
             client.calls(),
             vec![
-                "set_log_stream(/tmp/tdlib.log)".to_owned(),
+                format!(
+                    "set_log_stream({})",
+                    log_file_path(&params().database_directory)
+                ),
                 "set_log_verbosity_level(1)".to_owned(),
                 "set_tdlib_parameters(api_id=42)".to_owned(),
                 "set_phone_number(+15551234567)".to_owned(),
