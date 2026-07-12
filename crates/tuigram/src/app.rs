@@ -120,10 +120,17 @@ pub enum Action {
     /// same thing here (see [`ConversationView::select_message`]), so this also
     /// brings the clicked message to the top of the pane, same as the wheel does.
     SelectMessageAt(i64),
-    /// Move the composer cursor to a character index and focus the composer (a
-    /// mouse click on the composer line) — the click-equivalent of tabbing into
-    /// the composer and pressing Left/Right/Home/End to land the cursor there.
-    ComposerClickAt(usize),
+    /// Move the composer cursor to the char index at this visual row/terminal
+    /// cell column and focus the composer (a mouse click on the composer,
+    /// #215) — the click-equivalent of tabbing into the composer and
+    /// pressing Left/Right/Up/Down/Home/End to land the cursor there.
+    ComposerClickAt {
+        /// Visual row within the composer's wrapped text, clamped to the
+        /// last row.
+        row: usize,
+        /// Terminal cell column within that row.
+        col: usize,
+    },
     /// Select and confirm the row at this index in the open modal list overlay —
     /// search results, forward targets, the reaction palette, or contact
     /// results (a mouse click on that overlay's row, #217). Resolved against
@@ -171,10 +178,19 @@ pub enum Action {
     ComposerLeft,
     /// Move the composer cursor one character right.
     ComposerRight,
-    /// Move the composer cursor to the start of the line.
+    /// Move the composer cursor to the start of the current logical line.
     ComposerHome,
-    /// Move the composer cursor to the end of the line.
+    /// Move the composer cursor to the end of the current logical line.
     ComposerEnd,
+    /// Move the composer cursor up one visual (wrapped) row, preserving its
+    /// horizontal position (#215). A no-op on the first visual row.
+    ComposerUp,
+    /// Move the composer cursor down one visual (wrapped) row, preserving its
+    /// horizontal position (#215). A no-op on the last visual row.
+    ComposerDown,
+    /// Insert a literal newline at the composer cursor (Alt-Enter, and
+    /// Shift-Enter where the terminal reports it, #215) — Enter still sends.
+    ComposerNewline,
     /// Send the composer's buffer (a no-op when it is empty). The text is routed
     /// to core in Phase 6; for now the buffer is just consumed.
     ComposerSubmit,
@@ -1329,10 +1345,11 @@ impl App {
     /// (`OpenChat`); a hit on an actual history row selects that message
     /// (`SelectMessageAt`) — both looked up from the row maps the last render
     /// recorded ([`ChatRows`](crate::ui::ChatRows), [`HistoryRows`](crate::ui::HistoryRows)).
-    /// A hit in the composer places the cursor at the clicked column
-    /// (`ComposerClickAt`) — the composer's rect always passed `focus_at`'s
-    /// containment check, so the column is already known to be inside it; the
-    /// text starts one column past the left border (`Block::bordered()`).
+    /// A hit in the composer places the cursor at the clicked visual row/column
+    /// (`ComposerClickAt`, #215) — the composer's rect always passed
+    /// `focus_at`'s containment check, so the position is already known to be
+    /// inside it; the text starts one column/row past the border
+    /// (`Block::bordered()`).
     /// A chat-list/history click with no row under it (empty list/history space
     /// below the last row) falls back to #161's plain focus-only click; outside
     /// any pane is `Noop`. Pure, like [`on_mouse`](Self::on_mouse).
@@ -1348,10 +1365,22 @@ impl App {
                 .map_or(Action::SetFocus(Focus::History), Action::SelectMessageAt),
             Some(Focus::Composer) => {
                 let inner_x = self.pane_layout.composer.x + 1;
-                Action::ComposerClickAt(column.saturating_sub(inner_x) as usize)
+                let inner_y = self.pane_layout.composer.y + 1;
+                Action::ComposerClickAt {
+                    row: row.saturating_sub(inner_y) as usize,
+                    col: column.saturating_sub(inner_x) as usize,
+                }
             }
             None => Action::Noop,
         }
+    }
+
+    /// The composer's current inner (border-excluded) width in display
+    /// columns, from the last render's recorded pane rect (#215) — the same
+    /// rect [`on_click`](Self::on_click) already reads, so a click and a
+    /// keyboard vertical move always agree on wrapping.
+    fn composer_inner_width(&self) -> usize {
+        self.pane_layout.composer.width.saturating_sub(2).max(1) as usize
     }
 
     /// A left-click's action while a modal list overlay is open: a hit on an
@@ -1420,9 +1449,10 @@ impl App {
                 self.focus = Focus::History;
                 self.dirty = true;
             }
-            Action::ComposerClickAt(index) => {
+            Action::ComposerClickAt { row, col } => {
                 self.focus = Focus::Composer;
-                self.composer.set_cursor(index);
+                let width = self.composer_inner_width();
+                self.composer.set_cursor_at_row_col(row, col, width);
                 self.dirty = true;
             }
             Action::OverlayRowClick(index) => match self.overlay {
@@ -1552,6 +1582,21 @@ impl App {
             }
             Action::ComposerEnd => {
                 self.composer.move_end();
+                self.dirty = true;
+            }
+            Action::ComposerUp => {
+                let width = self.composer_inner_width();
+                self.composer.move_up(width);
+                self.dirty = true;
+            }
+            Action::ComposerDown => {
+                let width = self.composer_inner_width();
+                self.composer.move_down(width);
+                self.dirty = true;
+            }
+            Action::ComposerNewline => {
+                self.composer.insert('\n');
+                self.wants_typing_ping = true;
                 self.dirty = true;
             }
             Action::ComposerSubmit => {
@@ -2215,9 +2260,10 @@ mod tests {
     /// composer: rows 20..22; status: row 23.
     fn app_with_panes() -> App {
         let mut app = App::new();
-        app.set_pane_layout(crate::ui::pane_layout(ratatui::layout::Rect::new(
-            0, 0, 80, 24,
-        )));
+        app.set_pane_layout(crate::ui::pane_layout(
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+            app.composer().text(),
+        ));
         app
     }
 
@@ -2238,7 +2284,7 @@ mod tests {
         // focus one (#217) — dispatching it still focuses the pane, with the
         // cursor landed at the clicked column too.
         let composer_click = app.on_terminal_event(mouse(LEFT_CLICK, 50, 21));
-        assert!(matches!(composer_click, Action::ComposerClickAt(_)));
+        assert!(matches!(composer_click, Action::ComposerClickAt { .. }));
         app.dispatch(composer_click);
         assert_eq!(app.focus(), Focus::Composer);
     }
@@ -2433,14 +2479,14 @@ mod tests {
 
         // The composer's inner text starts one column past its left border
         // (`Block::bordered()`); its inner row is one row past its top border.
-        let panes = crate::ui::pane_layout(ratatui::layout::Rect::new(0, 0, 80, 24));
+        let panes = crate::ui::pane_layout(ratatui::layout::Rect::new(0, 0, 80, 24), "hello world");
         let inner_x = panes.composer.x + 1;
         let row = panes.composer.y + 1;
 
         // Click 3 columns into "hello world" — the cursor should land between
         // the "hel" and "lo world" it split, i.e. character index 3.
         let action = app.on_terminal_event(mouse(LEFT_CLICK, inner_x + 3, row));
-        assert_eq!(action, Action::ComposerClickAt(3));
+        assert_eq!(action, Action::ComposerClickAt { row: 0, col: 3 });
 
         app.dispatch(action);
         assert_eq!(app.focus(), Focus::Composer, "click focuses the composer");
@@ -2651,8 +2697,95 @@ mod tests {
         assert_eq!(mapped(KeyCode::Home), Action::ComposerHome);
         assert_eq!(mapped(KeyCode::End), Action::ComposerEnd);
         assert_eq!(mapped(KeyCode::Esc), Action::ComposerCancel);
+        assert_eq!(mapped(KeyCode::Up), Action::ComposerUp);
+        assert_eq!(mapped(KeyCode::Down), Action::ComposerDown);
         // An unbound printable key inserts rather than running a command.
         assert_eq!(mapped(KeyCode::Char('q')), Action::ComposerInput('q'));
+
+        // Alt-Enter (and Shift-Enter, best-effort where the terminal reports
+        // it) insert a newline instead of submitting (#215).
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Enter, KeyModifiers::ALT)),
+            Action::ComposerNewline
+        );
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Action::ComposerNewline
+        );
+        // Plain Enter still sends.
+        assert_eq!(mapped(KeyCode::Enter), Action::ComposerSubmit);
+    }
+
+    #[test]
+    fn composer_newline_action_inserts_a_literal_newline_without_submitting() {
+        let mut app = App::new();
+        app.dispatch(Action::ComposerInput('a'));
+        app.dispatch(Action::ComposerNewline);
+        app.dispatch(Action::ComposerInput('b'));
+        assert_eq!(app.composer().text(), "a\nb");
+        // A newline is not a submit — nothing queued to send.
+        assert_eq!(app.take_outbound(), None);
+    }
+
+    #[test]
+    fn composer_up_and_down_actions_round_trip_across_a_wrapped_row() {
+        let mut app = App::new();
+        app.dispatch(Action::SetFocus(Focus::Composer));
+        render_and_record(&mut app);
+
+        // A full first row (real newline, not a wrap seam, so the row split
+        // is unambiguous) followed by a short second row.
+        let width = app.composer_inner_width();
+        let draft = format!("{}\nab", "x".repeat(width));
+        for c in draft.chars() {
+            app.dispatch(Action::ComposerInput(c));
+        }
+        let end_cursor = app.composer().cursor();
+
+        app.dispatch(Action::ComposerUp);
+        assert_ne!(
+            app.composer().cursor(),
+            end_cursor,
+            "moved off the last row"
+        );
+
+        app.dispatch(Action::ComposerDown);
+        assert_eq!(
+            app.composer().cursor(),
+            end_cursor,
+            "the remembered goal column returns to the same spot"
+        );
+    }
+
+    #[test]
+    fn left_click_on_a_wrapped_composer_row_moves_the_cursor_there() {
+        let width = crate::ui::pane_layout(ratatui::layout::Rect::new(0, 0, 80, 24), "")
+            .composer
+            .width as usize
+            - 2;
+        let mut composer = Composer::default();
+        for c in format!("{}\nab", "x".repeat(width)).chars() {
+            composer.insert(c);
+        }
+        let mut app = App::with_composer(composer);
+        render_and_record(&mut app);
+
+        let panes = app.pane_layout();
+        let inner_x = panes.composer.x + 1;
+        let inner_y = panes.composer.y + 1;
+
+        // Click on the second visual row, 1 column into "ab".
+        let action = app.on_terminal_event(mouse(LEFT_CLICK, inner_x + 1, inner_y + 1));
+        assert_eq!(action, Action::ComposerClickAt { row: 1, col: 1 });
+
+        app.dispatch(action);
+        assert_eq!(app.focus(), Focus::Composer);
+        // Cursor lands between 'a' and 'b' on the second (short) row, not
+        // wherever character index 1 would fall in the flat buffer.
+        assert_eq!(
+            app.composer().text().chars().nth(app.composer().cursor()),
+            Some('b')
+        );
     }
 
     #[test]

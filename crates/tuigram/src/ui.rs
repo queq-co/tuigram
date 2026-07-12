@@ -40,8 +40,16 @@ use crate::status::NoticeLevel;
 /// percentage keeps the skeleton responsive across terminal sizes.)
 const CHAT_LIST_PERCENT: u16 = 30;
 
-/// Composer height in rows: one input line framed by a border.
+/// The composer's height at its 1-row floor (an empty or single-row buffer):
+/// one input line framed by a border. [`pane_layout`] computes the composer's
+/// actual height dynamically, up to [`MAX_COMPOSER_ROWS`] (#215) — this is
+/// only the fixed baseline tests render against with an empty composer.
+#[cfg(test)]
 const COMPOSER_HEIGHT: u16 = 3;
+
+/// The composer's growth cap, in visual rows of text (#215): beyond this,
+/// the pane stops growing and scrolls internally instead.
+const MAX_COMPOSER_ROWS: u16 = 5;
 
 /// Status-bar height in rows: a single strip across the bottom (#88).
 const STATUS_HEIGHT: u16 = 1;
@@ -93,7 +101,7 @@ impl PaneLayout {
 /// layout is defined: [`ui`] renders into these rects and the loop records the same
 /// ones on `App` (via [`RenderOutput`]) for mouse hit-testing, so what was drawn and
 /// what is hit-tested can never drift.
-pub fn pane_layout(area: Rect) -> PaneLayout {
+pub fn pane_layout(area: Rect, composer_text: &str) -> PaneLayout {
     // Outer split: the three panes over a one-row status bar pinned to the bottom.
     let [content_area, status] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(STATUS_HEIGHT)]).areas(area);
@@ -105,9 +113,18 @@ pub fn pane_layout(area: Rect) -> PaneLayout {
     ])
     .areas(content_area);
 
-    // Conversation split: message history over a fixed composer line.
+    // Conversation split: message history over the composer, whose height
+    // grows with its draft's wrapped row count (1..=MAX_COMPOSER_ROWS) plus
+    // its 2-row border (#215) — computed here, synchronously, since the
+    // composer's width (== convo_area's width) is already fixed by the
+    // horizontal split above, before this vertical split runs.
+    let composer_width = convo_area.width.saturating_sub(2).max(1) as usize;
+    let composer_rows = crate::wrap::layout_rows(composer_text, composer_width)
+        .len()
+        .clamp(1, MAX_COMPOSER_ROWS as usize) as u16;
+    let composer_height = composer_rows + 2;
     let [history, composer] =
-        Layout::vertical([Constraint::Min(0), Constraint::Length(COMPOSER_HEIGHT)])
+        Layout::vertical([Constraint::Min(0), Constraint::Length(composer_height)])
             .areas(convo_area);
 
     PaneLayout {
@@ -216,7 +233,7 @@ pub struct RenderOutput {
 /// Render the whole UI for one frame from the current `App` state, returning what
 /// the loop records back onto `App` (see [`RenderOutput`]).
 pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
-    let panes = pane_layout(frame.area());
+    let panes = pane_layout(frame.area(), app.composer().text());
 
     let chat_rows = render_chat_list(frame, panes.list, app);
     let history_rows = render_conversation(frame, panes.history, app);
@@ -1322,15 +1339,63 @@ fn render_composer(frame: &mut Frame, area: Rect, app: &App) {
         app.focus() == Focus::Composer,
     );
 
-    let line = if composer.is_empty() {
-        Line::from(Span::styled(
+    if composer.is_empty() {
+        let line = Line::from(Span::styled(
             COMPOSER_PLACEHOLDER,
             Style::new().add_modifier(Modifier::DIM),
-        ))
-    } else {
-        input_line(composer.text(), composer.cursor())
-    };
-    frame.render_widget(Paragraph::new(line).block(block), area);
+        ));
+        frame.render_widget(Paragraph::new(line).block(block), area);
+        return;
+    }
+
+    let inner = block.inner(area);
+    let width = inner.width as usize;
+    let text = composer.text();
+    let cursor_byte = composer.cursor_byte();
+    let rows = crate::wrap::layout_rows(text, width);
+    let cursor_row = crate::wrap::row_of(&rows, cursor_byte);
+    let lines = composer_lines(text, &rows, cursor_byte, cursor_row);
+    let scroll = composer_scroll(rows.len(), inner.height as usize, cursor_row);
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+}
+
+/// Multi-row counterpart of [`input_line`] for the composer (#215): one
+/// [`Line`] per row in `rows` (already laid out by
+/// [`crate::wrap::layout_rows`]), with the reverse-video cursor cell placed
+/// in `cursor_row`. Never used by the single-line fields `input_line` still
+/// serves (search/login/mediaform/settingsform/contact_picker) — those are
+/// unaffected by this addition.
+fn composer_lines(
+    text: &str,
+    rows: &[crate::wrap::Row],
+    cursor_byte: usize,
+    cursor_row: usize,
+) -> Vec<Line<'static>> {
+    rows.iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let row_text = &text[row.start..row.end];
+            if i == cursor_row {
+                let row_cursor = row_text[..cursor_byte - row.start].chars().count();
+                input_line(row_text, row_cursor)
+            } else {
+                Line::from(row_text.to_owned())
+            }
+        })
+        .collect()
+}
+
+/// The first visible row that keeps `cursor_row` in view (#215): `0` while
+/// everything fits (`total_rows <= visible_rows`), otherwise just enough
+/// forward scroll that `cursor_row` becomes the last visible row. A pure
+/// function of the three counts — no persisted scroll state, so it's always
+/// exactly in sync with wherever the cursor moved to this render.
+fn composer_scroll(total_rows: usize, visible_rows: usize, cursor_row: usize) -> u16 {
+    if visible_rows == 0 || total_rows <= visible_rows {
+        return 0;
+    }
+    let max_scroll = total_rows - visible_rows;
+    cursor_row.saturating_sub(visible_rows - 1).min(max_scroll) as u16
 }
 
 /// The composer's border title, doubling as the mode indicator: a plain label when
@@ -2022,7 +2087,7 @@ mod tests {
         // The same 80×24 geometry the skeleton renders at, so this exercises the
         // exact rects `ui` draws into. A point lands in the pane whose rect holds
         // it; the status strip and out-of-bounds are not focus targets (#161).
-        let panes = pane_layout(Rect::new(0, 0, 80, 24));
+        let panes = pane_layout(Rect::new(0, 0, 80, 24), "");
         // Chat list is the left column.
         assert_eq!(panes.focus_at(1, 1), Some(Focus::ChatList));
         // History fills the right column above the composer.
@@ -2033,6 +2098,40 @@ mod tests {
         assert_eq!(panes.focus_at(0, panes.status.y), None);
         // A point past the right edge hits nothing.
         assert_eq!(panes.focus_at(80, 0), None);
+    }
+
+    #[test]
+    fn composer_height_grows_with_wrapped_rows_up_to_the_cap() {
+        // A drift-guard against `wrap::layout_rows`, mirroring `content_rows`'s
+        // own drift-guard tests: each expected row count is computed
+        // independently (a hard-broken run of exactly `width` chars per row,
+        // per `wrap.rs`'s own tests) rather than re-deriving `pane_layout`'s math.
+        let width = pane_layout(Rect::new(0, 0, 80, 24), "").composer.width as usize - 2;
+        let row = "x".repeat(width);
+
+        assert_eq!(
+            pane_layout(Rect::new(0, 0, 80, 24), "hi").composer.height,
+            3
+        );
+        assert_eq!(
+            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(3))
+                .composer
+                .height,
+            5
+        );
+        assert_eq!(
+            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(5))
+                .composer
+                .height,
+            7
+        );
+        // Capped at MAX_COMPOSER_ROWS: far beyond it, height stops growing.
+        assert_eq!(
+            pane_layout(Rect::new(0, 0, 80, 24), &row.repeat(8))
+                .composer
+                .height,
+            7
+        );
     }
 
     #[test]
@@ -3355,6 +3454,40 @@ mod tests {
             cursor_symbol(&buffer).is_some(),
             "cursor on the prefilled text"
         );
+    }
+
+    #[test]
+    fn a_long_draft_wraps_and_grows_the_composer_up_to_the_cap() {
+        // A draft wider than the pane wraps onto more than one row; the
+        // composer pane grows to fit it (#215).
+        let width = pane_layout(Rect::new(0, 0, 80, 24), "").composer.width as usize - 2;
+        let composer = typed_composer(&"x".repeat(width * 3));
+        let output = render_output(&App::with_composer(composer), 80, 24);
+        assert_eq!(output.panes.composer.height, 5); // 3 rows + 2 border
+    }
+
+    #[test]
+    fn a_draft_past_the_row_cap_scrolls_internally_keeping_the_cursor_in_view() {
+        // 8 short logical lines, well under the row cap's width but over its
+        // row count — the cursor (typed to the end) should stay in view by
+        // scrolling the earlier lines out, not by growing past the cap.
+        let lines: Vec<String> = (0..8).map(|i| format!("line{i}")).collect();
+        let composer = typed_composer(&lines.join("\n"));
+        let output = render_output(&App::with_composer(composer.clone()), 80, 24);
+        assert_eq!(output.panes.composer.height, 7, "capped at 5 rows + border");
+
+        let text = flatten(&render(&App::with_composer(composer), 80, 24));
+        for i in 0..3 {
+            let line = format!("line{i}");
+            assert!(
+                !text.contains(&line),
+                "{line} should have scrolled out of view"
+            );
+        }
+        for i in 3..8 {
+            let line = format!("line{i}");
+            assert!(text.contains(&line), "{line} should still be visible");
+        }
     }
 
     // --- search & forward overlays (#84) ---

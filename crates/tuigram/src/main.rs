@@ -339,19 +339,33 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // implementations don't reliably clear previously-painted pixels
             // even when ratatui rewrites the underlying cell, since those
             // protocols paint raw pixels with no cell-level linkage (unlike
-            // Kitty's unicode-placeholder trick). A real `clear()` (`ClearType::All`
-            // + resetting ratatui's own back-buffer, the same thing ratatui
-            // already does internally on a resize) is the standard workaround
+            // Kitty's unicode-placeholder trick). A real clear (`ClearType::All`
+            // + resetting ratatui's own back-buffer) is the standard workaround
             // for that class of issue, but isn't guaranteed on every terminal
             // (e.g. Contour+Sixel is reported not to clear even then) — this
             // is a best-effort mitigation pending real-terminal confirmation,
             // not a verified fix.
+            //
+            // Forced via `resize()` to the current size, not `Terminal::clear()`
+            // (#234 hotfix): `clear()` snapshots the cursor position first via a
+            // blocking DSR query (`ESC[6n`, crossterm's `cursor::position()`),
+            // which reads the terminal's reply from stdin — the same stdin our
+            // `EventStream` is concurrently draining in the background. Under
+            // active input (scrolling generates a steady stream of key/mouse
+            // events) that reader reliably wins the race and steals the DSR
+            // reply, so `position()` times out and `clear()` returns a fatal
+            // `io::Error` ("cursor position could not be read"), crashing the
+            // whole app via `?`. `resize()` to an unchanged size performs the
+            // exact same clear + back-buffer-reset ratatui's own resize path
+            // does internally (see `clear_viewport`) but never touches cursor
+            // position, so it can't race the event reader.
             if should_clear_for_graphics(
                 app.graphics_active(),
                 history.open != last_open_chat,
                 app.overlay() != last_overlay,
             ) {
-                guard.terminal_mut().clear()?;
+                let area = guard.terminal_mut().size()?.into();
+                guard.terminal_mut().resize(area)?;
             }
             last_open_chat = history.open;
             last_overlay = app.overlay();

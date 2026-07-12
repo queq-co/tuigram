@@ -119,6 +119,131 @@ pub(crate) fn row_count(text: &str, width: usize) -> usize {
     wrap_breaks(text, width).len()
 }
 
+/// A visual row's byte span within (possibly multi-line) text, half-open
+/// (`start..end`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Row {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Visual rows for `text` (which may contain `'\n'`) wrapped at `width`
+/// display columns — the composer's row/cursor geometry (#215), built on the
+/// same [`wrap_breaks`] the conversation pane uses so both stay in lockstep.
+///
+/// Splits on `'\n'` first, then windows each logical line's [`wrap_breaks`]
+/// output into spans the same way `ui.rs`'s `content_lines`/`text_lines`
+/// slice `line[row_start..row_end]` — the break list always starts at `0`
+/// and the last break's row extends to the line's end.
+///
+/// `width == 0` is the existing "not yet measured" sentinel (see
+/// `conversation::content_rows`): one unwrapped `Row` per logical line.
+///
+/// Always returns at least one `Row` — empty text yields a single empty row.
+pub(crate) fn layout_rows(text: &str, width: usize) -> Vec<Row> {
+    let mut rows = Vec::new();
+    let mut line_start = 0usize;
+    for line in text.split('\n') {
+        if width == 0 {
+            rows.push(Row {
+                start: line_start,
+                end: line_start + line.len(),
+            });
+        } else {
+            let breaks = wrap_breaks(line, width);
+            for (i, &row_start) in breaks.iter().enumerate() {
+                let row_end = breaks.get(i + 1).copied().unwrap_or(line.len());
+                rows.push(Row {
+                    start: line_start + row_start,
+                    end: line_start + row_end,
+                });
+            }
+        }
+        line_start += line.len() + 1; // +1 for the '\n' consumed by split
+    }
+    rows
+}
+
+/// The index into `rows` containing byte offset `pos`.
+///
+/// Seam rule, shared by rendering and vertical navigation so they can never
+/// disagree: a position exactly at a row's `end` advances to the next row
+/// only when the two rows are contiguous (`rows[i + 1].start == rows[i].end`
+/// — a plain *wrap* seam with no literal `'\n'` consumed between them, so the
+/// text continues immediately into the next row). When a literal `'\n'` was
+/// consumed between them (`rows[i + 1].start > rows[i].end`), the position
+/// stays on row `i` — the cursor visually sits at the end of that logical
+/// line, not wrapped onto the next one. The true end of the text always
+/// belongs to the last row.
+pub(crate) fn row_of(rows: &[Row], pos: usize) -> usize {
+    let last = rows.len() - 1;
+    let mut i = 0;
+    while i < last {
+        let seamless = rows[i + 1].start == rows[i].end;
+        if pos < rows[i].end || (pos == rows[i].end && !seamless) {
+            return i;
+        }
+        i += 1;
+    }
+    last
+}
+
+/// Display-column width of `row_text[..byte_offset]`. `byte_offset` must
+/// land on a char boundary within `row_text`.
+pub(crate) fn display_col(row_text: &str, byte_offset: usize) -> usize {
+    UnicodeWidthStr::width(&row_text[..byte_offset])
+}
+
+/// The inverse of [`display_col`]: the byte offset in `row_text` whose
+/// display column is closest to `target_col` without exceeding it — snapping
+/// to the left edge of a wide character that straddles the target column.
+/// Clamped to `row_text.len()`.
+///
+/// Shared by vertical navigation (`target_col` = a remembered goal column)
+/// and mouse click (`target_col` = the clicked terminal cell column) so wide
+/// (CJK/emoji) characters resolve identically for both.
+pub(crate) fn byte_for_col(row_text: &str, target_col: usize) -> usize {
+    let mut col = 0usize;
+    for (idx, c) in row_text.char_indices() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if col + w > target_col {
+            return idx;
+        }
+        col += w;
+    }
+    row_text.len()
+}
+
+/// The absolute byte offset in `text` for `target_col` on `rows[row]`,
+/// guaranteed to resolve back to `row` under [`row_of`] (#215).
+///
+/// [`byte_for_col`] alone can return a row's raw length — landing exactly at
+/// its end — which, for a row that continues *seamlessly* (no literal
+/// `'\n'`) into `rows[row + 1]`, is the same byte value [`row_of`] assigns to
+/// that next row: [`move_up`](crate::composer::Composer::move_up)/
+/// [`move_down`](crate::composer::Composer::move_down) or a click landing
+/// there would silently resolve onto the row below instead, discarding the
+/// move (up could get permanently stuck a full-width row short of the top).
+/// This backs off to the last char boundary strictly inside the row in that
+/// one case — trading a column of precision at that exact edge for
+/// navigation that never gets stuck. Every other case (a real newline, or
+/// the true last row) is never ambiguous and is returned unchanged.
+pub(crate) fn resolve_in_row(text: &str, rows: &[Row], row: usize, target_col: usize) -> usize {
+    let span = rows[row];
+    let row_text = &text[span.start..span.end];
+    let offset = byte_for_col(row_text, target_col);
+    let seamless_next = rows.get(row + 1).is_some_and(|next| next.start == span.end);
+    let offset = if seamless_next && offset == row_text.len() {
+        row_text
+            .char_indices()
+            .last()
+            .map_or(offset, |(prev, _)| prev)
+    } else {
+        offset
+    };
+    span.start + offset
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +310,152 @@ mod tests {
         // to fit on one row.
         assert_eq!(row_count("😀😀😀", 6), 1);
         assert_eq!(row_count("😀😀😀", 5), 2);
+    }
+
+    #[test]
+    fn layout_rows_of_empty_text_is_a_single_empty_row() {
+        assert_eq!(layout_rows("", 10), vec![Row { start: 0, end: 0 }]);
+    }
+
+    #[test]
+    fn layout_rows_splits_on_newlines_before_wrapping_each_line() {
+        let rows = layout_rows("ab\ncd", 10);
+        assert_eq!(
+            rows,
+            vec![Row { start: 0, end: 2 }, Row { start: 3, end: 5 }]
+        );
+    }
+
+    #[test]
+    fn layout_rows_wraps_a_long_line_into_contiguous_rows() {
+        // "abcde" at width 3 wraps into "abc" | "de" — contiguous, no gap.
+        let rows = layout_rows("abcde", 3);
+        assert_eq!(
+            rows,
+            vec![Row { start: 0, end: 3 }, Row { start: 3, end: 5 }]
+        );
+    }
+
+    #[test]
+    fn layout_rows_width_zero_is_one_unwrapped_row_per_logical_line() {
+        let rows = layout_rows("hello world\nfoo", 0);
+        assert_eq!(
+            rows,
+            vec![Row { start: 0, end: 11 }, Row { start: 12, end: 15 },]
+        );
+    }
+
+    #[test]
+    fn row_of_a_wrap_seam_belongs_to_the_next_row() {
+        // "abcde" @ width 3 -> rows [0,3) "abc", [3,5) "de", contiguous.
+        let rows = layout_rows("abcde", 3);
+        assert_eq!(row_of(&rows, 2), 0); // mid-row
+        assert_eq!(row_of(&rows, 3), 1); // exactly at the seam
+        assert_eq!(row_of(&rows, 5), 1); // true end of text
+    }
+
+    #[test]
+    fn row_of_a_real_newline_seam_stays_on_the_current_row() {
+        // "ab\ncd" -> rows [0,2) "ab", [3,5) "cd" — a gap for the '\n'.
+        let rows = layout_rows("ab\ncd", 10);
+        assert_eq!(row_of(&rows, 2), 0); // right before the '\n': end of row 0
+        assert_eq!(row_of(&rows, 3), 1); // right after the '\n': start of row 1
+        assert_eq!(row_of(&rows, 5), 1); // true end of text
+    }
+
+    #[test]
+    fn row_of_a_single_row_is_always_zero() {
+        let rows = layout_rows("hi", 10);
+        assert_eq!(row_of(&rows, 0), 0);
+        assert_eq!(row_of(&rows, 2), 0);
+    }
+
+    #[test]
+    fn display_col_and_byte_for_col_round_trip_ascii() {
+        assert_eq!(display_col("hello", 3), 3);
+        assert_eq!(byte_for_col("hello", 3), 3);
+    }
+
+    #[test]
+    fn display_col_and_byte_for_col_round_trip_through_wide_emoji() {
+        // 😀 is width 2 in unicode-width and 4 bytes in UTF-8.
+        let text = "a😀b";
+        assert_eq!(display_col(text, 0), 0); // before 'a'
+        assert_eq!(display_col(text, 1), 1); // before 😀
+        assert_eq!(display_col(text, 5), 3); // before 'b' (1 + 2)
+        assert_eq!(display_col(text, 6), 4); // end of text
+
+        assert_eq!(byte_for_col(text, 0), 0);
+        assert_eq!(byte_for_col(text, 1), 1);
+        assert_eq!(byte_for_col(text, 3), 5); // exactly at 'b'
+        assert_eq!(byte_for_col(text, 4), 6); // past the end -> clamped
+    }
+
+    #[test]
+    fn byte_for_col_snaps_to_the_left_edge_of_a_straddled_wide_char() {
+        // 😀 spans columns 1-2; a target column of 2 lands inside it, so the
+        // byte offset snaps back to its start rather than splitting it.
+        let text = "a😀b";
+        assert_eq!(byte_for_col(text, 2), 1);
+    }
+
+    #[test]
+    fn display_col_and_byte_for_col_round_trip_through_wide_cjk() {
+        // 中 is width 2 and 3 bytes in UTF-8.
+        let text = "中中";
+        assert_eq!(display_col(text, 3), 2);
+        assert_eq!(byte_for_col(text, 2), 3);
+        assert_eq!(byte_for_col(text, 4), 6); // past the end -> clamped
+    }
+
+    #[test]
+    fn resolve_in_row_backs_off_a_full_width_seamless_seam_so_it_stays_on_that_row() {
+        // "abcdef" @ width 3 hard-breaks into "abc" | "def", contiguous (no
+        // '\n'). Landing at column 3 of row 0 would be byte 3 — but that's
+        // also row 1's start, so plain `byte_for_col` would put the cursor
+        // right back where `row_of` reports it as row 1, exactly the bug a
+        // repeated Up should never hit (it would look stuck).
+        let text = "abcdef";
+        let rows = layout_rows(text, 3);
+        assert_eq!(
+            rows,
+            vec![Row { start: 0, end: 3 }, Row { start: 3, end: 6 }]
+        );
+
+        let landed = resolve_in_row(text, &rows, 0, 3);
+        assert_eq!(landed, 2, "backs off one char from the ambiguous seam");
+        assert_eq!(row_of(&rows, landed), 0, "stays resolvable to row 0");
+    }
+
+    #[test]
+    fn resolve_in_row_does_not_back_off_the_true_last_row() {
+        // Row 1 here has no row after it, so landing at its full end (the
+        // true end of the text) is never ambiguous — must not be touched.
+        let text = "abcdef";
+        let rows = layout_rows(text, 3);
+        let landed = resolve_in_row(text, &rows, 1, 10); // clamps well past "def"
+        assert_eq!(landed, 6);
+        assert_eq!(row_of(&rows, landed), 1);
+    }
+
+    #[test]
+    fn resolve_in_row_does_not_back_off_a_real_newline_seam() {
+        // "ab" | "cd" separated by a literal '\n' — row 0's end is never
+        // ambiguous with row 1's start (there's a byte gap for the '\n'), so
+        // landing at its raw end is already unambiguous and untouched.
+        let text = "ab\ncd";
+        let rows = layout_rows(text, 10);
+        let landed = resolve_in_row(text, &rows, 0, 10); // clamps past "ab"
+        assert_eq!(landed, 2);
+        assert_eq!(row_of(&rows, landed), 0);
+    }
+
+    #[test]
+    fn resolve_in_row_leaves_a_short_landing_within_the_row_untouched() {
+        // A target column that lands strictly inside the row needs no
+        // adjustment at all.
+        let text = "abcdef";
+        let rows = layout_rows(text, 3);
+        assert_eq!(resolve_in_row(text, &rows, 0, 1), 1);
     }
 }
