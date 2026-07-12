@@ -492,6 +492,13 @@ const BINDINGS: &[Binding] = &[
     },
     Binding {
         context: Context::Nav,
+        trigger: Trigger::Plain(&[KeyCode::Char('b')]),
+        action: Action::ToggleChatListCollapse,
+        keys: "b",
+        description: "collapse / expand the chat-list pane",
+    },
+    Binding {
+        context: Context::Nav,
         trigger: Trigger::Plain(&[KeyCode::Char('q')]),
         action: Action::Quit,
         keys: "q",
@@ -968,6 +975,24 @@ mod tests {
         assert_eq!(
             resolved(Focus::Composer, KeyCode::Char(',')),
             Action::ComposerInput(',')
+        );
+    }
+
+    #[test]
+    fn b_toggles_the_chat_list_collapse_in_nav_panes_but_types_in_the_composer() {
+        // Nav, like `,`/`/`/`q`: works from either browsing pane, never steals
+        // the letter from a message being composed (#213).
+        assert_eq!(
+            resolved(Focus::ChatList, KeyCode::Char('b')),
+            Action::ToggleChatListCollapse
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('b')),
+            Action::ToggleChatListCollapse
+        );
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char('b')),
+            Action::ComposerInput('b')
         );
     }
 

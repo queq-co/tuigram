@@ -150,6 +150,12 @@ pub enum Action {
     NextList,
     /// Switch to the previous chat list, wrapping.
     PrevList,
+    /// Collapse the chat-list pane to zero width, or restore it (`b`, #213):
+    /// on narrow terminals the history pane can take the full width once
+    /// you're inside a conversation. Session-only for now — not persisted to
+    /// `settings.toml`. If the pane is focused when it collapses, focus moves
+    /// to the history pane, since a zero-width pane can no longer hold it.
+    ToggleChatListCollapse,
     /// Scroll the conversation history one row toward the newest (#222) —
     /// `j` / ↓ / the mouse wheel. A small, fixed step regardless of the
     /// message it crosses, unlike [`PageDown`](Action::PageDown).
@@ -417,6 +423,10 @@ pub struct App {
     /// Which pane currently receives input; drives both key resolution and the
     /// focused-pane border highlight.
     focus: Focus,
+    /// Whether the chat-list pane is collapsed to zero width (`b`, #213), so
+    /// the history pane can take the full terminal width on narrow
+    /// terminals. Session-only: not read from or written to `settings.toml`.
+    chat_list_collapsed: bool,
     /// The modal overlay drawn over the panes, if any. While set it captures input
     /// (key resolution routes to it instead of `focus`).
     overlay: Overlay,
@@ -647,6 +657,11 @@ impl App {
     /// Which pane currently has input focus, for the focused-border highlight.
     pub fn focus(&self) -> Focus {
         self.focus
+    }
+
+    /// Whether the chat-list pane is collapsed to zero width (#213).
+    pub fn chat_list_collapsed(&self) -> bool {
+        self.chat_list_collapsed
     }
 
     /// The modal overlay currently drawn over the panes (or [`Overlay::None`]).
@@ -1427,14 +1442,30 @@ impl App {
             Action::SetConnection(state) => self.set_connection(state),
             Action::FocusNext => {
                 self.focus = self.focus.next();
+                // Collapsed, the chat-list pane isn't a cycle stop (#213):
+                // step past it in the same direction.
+                if self.chat_list_collapsed && self.focus == Focus::ChatList {
+                    self.focus = self.focus.next();
+                }
                 self.dirty = true;
             }
             Action::FocusPrev => {
                 self.focus = self.focus.prev();
+                if self.chat_list_collapsed && self.focus == Focus::ChatList {
+                    self.focus = self.focus.prev();
+                }
                 self.dirty = true;
             }
             Action::SetFocus(focus) => {
                 self.focus = focus;
+                self.dirty = true;
+            }
+            Action::ToggleChatListCollapse => {
+                self.chat_list_collapsed = !self.chat_list_collapsed;
+                // The pane can't hold focus once it has zero width.
+                if self.chat_list_collapsed && self.focus == Focus::ChatList {
+                    self.focus = Focus::History;
+                }
                 self.dirty = true;
             }
             Action::OpenChat(chat_id) => {
@@ -2263,6 +2294,7 @@ mod tests {
         app.set_pane_layout(crate::ui::pane_layout(
             ratatui::layout::Rect::new(0, 0, 80, 24),
             app.composer().text(),
+            app.chat_list_collapsed(),
         ));
         app
     }
@@ -2479,7 +2511,11 @@ mod tests {
 
         // The composer's inner text starts one column past its left border
         // (`Block::bordered()`); its inner row is one row past its top border.
-        let panes = crate::ui::pane_layout(ratatui::layout::Rect::new(0, 0, 80, 24), "hello world");
+        let panes = crate::ui::pane_layout(
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+            "hello world",
+            false,
+        );
         let inner_x = panes.composer.x + 1;
         let row = panes.composer.y + 1;
 
@@ -2613,6 +2649,67 @@ mod tests {
         assert_eq!(app.focus(), Focus::ChatList, "wraps back to the start");
         app.dispatch(Action::FocusPrev);
         assert_eq!(app.focus(), Focus::Composer, "and back the other way");
+    }
+
+    #[test]
+    fn toggle_chat_list_collapse_flips_state_and_marks_dirty() {
+        let mut app = App::new();
+        assert!(!app.chat_list_collapsed());
+        app.clear_dirty();
+        app.dispatch(Action::ToggleChatListCollapse);
+        assert!(app.chat_list_collapsed());
+        assert!(app.is_dirty());
+        app.dispatch(Action::ToggleChatListCollapse);
+        assert!(!app.chat_list_collapsed());
+    }
+
+    #[test]
+    fn collapsing_the_chat_list_while_focused_moves_focus_to_history() {
+        let mut app = App::new();
+        assert_eq!(app.focus(), Focus::ChatList);
+        app.dispatch(Action::ToggleChatListCollapse);
+        assert_eq!(
+            app.focus(),
+            Focus::History,
+            "a zero-width pane can't hold focus"
+        );
+    }
+
+    #[test]
+    fn focus_next_and_prev_skip_the_collapsed_chat_list() {
+        let mut app = App::new();
+        app.dispatch(Action::ToggleChatListCollapse);
+        assert_eq!(app.focus(), Focus::History);
+
+        app.dispatch(Action::FocusNext);
+        assert_eq!(app.focus(), Focus::Composer);
+        app.dispatch(Action::FocusNext);
+        assert_eq!(
+            app.focus(),
+            Focus::History,
+            "cycles straight past ChatList back to History"
+        );
+
+        app.dispatch(Action::FocusPrev);
+        assert_eq!(app.focus(), Focus::Composer);
+        app.dispatch(Action::FocusPrev);
+        assert_eq!(app.focus(), Focus::History, "same going the other way");
+    }
+
+    #[test]
+    fn expanding_the_chat_list_restores_its_selection() {
+        let mut app = App::new();
+        app.dispatch(Action::SelectNext);
+        let selected_before = app.chat_list().selected();
+
+        app.dispatch(Action::ToggleChatListCollapse);
+        app.dispatch(Action::ToggleChatListCollapse);
+
+        assert_eq!(
+            app.chat_list().selected(),
+            selected_before,
+            "collapsing/expanding never touches chat_list's own state"
+        );
     }
 
     #[test]
@@ -2759,7 +2856,7 @@ mod tests {
 
     #[test]
     fn left_click_on_a_wrapped_composer_row_moves_the_cursor_there() {
-        let width = crate::ui::pane_layout(ratatui::layout::Rect::new(0, 0, 80, 24), "")
+        let width = crate::ui::pane_layout(ratatui::layout::Rect::new(0, 0, 80, 24), "", false)
             .composer
             .width as usize
             - 2;
