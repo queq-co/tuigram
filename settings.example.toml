@@ -34,3 +34,20 @@ keep_channels = "forever"   # broadcast channels
 # K/M/G also works), or a plain byte count ("1073741824" / "1073741824B").
 # Units are binary (1GB = 1024 MB).
 max_cache = "unbounded"
+
+# Terminal-UI behaviour.
+[interface]
+
+# Mouse support: when on (the default), clicking a pane focuses it and the mouse
+# wheel scrolls whichever pane the pointer is over. Enabling it takes over the
+# terminal's native text selection, so set this to false if you'd rather keep
+# drag-to-select (on most emulators Shift/Option-drag bypasses capture anyway).
+mouse = true
+
+# Graphics rendering: when on (the default), sender avatars and inline media
+# (photos, stickers, GIF/video stills) draw as images on a graphics-capable
+# terminal (Sixel/Kitty/iTerm2). Set this to false for a purist, text-only TUI —
+# no avatar gutter (not even the generated fallback bubble) and text
+# placeholders for media — even on a terminal that could otherwise show them.
+# Takes effect live; the in-app editor can flip it without a restart.
+graphics = true

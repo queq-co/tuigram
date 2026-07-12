@@ -16,16 +16,18 @@
 //! [`Voice`], [`Sticker`], [`Animation`]), and the **structured** types
 //! ([`Location`], [`Venue`], [`Contact`], [`Poll`]); rarer content is
 //! `Unsupported`, for follow-up issues. Message **reactions** are modeled (#51,
-//! see [`Reaction`]); forwards, replies, and service messages are out of scope
-//! for this model.
+//! see [`Reaction`]) and so are **replies** (#210, see [`ReplyTo`]); forwards
+//! and service messages are still out of scope for this model.
 
 use tdlib_rs::enums::{
     ChatAction as TdChatAction, ChatList as TdChatList, ChatType as TdChatType,
     InputFile as TdInputFile, InputMessageContent as TdInputMessageContent,
     InputMessageReplyTo as TdInputMessageReplyTo, MessageContent as TdMessageContent,
-    MessageSender as TdMessageSender, MessageSendingState as TdMessageSendingState,
-    PollType as TdPollType, ReactionType as TdReactionType, SecretChatState as TdSecretChatState,
-    TextEntityType as TdTextEntityType, UserStatus as TdUserStatus, UserType as TdUserType,
+    MessageReplyTo as TdMessageReplyTo, MessageSender as TdMessageSender,
+    MessageSendingState as TdMessageSendingState, PollType as TdPollType,
+    ReactionType as TdReactionType, SecretChatState as TdSecretChatState,
+    StickerFormat as TdStickerFormat, TextEntityType as TdTextEntityType,
+    UserStatus as TdUserStatus, UserType as TdUserType,
 };
 use tdlib_rs::types::{
     Chat as TdChat, ChatFolderInfo as TdChatFolderInfo, ChatListFolder,
@@ -257,6 +259,19 @@ impl UserKind {
     }
 }
 
+/// Decode a TDLib `Minithumbnail`'s base64 JPEG payload to raw bytes (#201,
+/// #208). Shared by every content type that carries one (`User`'s profile
+/// photo, `Video`, `Animation`) so the base64 handling lives in one place.
+/// `None` when there is no minithumbnail, or its payload fails to decode.
+fn decode_minithumbnail(thumb: Option<&tdlib_rs::types::Minithumbnail>) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    thumb.and_then(|thumb| {
+        base64::engine::general_purpose::STANDARD
+            .decode(&thumb.data)
+            .ok()
+    })
+}
+
 /// A user — tuigram's projection of TDLib's `User`, carrying what a sender line
 /// and a private-chat header need to read as a name instead of a bare id.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,6 +292,15 @@ pub struct User {
     pub kind: UserKind,
     /// Current online presence.
     pub status: Presence,
+    /// Identifier of the accent color for the user's name and header tint
+    /// (#194): TDLib's fixed built-in ids are `0..=6`; `>=7` are Telegram
+    /// Premium custom colors this crate does not resolve to an exact RGB yet.
+    pub accent_color_id: i32,
+    /// The user's profile-photo minithumbnail, decoded to raw JPEG bytes
+    /// (#201): a small inline preview TDLib delivers with the user record
+    /// itself, needing no `downloadFile` round trip. `None` when the user has
+    /// no profile photo, or has one with no minithumbnail attached.
+    pub avatar_minithumbnail: Option<Vec<u8>>,
 }
 
 impl User {
@@ -286,17 +310,28 @@ impl User {
     pub fn from_tdlib(user: &TdUser) -> Self {
         Self {
             id: user.id,
-            first_name: user.first_name.clone(),
-            last_name: user.last_name.clone(),
+            first_name: crate::sanitize::scrub_line(&user.first_name),
+            last_name: crate::sanitize::scrub_line(&user.last_name),
             usernames: user
                 .usernames
                 .as_ref()
-                .map(|u| u.active_usernames.clone())
+                .map(|u| {
+                    u.active_usernames
+                        .iter()
+                        .map(|name| crate::sanitize::scrub_line(name))
+                        .collect()
+                })
                 .unwrap_or_default(),
-            phone_number: Some(user.phone_number.clone()).filter(|p| !p.is_empty()),
+            phone_number: Some(crate::sanitize::scrub_line(&user.phone_number))
+                .filter(|p| !p.is_empty()),
             is_contact: user.is_contact,
             kind: UserKind::from_tdlib(&user.r#type),
             status: Presence::from_tdlib(&user.status),
+            accent_color_id: user.accent_color_id,
+            avatar_minithumbnail: user
+                .profile_photo
+                .as_ref()
+                .and_then(|photo| decode_minithumbnail(photo.minithumbnail.as_ref())),
         }
     }
 
@@ -744,8 +779,12 @@ impl FormattedText {
     /// Project TDLib's `FormattedText`.
     #[must_use]
     pub fn from_tdlib(text: &TdFormattedText) -> Self {
+        // Trust boundary: message bodies and captions are attacker-controlled and
+        // end up in terminal cells, so neutralize control sequences here — once,
+        // where every text/caption/poll projection funnels through. Replacing
+        // controls one-for-one keeps the entities' UTF-16 offsets aligned.
         Self {
-            text: text.text.clone(),
+            text: crate::sanitize::scrub_prose(&text.text),
             entities: text.entities.iter().map(TextEntity::from_tdlib).collect(),
         }
     }
@@ -920,6 +959,11 @@ pub struct Video {
     pub file_name: String,
     /// MIME type, as given by the sender (may be empty).
     pub mime_type: String,
+    /// The video's minithumbnail, decoded to raw JPEG bytes (#208): a small
+    /// inline preview TDLib delivers with the video itself, needing no
+    /// `downloadFile` round trip — used as the video's static still. `None`
+    /// when TDLib attached none.
+    pub minithumbnail: Option<Vec<u8>>,
 }
 
 impl Video {
@@ -932,8 +976,9 @@ impl Video {
             width: m.video.width,
             height: m.video.height,
             duration: m.video.duration,
-            file_name: m.video.file_name.clone(),
-            mime_type: m.video.mime_type.clone(),
+            file_name: crate::sanitize::scrub_line(&m.video.file_name),
+            mime_type: crate::sanitize::scrub_line(&m.video.mime_type),
+            minithumbnail: decode_minithumbnail(m.video.minithumbnail.as_ref()),
         }
     }
 }
@@ -958,8 +1003,8 @@ impl Document {
         Self {
             caption: FormattedText::from_tdlib(&m.caption),
             file: FileRef::new(m.document.document.id),
-            file_name: m.document.file_name.clone(),
-            mime_type: m.document.mime_type.clone(),
+            file_name: crate::sanitize::scrub_line(&m.document.file_name),
+            mime_type: crate::sanitize::scrub_line(&m.document.mime_type),
         }
     }
 }
@@ -991,10 +1036,10 @@ impl Audio {
             caption: FormattedText::from_tdlib(&m.caption),
             file: FileRef::new(m.audio.audio.id),
             duration: m.audio.duration,
-            title: m.audio.title.clone(),
-            performer: m.audio.performer.clone(),
-            file_name: m.audio.file_name.clone(),
-            mime_type: m.audio.mime_type.clone(),
+            title: crate::sanitize::scrub_line(&m.audio.title),
+            performer: crate::sanitize::scrub_line(&m.audio.performer),
+            file_name: crate::sanitize::scrub_line(&m.audio.file_name),
+            mime_type: crate::sanitize::scrub_line(&m.audio.mime_type),
         }
     }
 }
@@ -1020,7 +1065,7 @@ impl Voice {
             caption: FormattedText::from_tdlib(&m.caption),
             file: FileRef::new(m.voice_note.voice.id),
             duration: m.voice_note.duration,
-            mime_type: m.voice_note.mime_type.clone(),
+            mime_type: crate::sanitize::scrub_line(&m.voice_note.mime_type),
         }
     }
 }
@@ -1037,6 +1082,12 @@ pub struct Sticker {
     pub height: i32,
     /// The emoji the sticker corresponds to (may be empty if unknown).
     pub emoji: String,
+    /// Whether the sticker is a static WEBP image (#208) — `false` for the
+    /// animated TGS (Lottie vector) and WEBM (video) formats, neither of
+    /// which the `image` crate can raster-decode. Kept as a plain bool rather
+    /// than exposing TDLib's own `StickerFormat` enum, consistent with this
+    /// module's insulation from `tdlib_rs` shapes.
+    pub is_static: bool,
 }
 
 impl Sticker {
@@ -1047,7 +1098,8 @@ impl Sticker {
             file: FileRef::new(m.sticker.sticker.id),
             width: m.sticker.width,
             height: m.sticker.height,
-            emoji: m.sticker.emoji.clone(),
+            emoji: crate::sanitize::scrub_line(&m.sticker.emoji),
+            is_static: matches!(m.sticker.format, TdStickerFormat::Webp),
         }
     }
 }
@@ -1069,6 +1121,11 @@ pub struct Animation {
     pub file_name: String,
     /// MIME type, as given by the sender (e.g. `video/mp4`; may be empty).
     pub mime_type: String,
+    /// The animation's minithumbnail, decoded to raw JPEG bytes (#208): a
+    /// small inline preview TDLib delivers with the animation itself, needing
+    /// no `downloadFile` round trip — used as the animation's static still.
+    /// `None` when TDLib attached none.
+    pub minithumbnail: Option<Vec<u8>>,
 }
 
 impl Animation {
@@ -1081,8 +1138,9 @@ impl Animation {
             width: m.animation.width,
             height: m.animation.height,
             duration: m.animation.duration,
-            file_name: m.animation.file_name.clone(),
-            mime_type: m.animation.mime_type.clone(),
+            file_name: crate::sanitize::scrub_line(&m.animation.file_name),
+            mime_type: crate::sanitize::scrub_line(&m.animation.mime_type),
+            minithumbnail: decode_minithumbnail(m.animation.minithumbnail.as_ref()),
         }
     }
 }
@@ -1134,8 +1192,8 @@ impl Venue {
     pub fn from_tdlib(v: &TdVenue) -> Self {
         Self {
             location: Location::from_tdlib(&v.location),
-            title: v.title.clone(),
-            address: v.address.clone(),
+            title: crate::sanitize::scrub_line(&v.title),
+            address: crate::sanitize::scrub_line(&v.address),
         }
     }
 }
@@ -1159,9 +1217,9 @@ impl Contact {
     #[must_use]
     pub fn from_tdlib(c: &TdContact) -> Self {
         Self {
-            first_name: c.first_name.clone(),
-            last_name: c.last_name.clone(),
-            phone_number: c.phone_number.clone(),
+            first_name: crate::sanitize::scrub_line(&c.first_name),
+            last_name: crate::sanitize::scrub_line(&c.last_name),
+            phone_number: crate::sanitize::scrub_line(&c.phone_number),
             user_id: c.user_id,
         }
     }
@@ -1704,7 +1762,7 @@ impl ReactionKind {
     #[must_use]
     pub fn from_tdlib(kind: &TdReactionType) -> Self {
         match kind {
-            TdReactionType::Emoji(e) => Self::Emoji(e.emoji.clone()),
+            TdReactionType::Emoji(e) => Self::Emoji(crate::sanitize::scrub_line(&e.emoji)),
             TdReactionType::CustomEmoji(c) => Self::CustomEmoji(c.custom_emoji_id),
             TdReactionType::Paid => Self::Paid,
         }
@@ -1764,6 +1822,53 @@ pub(crate) fn reactions_from(info: Option<&TdMessageInteractionInfo>) -> Vec<Rea
         .unwrap_or_default()
 }
 
+/// What a message replies to — tuigram's projection of TDLib's
+/// `MessageReplyTo` (#210). A construction-time field like
+/// [`Message::content`]/[`Message::sender`]: TDLib has no live "reply
+/// changed" update, so unlike [`Reaction`] this needs no store-reducer fold.
+///
+/// Resolving *who* was replied to and *what they said* is deliberately not
+/// done here: it is a render-time lookup against the currently loaded
+/// history (so it naturally catches up once a history page brings the
+/// target message in, per #207's re-projection fix), not a value cached onto
+/// this projection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplyTo {
+    /// A reply to a message, possibly in another chat/topic.
+    Message {
+        /// The chat the replied-to message belongs to (may differ from this
+        /// message's own chat for a cross-chat/topic reply).
+        chat_id: i64,
+        /// The replied-to message's id.
+        message_id: i64,
+        /// The sender's manually-chosen quoted excerpt, if any (sanitized
+        /// like any other prose).
+        quote: Option<String>,
+    },
+    /// A reply to a story — out of scope to resolve or render; carried only
+    /// so the projection stays total over TDLib's enum, matching
+    /// [`MessageContent::Unsupported`]'s convention.
+    Unsupported(&'static str),
+}
+
+impl ReplyTo {
+    /// Project TDLib's `MessageReplyTo`.
+    #[must_use]
+    pub fn from_tdlib(reply: &TdMessageReplyTo) -> Self {
+        match reply {
+            TdMessageReplyTo::Message(m) => Self::Message {
+                chat_id: m.chat_id,
+                message_id: m.message_id,
+                quote: m
+                    .quote
+                    .as_ref()
+                    .map(|q| crate::sanitize::scrub_prose(&q.text.text)),
+            },
+            TdMessageReplyTo::Story(_) => Self::Unsupported("messageReplyToStory"),
+        }
+    }
+}
+
 /// A single message — tuigram's projection of TDLib's `Message`.
 ///
 /// Not `Eq`: a [`MessageContent::Location`] carries `f64` coordinates, so the
@@ -1789,6 +1894,8 @@ pub struct Message {
     /// Reactions added to the message, one bucket per reaction, in TDLib's
     /// order. Empty when the message has no reactions.
     pub reactions: Vec<Reaction>,
+    /// What this message replies to, if it is a reply (#210).
+    pub reply_to: Option<ReplyTo>,
 }
 
 impl Message {
@@ -1805,6 +1912,7 @@ impl Message {
             content: MessageContent::from_tdlib(&message.content),
             send_state: SendState::from_tdlib(message.sending_state.as_ref()),
             reactions: reactions_from(message.interaction_info.as_ref()),
+            reply_to: message.reply_to.as_ref().map(ReplyTo::from_tdlib),
         }
     }
 
@@ -1926,7 +2034,7 @@ impl Chat {
     pub fn from_tdlib(chat: &TdChat) -> Self {
         Self {
             id: chat.id,
-            title: chat.title.clone(),
+            title: crate::sanitize::scrub_line(&chat.title),
             kind: ChatKind::from_tdlib(&chat.r#type),
             last_message: chat.last_message.as_ref().map(Message::from_tdlib),
             unread_count: chat.unread_count,
@@ -2261,6 +2369,7 @@ mod tests {
                 duration: 12,
                 file_name: "clip.mp4".to_owned(),
                 mime_type: "video/mp4".to_owned(),
+                minithumbnail: None,
             })
         );
     }
@@ -2286,6 +2395,43 @@ mod tests {
                 mime_type: "application/pdf".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn text_projection_scrubs_terminal_escapes_at_the_boundary() {
+        // The seam is wired: a body with an ESC-introduced control sequence is
+        // neutralized by the projection, so the store never holds hostile bytes.
+        let content = td_text("hi\u{1b}]0;pwned\u{07}there", vec![]);
+        let MessageContent::Text(text) = MessageContent::from_tdlib(&content) else {
+            panic!("text content");
+        };
+        assert!(
+            !text.text.chars().any(|c| c.is_control() && c != '\n'),
+            "no control byte stored: {:?}",
+            text.text
+        );
+        assert_eq!(text.text, "hi\u{fffd}]0;pwned\u{fffd}there");
+    }
+
+    #[test]
+    fn document_projection_scrubs_bidi_spoofed_file_name() {
+        // A Trojan-Source file name (an override that flips `exe`/`txt`) is
+        // neutralized on projection so the stored name reads honestly.
+        let content = TdMessageContent::MessageDocument(TdMessageDocument {
+            document: tdlib_rs::types::Document {
+                file_name: "report_e\u{202e}xe.txt".to_owned(),
+                mime_type: "application/pdf".to_owned(),
+                minithumbnail: None,
+                thumbnail: None,
+                document: td_file(3),
+            },
+            caption: TdFormattedTextT::default(),
+        });
+        let MessageContent::Document(doc) = MessageContent::from_tdlib(&content) else {
+            panic!("document content");
+        };
+        assert!(!doc.file_name.contains('\u{202e}'), "override removed");
+        assert_eq!(doc.file_name, "report_e\u{fffd}xe.txt");
     }
 
     #[test]
@@ -2366,8 +2512,33 @@ mod tests {
                 width: 512,
                 height: 512,
                 emoji: "😀".to_owned(),
+                is_static: true,
             })
         );
+    }
+
+    #[test]
+    fn animated_sticker_projects_as_not_static() {
+        let content = TdMessageContent::MessageSticker(TdMessageSticker {
+            sticker: tdlib_rs::types::Sticker {
+                id: 0,
+                set_id: 0,
+                width: 512,
+                height: 512,
+                emoji: "😀".to_owned(),
+                format: tdlib_rs::enums::StickerFormat::Tgs,
+                full_type: tdlib_rs::enums::StickerFullType::Regular(
+                    tdlib_rs::types::StickerFullTypeRegular::default(),
+                ),
+                thumbnail: None,
+                sticker: td_file(4),
+            },
+            is_premium: false,
+        });
+        let MessageContent::Sticker(sticker) = MessageContent::from_tdlib(&content) else {
+            panic!("expected Sticker content");
+        };
+        assert!(!sticker.is_static);
     }
 
     #[test]
@@ -2399,8 +2570,71 @@ mod tests {
                 duration: 3,
                 file_name: "loop.gif".to_owned(),
                 mime_type: "video/mp4".to_owned(),
+                minithumbnail: None,
             })
         );
+    }
+
+    #[test]
+    fn video_and_animation_decode_their_minithumbnail_when_present() {
+        use base64::Engine as _;
+        let raw = b"not really a jpeg, just test bytes".to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let minithumbnail = Some(tdlib_rs::types::Minithumbnail {
+            width: 8,
+            height: 8,
+            data: encoded,
+        });
+
+        let video_content = TdMessageContent::MessageVideo(TdMessageVideo {
+            video: tdlib_rs::types::Video {
+                duration: 12,
+                width: 640,
+                height: 480,
+                file_name: "clip.mp4".to_owned(),
+                mime_type: "video/mp4".to_owned(),
+                has_stickers: false,
+                supports_streaming: true,
+                minithumbnail: minithumbnail.clone(),
+                thumbnail: None,
+                video: td_file(7),
+            },
+            alternative_videos: vec![],
+            storyboards: vec![],
+            cover: None,
+            start_timestamp: 0,
+            caption: TdFormattedTextT::default(),
+            show_caption_above_media: false,
+            has_spoiler: false,
+            is_secret: false,
+        });
+        let MessageContent::Video(video) = MessageContent::from_tdlib(&video_content) else {
+            panic!("expected Video content");
+        };
+        assert_eq!(video.minithumbnail, Some(raw.clone()));
+
+        let animation_content = TdMessageContent::MessageAnimation(TdMessageAnimation {
+            animation: tdlib_rs::types::Animation {
+                duration: 3,
+                width: 320,
+                height: 240,
+                file_name: "loop.gif".to_owned(),
+                mime_type: "video/mp4".to_owned(),
+                has_stickers: false,
+                minithumbnail,
+                thumbnail: None,
+                animation: td_file(6),
+            },
+            caption: TdFormattedTextT::default(),
+            show_caption_above_media: false,
+            has_spoiler: false,
+            is_secret: false,
+        });
+        let MessageContent::Animation(animation) = MessageContent::from_tdlib(&animation_content)
+        else {
+            panic!("expected Animation content");
+        };
+        assert_eq!(animation.minithumbnail, Some(raw));
     }
 
     #[test]
@@ -2872,6 +3106,7 @@ mod tests {
     }
 
     /// A TDLib `User` with every field zeroed but the ones a test cares about.
+    #[allow(clippy::too_many_arguments)]
     fn td_user(
         id: i64,
         first: &str,
@@ -2880,6 +3115,7 @@ mod tests {
         phone: &str,
         kind: TdUserType,
         status: TdUserStatus,
+        accent_color_id: i32,
     ) -> TdUser {
         TdUser {
             id,
@@ -2892,7 +3128,7 @@ mod tests {
             phone_number: phone.to_owned(),
             status,
             profile_photo: None,
-            accent_color_id: 0,
+            accent_color_id,
             background_custom_emoji_id: 0,
             upgraded_gift_colors: None,
             profile_accent_color_id: 0,
@@ -2974,6 +3210,7 @@ mod tests {
             "+15551234",
             TdUserType::Regular,
             TdUserStatus::Online(tdlib_rs::types::UserStatusOnline { expires: 5 }),
+            3,
         ));
         assert_eq!(user.id, 7);
         assert_eq!(user.username(), Some("ada"));
@@ -2981,6 +3218,8 @@ mod tests {
         assert_eq!(user.phone_number.as_deref(), Some("+15551234"));
         assert_eq!(user.kind, UserKind::Regular);
         assert_eq!(user.status, Presence::Online { expires: 5 });
+        assert_eq!(user.accent_color_id, 3);
+        assert_eq!(user.avatar_minithumbnail, None);
 
         // No usernames and an empty phone collapse to None/empty, not "".
         let bare = User::from_tdlib(&td_user(
@@ -2991,10 +3230,45 @@ mod tests {
             "",
             TdUserType::Regular,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(bare.username(), None);
         assert!(bare.usernames.is_empty());
         assert_eq!(bare.phone_number, None);
+    }
+
+    #[test]
+    fn user_decodes_a_profile_photo_minithumbnail_when_present() {
+        use base64::Engine as _;
+        let raw = b"not really a jpeg, just test bytes".to_vec();
+        let mut td = td_user(
+            7,
+            "Ada",
+            "Lovelace",
+            vec![],
+            "",
+            TdUserType::Regular,
+            TdUserStatus::Empty,
+            0,
+        );
+        td.profile_photo = Some(tdlib_rs::types::ProfilePhoto {
+            id: 1,
+            small: TdFile::default(),
+            big: TdFile::default(),
+            minithumbnail: Some(tdlib_rs::types::Minithumbnail {
+                width: 8,
+                height: 8,
+                data: base64::engine::general_purpose::STANDARD.encode(&raw),
+            }),
+            has_animation: false,
+            is_personal: false,
+        });
+        let user = User::from_tdlib(&td);
+        assert_eq!(user.avatar_minithumbnail, Some(raw));
+
+        // A profile photo with no minithumbnail attached still projects to None.
+        td.profile_photo.as_mut().unwrap().minithumbnail = None;
+        assert_eq!(User::from_tdlib(&td).avatar_minithumbnail, None);
     }
 
     #[test]
@@ -3007,6 +3281,7 @@ mod tests {
             "",
             TdUserType::Regular,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(named.display_name(), "Ada Lovelace");
 
@@ -3019,6 +3294,7 @@ mod tests {
             "",
             TdUserType::Regular,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(handle.display_name(), "@grace");
 
@@ -3031,6 +3307,7 @@ mod tests {
             "",
             TdUserType::Deleted,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(gone.display_name(), "Deleted Account");
 
@@ -3043,6 +3320,7 @@ mod tests {
             "",
             TdUserType::Regular,
             TdUserStatus::Empty,
+            0,
         ));
         assert_eq!(anon.display_name(), "User 10");
     }
@@ -3245,6 +3523,143 @@ mod tests {
                 count: 4,
                 is_chosen: true,
             }]
+        );
+    }
+
+    /// A message with no `reply_to` at all projects to `None` — the common
+    /// case, and what every other `td_message`-built fixture already gets.
+    #[test]
+    fn message_with_no_reply_to_projects_to_none() {
+        let bare = td_message(
+            1,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("hi", vec![]),
+            None,
+            false,
+        );
+        assert_eq!(Message::from_tdlib(&bare).reply_to, None);
+    }
+
+    /// A reply within the same chat projects its target id and no quote (#210).
+    #[test]
+    fn message_projects_a_same_chat_reply() {
+        use tdlib_rs::types::MessageReplyToMessage;
+
+        let mut replying = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("sure", vec![]),
+            None,
+            false,
+        );
+        replying.reply_to = Some(TdMessageReplyTo::Message(MessageReplyToMessage {
+            chat_id: 10,
+            message_id: 1,
+            quote: None,
+            ..Default::default()
+        }));
+        assert_eq!(
+            Message::from_tdlib(&replying).reply_to,
+            Some(ReplyTo::Message {
+                chat_id: 10,
+                message_id: 1,
+                quote: None,
+            })
+        );
+    }
+
+    /// A reply that carries an explicit, sender-chosen quote projects the
+    /// quote's (sanitized) text alongside the target.
+    #[test]
+    fn message_projects_a_reply_s_explicit_quote() {
+        use tdlib_rs::types::{MessageReplyToMessage, TextQuote};
+
+        let mut replying = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("sure", vec![]),
+            None,
+            false,
+        );
+        replying.reply_to = Some(TdMessageReplyTo::Message(MessageReplyToMessage {
+            chat_id: 10,
+            message_id: 1,
+            quote: Some(TextQuote {
+                text: TdFormattedTextT {
+                    text: "the important bit".to_owned(),
+                    entities: vec![],
+                },
+                position: 0,
+                is_manual: true,
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            Message::from_tdlib(&replying).reply_to,
+            Some(ReplyTo::Message {
+                chat_id: 10,
+                message_id: 1,
+                quote: Some("the important bit".to_owned()),
+            })
+        );
+    }
+
+    /// A cross-chat reply carries the origin chat id, distinct from the
+    /// reply's own chat — the render layer's cue that the target is not in
+    /// the currently open chat's loaded window.
+    #[test]
+    fn message_projects_a_cross_chat_reply_s_origin_chat() {
+        use tdlib_rs::types::MessageReplyToMessage;
+
+        let mut replying = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("sure", vec![]),
+            None,
+            false,
+        );
+        replying.reply_to = Some(TdMessageReplyTo::Message(MessageReplyToMessage {
+            chat_id: 99,
+            message_id: 1,
+            quote: None,
+            ..Default::default()
+        }));
+        assert_eq!(
+            Message::from_tdlib(&replying).reply_to,
+            Some(ReplyTo::Message {
+                chat_id: 99,
+                message_id: 1,
+                quote: None,
+            })
+        );
+    }
+
+    /// A reply to a story is out of scope to resolve/render, but the
+    /// projection stays total over TDLib's enum rather than silently
+    /// dropping it.
+    #[test]
+    fn message_projects_a_story_reply_as_unsupported() {
+        use tdlib_rs::types::MessageReplyToStory;
+
+        let mut replying = td_message(
+            2,
+            10,
+            TdMessageSender::User(MessageSenderUser { user_id: 1 }),
+            td_text("nice story", vec![]),
+            None,
+            false,
+        );
+        replying.reply_to = Some(TdMessageReplyTo::Story(MessageReplyToStory {
+            story_poster_chat_id: 5,
+            story_id: 42,
+        }));
+        assert_eq!(
+            Message::from_tdlib(&replying).reply_to,
+            Some(ReplyTo::Unsupported("messageReplyToStory"))
         );
     }
 

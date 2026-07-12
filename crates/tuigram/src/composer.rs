@@ -79,6 +79,13 @@ pub struct Composer {
     input: TextInput,
     /// What a submit will do, and what the indicator shows.
     mode: ComposerMode,
+    /// The display column [`move_up`](Self::move_up)/[`move_down`](Self::move_down)
+    /// are steering toward, remembered across a run of consecutive vertical
+    /// moves so crossing a shorter row and back doesn't drift the cursor's
+    /// horizontal position (#215) — standard editor behavior. `None` means no
+    /// vertical move is in progress; reset by every other mutator below so a
+    /// stale goal never survives an edit or a horizontal/click move.
+    goal_col: Option<usize>,
 }
 
 impl Composer {
@@ -88,10 +95,22 @@ impl Composer {
         self.input.text()
     }
 
-    /// The cursor position, as a character index in `0..=chars`.
+    /// The cursor position, as a character index in `0..=chars`. Rendering and
+    /// row-aware movement read [`cursor_byte`](Self::cursor_byte) instead
+    /// (#215); this plain char-index form is test-only, for asserting cursor
+    /// state directly.
+    #[cfg(test)]
     #[must_use]
     pub fn cursor(&self) -> usize {
         self.input.cursor()
+    }
+
+    /// The cursor position, as a byte offset into [`text`](Self::text) — the
+    /// unit [`crate::wrap`]'s row geometry operates in, needed by the
+    /// composer's multi-row renderer (#215).
+    #[must_use]
+    pub fn cursor_byte(&self) -> usize {
+        self.input.byte_at(self.input.cursor())
     }
 
     /// The current mode (compose, reply, or edit).
@@ -109,40 +128,119 @@ impl Composer {
     /// Insert a character at the cursor and step the cursor past it.
     pub fn insert(&mut self, c: char) {
         self.input.insert(c);
+        self.goal_col = None;
     }
 
     /// Delete the character before the cursor (Backspace). A no-op at the start.
     pub fn backspace(&mut self) {
         self.input.backspace();
+        self.goal_col = None;
     }
 
     /// Move the cursor one character left, clamping at the start.
     pub fn move_left(&mut self) {
         self.input.move_left();
+        self.goal_col = None;
     }
 
     /// Move the cursor one character right, clamping at the end.
     pub fn move_right(&mut self) {
         self.input.move_right();
+        self.goal_col = None;
     }
 
-    /// Move the cursor to the start of the line (Home).
+    /// Move the cursor to the start of the current logical line (Home) — the
+    /// nearest embedded newline at or before the cursor, or the buffer start
+    /// (#215).
     pub fn move_home(&mut self) {
-        self.input.move_home();
+        self.input.move_line_home();
+        self.goal_col = None;
     }
 
-    /// Move the cursor to the end of the line (End).
+    /// Move the cursor to the end of the current logical line (End) — the
+    /// nearest embedded newline at or after the cursor, or the buffer end
+    /// (#215).
     pub fn move_end(&mut self) {
-        self.input.move_end();
+        self.input.move_line_end();
+        self.goal_col = None;
+    }
+
+    /// Move the cursor up one visual row at `width` display columns,
+    /// preserving the horizontal position (the "goal column") across a run
+    /// of consecutive vertical moves (#215). A no-op on the first visual row.
+    pub fn move_up(&mut self, width: usize) {
+        self.move_vertical(width, -1);
+    }
+
+    /// Move the cursor down one visual row at `width` display columns,
+    /// preserving the horizontal position (the "goal column") across a run
+    /// of consecutive vertical moves (#215). A no-op on the last visual row.
+    pub fn move_down(&mut self, width: usize) {
+        self.move_vertical(width, 1);
+    }
+
+    /// Shared implementation of [`move_up`](Self::move_up)/[`move_down`](Self::move_down):
+    /// steps the cursor to the row at `row_of(current) + direction` (`-1` or
+    /// `1`), landing at the remembered [`goal_col`](Self::goal_col) — or the
+    /// current display column, if no vertical move is already in progress.
+    /// A no-op if the target row would fall outside `0..rows.len()`.
+    fn move_vertical(&mut self, width: usize, direction: isize) {
+        let text = self.input.text();
+        let rows = crate::wrap::layout_rows(text, width);
+        let cursor_byte = self.input.byte_at(self.input.cursor());
+        let row = crate::wrap::row_of(&rows, cursor_byte);
+        let Some(target) = row.checked_add_signed(direction) else {
+            return;
+        };
+        if target >= rows.len() {
+            return;
+        }
+
+        let goal = self.goal_col.unwrap_or_else(|| {
+            let current_row = rows[row];
+            crate::wrap::display_col(
+                &text[current_row.start..current_row.end],
+                cursor_byte - current_row.start,
+            )
+        });
+
+        let new_byte = crate::wrap::resolve_in_row(text, &rows, target, goal);
+        self.input.set_cursor(self.input.char_at(new_byte));
+        self.goal_col = Some(goal);
+    }
+
+    /// Move the cursor directly to a character index, clamping to the end of
+    /// the buffer. Mouse clicks resolve through the row-aware
+    /// [`set_cursor_at_row_col`](Self::set_cursor_at_row_col) instead (#215);
+    /// this plain char-index form is test-only, for positioning the cursor
+    /// before exercising a movement.
+    #[cfg(test)]
+    pub fn set_cursor(&mut self, index: usize) {
+        self.input.set_cursor(index);
+        self.goal_col = None;
+    }
+
+    /// Move the cursor to the char index at visual `row`/terminal cell `col`
+    /// at `width` display columns (a click on a multi-row composer) (#215).
+    /// `row` clamps to the last visual row; `col` resolves the same way
+    /// [`move_up`](Self::move_up)/[`move_down`](Self::move_down) does, so a
+    /// click and a vertical move land identically on a wide (CJK/emoji)
+    /// character.
+    pub fn set_cursor_at_row_col(&mut self, row: usize, col: usize, width: usize) {
+        let text = self.input.text();
+        let rows = crate::wrap::layout_rows(text, width);
+        let row = row.min(rows.len() - 1);
+        let new_byte = crate::wrap::resolve_in_row(text, &rows, row, col);
+        self.input.set_cursor(self.input.char_at(new_byte));
+        self.goal_col = None;
     }
 
     /// Enter reply mode against `message_id`, showing `preview` in the indicator.
     /// The buffer is left as-is so a half-typed message survives starting a reply.
     ///
-    /// The key that starts a reply lands with #83's focus model (and #84's forward
-    /// flow), so this is unused in the non-test binary today; the render tests drive
-    /// it through [`with_composer`](crate::app::App::with_composer).
-    #[allow(dead_code)]
+    /// Driven by [`Action::ReplyMessage`](crate::app::Action::ReplyMessage) — `r` in
+    /// the history pane (#195) — which focuses the composer so the reply can be typed
+    /// straight away; submitting routes through the send seam as a reply (#116).
     pub fn reply_to(&mut self, message_id: i64, preview: String) {
         self.mode = ComposerMode::Reply {
             message_id,
@@ -153,13 +251,13 @@ impl Composer {
     /// Enter edit mode against `message_id`, pre-filling the buffer with its
     /// current `text` and placing the cursor at the end.
     ///
-    /// Like [`reply_to`](Self::reply_to), the key that starts an edit arrives with
-    /// #83's focus model, so this is unused in the non-test binary for now and the
-    /// render tests exercise it directly.
-    #[allow(dead_code)]
+    /// Driven by [`Action::EditMessage`](crate::app::Action::EditMessage) — `e` in
+    /// the history pane (#195), for our own text messages — which focuses the
+    /// composer; submitting routes through the edit seam (#116).
     pub fn edit(&mut self, message_id: i64, text: String) {
         self.input.set(text);
         self.mode = ComposerMode::Edit { message_id };
+        self.goal_col = None;
     }
 
     /// Cancel back to plain compose: drop any reply/edit context and clear the
@@ -167,6 +265,7 @@ impl Composer {
     pub fn cancel(&mut self) {
         self.input.clear();
         self.mode = ComposerMode::Compose;
+        self.goal_col = None;
     }
 
     /// Submit the buffer. Resolves the current [mode](Self::mode) into a
@@ -181,6 +280,7 @@ impl Composer {
             return None;
         }
         let text = self.input.take();
+        self.goal_col = None;
         // `take` resets the mode to its `Compose` default, leaving the composer
         // ready for the next message regardless of what it was just acting on.
         let submission = match std::mem::take(&mut self.mode) {
@@ -359,5 +459,97 @@ mod tests {
         assert!(composer.is_empty());
         assert_eq!(composer.cursor(), 0);
         assert_eq!(composer.mode(), &ComposerMode::Compose);
+    }
+
+    #[test]
+    fn move_up_and_down_cross_a_wrap_seam_preserving_the_goal_column() {
+        // "abcde" @ width 3 wraps into "abc" | "de".
+        let mut composer = typed("abcde"); // cursor at the end (char 5, row 1 col 2)
+        composer.move_up(3);
+        // Row 1's cursor was at its own end (col 2); row 0 is wider, so the
+        // goal column (2) lands one char short of row 0's end.
+        assert_eq!(composer.cursor(), 2);
+        composer.move_down(3);
+        // The remembered goal column (2) returns the cursor to row 1's end.
+        assert_eq!(composer.cursor(), 5);
+    }
+
+    #[test]
+    fn move_up_is_a_noop_on_the_first_row_and_move_down_on_the_last() {
+        let mut composer = typed("abcde"); // "abc" | "de" @ width 3
+        composer.set_cursor(1);
+        composer.move_up(3);
+        assert_eq!(composer.cursor(), 1);
+
+        composer.set_cursor(5);
+        composer.move_down(3);
+        assert_eq!(composer.cursor(), 5);
+    }
+
+    #[test]
+    fn move_up_reaches_the_top_row_across_a_full_width_hard_break_seam() {
+        // "abcdef" @ width 3 hard-breaks into "abc" | "def" with no '\n' —
+        // the last row is exactly as wide as the first, so the goal column
+        // (3, "def"'s own width) lands right on the ambiguous wrap seam
+        // between them. A naive landing there would resolve back onto row 1
+        // (see `wrap::resolve_in_row`), leaving Up looking like a no-op and
+        // a second Up permanently stuck instead of reaching row 0.
+        let mut composer = typed("abcdef");
+        composer.move_up(3);
+        assert_eq!(composer.cursor(), 2, "landed on row 0, not back on row 1");
+        // Pressing Up again is a genuine no-op at the first row, not a
+        // symptom of being stuck mid-buffer.
+        composer.move_up(3);
+        assert_eq!(composer.cursor(), 2);
+    }
+
+    #[test]
+    fn any_other_movement_resets_the_goal_column() {
+        // "abcde" @ width 3 wraps into "abc" | "de".
+        let mut composer = typed("abcde");
+        composer.move_up(3); // cursor -> 2 (row 0, col 2), goal_col = Some(2)
+        composer.move_left(); // cursor -> 1 (row 0, col 1); resets goal_col
+        composer.move_down(3);
+        // A stale goal (2) would land at col 2 ("de"'s end, cursor 5); the
+        // freshly recomputed goal (1) lands one column short instead.
+        assert_eq!(composer.cursor(), 4);
+    }
+
+    #[test]
+    fn move_up_and_down_measure_the_goal_column_by_display_width_not_char_count() {
+        // "ab😀" (a real line, ended by '\n') over "cd" — 😀 is width 2.
+        let mut composer = typed("ab😀\ncd");
+        composer.set_cursor(3); // right after 😀, before the '\n'
+        composer.move_down(10);
+        // Row 1 ("cd") is narrower than the goal column (4: 1+1+2), so the
+        // cursor clamps to its end.
+        assert_eq!(composer.cursor(), 6);
+        composer.move_up(10);
+        // The remembered goal column (4) returns the cursor to right after
+        // 😀 — proof the column math is display-width-aware, not char-count.
+        assert_eq!(composer.cursor(), 3);
+    }
+
+    #[test]
+    fn set_cursor_at_row_col_resolves_a_click_and_clamps_past_the_row_and_past_the_last_row() {
+        // "abcde" @ width 3 wraps into "abc" | "de".
+        let mut composer = typed("abcde");
+        composer.set_cursor_at_row_col(0, 1, 3);
+        assert_eq!(composer.cursor(), 1); // between 'a' and 'b'
+        composer.set_cursor_at_row_col(1, 5, 3);
+        assert_eq!(composer.cursor(), 5); // clamped to row 1's end
+        composer.set_cursor_at_row_col(9, 0, 3);
+        assert_eq!(composer.cursor(), 3); // row clamped to the last row (1)
+    }
+
+    #[test]
+    fn set_cursor_at_row_col_at_a_full_width_seam_stays_on_the_clicked_row() {
+        // "abcdef" @ width 3 hard-breaks into "abc" | "def", contiguous — a
+        // click past row 0's right edge must still land on row 0, not
+        // silently resolve onto row 1 (the same ambiguous-seam hazard
+        // `move_up`/`move_down` have).
+        let mut composer = typed("abcdef");
+        composer.set_cursor_at_row_col(0, 3, 3);
+        assert_eq!(composer.cursor(), 2);
     }
 }

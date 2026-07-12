@@ -74,9 +74,22 @@ pub enum Overlay {
     SendMedia,
     /// The secret-chat lifecycle confirm: start or close a secret chat (#87).
     SecretChat,
-    /// The retention settings editor (#146): edit the four download-cache knobs,
-    /// applied live and written back to `settings.toml` on confirm.
+    /// The contact-search query line (#197): typing builds the query, Enter runs
+    /// it against `search_contacts`.
+    ContactSearchInput,
+    /// The contact-search results list (#197): navigate hits, Enter opens the
+    /// secret-chat confirm for the selected contact, or close.
+    ContactSearchResults,
+    /// The settings editor (#146): edit the four download-cache knobs plus the
+    /// graphics toggle (#209), applied live and written back to `settings.toml`
+    /// on confirm.
     Settings,
+    /// The delete-message confirm (#195): pick the scope (for me / for everyone)
+    /// and confirm, or cancel. Gates the destructive delete behind an explicit step.
+    DeleteConfirm,
+    /// The logout confirm (#195): confirm ends the session and wipes the local
+    /// data, or cancel. Gates the destructive logout behind an explicit step.
+    LogoutConfirm,
 }
 
 /// The focus context a binding applies in. `Global` always applies; `Nav` applies
@@ -116,6 +129,15 @@ enum Trigger {
     Plain(&'static [KeyCode]),
     /// A specific key code with Ctrl held.
     Ctrl(KeyCode),
+    /// A specific key code with Alt held (and not Ctrl) — e.g. Alt-Enter to
+    /// insert a composer newline (#215) without also matching a Ctrl chord.
+    Alt(KeyCode),
+    /// A specific key code with Shift held — best-effort: crossterm only
+    /// reports Shift on a key like Enter when the terminal supports and the
+    /// app has enabled the Kitty keyboard-enhancement protocol, which this
+    /// crate does not enable, so this fires only on terminals that report it
+    /// unprompted (#215).
+    Shift(KeyCode),
 }
 
 impl Trigger {
@@ -127,6 +149,12 @@ impl Trigger {
                     && codes.contains(&key.code)
             }
             Self::Ctrl(code) => key.modifiers.contains(KeyModifiers::CONTROL) && key.code == *code,
+            Self::Alt(code) => {
+                key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == *code
+            }
+            Self::Shift(code) => key.modifiers.contains(KeyModifiers::SHIFT) && key.code == *code,
         }
     }
 }
@@ -184,6 +212,20 @@ const BINDINGS: &[Binding] = &[
         keys: "Ctrl-G",
         description: "dismiss notification",
     },
+    Binding {
+        context: Context::Global,
+        trigger: Trigger::Ctrl(KeyCode::Char('r')),
+        action: Action::Resync,
+        keys: "Ctrl-R",
+        description: "resync after a dropped-update gap",
+    },
+    Binding {
+        context: Context::Global,
+        trigger: Trigger::Ctrl(KeyCode::Char('q')),
+        action: Action::LogoutOpen,
+        keys: "Ctrl-Q",
+        description: "log out (confirm first)",
+    },
     // Chat list.
     Binding {
         context: Context::ChatList,
@@ -227,20 +269,48 @@ const BINDINGS: &[Binding] = &[
         keys: "s",
         description: "secret chat: start / close",
     },
+    Binding {
+        context: Context::ChatList,
+        trigger: Trigger::Plain(&[KeyCode::Char('n')]),
+        action: Action::ContactSearchOpen,
+        keys: "n",
+        description: "new secret chat with a contact (search by name)",
+    },
     // History.
     Binding {
         context: Context::History,
-        trigger: Trigger::Plain(&[KeyCode::Char('j'), KeyCode::Down, KeyCode::PageDown]),
+        trigger: Trigger::Plain(&[KeyCode::Char('j'), KeyCode::Down]),
         action: Action::ScrollDown,
-        keys: "j / ↓ / PgDn",
-        description: "scroll down",
+        keys: "j / ↓",
+        description: "scroll down one row",
     },
     Binding {
         context: Context::History,
-        trigger: Trigger::Plain(&[KeyCode::Char('k'), KeyCode::Up, KeyCode::PageUp]),
+        trigger: Trigger::Plain(&[KeyCode::Char('k'), KeyCode::Up]),
         action: Action::ScrollUp,
-        keys: "k / ↑ / PgUp",
-        description: "scroll up",
+        keys: "k / ↑",
+        description: "scroll up one row",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::PageDown]),
+        action: Action::PageDown,
+        keys: "PgDn",
+        description: "scroll down a full page",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::PageUp]),
+        action: Action::PageUp,
+        keys: "PgUp",
+        description: "scroll up a full page",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('G'), KeyCode::End]),
+        action: Action::JumpToNewest,
+        keys: "G / End",
+        description: "jump to the newest message (top of the last screenful)",
     },
     Binding {
         context: Context::History,
@@ -252,8 +322,36 @@ const BINDINGS: &[Binding] = &[
     Binding {
         context: Context::History,
         trigger: Trigger::Plain(&[KeyCode::Char('r')]),
-        action: Action::ReactionOpen,
+        action: Action::ReplyMessage,
         keys: "r",
+        description: "reply to the selected message",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('e')]),
+        action: Action::EditMessage,
+        keys: "e",
+        description: "edit the selected message (your own)",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('g')]),
+        action: Action::JumpToQuoted,
+        keys: "g",
+        description: "jump to the message the selected reply quotes",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('d')]),
+        action: Action::DeleteMessage,
+        keys: "d",
+        description: "delete the selected message",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('R')]),
+        action: Action::ReactionOpen,
+        keys: "R",
         description: "react to the selected message",
     },
     Binding {
@@ -277,7 +375,43 @@ const BINDINGS: &[Binding] = &[
         keys: "a",
         description: "attach / send media",
     },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('S')]),
+        action: Action::SaveMedia,
+        keys: "S",
+        description: "save / download the selected message's media",
+    },
+    Binding {
+        context: Context::History,
+        trigger: Trigger::Plain(&[KeyCode::Char('y')]),
+        action: Action::CopyMessage,
+        keys: "y",
+        description: "copy the selected message's text",
+    },
     // Composer — editing keys; any other printable character inserts (see resolve).
+    //
+    // Alt/Shift-Enter must be checked *before* the plain Enter binding below:
+    // `Trigger::Plain` is deliberately Shift-agnostic (so shifted glyphs and
+    // capital letters still match plain bindings elsewhere), which means a
+    // Shift-Enter also satisfies `Trigger::Plain(&[KeyCode::Enter])` — were
+    // that binding listed first, `resolve_panes`'s first-match walk would
+    // resolve Shift-Enter to `ComposerSubmit` and this line-break binding
+    // would never fire (#215).
+    Binding {
+        context: Context::Composer,
+        trigger: Trigger::Alt(KeyCode::Enter),
+        action: Action::ComposerNewline,
+        keys: "Alt-Enter",
+        description: "insert a line break",
+    },
+    Binding {
+        context: Context::Composer,
+        trigger: Trigger::Shift(KeyCode::Enter),
+        action: Action::ComposerNewline,
+        keys: "Shift-Enter",
+        description: "insert a line break (where the terminal reports it)",
+    },
     Binding {
         context: Context::Composer,
         trigger: Trigger::Plain(&[KeyCode::Enter]),
@@ -327,6 +461,20 @@ const BINDINGS: &[Binding] = &[
         keys: "End",
         description: "end of line",
     },
+    Binding {
+        context: Context::Composer,
+        trigger: Trigger::Plain(&[KeyCode::Up]),
+        action: Action::ComposerUp,
+        keys: "↑",
+        description: "cursor up a wrapped row",
+    },
+    Binding {
+        context: Context::Composer,
+        trigger: Trigger::Plain(&[KeyCode::Down]),
+        action: Action::ComposerDown,
+        keys: "↓",
+        description: "cursor down a wrapped row",
+    },
     // Navigation panes (chat list + history): commands that read, not type.
     Binding {
         context: Context::Nav,
@@ -340,7 +488,14 @@ const BINDINGS: &[Binding] = &[
         trigger: Trigger::Plain(&[KeyCode::Char(',')]),
         action: Action::SettingsOpen,
         keys: ",",
-        description: "cache-retention settings",
+        description: "settings (cache retention, graphics)",
+    },
+    Binding {
+        context: Context::Nav,
+        trigger: Trigger::Plain(&[KeyCode::Char('b')]),
+        action: Action::ToggleChatListCollapse,
+        keys: "b",
+        description: "collapse / expand the chat-list pane",
     },
     Binding {
         context: Context::Nav,
@@ -390,7 +545,11 @@ pub fn resolve(focus: Focus, overlay: Overlay, key: &KeyEvent) -> Action {
         Overlay::Reaction => resolve_reaction(key),
         Overlay::SendMedia => resolve_send_media(key),
         Overlay::SecretChat => resolve_secret_chat(key),
+        Overlay::ContactSearchInput => resolve_contact_search_input(key),
+        Overlay::ContactSearchResults => resolve_contact_search_results(key),
         Overlay::Settings => resolve_settings(key),
+        Overlay::DeleteConfirm => resolve_delete_confirm(key),
+        Overlay::LogoutConfirm => resolve_logout_confirm(key),
     }
 }
 
@@ -531,10 +690,10 @@ fn resolve_send_media(key: &KeyEvent) -> Action {
     }
 }
 
-/// The retention settings editor (#146): typing edits the focused knob, Tab moves
-/// between the four fields, Enter validates and saves (a bad value is rejected in
-/// place, keeping the overlay open), Esc cancels. Mirrors the send-media prompt's
-/// multi-field editing.
+/// The settings editor (#146, plus the graphics toggle, #209): typing edits the
+/// focused knob, Tab moves between the five fields, Enter validates and saves (a
+/// bad value is rejected in place, keeping the overlay open), Esc cancels.
+/// Mirrors the send-media prompt's multi-field editing.
 fn resolve_settings(key: &KeyEvent) -> Action {
     if is_quit(key) {
         return Action::Quit;
@@ -563,6 +722,71 @@ fn resolve_secret_chat(key: &KeyEvent) -> Action {
     match key.code {
         KeyCode::Esc => Action::SecretCancel,
         KeyCode::Enter => Action::SecretConfirm,
+        _ => Action::Noop,
+    }
+}
+
+/// The contact-search query line (#197): typing edits the query, Enter runs it,
+/// Esc cancels. Mirrors [`resolve_search_input`].
+fn resolve_contact_search_input(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::ContactSearchCancel,
+        KeyCode::Enter => Action::ContactSearchSubmit,
+        KeyCode::Backspace => Action::ContactSearchBackspace,
+        KeyCode::Left => Action::ContactSearchLeft,
+        KeyCode::Right => Action::ContactSearchRight,
+        KeyCode::Home => Action::ContactSearchHome,
+        KeyCode::End => Action::ContactSearchEnd,
+        _ => match printable(key) {
+            Some(c) => Action::ContactSearchInput(c),
+            None => Action::Noop,
+        },
+    }
+}
+
+/// The contact-search results list (#197): navigate hits, Enter opens the
+/// secret-chat confirm for the selected one, Esc closes. Mirrors
+/// [`resolve_search_results`] minus the forward shortcut (not meaningful here).
+fn resolve_contact_search_results(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::ContactSearchCancel,
+        KeyCode::Char('j') | KeyCode::Down => Action::ContactResultNext,
+        KeyCode::Char('k') | KeyCode::Up => Action::ContactResultPrev,
+        KeyCode::Enter => Action::ContactResultConfirm,
+        _ => Action::Noop,
+    }
+}
+
+/// The delete-message confirm (#195): Enter runs the delete at the chosen scope,
+/// Tab flips between "for me" and "for everyone", Esc cancels. Ctrl-C still quits.
+fn resolve_delete_confirm(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::DeleteCancel,
+        KeyCode::Enter => Action::DeleteConfirm,
+        KeyCode::Tab => Action::DeleteToggleScope,
+        _ => Action::Noop,
+    }
+}
+
+/// The logout confirm (#195): Enter ends the session and wipes local data, Esc
+/// cancels. A deliberately spare confirm — a stray key does nothing — since the
+/// action is destructive. Ctrl-C still quits the app (without logging out).
+fn resolve_logout_confirm(key: &KeyEvent) -> Action {
+    if is_quit(key) {
+        return Action::Quit;
+    }
+    match key.code {
+        KeyCode::Esc => Action::LogoutCancel,
+        KeyCode::Enter => Action::LogoutConfirm,
         _ => Action::Noop,
     }
 }
@@ -714,6 +938,8 @@ mod tests {
             Overlay::SendMedia,
             Overlay::SecretChat,
             Overlay::Settings,
+            Overlay::DeleteConfirm,
+            Overlay::LogoutConfirm,
         ] {
             assert_eq!(
                 resolve(Focus::History, overlay, &ctrl('g')),
@@ -749,6 +975,24 @@ mod tests {
         assert_eq!(
             resolved(Focus::Composer, KeyCode::Char(',')),
             Action::ComposerInput(',')
+        );
+    }
+
+    #[test]
+    fn b_toggles_the_chat_list_collapse_in_nav_panes_but_types_in_the_composer() {
+        // Nav, like `,`/`/`/`q`: works from either browsing pane, never steals
+        // the letter from a message being composed (#213).
+        assert_eq!(
+            resolved(Focus::ChatList, KeyCode::Char('b')),
+            Action::ToggleChatListCollapse
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('b')),
+            Action::ToggleChatListCollapse
+        );
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char('b')),
+            Action::ComposerInput('b')
         );
     }
 
@@ -887,10 +1131,41 @@ mod tests {
     }
 
     #[test]
+    fn g_and_end_jump_to_the_newest_message_in_the_history() {
+        // `G` (Shift-g) and End jump to the bottom-anchored newest message (#158),
+        // only in the history pane — End still means end-of-line in the composer.
+        let shift_g = KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT);
+        assert_eq!(
+            resolve(Focus::History, Overlay::None, &shift_g),
+            Action::JumpToNewest
+        );
+        assert_eq!(resolved(Focus::History, KeyCode::End), Action::JumpToNewest);
+        assert_eq!(resolved(Focus::Composer, KeyCode::End), Action::ComposerEnd);
+        // Unbound in the chat list (history-only context).
+        assert_eq!(resolved(Focus::ChatList, KeyCode::End), Action::Noop);
+    }
+
+    #[test]
     fn history_keys_act_on_the_selected_message() {
-        // r / p / f / a operate on the selected message in the history pane.
+        // r / e / d / R / p / f / a / S operate on the selected message in the
+        // history pane. Reply took `r` (the vim/mutt/Telegram convention) and react
+        // moved to `R` (#195).
         assert_eq!(
             resolved(Focus::History, KeyCode::Char('r')),
+            Action::ReplyMessage
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('e')),
+            Action::EditMessage
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('d')),
+            Action::DeleteMessage
+        );
+        // React is now the shifted `R`; the lowercase `r` replies.
+        let shift_r = KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT);
+        assert_eq!(
+            resolve(Focus::History, Overlay::None, &shift_r),
             Action::ReactionOpen
         );
         assert_eq!(
@@ -905,13 +1180,66 @@ mod tests {
             resolved(Focus::History, KeyCode::Char('a')),
             Action::AttachOpen
         );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('S')),
+            Action::SaveMedia
+        );
+        assert_eq!(
+            resolved(Focus::History, KeyCode::Char('y')),
+            Action::CopyMessage
+        );
         // The same letters are plain text in the composer, not history commands.
         assert_eq!(
             resolved(Focus::Composer, KeyCode::Char('r')),
             Action::ComposerInput('r')
         );
+        assert_eq!(
+            resolved(Focus::Composer, KeyCode::Char('e')),
+            Action::ComposerInput('e')
+        );
         // …and unbound in the chat list (history-only context).
         assert_eq!(resolved(Focus::ChatList, KeyCode::Char('p')), Action::Noop);
+    }
+
+    #[test]
+    fn ctrl_r_resyncs_and_ctrl_q_opens_logout_from_every_focus() {
+        // Both are global Ctrl chords, so they fire from any pane — including the
+        // composer, where a bare letter would type (a Ctrl chord never inserts).
+        for focus in [Focus::ChatList, Focus::History, Focus::Composer] {
+            assert_eq!(resolve(focus, Overlay::None, &ctrl('r')), Action::Resync);
+            assert_eq!(
+                resolve(focus, Overlay::None, &ctrl('q')),
+                Action::LogoutOpen
+            );
+        }
+    }
+
+    #[test]
+    fn the_delete_confirm_overlay_picks_a_scope_and_confirms() {
+        let at = |code| resolve(Focus::History, Overlay::DeleteConfirm, &key(code));
+        assert_eq!(at(KeyCode::Enter), Action::DeleteConfirm);
+        assert_eq!(at(KeyCode::Tab), Action::DeleteToggleScope);
+        assert_eq!(at(KeyCode::Esc), Action::DeleteCancel);
+        // A stray key does nothing while the destructive confirm is up.
+        assert_eq!(at(KeyCode::Char('x')), Action::Noop);
+        // Ctrl-C still escapes the modal.
+        assert_eq!(
+            resolve(Focus::History, Overlay::DeleteConfirm, &ctrl('c')),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn the_logout_confirm_overlay_confirms_or_cancels() {
+        let at = |code| resolve(Focus::ChatList, Overlay::LogoutConfirm, &key(code));
+        assert_eq!(at(KeyCode::Enter), Action::LogoutConfirm);
+        assert_eq!(at(KeyCode::Esc), Action::LogoutCancel);
+        assert_eq!(at(KeyCode::Char('x')), Action::Noop);
+        // Ctrl-C quits the app without logging out.
+        assert_eq!(
+            resolve(Focus::ChatList, Overlay::LogoutConfirm, &ctrl('c')),
+            Action::Quit
+        );
     }
 
     #[test]
@@ -973,6 +1301,8 @@ mod tests {
             Overlay::Reaction,
             Overlay::SendMedia,
             Overlay::SecretChat,
+            Overlay::DeleteConfirm,
+            Overlay::LogoutConfirm,
         ] {
             assert_eq!(resolve(Focus::ChatList, overlay, &ctrl('c')), Action::Quit);
         }

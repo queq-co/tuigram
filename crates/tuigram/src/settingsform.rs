@@ -1,24 +1,25 @@
 //! The in-app settings editor's view-model: the four download-cache retention
-//! knobs the settings overlay edits (#146).
+//! knobs plus the graphics toggle (#209) the settings overlay edits (#146).
 //!
 //! Mirrors [`MediaDraft`](crate::mediaform::MediaDraft): one [`TextInput`] per
 //! field, Tab cycling between them, and a pure [`confirm`](SettingsDraft::confirm)
 //! that validates the typed values through core's [`KeepMedia`]/[`CacheCap`]
-//! parsers. It owns no terminal state and touches no `Client`, so the whole
-//! edit-and-validate flow is unit-testable headlessly. The draft opens pre-filled
-//! with the policy currently in effect (via each value's `Display` form), so the
-//! overlay shows what is live; confirming yields the new [`StorageSettings`] for the
-//! loop to persist ([#145's `render`](tuigram_core::StorageSettings::render)) and to
-//! swap into the running retention immediately, while an invalid value is rejected
-//! in place with a readable reason rather than saved.
+//! parsers (plus a small on/off parse for graphics). It owns no terminal state and
+//! touches no `Client`, so the whole edit-and-validate flow is unit-testable
+//! headlessly. The draft opens pre-filled with the policy currently in effect (via
+//! each value's `Display` form), so the overlay shows what is live; confirming
+//! yields the new [`StorageSettings`] (for the loop to persist and swap into the
+//! running retention, [#145's `render`](tuigram_core::StorageSettings::render)) and
+//! the new graphics bool, while an invalid value is rejected in place with a
+//! readable reason rather than saved.
 
 use tuigram_core::{CacheCap, KeepMedia, StorageSettings};
 
 use crate::textinput::TextInput;
 
-/// Which retention field is being edited. Tab cycles through them in this order,
-/// grouped as the settings file lists them: the three per-kind TTLs, then the
-/// global size cap.
+/// Which field is being edited. Tab cycles through them in this order, grouped
+/// as the settings file lists them: the three per-kind TTLs, the global size
+/// cap, then the graphics toggle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsField {
     /// Retention for one-to-one (private, secret) chats.
@@ -30,6 +31,8 @@ pub enum SettingsField {
     KeepChannels,
     /// The global cache-size ceiling.
     MaxCache,
+    /// The graphics-rendering toggle (#209): avatars and inline media on or off.
+    Graphics,
 }
 
 impl SettingsField {
@@ -40,7 +43,8 @@ impl SettingsField {
             Self::KeepPrivate => Self::KeepGroups,
             Self::KeepGroups => Self::KeepChannels,
             Self::KeepChannels => Self::MaxCache,
-            Self::MaxCache => Self::KeepPrivate,
+            Self::MaxCache => Self::Graphics,
+            Self::Graphics => Self::KeepPrivate,
         }
     }
 
@@ -52,20 +56,26 @@ impl SettingsField {
             Self::KeepGroups => "groups",
             Self::KeepChannels => "channels",
             Self::MaxCache => "max cache",
+            Self::Graphics => "graphics",
         }
     }
 }
 
-/// The settings editor's state: one input per retention knob, which field is
-/// focused, and the last validation error (shown inline, cleared as soon as
-/// editing resumes). Open it with [`from_settings`](Self::from_settings) so the
-/// fields start at the values currently in effect.
+/// The settings editor's state: one input per retention knob, one for the
+/// graphics toggle, which field is focused, and the last validation error (shown
+/// inline, cleared as soon as editing resumes). Open it with
+/// [`from_settings`](Self::from_settings) so the fields start at the values
+/// currently in effect.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsDraft {
     keep_private: TextInput,
     keep_groups: TextInput,
     keep_channels: TextInput,
     max_cache: TextInput,
+    /// Typed as text (`"on"`/`"off"`) like every other field (#209) — not a
+    /// dedicated toggle widget — so it reuses `input`/`active`/`value`/`cursor`
+    /// unchanged rather than special-casing a boolean through every method here.
+    graphics: TextInput,
     field: SettingsField,
     /// The reason the last confirm was rejected, if any — shown under the fields so
     /// the user sees *why* a value was refused. Cleared on the next edit.
@@ -75,14 +85,18 @@ pub struct SettingsDraft {
 impl SettingsDraft {
     /// A draft pre-filled with `settings`' current values, cursor at each field's
     /// end. Each field starts at the policy's rendered form (`"forever"`, `"3d"`,
-    /// `"2GB"`, …) so the overlay opens showing exactly what is in effect.
+    /// `"2GB"`, …), and `graphics` at `"on"`/`"off"`, so the overlay opens showing
+    /// exactly what is in effect.
     #[must_use]
-    pub fn from_settings(settings: StorageSettings) -> Self {
+    pub fn from_settings(settings: StorageSettings, graphics: bool) -> Self {
         let mut draft = Self::default();
         draft.keep_private.set(settings.keep_private.to_string());
         draft.keep_groups.set(settings.keep_groups.to_string());
         draft.keep_channels.set(settings.keep_channels.to_string());
         draft.max_cache.set(settings.max_cache.to_string());
+        draft
+            .graphics
+            .set(if graphics { "on" } else { "off" }.to_owned());
         draft
     }
 
@@ -117,6 +131,7 @@ impl SettingsDraft {
             SettingsField::KeepGroups => &self.keep_groups,
             SettingsField::KeepChannels => &self.keep_channels,
             SettingsField::MaxCache => &self.max_cache,
+            SettingsField::Graphics => &self.graphics,
         }
     }
 
@@ -132,6 +147,7 @@ impl SettingsDraft {
             SettingsField::KeepGroups => &mut self.keep_groups,
             SettingsField::KeepChannels => &mut self.keep_channels,
             SettingsField::MaxCache => &mut self.max_cache,
+            SettingsField::Graphics => &mut self.graphics,
         }
     }
 
@@ -174,25 +190,31 @@ impl SettingsDraft {
         self.active_mut().move_end();
     }
 
-    /// Validate every field through the same [`KeepMedia`]/[`CacheCap`] parsers the
-    /// config file uses, returning the assembled [`StorageSettings`] on success. On
-    /// the first invalid value it moves focus to the offending field, records a
-    /// readable reason (retrievable via [`error`](Self::error)), and returns `None`
-    /// — the reducer keeps the overlay open so the user can fix it in place. The
-    /// error text is derived only from the field name and the parser's own message,
-    /// never leaking anything beyond what the user typed back at them.
-    pub fn confirm(&mut self) -> Option<StorageSettings> {
+    /// Validate every field — the four retention knobs through the same
+    /// [`KeepMedia`]/[`CacheCap`] parsers the config file uses, and `graphics`
+    /// through its own on/off parse — returning the assembled [`StorageSettings`]
+    /// and the graphics bool on success. On the first invalid value it moves focus
+    /// to the offending field, records a readable reason (retrievable via
+    /// [`error`](Self::error)), and returns `None` — the reducer keeps the overlay
+    /// open so the user can fix it in place. The error text is derived only from
+    /// the field name and the parser's own message, never leaking anything beyond
+    /// what the user typed back at them.
+    pub fn confirm(&mut self) -> Option<(StorageSettings, bool)> {
         let keep_private = self.parse_keep(SettingsField::KeepPrivate)?;
         let keep_groups = self.parse_keep(SettingsField::KeepGroups)?;
         let keep_channels = self.parse_keep(SettingsField::KeepChannels)?;
         let max_cache = self.parse_cap(SettingsField::MaxCache)?;
+        let graphics = self.parse_graphics(SettingsField::Graphics)?;
         self.error = None;
-        Some(StorageSettings {
-            keep_private,
-            keep_groups,
-            keep_channels,
-            max_cache,
-        })
+        Some((
+            StorageSettings {
+                keep_private,
+                keep_groups,
+                keep_channels,
+                max_cache,
+            },
+            graphics,
+        ))
     }
 
     /// Parse a per-kind TTL field, recording a field-scoped error and focusing it on
@@ -214,6 +236,20 @@ impl SettingsDraft {
             Ok(cap) => Some(cap),
             Err(reason) => {
                 self.reject(field, &reason);
+                None
+            }
+        }
+    }
+
+    /// Parse the graphics toggle field: `"on"`/`"true"`/`"yes"` or
+    /// `"off"`/`"false"`/`"no"`, case-insensitively, recording a field-scoped error
+    /// and focusing it on failure — same rejection shape as the other fields.
+    fn parse_graphics(&mut self, field: SettingsField) -> Option<bool> {
+        match self.value(field).trim().to_ascii_lowercase().as_str() {
+            "on" | "true" | "yes" => Some(true),
+            "off" | "false" | "no" => Some(false),
+            _ => {
+                self.reject(field, "expected \"on\" or \"off\"");
                 None
             }
         }
@@ -244,18 +280,19 @@ mod tests {
             keep_channels: KeepMedia::Days(3),
             max_cache: CacheCap::Bytes(2 * 1024 * 1024 * 1024),
         };
-        let draft = SettingsDraft::from_settings(settings);
+        let draft = SettingsDraft::from_settings(settings, false);
         assert_eq!(draft.value(SettingsField::KeepPrivate), "forever");
         assert_eq!(draft.value(SettingsField::KeepGroups), "7d");
         assert_eq!(draft.value(SettingsField::KeepChannels), "3d");
         assert_eq!(draft.value(SettingsField::MaxCache), "2GB");
+        assert_eq!(draft.value(SettingsField::Graphics), "off");
         // Landing focus is the first field, no error yet.
         assert_eq!(draft.field(), SettingsField::KeepPrivate);
         assert_eq!(draft.error(), None);
     }
 
     #[test]
-    fn tab_cycles_through_all_four_fields_and_wraps() {
+    fn tab_cycles_through_all_five_fields_and_wraps() {
         let mut draft = SettingsDraft::default();
         assert_eq!(draft.field(), SettingsField::KeepPrivate);
         draft.toggle_field();
@@ -264,6 +301,8 @@ mod tests {
         assert_eq!(draft.field(), SettingsField::KeepChannels);
         draft.toggle_field();
         assert_eq!(draft.field(), SettingsField::MaxCache);
+        draft.toggle_field();
+        assert_eq!(draft.field(), SettingsField::Graphics);
         draft.toggle_field();
         assert_eq!(
             draft.field(),
@@ -274,7 +313,7 @@ mod tests {
 
     #[test]
     fn editing_touches_only_the_focused_field() {
-        let mut draft = SettingsDraft::from_settings(StorageSettings::default());
+        let mut draft = SettingsDraft::from_settings(StorageSettings::default(), true);
         // Clear the private field and retype it, then move on and edit channels.
         for _ in 0.."forever".len() {
             draft.backspace();
@@ -293,11 +332,12 @@ mod tests {
             "untouched"
         );
         assert_eq!(draft.value(SettingsField::KeepChannels), "3d");
+        assert_eq!(draft.value(SettingsField::Graphics), "on", "untouched");
     }
 
     #[test]
     fn confirm_builds_the_edited_policy() {
-        let mut draft = SettingsDraft::from_settings(StorageSettings::default());
+        let mut draft = SettingsDraft::from_settings(StorageSettings::default(), true);
         // Set channels to 3d and max cache to 2GB, leaving the rest at forever.
         draft.toggle_field(); // groups
         draft.toggle_field(); // channels
@@ -310,16 +350,22 @@ mod tests {
             draft.backspace();
         }
         typed(&mut draft, "2GB");
-        let settings = draft.confirm().expect("all fields valid");
+        draft.toggle_field(); // graphics
+        for _ in 0.."on".len() {
+            draft.backspace();
+        }
+        typed(&mut draft, "off");
+        let (settings, graphics) = draft.confirm().expect("all fields valid");
         assert_eq!(settings.keep_private, KeepMedia::Forever);
         assert_eq!(settings.keep_channels, KeepMedia::Days(3));
         assert_eq!(settings.max_cache, CacheCap::Bytes(2 * 1024 * 1024 * 1024));
+        assert!(!graphics);
         assert_eq!(draft.error(), None);
     }
 
     #[test]
     fn an_invalid_value_is_rejected_in_place_with_a_reason() {
-        let mut draft = SettingsDraft::from_settings(StorageSettings::default());
+        let mut draft = SettingsDraft::from_settings(StorageSettings::default(), true);
         // Type an unsupported unit into the max-cache field.
         draft.toggle_field();
         draft.toggle_field();
@@ -339,7 +385,7 @@ mod tests {
     fn a_zero_ttl_is_rejected() {
         // "0d" would wipe media the instant it is fetched — the parser rejects it, and
         // the editor surfaces that rather than saving.
-        let mut draft = SettingsDraft::from_settings(StorageSettings::default());
+        let mut draft = SettingsDraft::from_settings(StorageSettings::default(), true);
         for _ in 0.."forever".len() {
             draft.backspace();
         }
@@ -351,7 +397,7 @@ mod tests {
 
     #[test]
     fn editing_after_a_rejection_clears_the_error() {
-        let mut draft = SettingsDraft::from_settings(StorageSettings::default());
+        let mut draft = SettingsDraft::from_settings(StorageSettings::default(), true);
         for _ in 0.."forever".len() {
             draft.backspace();
         }
@@ -364,5 +410,48 @@ mod tests {
             None,
             "resuming an edit clears the stale error"
         );
+    }
+
+    #[test]
+    fn graphics_accepts_on_off_synonyms_case_insensitively() {
+        for (typed_value, expected) in [
+            ("on", true),
+            ("ON", true),
+            ("true", true),
+            ("yes", true),
+            ("off", false),
+            ("OFF", false),
+            ("false", false),
+            ("no", false),
+        ] {
+            let mut draft = SettingsDraft::from_settings(StorageSettings::default(), true);
+            draft.toggle_field();
+            draft.toggle_field();
+            draft.toggle_field();
+            draft.toggle_field(); // graphics
+            for _ in 0.."on".len() {
+                draft.backspace();
+            }
+            typed(&mut draft, typed_value);
+            let (_, graphics) = draft.confirm().expect("a recognised on/off synonym");
+            assert_eq!(graphics, expected, "input {typed_value:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_graphics_value_is_rejected_in_place() {
+        let mut draft = SettingsDraft::from_settings(StorageSettings::default(), true);
+        draft.toggle_field();
+        draft.toggle_field();
+        draft.toggle_field();
+        draft.toggle_field(); // graphics
+        for _ in 0.."on".len() {
+            draft.backspace();
+        }
+        typed(&mut draft, "maybe");
+        assert!(draft.confirm().is_none());
+        assert_eq!(draft.field(), SettingsField::Graphics);
+        let error = draft.error().expect("a rejection reason");
+        assert!(error.starts_with("graphics:"), "names the field: {error}");
     }
 }

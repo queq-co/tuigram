@@ -70,10 +70,11 @@ use std::collections::HashSet;
 
 use tdlib_rs::enums::{
     FoundChatMessages, FoundMessages, InputMessageContent, InputMessageReplyTo, MessageSource,
-    Messages, ReactionType, Update,
+    Messages, ReactionType, TextParseMode, Update,
 };
 use tdlib_rs::types::{
     Error as TdError, InputMessageReplyToMessage, InputMessageText, ReactionTypeEmoji,
+    TextParseModeMarkdown,
 };
 
 use crate::bridge::Bridge;
@@ -174,6 +175,21 @@ pub trait EditRequests {
         message_id: i64,
         caption: FormattedText,
     ) -> Result<Message, TdError>;
+}
+
+/// Parse composer text into formatting entities before it is sent (#212).
+#[allow(async_fn_in_trait)]
+pub trait FormatRequests {
+    /// Parse `text` as Telegram's MarkdownV2 (`*bold*`, `_italic_`,
+    /// `__underline__`, `~strikethrough~`, `` `code` ``, ```` ```pre``` ````,
+    /// `[text](url)`, `||spoiler||`), TDLib's `parseTextEntities` with
+    /// `TextParseMode::Markdown { version: 2 }`. MarkdownV2 requires escaping
+    /// reserved punctuation anywhere it appears, so ordinary prose containing
+    /// unescaped punctuation commonly errors here — callers must treat that as
+    /// expected and fall back to sending `text` plain
+    /// ([`send_formatted_text`]/[`edit_formatted_text`] already do), never as
+    /// a reason to block the send.
+    async fn parse_markdown(&self, text: String) -> Result<FormattedText, TdError>;
 }
 
 /// Delete messages from a chat.
@@ -332,6 +348,7 @@ pub trait MessageRequests:
     HistoryRequests
     + SendRequests
     + EditRequests
+    + FormatRequests
     + DeleteRequests
     + ReadRequests
     + ForwardRequests
@@ -345,6 +362,7 @@ impl<T> MessageRequests for T where
     T: HistoryRequests
         + SendRequests
         + EditRequests
+        + FormatRequests
         + DeleteRequests
         + ReadRequests
         + ForwardRequests
@@ -476,6 +494,60 @@ impl EditRequests for Bridge {
         .await?;
         Ok(Message::from_tdlib(&edited))
     }
+}
+
+impl FormatRequests for Bridge {
+    async fn parse_markdown(&self, text: String) -> Result<FormattedText, TdError> {
+        let tdlib_rs::enums::FormattedText::FormattedText(parsed) =
+            tdlib_rs::functions::parse_text_entities(
+                text,
+                TextParseMode::Markdown(TextParseModeMarkdown { version: 2 }),
+                self.id(),
+            )
+            .await?;
+        Ok(FormattedText::from_tdlib(&parsed))
+    }
+}
+
+/// Parse `text` as markdown ([`FormatRequests::parse_markdown`]) and send it,
+/// optionally as a reply to `reply_to`. A parse failure — expected for
+/// ordinary prose containing unescaped MarkdownV2 punctuation, not just
+/// malformed input — must never block the send, so it falls back to sending
+/// `text` plain, with no entities, exactly as an unparsed composer send did
+/// before #212.
+pub async fn send_formatted_text<C: FormatRequests + SendRequests>(
+    client: &C,
+    chat_id: i64,
+    reply_to: Option<i64>,
+    text: String,
+) -> Result<Message, TdError> {
+    let formatted = client
+        .parse_markdown(text.clone())
+        .await
+        .unwrap_or(FormattedText {
+            text,
+            entities: Vec::new(),
+        });
+    client.send_text(chat_id, reply_to, formatted).await
+}
+
+/// Parse `text` as markdown and edit a message's text with it — the edit
+/// counterpart to [`send_formatted_text`], with the same parse-failure
+/// fallback to plain text.
+pub async fn edit_formatted_text<C: FormatRequests + EditRequests>(
+    client: &C,
+    chat_id: i64,
+    message_id: i64,
+    text: String,
+) -> Result<Message, TdError> {
+    let formatted = client
+        .parse_markdown(text.clone())
+        .await
+        .unwrap_or(FormattedText {
+            text,
+            entities: Vec::new(),
+        });
+    client.edit_text(chat_id, message_id, formatted).await
 }
 
 impl DeleteRequests for Bridge {
@@ -935,6 +1007,15 @@ impl MessageStore {
     /// Merge a history page (or any batch of messages) into the store. Each
     /// message is filed under its own chat and id, so re-merging an overlapping
     /// page is idempotent — duplicates collapse onto the same entry.
+    ///
+    /// A re-fetched page **replaces** an already-known message rather than
+    /// skipping it: `getChatHistory` is server-authoritative, and is the one
+    /// documented recovery path (#207) for a message whose reactions or content
+    /// changed while its chat was closed and so never arrived as a live update —
+    /// opening the chat and re-paging its history is what catches those up mid
+    /// session, exactly as a restart does. A live fold ([`reduce`](Self::reduce))
+    /// racing a page fetch for the same id is a narrower, separate concern than
+    /// disabling that recovery path is worth trading away here.
     pub fn merge(&mut self, messages: impl IntoIterator<Item = Message>) {
         for message in messages {
             self.insert(message);
@@ -1045,6 +1126,7 @@ mod tests {
             }),
             send_state: SendState::Sent,
             reactions: vec![],
+            reply_to: None,
         }
     }
 
@@ -1203,6 +1285,35 @@ mod tests {
         store.merge([msg(10, 20), msg(10, 30)]);
 
         assert_eq!(ids(&store.history(10)), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn a_re_fetched_page_refreshes_reactions_missed_while_the_chat_was_closed() {
+        // #207: opening a chat and re-paging its history is the documented
+        // recovery path for reactions that changed while the chat was closed —
+        // TDLib only guarantees live `updateMessageInteractionInfo` delivery for
+        // an open chat, so a message reacted-to while closed can only catch up
+        // through a fresh, server-authoritative `getChatHistory` page. `merge`
+        // must let that page win over the stale (reaction-less) copy already
+        // known from a live `updateNewMessage`.
+        let mut store = MessageStore::new();
+        store.merge([msg(10, 1), msg(10, 2)]);
+        assert!(store.get(10, 2).unwrap().reactions.is_empty());
+
+        // The chat is (re)opened; the landing page comes back with the reaction
+        // that landed while it was closed.
+        let mut reacted = msg(10, 2);
+        reacted.reactions = vec![Reaction {
+            kind: crate::model::ReactionKind::Emoji("👍".to_owned()),
+            count: 1,
+            is_chosen: true,
+        }];
+        store.merge([msg(10, 1), reacted]);
+
+        assert!(
+            !store.get(10, 2).unwrap().reactions.is_empty(),
+            "a re-fetched page must refresh an already-known message"
+        );
     }
 
     #[test]
@@ -1373,6 +1484,173 @@ mod tests {
         assert_eq!(*spy.last.borrow(), Some((10, Some(42), body)));
         // The seam's contract: the caller gets an optimistic Pending message back.
         assert_eq!(optimistic.send_state, SendState::Pending);
+    }
+
+    /// A spy scripted with a `parse_markdown` result (success or failure) that
+    /// also captures the `send_text`/`edit_text` call it drives — #212's
+    /// request-seam test double, verifying the parsed (or, on failure,
+    /// fallback-plain) `FormattedText` actually rides the send/edit call.
+    struct FormatSpy {
+        parse_result: Result<FormattedText, TdError>,
+        last_send: RefCell<Option<(i64, Option<i64>, FormattedText)>>,
+        last_edit: RefCell<Option<(i64, i64, FormattedText)>>,
+    }
+
+    impl FormatRequests for FormatSpy {
+        async fn parse_markdown(&self, _text: String) -> Result<FormattedText, TdError> {
+            self.parse_result.clone()
+        }
+    }
+
+    impl SendRequests for FormatSpy {
+        async fn send_text(
+            &self,
+            chat_id: i64,
+            reply_to: Option<i64>,
+            text: FormattedText,
+        ) -> Result<Message, TdError> {
+            self.last_send
+                .borrow_mut()
+                .replace((chat_id, reply_to, text));
+            Ok(Message::from_tdlib(&td_message_state(
+                chat_id,
+                1001,
+                Some(MessageSendingState::Pending(
+                    MessageSendingStatePending::default(),
+                )),
+            )))
+        }
+
+        async fn send_media(
+            &self,
+            _chat_id: i64,
+            _reply_to: Option<i64>,
+            _media: OutgoingMedia,
+        ) -> Result<Message, TdError> {
+            unimplemented!("FormatSpy exercises the send-text path only")
+        }
+    }
+
+    impl EditRequests for FormatSpy {
+        async fn edit_text(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            text: FormattedText,
+        ) -> Result<Message, TdError> {
+            self.last_edit
+                .borrow_mut()
+                .replace((chat_id, message_id, text));
+            Ok(Message::from_tdlib(&td_message_state(
+                chat_id, message_id, None,
+            )))
+        }
+
+        async fn edit_caption(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+            _caption: FormattedText,
+        ) -> Result<Message, TdError> {
+            unimplemented!("FormatSpy exercises the edit-text path only")
+        }
+    }
+
+    #[tokio::test]
+    async fn send_formatted_text_threads_a_successful_parse_s_entities_onto_send_text() {
+        use crate::model::TextEntity;
+        let parsed = FormattedText {
+            text: "bold".to_owned(),
+            entities: vec![TextEntity {
+                offset: 0,
+                length: 4,
+                kind: crate::model::EntityKind::Bold,
+            }],
+        };
+        let spy = FormatSpy {
+            parse_result: Ok(parsed.clone()),
+            last_send: RefCell::new(None),
+            last_edit: RefCell::new(None),
+        };
+        send_formatted_text(&spy, 10, Some(42), "*bold*".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(*spy.last_send.borrow(), Some((10, Some(42), parsed)));
+    }
+
+    #[tokio::test]
+    async fn send_formatted_text_falls_back_to_plain_text_on_a_parse_error() {
+        let spy = FormatSpy {
+            parse_result: Err(TdError {
+                code: 400,
+                message: "Can't parse entities: character '.' is reserved".to_owned(),
+            }),
+            last_send: RefCell::new(None),
+            last_edit: RefCell::new(None),
+        };
+        send_formatted_text(&spy, 10, None, "hi.".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            *spy.last_send.borrow(),
+            Some((
+                10,
+                None,
+                FormattedText {
+                    text: "hi.".to_owned(),
+                    entities: vec![],
+                }
+            )),
+            "a parse failure must still send, plain"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_formatted_text_threads_a_successful_parse_s_entities_onto_edit_text() {
+        use crate::model::TextEntity;
+        let parsed = FormattedText {
+            text: "code".to_owned(),
+            entities: vec![TextEntity {
+                offset: 0,
+                length: 4,
+                kind: crate::model::EntityKind::Code,
+            }],
+        };
+        let spy = FormatSpy {
+            parse_result: Ok(parsed.clone()),
+            last_send: RefCell::new(None),
+            last_edit: RefCell::new(None),
+        };
+        edit_formatted_text(&spy, 10, 7, "`code`".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(*spy.last_edit.borrow(), Some((10, 7, parsed)));
+    }
+
+    #[tokio::test]
+    async fn edit_formatted_text_falls_back_to_plain_text_on_a_parse_error() {
+        let spy = FormatSpy {
+            parse_result: Err(TdError {
+                code: 400,
+                message: "Can't parse entities: unmatched *".to_owned(),
+            }),
+            last_send: RefCell::new(None),
+            last_edit: RefCell::new(None),
+        };
+        edit_formatted_text(&spy, 10, 7, "*oops".to_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            *spy.last_edit.borrow(),
+            Some((
+                10,
+                7,
+                FormattedText {
+                    text: "*oops".to_owned(),
+                    entities: vec![],
+                }
+            ))
+        );
     }
 
     /// A spy that returns scripted history pages in order, then empty pages. It

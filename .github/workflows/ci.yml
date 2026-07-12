@@ -22,6 +22,11 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    # Historical total job time is ~3.5 minutes across the matrix (#223); this
+    # is a generous ceiling so a genuine hang (e.g. windows-x86_64 stuck on
+    # Test) fails fast and visibly instead of silently burning runner-minutes
+    # up to GitHub's 360-minute default.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:

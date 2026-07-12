@@ -25,9 +25,7 @@
 use std::error::Error;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::time::Duration;
 
-use tuigram_core::enums::AuthorizationState;
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
     ApiCredentials, AuthRequests, AuthState, Bridge, ClientParameters, CredentialError,
@@ -94,23 +92,11 @@ async fn initialize(bridge: &Bridge, params: ClientParameters) -> BootResult<()>
 /// (via `client.bridge()`) and a login that quit before [`Client::start`] was
 /// ever called, where there is no `Client` yet — only the bridge.
 pub async fn shutdown(bridge: &Bridge) {
-    // Ignore the result: an already-closing/closed client rejects `close`, which
-    // is exactly the state we want.
-    let _ = bridge.close().await;
-    wait_until_closed(bridge).await;
-}
-
-/// Wait for TDLib to reach `Closed` — the signal that `close` has finished
-/// flushing and closing the local database. Bounded (~5s) so a stuck teardown
-/// cannot hang exit; a query that errors (the client is already gone) counts as
-/// closed.
-async fn wait_until_closed(bridge: &Bridge) {
-    for _ in 0..50 {
-        match bridge.authorization_state().await {
-            Ok(AuthorizationState::Closed) | Err(_) => return,
-            Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    }
+    // The shared whole-operation (#195): close, then wait for `Closed` so the
+    // database is fully flushed before the process exits — the same clean-shutdown
+    // semantics the REPL harness uses. An already-closing/closed client's rejected
+    // `close` is ignored inside it and the wait returns at once.
+    bridge.close_and_wait().await;
 }
 
 /// Build the `setTdlibParameters` bundle from the resolved credentials and the

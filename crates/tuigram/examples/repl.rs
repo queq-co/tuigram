@@ -45,8 +45,15 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rustyline::completion::Completer;
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::history::DefaultHistory;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config, Context, Editor, Helper};
 use tokio_stream::StreamExt;
-use tuigram_core::enums::{AuthorizationState, Update};
+use tuigram_core::enums::Update;
 use tuigram_core::types::Error as TdError;
 use tuigram_core::{
     ApiCredentials, AuthRequests, AuthState, Bridge, Chat, ChatAction, ChatActionRequests,
@@ -55,7 +62,7 @@ use tuigram_core::{
     Login, Message, MessageContent, NEWEST, Onboarding, OutgoingMedia, PinRequests, Reaction,
     ReactionKind, ReactionRequests, ReadRequests, SecretChatRequests, SecretChatState,
     SendRequests, SendState, Sender, SessionStorage, TgClient, UpdateStream, load_archive_list,
-    load_folder_list, load_main_list,
+    load_folder_list, load_main_list, scrub_line, scrub_prose,
 };
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
@@ -278,12 +285,38 @@ async fn run_repl(client: &Client) -> Fallible {
     tokio::time::sleep(SETTLE).await;
     print_help();
 
+    // The interactive command prompt gets readline-style editing: in-session
+    // up/down recall and command-name tab completion (#156–#157). History is
+    // in-memory only (see `build_editor`); the login and onboarding prompts above
+    // deliberately keep the plain `prompt` reads so secrets never reach it.
+    let mut editor = match build_editor() {
+        Ok(editor) => editor,
+        Err(e) => {
+            eprintln!("Could not start the line editor: {e}");
+            return Ok(());
+        }
+    };
+
     loop {
-        // EOF (Ctrl-D) ends the REPL cleanly, the same exit a `quit` gives.
-        let line = match prompt("\ntuigram> ") {
-            Ok(line) => line,
-            Err(_) => {
+        let line = match editor.readline("\ntuigram> ") {
+            Ok(line) => {
+                let line = line.trim().to_owned();
+                if !line.is_empty() {
+                    // Record the command for up/down recall (in-memory only).
+                    let _ = editor.add_history_entry(line.as_str());
+                }
+                line
+            }
+            // Ctrl-C abandons the current line and re-prompts, like a shell.
+            Err(ReadlineError::Interrupted) => continue,
+            // Ctrl-D (EOF) ends the REPL cleanly — the same exit `quit` gives, so
+            // `shutdown` still flushes and closes the TDLib database on the way out.
+            Err(ReadlineError::Eof) => {
                 println!("Bye.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Input error: {e}");
                 return Ok(());
             }
         };
@@ -390,6 +423,7 @@ async fn run_repl(client: &Client) -> Fallible {
                 Err(_) => println!("usage: secret-close <secret_chat_id>"),
             },
             "status" => show_status(client),
+            "probe" => run_probe(rest),
             "resync" => resync(client).await,
             "logout" => {
                 if logout(client).await == Flow::Done {
@@ -934,11 +968,13 @@ async fn close_secret_chat(client: &Client, secret_chat_id: i32) {
 /// a half-cleared session the next run can neither resume nor cleanly replace.
 async fn logout(client: &Client) -> Flow {
     println!("Logging out…");
-    if let Err(e) = client.bridge().log_out().await {
+    // `log_out_and_wait` bundles the logOut with the wait for `Closed` that makes
+    // the teardown complete before we return (#195) — the same whole-operation the
+    // TUI uses, so the two clients cannot drift on what "logout" requires.
+    if let Err(e) = client.bridge().log_out_and_wait().await {
         println!("Logout failed: {} {}", e.code, e.message);
         return Flow::Continue;
     }
-    wait_until_closed(client.bridge()).await;
     println!("Logged out. The local session has been cleared — re-run to sign in again.");
     Flow::Done
 }
@@ -946,27 +982,12 @@ async fn logout(client: &Client) -> Flow {
 /// Cleanly close the TDLib instance before the process exits, so its database is
 /// flushed and properly closed rather than left mid-write. Called on every exit
 /// path; harmless when the session is already gone (e.g. straight after
-/// `logout`) — the `close` request just fails and the wait returns at once.
+/// `logout`) — `close_and_wait` ignores the rejected `close` and returns at once.
+///
+/// Delegates to the shared [`AuthRequests::close_and_wait`] whole-operation (#195),
+/// the same one the TUI's shutdown uses, so "clean shutdown" means one thing.
 async fn shutdown(client: &Client) {
-    // Ignore the result: an already-closing/closed client (the usual case after
-    // `logout`) rejects it, which is exactly the state we want.
-    let _ = client.bridge().close().await;
-    wait_until_closed(client.bridge()).await;
-}
-
-/// Wait for TDLib to reach `Closed` — the signal that `log_out`/`close` has
-/// finished flushing and closing the local database. Both teardown paths drive
-/// authorization through `Closing` to `Closed`; returning before then would exit
-/// with the database mid-write, leaving it malformed for the next run. Bounded
-/// (~5s) so a stuck teardown cannot hang the harness; a query that errors (the
-/// client is already gone) counts as closed.
-async fn wait_until_closed(bridge: &Bridge) {
-    for _ in 0..50 {
-        match bridge.authorization_state().await {
-            Ok(AuthorizationState::Closed) | Err(_) => return,
-            Ok(_) => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    }
+    client.bridge().close_and_wait().await;
 }
 
 /// Render one message for display: id, sender, send state, and its body. A
@@ -1236,40 +1257,407 @@ fn parse_sendmedia(rest: &str) -> Result<(i64, OutgoingMedia), String> {
     Ok((chat_id, media))
 }
 
-/// The command reference, shown on entry and on `help`.
-fn print_help() {
+/// A built-in terminal-injection payload for the `probe` command: a human label
+/// and the raw hostile bytes exactly as a contact could embed them in a message.
+struct Payload {
+    /// What the payload attempts, for the operator's benefit.
+    label: &'static str,
+    /// The raw attacker bytes — real ESC/BEL/bidi, not their printable spellings.
+    raw: &'static str,
+    /// Whether this stands in for a single-line identifier (file name, title),
+    /// which the boundary scrubs with [`scrub_line`], versus a prose body
+    /// ([`scrub_prose`]). Mirrors the field-shape split in `from_tdlib`.
+    line: bool,
+}
+
+/// The payloads `probe` exercises: the escape-injection vectors #174 defends
+/// against, carried as literals so the operator never has to type a raw ESC
+/// (which most terminals and editors swallow) to reproduce the attack.
+const PROBE_PAYLOADS: &[Payload] = &[
+    Payload {
+        label: "OSC set-window-title",
+        raw: "before \x1b]0;PWNED\x07 after",
+        line: false,
+    },
+    Payload {
+        label: "OSC 8 hyperlink cloak",
+        raw: "\x1b]8;;https://evil.example\x1b\\click me\x1b]8;;\x1b\\",
+        line: false,
+    },
+    Payload {
+        label: "DECRQSS status query",
+        raw: "\x1bP$qm\x1b\\",
+        line: false,
+    },
+    Payload {
+        label: "SGR colour bleed",
+        raw: "\x1b[31mred-forever",
+        line: false,
+    },
+    Payload {
+        label: "Trojan-Source file name",
+        raw: "report_e\u{202e}xe.txt",
+        line: true,
+    },
+];
+
+/// Demonstrate the terminal-injection defence (#174) with no network round-trip
+/// and no second account. The default run pushes each built-in payload through
+/// the same public sanitizer the `from_tdlib` trust boundary uses and prints the
+/// neutralized result, so you can confirm on a real terminal that nothing reacts.
+/// `probe raw` instead emits the *unscrubbed* bytes so you can watch the attack
+/// fire — proof the threat is real — then restores the window title.
+fn run_probe(rest: &str) {
+    if rest.trim() == "raw" {
+        probe_raw();
+    } else {
+        probe_safe();
+    }
+}
+
+/// Scrub each payload at the boundary and report whether any control byte
+/// survived — the property #174 guarantees.
+fn probe_safe() {
     println!(
-        "Commands:\n\
-         \x20 chats                              list the Main chat list\n\
-         \x20 open <chat>                        load + mark read + show recent history\n\
-         \x20 history <chat>                     show known messages for a chat\n\
-         \x20 send <chat> <text>                 send a text message\n\
-         \x20 reply <chat> <msg> <text>          reply to a message\n\
-         \x20 edit <chat> <msg> <text>           edit one of your messages\n\
-         \x20 delete <chat> <msg> [all]          delete a message (all = for everyone)\n\
-         \x20 read <chat>                        mark a chat's known messages read\n\
-         \x20 search [chat] <query>             search one chat (with id) or the whole account\n\
-         \x20 forward <from> <ids> <to>          forward msg ids (comma-separated) between chats\n\
-         \x20 download <chat> <msg>              download a message's media; show the local path\n\
-         \x20 file <file_id>                     show a file's transfer state + local path\n\
-         \x20 sendmedia <chat> <kind> <path> [cap]  send photo|video|document from a local path\n\
-         \x20 archive                            list the Archive chat list\n\
-         \x20 folders                            list chat folders\n\
-         \x20 folder <id>                        list a folder's chats\n\
-         \x20 react <chat> <msg> <emoji>         add an emoji reaction\n\
-         \x20 unreact <chat> <msg> <emoji>       remove your emoji reaction\n\
-         \x20 pin <chat> <msg>                   pin a message (silently, chat-wide)\n\
-         \x20 unpin <chat> <msg>                 unpin a message\n\
-         \x20 typing <chat>                      send a one-shot typing action\n\
-         \x20 secret-new <user_id>               start a secret chat with a user\n\
-         \x20 secrets                            list known secret chats + state\n\
-         \x20 secret-close <secret_id>           close a secret chat\n\
-         \x20 status                             show connection/sync status + any dropped-update gap\n\
-         \x20 resync                             re-query the chat list after a dropped-update gap\n\
-         \x20 logout                             end the session and exit (next run logs in fresh)\n\
-         \x20 help                               show this help\n\
-         \x20 quit                               exit (Ctrl-D also works)"
+        "Terminal-injection probe — each payload scrubbed at the from_tdlib boundary (#174):\n"
     );
+    let mut all_inert = true;
+    for p in PROBE_PAYLOADS {
+        let scrubbed = if p.line {
+            scrub_line(p.raw)
+        } else {
+            scrub_prose(p.raw)
+        };
+        // `\n` is legitimate in scrubbed prose; any other control byte is a leak.
+        let inert = !scrubbed.chars().any(|c| c.is_control() && c != '\n');
+        all_inert &= inert;
+        let verdict = if inert { "inert" } else { "LEAK" };
+        println!("  {:<24} [{verdict}] {scrubbed}", p.label);
+    }
+    if all_inert {
+        println!(
+            "\nAll payloads inert. Your terminal title is unchanged and every escape shows as `\u{fffd}`."
+        );
+    } else {
+        println!("\nA payload LEAKED a control byte — #174 has regressed.");
+    }
+    println!("Run `probe raw` to see the same payloads fire on an unprotected terminal.");
+}
+
+/// Emit the payloads unscrubbed so the operator can watch a real terminal react —
+/// then undo the window title so the REPL does not leave `PWNED` behind.
+fn probe_raw() {
+    println!(
+        "DANGER: writing raw payloads to your terminal — expect the window title to change.\n"
+    );
+    for p in PROBE_PAYLOADS {
+        // The hostile bytes verbatim, exactly as an unsanitized render would emit.
+        println!("  {}:\n    {}", p.label, p.raw);
+    }
+    // Courtesy reset: put the window title back so the demonstration is reversible.
+    print!("\x1b]0;tuigram repl\x07");
+    let _ = io::stdout().flush();
+    println!("\n(window title restored). This is what #174 neutralizes on the real message path.");
+}
+
+/// One entry in the REPL's command table: the word that invokes it, its argument
+/// summary, and a one-line description. This table is the single source of truth
+/// for both the help listing ([`print_help`]) and tab completion ([`ReplHelper`]),
+/// so the two cannot drift (#157).
+struct Command {
+    /// The word typed to run it — the tab-completion target.
+    name: &'static str,
+    /// Argument summary shown after the name in help, e.g. `"<chat> <text>"`.
+    args: &'static str,
+    /// One-line description of what the command does.
+    help: &'static str,
+}
+
+/// The full command set, in help-display order. `help`/`quit` list their canonical
+/// spellings; the `?`/`exit` aliases still work in the dispatcher but are not
+/// completion targets. Keep this in sync with the `match` in [`run_repl`].
+const COMMANDS: &[Command] = &[
+    Command {
+        name: "chats",
+        args: "",
+        help: "list the Main chat list",
+    },
+    Command {
+        name: "open",
+        args: "<chat>",
+        help: "load + mark read + show recent history",
+    },
+    Command {
+        name: "history",
+        args: "<chat>",
+        help: "show known messages for a chat",
+    },
+    Command {
+        name: "send",
+        args: "<chat> <text>",
+        help: "send a text message",
+    },
+    Command {
+        name: "reply",
+        args: "<chat> <msg> <text>",
+        help: "reply to a message",
+    },
+    Command {
+        name: "edit",
+        args: "<chat> <msg> <text>",
+        help: "edit one of your messages",
+    },
+    Command {
+        name: "delete",
+        args: "<chat> <msg> [all]",
+        help: "delete a message (all = for everyone)",
+    },
+    Command {
+        name: "read",
+        args: "<chat>",
+        help: "mark a chat's known messages read",
+    },
+    Command {
+        name: "search",
+        args: "[chat] <query>",
+        help: "search one chat (with id) or the whole account",
+    },
+    Command {
+        name: "forward",
+        args: "<from> <ids> <to>",
+        help: "forward msg ids (comma-separated) between chats",
+    },
+    Command {
+        name: "download",
+        args: "<chat> <msg>",
+        help: "download a message's media; show the local path",
+    },
+    Command {
+        name: "file",
+        args: "<file_id>",
+        help: "show a file's transfer state + local path",
+    },
+    Command {
+        name: "sendmedia",
+        args: "<chat> <kind> <path> [cap]",
+        help: "send photo|video|document from a local path",
+    },
+    Command {
+        name: "archive",
+        args: "",
+        help: "list the Archive chat list",
+    },
+    Command {
+        name: "folders",
+        args: "",
+        help: "list chat folders",
+    },
+    Command {
+        name: "folder",
+        args: "<id>",
+        help: "list a folder's chats",
+    },
+    Command {
+        name: "react",
+        args: "<chat> <msg> <emoji>",
+        help: "add an emoji reaction",
+    },
+    Command {
+        name: "unreact",
+        args: "<chat> <msg> <emoji>",
+        help: "remove your emoji reaction",
+    },
+    Command {
+        name: "pin",
+        args: "<chat> <msg>",
+        help: "pin a message (silently, chat-wide)",
+    },
+    Command {
+        name: "unpin",
+        args: "<chat> <msg>",
+        help: "unpin a message",
+    },
+    Command {
+        name: "typing",
+        args: "<chat>",
+        help: "send a one-shot typing action",
+    },
+    Command {
+        name: "secret-new",
+        args: "<user_id>",
+        help: "start a secret chat with a user",
+    },
+    Command {
+        name: "secrets",
+        args: "",
+        help: "list known secret chats + state",
+    },
+    Command {
+        name: "secret-close",
+        args: "<secret_id>",
+        help: "close a secret chat",
+    },
+    Command {
+        name: "status",
+        args: "",
+        help: "show connection/sync status + any dropped-update gap",
+    },
+    Command {
+        name: "probe",
+        args: "[raw]",
+        help: "terminal-injection self-test (#174); `raw` fires the unscrubbed attack",
+    },
+    Command {
+        name: "resync",
+        args: "",
+        help: "re-query the chat list after a dropped-update gap",
+    },
+    Command {
+        name: "logout",
+        args: "",
+        help: "end the session and exit (next run logs in fresh)",
+    },
+    Command {
+        name: "help",
+        args: "",
+        help: "show this help",
+    },
+    Command {
+        name: "quit",
+        args: "",
+        help: "exit (Ctrl-D also works)",
+    },
+];
+
+/// The command reference, shown on entry and on `help`. Rendered from the shared
+/// [`COMMANDS`] table so it always lists exactly what tab completion offers.
+fn print_help() {
+    // Align the descriptions: pad each "name args" signature to the widest one.
+    let width = COMMANDS
+        .iter()
+        .map(|c| {
+            c.name.len()
+                + if c.args.is_empty() {
+                    0
+                } else {
+                    1 + c.args.len()
+                }
+        })
+        .max()
+        .unwrap_or(0);
+    println!("Commands:");
+    for c in COMMANDS {
+        let signature = if c.args.is_empty() {
+            c.name.to_owned()
+        } else {
+            format!("{} {}", c.name, c.args)
+        };
+        println!("  {signature:<width$}  {}", c.help);
+    }
+}
+
+/// The command-name candidates for a completion `head` — the whitespace-free
+/// command word before the cursor. Shared by the [`Completer`] impl and its tests,
+/// and read straight from [`COMMANDS`] so completion always tracks the table (#157).
+fn complete_command(head: &str) -> Vec<String> {
+    COMMANDS
+        .iter()
+        .map(|c| c.name)
+        .filter(|name| name.starts_with(head))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Build the REPL's line editor: command-name tab completion (#157) plus in-memory
+/// command history for up/down recall (#156). The history is `MemHistory` — session
+/// only, never written to disk — because command lines carry real message text and
+/// file paths; persisting them would drop private content into a plaintext file, at
+/// odds with the encrypted-at-rest posture (#8). `CompletionType::List` prints the
+/// candidates on an ambiguous prefix rather than cycling through them silently.
+fn build_editor() -> Result<Editor<ReplHelper, DefaultHistory>, ReadlineError> {
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor: Editor<ReplHelper, DefaultHistory> = Editor::with_config(config)?;
+    editor.set_helper(Some(ReplHelper));
+    Ok(editor)
+}
+
+/// rustyline glue for the REPL prompt. It completes the command word from the
+/// shared [`COMMANDS`] table (#157); editing, hinting, and highlighting stay at
+/// their trait defaults. Completion only fires in command position — once the
+/// cursor is past the first token it returns nothing, so argument typing is left
+/// untouched (the stretch of completing chat ids in argument position is not done).
+struct ReplHelper;
+
+impl Completer for ReplHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> Result<(usize, Vec<String>), ReadlineError> {
+        // Only the first word is a command. If anything before the cursor is
+        // whitespace we are in argument position — offer nothing there.
+        let head = &line[..pos];
+        if head.contains(char::is_whitespace) {
+            return Ok((pos, Vec::new()));
+        }
+        // Replace from index 0: `head` is the whole (whitespace-free) command word.
+        Ok((0, complete_command(head)))
+    }
+}
+
+// The REPL needs only completion; hinting, highlighting, and validation stay at
+// their trait defaults so `ReplHelper` can satisfy `Helper`.
+impl Hinter for ReplHelper {
+    type Hint = String;
+}
+impl Highlighter for ReplHelper {}
+impl Validator for ReplHelper {}
+impl Helper for ReplHelper {}
+
+#[cfg(test)]
+mod tests {
+    use super::{COMMANDS, complete_command};
+
+    #[test]
+    fn unique_prefix_completes_to_the_one_command() {
+        assert_eq!(complete_command("op"), ["open"]);
+    }
+
+    #[test]
+    fn ambiguous_prefix_lists_every_candidate() {
+        let mut hits = complete_command("secret");
+        hits.sort();
+        assert_eq!(hits, ["secret-close", "secret-new", "secrets"]);
+    }
+
+    #[test]
+    fn empty_head_offers_the_whole_command_table() {
+        assert_eq!(complete_command("").len(), COMMANDS.len());
+    }
+
+    #[test]
+    fn unknown_prefix_completes_to_nothing() {
+        assert!(complete_command("zzz").is_empty());
+    }
+
+    #[test]
+    fn every_dispatched_command_is_in_the_table() {
+        // Guards the table against drifting from the `run_repl` match arms.
+        // `REPL_COMMANDS` is the same list the TUI's command-parity guard
+        // (`crates/tuigram/src/parity.rs`) reads (#197) — kept here, not
+        // hand-duplicated, so the two checks can't drift apart.
+        for name in tuigram_core::command_surface::REPL_COMMANDS {
+            assert!(
+                COMMANDS.iter().any(|c| c.name == *name),
+                "`{name}` is dispatched but missing from COMMANDS (help + completion)",
+            );
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------

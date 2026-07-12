@@ -197,6 +197,14 @@ impl SearchView {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// Move the selection directly to a row index (a click on a result), clamping
+    /// at the last hit. A no-op with no hits.
+    pub fn select(&mut self, index: usize) {
+        if !self.results.is_empty() {
+            self.selected = index.min(self.results.len() - 1);
+        }
+    }
+
     /// Clear the query and results back to a fresh search — used when the overlay
     /// is (re)opened so a previous search never leaks into the next.
     pub fn reset(&mut self) {

@@ -9,12 +9,15 @@ pub mod auth;
 pub mod bridge;
 pub mod chats;
 pub mod client;
+pub mod command_surface;
 pub mod connection;
+pub mod contacts;
 pub mod credentials;
 pub mod files;
 pub mod messages;
 pub mod model;
 pub mod router;
+pub mod sanitize;
 pub mod secret_chats;
 pub mod session;
 pub mod settings;
@@ -24,10 +27,13 @@ pub use actions::{ChatActionRequests, ChatActionStore};
 pub use auth::{AuthRequests, AuthState, Login};
 pub use bridge::{Bridge, ClientParameters, RouterEvent, RouterStream, TgClient, UpdateStream};
 pub use chats::{
-    CHATS_EXHAUSTED, ChatRequests, ChatStore, load_archive_list, load_folder_list, load_main_list,
+    CHATS_EXHAUSTED, ChatLifecycleRequests, ChatRequests, ChatStore, load_archive_list,
+    load_folder_list, load_main_list,
 };
 pub use client::{AccountState, Client};
+pub use command_surface::REPL_COMMANDS;
 pub use connection::{ConnectionState, ConnectionStore};
+pub use contacts::ContactRequests;
 pub use credentials::{
     ApiCredentials, CredentialError, CredentialResolver, Onboarding, is_api_id_published_flood,
 };
@@ -35,21 +41,23 @@ pub use files::{
     DOWNLOAD_PRIORITY, FileRequests, FileStore, SWEEP_IMMUNITY_DELAY, StorageRequests,
 };
 pub use messages::{
-    DeleteRequests, EditRequests, ForwardRequests, HistoryRequests, MessageRequests, MessageStore,
-    NEWEST, PinRequests, ReactionRequests, ReadRequests, SearchPage, SearchRequests, SearchResults,
-    SendRequests, load_history, search_chat, search_global,
+    DeleteRequests, EditRequests, FormatRequests, ForwardRequests, HistoryRequests,
+    MessageRequests, MessageStore, NEWEST, PinRequests, ReactionRequests, ReadRequests, SearchPage,
+    SearchRequests, SearchResults, SendRequests, edit_formatted_text, load_history, search_chat,
+    search_global, send_formatted_text,
 };
 pub use model::{
     Animation, Audio, Chat, ChatAction, ChatFolderInfo, ChatKind, ChatListKind, ChatPosition,
     Contact, Document, Draft, EntityKind, File, FileRef, FormattedText, Location, Message,
     MessageContent, OutgoingMedia, Photo, Poll, PollKind, PollOption, Presence, Reaction,
-    ReactionKind, SecretChat, SecretChatState, SendState, Sender, Sticker, TextEntity, User,
-    UserKind, Venue, Video, Voice,
+    ReactionKind, ReplyTo, SecretChat, SecretChatState, SendState, Sender, Sticker, TextEntity,
+    User, UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
+pub use sanitize::{scrub_line, scrub_prose};
 pub use secret_chats::{SecretChatRequests, SecretChatStore};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
-pub use settings::{CacheCap, KeepMedia, StorageSettings};
+pub use settings::{CacheCap, InterfaceSettings, KeepMedia, StorageSettings};
 pub use users::{UserRequests, UserStore};
 
 /// TDLib's typed request API and data model, re-exported so callers depend on
@@ -66,6 +74,22 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn version() -> &'static str {
     VERSION
 }
+
+/// Serializes tests that create a real `tdjson` client (#223).
+///
+/// `tdjson`'s receive queue and observer are process-global —
+/// [`Bridge`](bridge::Bridge)'s own module doc documents "at most one
+/// `Bridge` per process" as an invariant — but Rust's default test harness
+/// runs `#[test]`/`#[tokio::test]` functions in parallel across threads
+/// within one process. [`prebuilt_tdjson_loads_and_creates_a_client`] (below)
+/// and `bridge::tests::live_request_correlates_and_updates_stream` both
+/// create a client, so without this lock they can race each other, which is
+/// the suspected cause of a Windows-only CI hang (#223 — unconfirmed on other
+/// platforms, since it hasn't been observed there). A `tokio::sync::Mutex`
+/// (not `std::sync::Mutex`) because the async test holds the guard across
+/// `.await` points.
+#[cfg(test)]
+pub(crate) static TDJSON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
 mod tests {
@@ -84,6 +108,7 @@ mod tests {
     /// it. The async request/update bridge over this client lands in #5.
     #[test]
     fn prebuilt_tdjson_loads_and_creates_a_client() {
+        let _guard = crate::TDJSON_TEST_LOCK.blocking_lock();
         let client_id = tdlib_rs::create_client();
         assert!(client_id >= 0, "tdjson returned an invalid client id");
     }

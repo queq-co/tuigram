@@ -7,7 +7,7 @@ members = ["crates/tuigram-core", "crates/tuigram"]
 # SemVer (leading zeros are rejected). MINOR is the release month, MICRO the
 # patch within it; both crates inherit this via `version.workspace = true`, and
 # it flows to TDLib as `application_version` through `tuigram_core::version()`.
-version = "2026.7.0"
+version = "2026.7.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/queq-co/tuigram"
@@ -32,6 +32,12 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 # async Stream feeding the central tokio::select! loop. See research/ratatui.md.
 ratatui = { version = "0.30" }
 crossterm = { version = "0.29", features = ["event-stream"] }
+# Local-time rendering for message timestamps (#194) — chrono is already pulled
+# in transitively via serde_with (a tdlib-rs dependency), so this adds no new
+# crate to the build graph, just promotes it to a direct dependency. Preferred
+# over the `time` crate, whose local-offset read is unsound in a multithreaded
+# process (this is a tokio app).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Config (de)serialization for ~/.config/tuigram/config.toml (api_id/api_hash).
 serde = { version = "1", features = ["derive"] }
 toml = { version = "1" }
@@ -48,6 +54,40 @@ tempfile = { version = "3" }
 # link is drawn as a scannable code. Nayuki's reference implementation — pure
 # Rust, zero dependencies, deterministic output (so the render is snapshot-testable).
 qrcodegen = { version = "1.8" }
+# OS clipboard access for "copy the selected message" (`y`, #197). Cross-platform
+# (macOS Pasteboard / X11+Wayland / Windows), matching our brew-tap macOS target.
+arboard = { version = "3" }
+# Readline-style line editing for the headless REPL harness only (#156–#157):
+# in-session up/down history and command-name tab completion. `default-features
+# = false` drops the file-history + directory helpers, so `DefaultHistory` is the
+# in-memory `MemHistory` — command lines (which carry message text and file paths)
+# are never written to disk, matching the encrypted-at-rest posture (#8). Harness
+# only: pulled in via `dep:rustyline` behind `login-harness`, never in the product
+# binary's dependency graph.
+rustyline = { version = "18", default-features = false }
+# Decodes TDLib's base64-encoded `Minithumbnail.data` (profile-photo mini
+# avatars, #201) once at projection time, so nothing downstream re-touches
+# base64. Already in the dependency graph transitively; promoted to direct.
+base64 = { version = "0.22" }
+# Renders the raster mini-avatar bubble (#201) as a Sixel/Kitty/iTerm2 image
+# widget. `image-defaults` picks the pure-Rust encoder path instead of the
+# default `chafa-dyn`/`chafa-static`, avoiding a system `libchafa` build
+# dependency; see docs/research (Stage 2 verification) for why.
+ratatui-image = { version = "11", default-features = false, features = ["image-defaults"] }
+# Decodes a sender's minithumbnail JPEG bytes into the `DynamicImage`
+# `Picker::new_protocol` (#201) needs. Already in the graph transitively via
+# `ratatui-image`/`arboard`; promoted to direct since Stage 3 calls
+# `image::load_from_memory` itself. Default features include the JPEG codec.
+image = { version = "0.25" }
+# Draws the generated fallback avatar bubble (#201, Stage 4) for senders with
+# no profile-photo minithumbnail: `imageproc` for the accent-color-filled
+# `RgbImage` + text drawing, `ab_glyph` as its font-rasterizing backend.
+imageproc = { version = "0.25", default-features = false }
+ab_glyph = { version = "0.2" }
+# Column-width measurement for word-wrapping message bodies and the composer
+# (#214, #215) — already in the graph transitively via ratatui; promoted to
+# direct since `wrap.rs` calls it to measure display width, not byte/char count.
+unicode-width = { version = "0.2" }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.

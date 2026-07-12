@@ -16,7 +16,7 @@
 //! [`prev_list`](ChatListView::prev_list) cycle them and the chat store's
 //! ordering is preserved verbatim (this never re-sorts; it only points at rows).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tuigram_core::model::{Chat, ChatAction, ChatKind, ChatListKind, SecretChatState};
 use tuigram_core::{ChatStore, SecretChatStore};
@@ -112,6 +112,12 @@ pub struct ChatListView {
     /// indicator. Phase 6 projects this from the core
     /// [`ChatActionStore`](tuigram_core::ChatActionStore); empty until then.
     actions: HashMap<i64, ChatAction>,
+    /// Ids of the private chats whose peer is a **bot** (#160), for the 🤖 row
+    /// marker. Resolved by the loop from the core [`UserStore`](tuigram_core::UserStore)
+    /// — the chat's [`ChatKind`] alone says "private", not "bot" — and replaced
+    /// wholesale on each chat-list re-projection. A private chat absent here is an
+    /// ordinary user (or Saved Messages), which the app draws without a marker.
+    bot_chats: HashSet<i64>,
 }
 
 impl Default for ChatListView {
@@ -127,6 +133,7 @@ impl Default for ChatListView {
             selected: 0,
             secret_states: HashMap::new(),
             actions: HashMap::new(),
+            bot_chats: HashSet::new(),
         }
     }
 }
@@ -151,6 +158,7 @@ impl ChatListView {
             selected: 0,
             secret_states: HashMap::new(),
             actions: HashMap::new(),
+            bot_chats: HashSet::new(),
         }
     }
 
@@ -202,6 +210,22 @@ impl ChatListView {
         self.actions.get(&chat_id)
     }
 
+    /// Whether chat `chat_id` is a private chat with a **bot** peer (#160) — the
+    /// source of the 🤖 row marker. `false` for groups, channels, ordinary private
+    /// chats, or a bot chat whose user record has not been folded yet.
+    #[must_use]
+    pub fn is_bot_chat(&self, chat_id: i64) -> bool {
+        self.bot_chats.contains(&chat_id)
+    }
+
+    /// Replace the set of private-bot chat ids (#160) wholesale, the way the loop
+    /// re-resolves it from the core user store on each chat-list re-projection —
+    /// the batch counterpart the running binary uses, mirroring
+    /// [`project_secret_states`](Self::project_secret_states).
+    pub fn set_bot_chats(&mut self, ids: HashSet<i64>) {
+        self.bot_chats = ids;
+    }
+
     /// Record (or replace) the secret-chat lifecycle state for chat `chat_id`. The
     /// granular counterpart to [`project_secret_states`](Self::project_secret_states);
     /// only tests call it now that the binary projects the whole map at once.
@@ -249,6 +273,16 @@ impl ChatListView {
     /// Move the selection up one row, clamping at the first row.
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Move the selection directly to a row index (a click on a chat, or a
+    /// forward-target picker click), clamping at the last row. A no-op on an
+    /// empty list.
+    pub fn select(&mut self, index: usize) {
+        let len = self.active_chats().len();
+        if len > 0 {
+            self.selected = index.min(len - 1);
+        }
     }
 
     /// Select the chat with `chat_id` in the **active** list, returning whether it
@@ -586,5 +620,17 @@ mod tests {
         // New list, cursor back at the top — not a stale index into the old list.
         assert_eq!(view.selected(), 0);
         assert_eq!(view.active_chats().len(), 1);
+    }
+
+    #[test]
+    fn bot_chats_are_recorded_and_replaced_wholesale() {
+        let mut view = ChatListView::default();
+        assert!(!view.is_bot_chat(5), "unknown chat is not a bot");
+        view.set_bot_chats(HashSet::from([5, 7]));
+        assert!(view.is_bot_chat(5) && view.is_bot_chat(7));
+        // A later re-projection replaces the set: 5 is gone, 9 is new.
+        view.set_bot_chats(HashSet::from([9]));
+        assert!(!view.is_bot_chat(5), "prior set cleared");
+        assert!(view.is_bot_chat(9));
     }
 }

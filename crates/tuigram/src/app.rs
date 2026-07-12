@@ -4,15 +4,20 @@
 //! marks the frame dirty, and the loop repaints from the new state. Nothing here
 //! touches the terminal or awaits — it stays a pure, unit-testable reducer.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseButton, MouseEvent, MouseEventKind};
+use ratatui_image::protocol::Protocol;
 use tuigram_core::StorageSettings;
-use tuigram_core::model::{File, Message, OutgoingMedia, SecretChatState};
+use tuigram_core::model::{
+    File, Message, MessageContent, OutgoingMedia, ReplyTo, SecretChatState, Sender,
+};
 
 use crate::chat_list::{ChatList, ChatListView};
 use crate::composer::{Composer, Submission};
-use crate::conversation::{ConversationView, PinIntent};
+use crate::contact_picker::{ContactHit, ContactPickerView};
+use crate::conversation::{ConversationView, DeleteIntent, DeletePrompt, PinIntent, SenderLabel};
 use crate::event::AppEvent;
 use crate::forward::{ForwardIntent, ForwardView};
 use crate::keymap::{self, Focus, Overlay};
@@ -21,7 +26,69 @@ use crate::reactions::{ReactionIntent, ReactionPicker};
 use crate::search::SearchView;
 use crate::secret::{SecretChatPrompt, SecretLifecycle};
 use crate::settingsform::SettingsDraft;
-use crate::status::{ConnectionState, Notifications};
+use crate::status::{ConnectionState, Notice, Notifications};
+use crate::terminal::AvatarSupport;
+
+/// Built avatar protocols, keyed by sender user id (#201), so each user's photo
+/// is decoded and handed to the `Picker` at most once per process lifetime —
+/// same shape as `downloads: HashMap<i32, File>` in `conversation.rs`.
+/// `ratatui_image::protocol::Protocol` has no `Debug` impl, so this wraps the
+/// map in a type with a hand-written one instead of blocking `App`'s derive.
+#[derive(Default)]
+pub struct AvatarCache(HashMap<i64, Protocol>);
+
+impl AvatarCache {
+    /// The built protocol for a user, if their avatar has already been
+    /// encoded this session.
+    pub fn get(&self, user_id: i64) -> Option<&Protocol> {
+        self.0.get(&user_id)
+    }
+
+    /// Record a newly built protocol for a user, replacing any previous one.
+    pub fn insert(&mut self, user_id: i64, protocol: Protocol) {
+        self.0.insert(user_id, protocol);
+    }
+}
+
+impl fmt::Debug for AvatarCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AvatarCache")
+            .field("cached_avatars", &self.0.len())
+            .finish()
+    }
+}
+
+/// Built inline-media protocols, keyed by message id (#208) — a message's own
+/// id rather than its backing file id, since a `Video`/`Animation` still comes
+/// from an embedded minithumbnail with no file id of its own, and keying
+/// uniformly by message id keeps `drive_inline_media`/the render path simple at the
+/// cost of not de-duplicating decodes across duplicate forwards of the same
+/// file (accepted; not worth the complexity here). Same shape as
+/// [`AvatarCache`], including the hand-written `Debug` for the same reason.
+#[derive(Default)]
+pub struct MediaCache(HashMap<i64, Protocol>);
+
+impl MediaCache {
+    /// The built protocol for a message's media, if already encoded this
+    /// session.
+    pub fn get(&self, message_id: i64) -> Option<&Protocol> {
+        self.0.get(&message_id)
+    }
+
+    /// Record a newly built protocol for a message's media, replacing any
+    /// previous one.
+    pub fn insert(&mut self, message_id: i64, protocol: Protocol) {
+        self.0.insert(message_id, protocol);
+    }
+}
+
+impl fmt::Debug for MediaCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MediaCache")
+            .field("cached_media", &self.0.len())
+            .finish()
+    }
+}
 
 /// A single, already-interpreted intent. Every event source (terminal input, the
 /// render tick, core updates) is funnelled through this enum before it touches
@@ -45,6 +112,30 @@ pub enum Action {
     /// Move input focus directly to a specific pane (e.g. Enter on a chat opens
     /// the history; `i` in the history jumps to the composer).
     SetFocus(Focus),
+    /// Open the chat with this id and focus the history pane (a mouse click on a
+    /// chat-list row) — the click-equivalent of selecting it, then pressing Enter.
+    OpenChat(i64),
+    /// Scroll the history so this message id is at the top and focus the history
+    /// pane (a mouse click on a history row). Selection and scroll offset are the
+    /// same thing here (see [`ConversationView::select_message`]), so this also
+    /// brings the clicked message to the top of the pane, same as the wheel does.
+    SelectMessageAt(i64),
+    /// Move the composer cursor to the char index at this visual row/terminal
+    /// cell column and focus the composer (a mouse click on the composer,
+    /// #215) — the click-equivalent of tabbing into the composer and
+    /// pressing Left/Right/Up/Down/Home/End to land the cursor there.
+    ComposerClickAt {
+        /// Visual row within the composer's wrapped text, clamped to the
+        /// last row.
+        row: usize,
+        /// Terminal cell column within that row.
+        col: usize,
+    },
+    /// Select and confirm the row at this index in the open modal list overlay —
+    /// search results, forward targets, the reaction palette, or contact
+    /// results (a mouse click on that overlay's row, #217). Resolved against
+    /// whichever overlay is open; a no-op if it has no selectable list.
+    OverlayRowClick(usize),
     /// Show or hide the help overlay.
     ToggleHelp,
     /// Scroll the help overlay one line toward the end (`j` / ↓).
@@ -59,10 +150,31 @@ pub enum Action {
     NextList,
     /// Switch to the previous chat list, wrapping.
     PrevList,
-    /// Scroll the conversation history one message toward the newest.
+    /// Collapse the chat-list pane to zero width, or restore it (`b`, #213):
+    /// on narrow terminals the history pane can take the full width once
+    /// you're inside a conversation. Session-only for now — not persisted to
+    /// `settings.toml`. If the pane is focused when it collapses, focus moves
+    /// to the history pane, since a zero-width pane can no longer hold it.
+    ToggleChatListCollapse,
+    /// Scroll the conversation history one row toward the newest (#222) —
+    /// `j` / ↓ / the mouse wheel. A small, fixed step regardless of the
+    /// message it crosses, unlike [`PageDown`](Action::PageDown).
     ScrollDown,
-    /// Scroll the conversation history one message toward the oldest.
+    /// Scroll the conversation history one row toward the oldest (#222) —
+    /// `k` / ↑ / the mouse wheel.
     ScrollUp,
+    /// Scroll the conversation history a full viewport toward the newest
+    /// (#222) — `PageDown`, meaningfully bigger than
+    /// [`ScrollDown`](Action::ScrollDown)'s single-row step now that the
+    /// distinction is possible.
+    PageDown,
+    /// Scroll the conversation history a full viewport toward the oldest
+    /// (#222) — `PageUp`.
+    PageUp,
+    /// Jump the conversation history to the bottom-anchored newest message (`G` /
+    /// `End`), the way a chat client's "go to bottom" does (#158). Also re-arms
+    /// auto-follow, since it lands the view back on the newest anchor (#159).
+    JumpToNewest,
     /// Insert a typed character into the composer at the cursor — the keymap's
     /// printable-input fall-through when the composer is focused.
     ComposerInput(char),
@@ -72,10 +184,19 @@ pub enum Action {
     ComposerLeft,
     /// Move the composer cursor one character right.
     ComposerRight,
-    /// Move the composer cursor to the start of the line.
+    /// Move the composer cursor to the start of the current logical line.
     ComposerHome,
-    /// Move the composer cursor to the end of the line.
+    /// Move the composer cursor to the end of the current logical line.
     ComposerEnd,
+    /// Move the composer cursor up one visual (wrapped) row, preserving its
+    /// horizontal position (#215). A no-op on the first visual row.
+    ComposerUp,
+    /// Move the composer cursor down one visual (wrapped) row, preserving its
+    /// horizontal position (#215). A no-op on the last visual row.
+    ComposerDown,
+    /// Insert a literal newline at the composer cursor (Alt-Enter, and
+    /// Shift-Enter where the terminal reports it, #215) — Enter still sends.
+    ComposerNewline,
     /// Send the composer's buffer (a no-op when it is empty). The text is routed
     /// to core in Phase 6; for now the buffer is just consumed.
     ComposerSubmit,
@@ -179,6 +300,37 @@ pub enum Action {
     SecretConfirm,
     /// Cancel the secret-chat prompt without acting.
     SecretCancel,
+    /// Open the contact-search picker on a fresh, empty query (`n` in the chat
+    /// list, #197) — the entry point for starting a secret chat with a contact
+    /// not already in the chat list.
+    ContactSearchOpen,
+    /// Insert a typed character into the contact-search query at the cursor.
+    ContactSearchInput(char),
+    /// Delete the character before the contact-search query cursor (Backspace).
+    ContactSearchBackspace,
+    /// Move the contact-search query cursor one character left.
+    ContactSearchLeft,
+    /// Move the contact-search query cursor one character right.
+    ContactSearchRight,
+    /// Move the contact-search query cursor to the start of the line.
+    ContactSearchHome,
+    /// Move the contact-search query cursor to the end of the line.
+    ContactSearchEnd,
+    /// Run the typed query and switch to the results list. The loop dispatches
+    /// the core `search_contacts` call; for now the results are whatever has
+    /// been injected.
+    ContactSearchSubmit,
+    /// Close the contact-search overlay (from either the query line or the
+    /// results).
+    ContactSearchCancel,
+    /// Move the contact-search results selection down one hit.
+    ContactResultNext,
+    /// Move the contact-search results selection up one hit.
+    ContactResultPrev,
+    /// Confirm the selected contact: open the secret-chat confirm
+    /// ([`Overlay::SecretChat`]) for that user, reusing the same "are you sure"
+    /// step the chat-list-scoped lifecycle uses. A no-op with no hits.
+    ContactResultConfirm,
     /// Open the retention settings editor (#146), pre-filled with the policy in
     /// effect.
     SettingsOpen,
@@ -202,6 +354,49 @@ pub enum Action {
     SettingsConfirm,
     /// Cancel the settings editor without saving.
     SettingsCancel,
+    /// Start a reply to the selected history message (`r`): put the composer into
+    /// reply mode against it and focus the composer (#195). A no-op on an empty
+    /// history. Reuses the already-built [`Composer::reply_to`](crate::composer::Composer::reply_to).
+    ReplyMessage,
+    /// Start editing the selected history message (`e`): pre-fill the composer with
+    /// its text and focus the composer (#195). Only our own text messages are
+    /// editable; anything else surfaces a toast and does nothing.
+    EditMessage,
+    /// Jump to the message the selected history message replies to (`g`, #210):
+    /// moves the cursor onto it if it is loaded in the same chat. A quiet no-op
+    /// otherwise — the selected message is not a reply, its target is in another
+    /// chat, or it is not (yet) in the loaded window.
+    JumpToQuoted,
+    /// Open the delete-confirm overlay for the selected history message (`d`), a
+    /// no-op on an empty history (#195).
+    DeleteMessage,
+    /// Flip the delete scope between "for me" and "for everyone" in the confirm
+    /// (Tab); only meaningful for our own message (#195).
+    DeleteToggleScope,
+    /// Confirm the delete at the chosen scope: record the intent for the loop and
+    /// close the overlay (#195).
+    DeleteConfirm,
+    /// Cancel the delete confirm without deleting (#195).
+    DeleteCancel,
+    /// Save / download the selected history message's media (`S`): record its file
+    /// id for the loop to reveal a local path or start the download (#195). A toast
+    /// with no downloadable media.
+    SaveMedia,
+    /// Copy the selected history message's text to the OS clipboard (`y`, #197).
+    /// Records the text for the loop to copy — `App` cannot reach the OS clipboard
+    /// directly and stays pure. A toast when there is no text to copy (an empty
+    /// history, or a non-text message).
+    CopyMessage,
+    /// Re-query the chat list after a dropped-update gap (`Ctrl-R`), recording the
+    /// request for the loop to run against core (#195).
+    Resync,
+    /// Open the logout confirm (`Ctrl-Q`) (#195).
+    LogoutOpen,
+    /// Confirm the logout: record the request for the loop, which ends the session
+    /// and exits (#195).
+    LogoutConfirm,
+    /// Cancel the logout confirm without logging out (#195).
+    LogoutCancel,
     /// Dismiss the current transient toast immediately (#88), revealing the next
     /// queued one. A no-op when nothing is showing.
     NoticeDismiss,
@@ -228,6 +423,10 @@ pub struct App {
     /// Which pane currently receives input; drives both key resolution and the
     /// focused-pane border highlight.
     focus: Focus,
+    /// Whether the chat-list pane is collapsed to zero width (`b`, #213), so
+    /// the history pane can take the full terminal width on narrow
+    /// terminals. Session-only: not read from or written to `settings.toml`.
+    chat_list_collapsed: bool,
     /// The modal overlay drawn over the panes, if any. While set it captures input
     /// (key resolution routes to it instead of `focus`).
     overlay: Overlay,
@@ -237,6 +436,9 @@ pub struct App {
     help_scroll: u16,
     /// The search overlay's state: the query line and the hit list it renders from.
     search: SearchView,
+    /// The contact-search picker's state (#197): the query line and the matching
+    /// contacts it renders from.
+    contacts: ContactPickerView,
     /// The forward overlay's state: the messages being forwarded and the target
     /// picker. Inert until a forward is started.
     forward: ForwardView,
@@ -259,8 +461,10 @@ pub struct App {
     /// confirmed, so reopening the editor shows the live values. `App` never touches
     /// the file — the loop persists and applies the confirmed change.
     storage: StorageSettings,
-    /// The settings editor's state (#146): the four retention inputs being edited.
-    /// Reset from [`storage`](Self::storage) each time the editor opens.
+    /// The settings editor's state (#146): the four retention inputs plus the
+    /// graphics toggle (#209) being edited. Reset from
+    /// [`storage`](Self::storage)/[`graphics_enabled`](Self::graphics_enabled)
+    /// each time the editor opens.
     settings: SettingsDraft,
     /// The core link's connection state (#88), shown in the status bar. Defaults to
     /// `Connecting`; Phase 6 folds `updateConnectionState` into it.
@@ -272,6 +476,13 @@ pub struct App {
     /// request the loop services by paging older history (#114). The loop reads and
     /// clears it each tick via [`take_wants_older_history`](Self::take_wants_older_history).
     wants_older_history: bool,
+    /// Set when a composer edit leaves unsent text in the buffer (#197): a pulse,
+    /// not the text itself, since the loop already knows the open chat and reads
+    /// the composer's buffer directly. The loop reads and clears it each tick via
+    /// [`take_wants_typing_ping`](Self::take_wants_typing_ping), throttling the
+    /// actual `sendChatAction(typing)` broadcast so it isn't refired on every
+    /// keystroke.
+    wants_typing_ping: bool,
     /// A submitted composer buffer awaiting dispatch to core (#116). `App` is pure
     /// and never touches the `Client`, so a submit lands here and the loop drains it
     /// via [`take_outbound`](Self::take_outbound), routing it to the send/edit seam.
@@ -282,6 +493,12 @@ pub struct App {
     /// global by context), and feeds the hits back through
     /// [`set_search_results`](Self::set_search_results).
     pending_search: Option<String>,
+    /// A submitted contact-search query awaiting dispatch to core (#197). Like
+    /// `pending_search`, `App` records the intent and the loop drains it via
+    /// [`take_contact_search`](Self::take_contact_search), runs
+    /// `search_contacts`, and feeds the resolved hits back through
+    /// [`set_contact_results`](Self::set_contact_results).
+    pending_contact_search: Option<String>,
     /// A `(chat_id, message_id)` the user opened from a search hit and wants the
     /// conversation to land on (#117). The loop opens the chat; the next projection
     /// of that chat scrolls to the message if it is loaded, then clears this. Cleared
@@ -322,13 +539,94 @@ pub struct App {
     /// swaps its live retention (the next sweep honours it), and persists it to
     /// `settings.toml`.
     pending_settings: Option<StorageSettings>,
+    /// Whether graphics rendering is enabled by the user's `[interface]` setting
+    /// (#209) — independent of [`avatar_support`](Self::avatar_support), which is
+    /// what the *terminal* can do. The gutter/media render paths and the
+    /// encode-kickoff loop all gate on the combination of the two (see
+    /// [`avatar_gutter_cols`](Self::avatar_gutter_cols) /
+    /// [`graphics_active`](Self::graphics_active)), so a graphics-capable
+    /// terminal still renders nothing with this off. Unlike `avatar_support`
+    /// (seeded once at startup), this changes live via
+    /// [`set_graphics_enabled`](Self::set_graphics_enabled).
+    graphics_enabled: bool,
+    /// A confirmed graphics-toggle edit awaiting the loop (#209). Confirming the
+    /// settings editor applies the change in-memory immediately (via
+    /// [`set_graphics_enabled`](Self::set_graphics_enabled)) and lands the new
+    /// value here; the loop drains it via [`take_graphics`](Self::take_graphics)
+    /// and persists it to `settings.toml`. Mirrors `pending_settings`.
+    pending_graphics: Option<bool>,
+    /// The delete-confirm overlay's state (#195): the message a `d` targets and the
+    /// chosen scope. `Some` only while [`Overlay::DeleteConfirm`] is open.
+    delete: Option<DeletePrompt>,
+    /// A confirmed delete awaiting dispatch to core (#195). Confirming the delete
+    /// overlay records the target and scope here; the loop drains it via
+    /// [`take_delete`](Self::take_delete) and routes it to
+    /// [`DeleteRequests::delete`](tuigram_core::messages::DeleteRequests). No
+    /// optimistic change — the real `updateDeleteMessages` folds and re-projects.
+    pending_delete: Option<DeleteIntent>,
+    /// A file id whose media the user asked to save (`S`) (#195). `App` stays pure
+    /// and cannot read the file store, so it records the id; the loop drains it via
+    /// [`take_save`](Self::take_save), reveals the local path if the file is already
+    /// present, or starts the download otherwise.
+    pending_save: Option<i32>,
+    /// Text the user asked to copy (`y`) (#197). `App` cannot reach the OS
+    /// clipboard, so it records the text; the loop drains it via
+    /// [`take_copy`](Self::take_copy) and writes it out, toasting the result.
+    pending_copy: Option<String>,
+    /// Set when the user asked to resync (`Ctrl-R`) (#195). The loop reads and
+    /// clears it via [`take_resync`](Self::take_resync) and re-queries the chat list.
+    pending_resync: bool,
+    /// Set when the user confirmed a logout (`Ctrl-Q`) (#195). The loop reads and
+    /// clears it via [`take_logout`](Self::take_logout), ends the session, and exits.
+    pending_logout: bool,
+    /// The graphics-protocol capability detected once at startup (#201), seeded
+    /// via [`set_avatar_support`](Self::set_avatar_support) from
+    /// `TerminalGuard::avatar_support` and read-only afterward. `None` (halfblocks
+    /// or no real terminal) renders today's #194 plain header with no avatar
+    /// gutter; only `Graphics` unlocks it (Stage 3).
+    avatar_support: AvatarSupport,
+    /// Built avatar protocols for senders seen this session (#201), populated by
+    /// the render path via [`cache_avatar`](Self::cache_avatar) as `drive_avatars`
+    /// finishes encoding each sender's photo.
+    avatar_cache: AvatarCache,
+    /// Built inline-media protocols for messages seen this session (#208),
+    /// populated via [`cache_media`](Self::cache_media) as `drive_inline_media`
+    /// finishes decoding each message's photo/sticker/still.
+    media_cache: MediaCache,
+    /// The pane rectangles the last render drew into (#161/#162), recorded by the
+    /// loop after each `draw` via [`set_pane_layout`](Self::set_pane_layout) so a
+    /// mouse event can be hit-tested to a pane without re-running layout. Default
+    /// (all-zero) rects until the first frame, which hit-test to `None` and so map
+    /// mouse events to `Noop`.
+    pane_layout: crate::ui::PaneLayout,
+    /// Row → chat id map the last render drew, recorded via
+    /// [`set_chat_rows`](Self::set_chat_rows), so a click on an actual chat row
+    /// can open that chat directly. Empty until the first frame, which hit-tests
+    /// every row to `None` and so falls back to focusing the pane.
+    chat_rows: crate::ui::ChatRows,
+    /// Row-range → message id map the last render drew, recorded via
+    /// [`set_history_rows`](Self::set_history_rows), so a click on an actual
+    /// history row can select that message directly. Empty until the first
+    /// frame, same fallback as `chat_rows`.
+    history_rows: crate::ui::HistoryRows,
+    /// Row/column → list-index map the open overlay's last render drew,
+    /// recorded via [`set_overlay_rows`](Self::set_overlay_rows), so a click on
+    /// an actual overlay row can select-and-confirm it directly (#217). Empty
+    /// when no overlay is open, or the open one has no selectable list.
+    overlay_rows: crate::ui::OverlayRows,
 }
 
 impl App {
     /// A fresh app, marked dirty so the first frame paints before any event.
+    /// `graphics_enabled` starts on — `bool`'s own `Default` is `false`, but an
+    /// unconfigured install (and every test that never calls
+    /// [`set_graphics_enabled`](Self::set_graphics_enabled)) should behave as if
+    /// graphics are on, matching [`InterfaceSettings`](tuigram_core::InterfaceSettings)'s
+    /// own default.
     pub fn new() -> Self {
         Self {
             dirty: true,
+            graphics_enabled: true,
             ..Self::default()
         }
     }
@@ -361,6 +659,11 @@ impl App {
         self.focus
     }
 
+    /// Whether the chat-list pane is collapsed to zero width (#213).
+    pub fn chat_list_collapsed(&self) -> bool {
+        self.chat_list_collapsed
+    }
+
     /// The modal overlay currently drawn over the panes (or [`Overlay::None`]).
     pub fn overlay(&self) -> Overlay {
         self.overlay
@@ -383,6 +686,12 @@ impl App {
     /// The search overlay's state, for rendering the query line and results.
     pub fn search(&self) -> &SearchView {
         &self.search
+    }
+
+    /// The contact-search picker's state, for rendering the query line and
+    /// matching contacts (#197).
+    pub fn contacts(&self) -> &ContactPickerView {
+        &self.contacts
     }
 
     /// The forward overlay's state, for rendering the target picker.
@@ -411,12 +720,111 @@ impl App {
         &self.settings
     }
 
+    /// The delete-confirm prompt's state, for rendering the overlay (#195); `None`
+    /// when the confirm is not open.
+    pub fn delete(&self) -> Option<&DeletePrompt> {
+        self.delete.as_ref()
+    }
+
     /// Seed the in-effect retention policy from `settings.toml` at startup (#146), so
     /// the editor opens pre-filled with the live values. The loop calls this once
     /// after loading settings; `App` keeps it only to fill and reflect the editor,
     /// never to touch the file.
     pub fn set_storage_settings(&mut self, settings: StorageSettings) {
         self.storage = settings;
+    }
+
+    /// Seed the graphics-protocol capability detected once at startup (#201).
+    /// The loop calls this immediately after `TerminalGuard::new` succeeds, with
+    /// a clone of `TerminalGuard::avatar_support` (the guard keeps its own copy
+    /// for the rest of the process's lifetime) — mirrors
+    /// [`set_storage_settings`](Self::set_storage_settings)'s seed-once shape.
+    /// Unlike that seed, this is not the whole story for graphics: see
+    /// [`sync_graphics_capable`](Self::sync_graphics_capable).
+    pub fn set_avatar_support(&mut self, support: AvatarSupport) {
+        self.avatar_support = support;
+        self.sync_graphics_capable();
+    }
+
+    /// The graphics-protocol capability in effect, for the render path to
+    /// decide whether to draw an avatar gutter at all.
+    pub fn avatar_support(&self) -> &AvatarSupport {
+        &self.avatar_support
+    }
+
+    /// Whether the user's `graphics` setting is on (#209) — orthogonal to
+    /// [`avatar_support`](Self::avatar_support), which is what the *terminal*
+    /// can do. Read by the settings editor to pre-fill its toggle.
+    pub fn graphics_enabled(&self) -> bool {
+        self.graphics_enabled
+    }
+
+    /// Apply a graphics-toggle edit (#209): on first seed (from `settings.toml`
+    /// at startup) and on every later live confirm from the settings editor.
+    /// Keeps the conversation view's combined capability in sync either way.
+    pub fn set_graphics_enabled(&mut self, enabled: bool) {
+        self.graphics_enabled = enabled;
+        self.sync_graphics_capable();
+    }
+
+    /// Recompute the conversation view's combined "render graphics at all"
+    /// bool from the terminal's detected capability and the user's setting —
+    /// the single place [`set_avatar_support`](Self::set_avatar_support) and
+    /// [`set_graphics_enabled`](Self::set_graphics_enabled) both funnel
+    /// through, so the two can never fall out of sync regardless of which
+    /// changes first.
+    fn sync_graphics_capable(&mut self) {
+        self.conversation
+            .set_graphics_capable(self.avatar_support.is_graphics() && self.graphics_enabled);
+    }
+
+    /// The avatar gutter width to draw: the terminal's own [`gutter_cols`
+    /// width](AvatarSupport::gutter_cols) when the user's `graphics` setting is
+    /// on, else `0` — collapsing the gutter exactly like a non-graphics
+    /// terminal, per #209's acceptance criterion that the toggle covers the
+    /// generated fallback bubble too, not just real photos.
+    pub fn avatar_gutter_cols(&self) -> usize {
+        if self.graphics_enabled {
+            self.avatar_support.gutter_cols()
+        } else {
+            0
+        }
+    }
+
+    /// Whether inline media should render at all: the terminal is
+    /// graphics-capable *and* the user's `graphics` setting is on (#209). The
+    /// single check the render path (`ui::media_ready`) and the encode-kickoff
+    /// loop (`drive_avatars`/`drive_inline_media` in `main.rs`) both gate on.
+    pub fn graphics_active(&self) -> bool {
+        self.graphics_enabled && self.avatar_support.is_graphics()
+    }
+
+    /// The built protocol for a sender's avatar, if already encoded this
+    /// session.
+    pub fn cached_avatar(&self, user_id: i64) -> Option<&Protocol> {
+        self.avatar_cache.get(user_id)
+    }
+
+    /// Record a newly built avatar protocol for a sender (`drive_avatars`,
+    /// #201), so the next render draws it instead of a blank gutter.
+    pub fn cache_avatar(&mut self, user_id: i64, protocol: Protocol) {
+        self.avatar_cache.insert(user_id, protocol);
+        self.dirty = true;
+    }
+
+    /// The built protocol for a message's inline media, if already decoded
+    /// this session.
+    pub fn cached_media(&self, message_id: i64) -> Option<&Protocol> {
+        self.media_cache.get(message_id)
+    }
+
+    /// Record a newly built media protocol for a message (`drive_inline_media`,
+    /// #208), so the next render draws it in the space `message_height`
+    /// already reserved once the backing file/minithumbnail became ready — no
+    /// reproject needed here, only a repaint.
+    pub fn cache_media(&mut self, message_id: i64, protocol: Protocol) {
+        self.media_cache.insert(message_id, protocol);
+        self.dirty = true;
     }
 
     /// The core link's connection state, for the status bar's left field.
@@ -450,6 +858,15 @@ impl App {
         self.dirty = true;
     }
 
+    /// Record which chats are private **bot** chats (#160), for the 🤖 row marker.
+    /// The loop resolves the set from the core user store on each chat-list signal
+    /// and hands it here right after [`project_chats`](Self::project_chats), so `App`
+    /// stays pure — the same split as [`project_secret_states`](Self::project_secret_states).
+    pub fn project_bot_chats(&mut self, ids: HashSet<i64>) {
+        self.chat_list.set_bot_chats(ids);
+        self.dirty = true;
+    }
+
     /// Re-project the conversation pane from the core
     /// [`MessageStore`](tuigram_core::messages::MessageStore) (#114). The loop reads
     /// the open `chat_id`'s history and pinned ids back from the `Client` on a
@@ -457,14 +874,29 @@ impl App {
     /// snapshot here, so `App` stays pure — the same split as
     /// [`project_chats`](Self::project_chats). [`ConversationView::project`] keeps
     /// the selected message under the cursor when refreshing the same chat, and
-    /// starts fresh at the top when a different chat is opened.
+    /// starts fresh at the top when a different chat is opened. `fresh_open` marks
+    /// the one call that is a genuine open (#164) — the loop's own open/close
+    /// tracking, not derivable from `chat_id` alone (see `project`'s doc).
+    #[allow(clippy::too_many_arguments)]
     pub fn project_conversation(
         &mut self,
         chat_id: i64,
         messages: Vec<Message>,
         pinned: HashSet<i64>,
+        senders: HashMap<Sender, SenderLabel>,
+        last_read_inbox: i64,
+        last_read_outbox: i64,
+        fresh_open: bool,
     ) {
-        self.conversation.project(chat_id, messages, pinned);
+        self.conversation.project(
+            chat_id,
+            messages,
+            pinned,
+            senders,
+            last_read_inbox,
+            last_read_outbox,
+            fresh_open,
+        );
         // Honor a pending search-hit jump (#117): once this chat's history holds the
         // target message, scroll to it and clear the jump. A jump for a different chat
         // is stale (the user opened elsewhere) — drop it so it never moves a later
@@ -490,6 +922,15 @@ impl App {
         std::mem::take(&mut self.wants_older_history)
     }
 
+    /// Take the pending typing-ping pulse, if any (#197). The loop reads and
+    /// clears this each tick: `true` means the composer holds unsent text as of
+    /// the last edit, so (throttled) the loop broadcasts `sendChatAction(typing)`
+    /// for the open chat; `false` means no composer edit was made since the last
+    /// drain.
+    pub fn take_wants_typing_ping(&mut self) -> bool {
+        std::mem::take(&mut self.wants_typing_ping)
+    }
+
     /// Take the pending composer submission, if any (#116). The loop drains this
     /// each tick and dispatches it to the send/edit seam; `None` means nothing was
     /// submitted since the last drain.
@@ -503,6 +944,15 @@ impl App {
     /// nothing was submitted since the last drain.
     pub fn take_search_query(&mut self) -> Option<String> {
         self.pending_search.take()
+    }
+
+    /// Take the pending contact-search query, if any (#197). The loop drains
+    /// this each tick, runs `search_contacts`, resolves each hit's display name,
+    /// and feeds the results back through
+    /// [`set_contact_results`](Self::set_contact_results); `None` means nothing
+    /// was submitted since the last drain.
+    pub fn take_contact_search(&mut self) -> Option<String> {
+        self.pending_contact_search.take()
     }
 
     /// Take the pending forward, if any (#118). The loop drains this each tick and
@@ -551,6 +1001,49 @@ impl App {
         self.pending_settings.take()
     }
 
+    /// Take the pending graphics-toggle edit, if any (#209). The loop drains this
+    /// each tick and persists it to `settings.toml`'s `[interface]` table; the
+    /// in-memory swap already happened at confirm time. `None` means no toggle
+    /// was confirmed since the last drain.
+    pub fn take_graphics(&mut self) -> Option<bool> {
+        self.pending_graphics.take()
+    }
+
+    /// Take the pending delete, if any (#195). The loop drains this each tick and
+    /// dispatches it to [`DeleteRequests::delete`](tuigram_core::messages::DeleteRequests);
+    /// `None` means no delete was confirmed since the last drain.
+    pub fn take_delete(&mut self) -> Option<DeleteIntent> {
+        self.pending_delete.take()
+    }
+
+    /// Take the pending save/download file id, if any (#195). The loop drains this
+    /// each tick and either reveals the local path (already present) or starts the
+    /// download; `None` means nothing was requested since the last drain.
+    pub fn take_save(&mut self) -> Option<i32> {
+        self.pending_save.take()
+    }
+
+    /// Take the pending copy text, if any (#197). The loop drains this each tick
+    /// and writes it to the OS clipboard; `None` means nothing was requested since
+    /// the last drain.
+    pub fn take_copy(&mut self) -> Option<String> {
+        self.pending_copy.take()
+    }
+
+    /// Take the pending resync request (#195). The loop drains this each tick and
+    /// re-queries the chat list; `false` means no resync was requested since the last
+    /// drain.
+    pub fn take_resync(&mut self) -> bool {
+        std::mem::take(&mut self.pending_resync)
+    }
+
+    /// Take the pending logout request (#195). The loop drains this each tick, ends
+    /// the session, and exits; `false` means no logout was confirmed since the last
+    /// drain.
+    pub fn take_logout(&mut self) -> bool {
+        std::mem::take(&mut self.pending_logout)
+    }
+
     /// Re-project the secret-chat lifecycle states from the core
     /// [`SecretChatStore`](tuigram_core::SecretChatStore) (#121). The loop reads each
     /// secret chat's folded state joined to its chat id back from the `Client` and
@@ -574,6 +1067,70 @@ impl App {
         self.dirty = true;
     }
 
+    /// Record the conversation pane's inner height measured by the last render (#158),
+    /// so the view can bottom-anchor an open / `G` and follow the tail against the real
+    /// number of visible rows. The loop calls this after each `draw`. Marks the frame
+    /// dirty only when the recorded height re-anchored the cursor (a first measurement
+    /// or a resize while following), so the corrected frame repaints without the draw
+    /// loop spinning when the height is unchanged.
+    pub fn set_conversation_viewport(&mut self, height: usize) {
+        if self.conversation.set_viewport_height(height) {
+            self.dirty = true;
+        }
+    }
+
+    /// Record the conversation pane's inner body width measured by the last
+    /// render (#214), so message bodies wrap against the real column budget
+    /// and a resize re-anchors the same way a height change does. The loop
+    /// calls this after each `draw`, alongside
+    /// [`set_conversation_viewport`](Self::set_conversation_viewport).
+    pub fn set_conversation_width(&mut self, width: usize) {
+        if self.conversation.set_viewport_width(width) {
+            self.dirty = true;
+        }
+    }
+
+    /// Record the pane rectangles the last render drew into (#161/#162), so the
+    /// next mouse event can be hit-tested to a pane. The loop calls this after each
+    /// `draw` with the [`RenderOutput::panes`](crate::ui::RenderOutput) it measured.
+    /// Pure bookkeeping — it never re-dirties, since geometry does not change what
+    /// is drawn.
+    pub fn set_pane_layout(&mut self, panes: crate::ui::PaneLayout) {
+        self.pane_layout = panes;
+    }
+
+    /// The pane rectangles the last render drew into (#161/#162). Read by
+    /// `drive_inline_media` (#226) so inline media is encoded at the history
+    /// pane's actual width instead of a fixed guess.
+    #[must_use]
+    pub fn pane_layout(&self) -> crate::ui::PaneLayout {
+        self.pane_layout
+    }
+
+    /// Record the chat-list row map the last render drew, so the next mouse
+    /// click on a chat row can open it directly. The loop calls this after each
+    /// `draw` with the [`RenderOutput::chat_rows`](crate::ui::RenderOutput) it
+    /// measured. Pure bookkeeping, like [`set_pane_layout`](Self::set_pane_layout).
+    pub fn set_chat_rows(&mut self, rows: crate::ui::ChatRows) {
+        self.chat_rows = rows;
+    }
+
+    /// Record the history row map the last render drew, so the next mouse click
+    /// on a message row can select it directly. The loop calls this after each
+    /// `draw` with the
+    /// [`RenderOutput::history_rows`](crate::ui::RenderOutput) it measured. Pure
+    /// bookkeeping, like [`set_pane_layout`](Self::set_pane_layout).
+    pub fn set_history_rows(&mut self, rows: crate::ui::HistoryRows) {
+        self.history_rows = rows;
+    }
+
+    /// Record the overlay row map the loop's last `draw` measured — the loop calls
+    /// this each frame with the [`RenderOutput::overlay_rows`](crate::ui::RenderOutput)
+    /// it measured. Pure bookkeeping, like [`set_pane_layout`](Self::set_pane_layout).
+    pub fn set_overlay_rows(&mut self, rows: crate::ui::OverlayRows) {
+        self.overlay_rows = rows;
+    }
+
     /// Open the forward target picker for `message_id` from `source_chat_id`, shared
     /// by the two entry points (a search hit, `ForwardOpen`; the selected history
     /// message, `ForwardMessage`). The picker reuses a snapshot of the chat list as
@@ -585,11 +1142,98 @@ impl App {
         self.dirty = true;
     }
 
+    /// Confirm the selected search hit (#117), shared by `ResultOpen` (Enter) and
+    /// a click on the hit's row (`OverlayRowClick`, #217): jump to its chat, focus
+    /// the history so the loop opens and pages it, and record the target so the
+    /// next projection of that chat scrolls to the message if it is loaded. A hit
+    /// whose chat is not in the active list (a global hit in a folder/archive)
+    /// still closes the overlay and focuses the history; the chat just stays
+    /// whatever was selected. No selected hit is a no-op.
+    fn confirm_search_result(&mut self) {
+        if let Some(hit) = self.search.selected_hit() {
+            let (chat_id, message_id) = (hit.chat_id, hit.message_id);
+            self.pending_jump = Some((chat_id, message_id));
+            self.chat_list.select_chat(chat_id);
+            self.focus = Focus::History;
+            self.overlay = Overlay::None;
+            self.dirty = true;
+        }
+    }
+
+    /// Confirm the forward to the selected target (#118), shared by
+    /// `ForwardConfirm` (Enter) and a click on the target's row
+    /// (`OverlayRowClick`, #217): record the send as a pure intent for the loop
+    /// and close the picker back to browsing. An empty picker (no target chat)
+    /// has nowhere to send, so it just closes without recording an intent.
+    fn confirm_forward(&mut self) {
+        if let Some(to_chat_id) = self.forward.selected_target().map(|c| c.id) {
+            self.pending_forward = Some(ForwardIntent {
+                from_chat_id: self.forward.source_chat_id(),
+                message_ids: self.forward.message_ids().to_vec(),
+                to_chat_id,
+            });
+        }
+        self.overlay = Overlay::None;
+        self.dirty = true;
+    }
+
+    /// React with the effective emoji (#119), shared by `ReactionConfirm`
+    /// (Enter) and a click on a palette row (`OverlayRowClick`, #217): the typed
+    /// custom one, or the highlighted palette one, then close. The optimistic
+    /// flip updates the `{emoji×n*}` chips directly; the intent it records
+    /// drives the core add/remove, whose real counts fold in later. Whether we
+    /// already had that reaction (pre-toggle) decides add vs remove. An empty
+    /// custom line has nothing to send, so it just closes.
+    fn confirm_reaction(&mut self) {
+        if let Some(emoji) = self.reaction.confirmed_emoji()
+            && let Some((chat_id, id)) = self
+                .conversation
+                .selected_message()
+                .map(|m| (m.chat_id, m.id))
+        {
+            let add = !self.conversation.has_own_reaction(id, &emoji);
+            self.conversation.toggle_reaction(id, &emoji);
+            self.pending_reaction = Some(ReactionIntent {
+                chat_id,
+                message_id: id,
+                emoji,
+                add,
+            });
+        }
+        self.overlay = Overlay::None;
+        self.dirty = true;
+    }
+
+    /// Confirm the selected contact (#197), shared by `ContactResultConfirm`
+    /// (Enter) and a click on the contact's row (`OverlayRowClick`, #217): hand
+    /// off to the same secret-chat confirm the chat-list-scoped lifecycle uses
+    /// (#87, #121) — the "are you sure" step and the create seam are shared,
+    /// only the target's origin differs. No selected hit (empty results) is a
+    /// no-op that stays on the results overlay.
+    fn confirm_contact_result(&mut self) {
+        if let Some(hit) = self.contacts.selected_hit() {
+            let lifecycle = SecretLifecycle::Start {
+                user_id: hit.user_id,
+            };
+            self.secret = Some(SecretChatPrompt::new(lifecycle, hit.display_name.clone()));
+            self.overlay = Overlay::SecretChat;
+            self.dirty = true;
+        }
+    }
+
     /// Replace the search overlay's hits with a fresh, projected result set (#117),
     /// resetting the selection to the top. The loop calls this when a spawned search
     /// completes.
     pub fn set_search_results(&mut self, hits: Vec<crate::search::SearchHit>) {
         self.search.set_results(hits);
+        self.dirty = true;
+    }
+
+    /// Replace the contact-search picker's hits with a fresh, resolved result set
+    /// (#197), resetting the selection to the top. The loop calls this when a
+    /// spawned `search_contacts` + name resolution completes.
+    pub fn set_contact_results(&mut self, hits: Vec<ContactHit>) {
+        self.contacts.set_results(hits);
         self.dirty = true;
     }
 
@@ -664,10 +1308,107 @@ impl App {
     pub fn on_terminal_event(&self, event: Event) -> Action {
         match event {
             Event::Key(key) => keymap::resolve(self.focus, self.overlay, &key),
+            // A left-click focuses the pane under the pointer; the wheel scrolls the
+            // pane it is over (#161/#162), hit-tested against the last render.
+            Event::Mouse(mouse) => self.on_mouse(mouse),
             // A resize must repaint against the new viewport.
             Event::Resize(_, _) => Action::Render,
             _ => Action::Noop,
         }
+    }
+
+    /// Map a mouse event to an [`Action`] against the pane rectangles the last
+    /// render recorded (#161/#162). While a modal overlay is open, a left-click
+    /// is hit-tested against its row map instead (see
+    /// [`on_overlay_click`](Self::on_overlay_click)) and every other mouse event
+    /// is ignored — overlay wheel-scroll stays out of scope (#217). Otherwise a
+    /// left-click focuses the pane under the pointer — or, on an actual
+    /// chat/history/composer position, opens/selects/places the cursor directly
+    /// (see [`on_click`](Self::on_click)) — and the wheel moves the chat-list
+    /// selection or scrolls the history, the pane the pointer is *over*
+    /// regardless of which pane holds focus. Clicks/wheels over the status bar
+    /// or empty space, and the wheel over the composer, are ignored. Pure, like
+    /// [`on_terminal_event`](Self::on_terminal_event).
+    fn on_mouse(&self, mouse: MouseEvent) -> Action {
+        if self.overlay != Overlay::None {
+            return match mouse.kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.on_overlay_click(mouse.column, mouse.row)
+                }
+                _ => Action::Noop,
+            };
+        }
+        let pane = self.pane_layout.focus_at(mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => self.on_click(pane, mouse.column, mouse.row),
+            MouseEventKind::ScrollUp => match pane {
+                Some(Focus::ChatList) => Action::SelectPrev,
+                Some(Focus::History) => Action::ScrollUp,
+                _ => Action::Noop,
+            },
+            MouseEventKind::ScrollDown => match pane {
+                Some(Focus::ChatList) => Action::SelectNext,
+                Some(Focus::History) => Action::ScrollDown,
+                _ => Action::Noop,
+            },
+            _ => Action::Noop,
+        }
+    }
+
+    /// A left-click's action for the pane it landed in and the position it hit
+    /// within that pane. A hit on an actual chat row opens that chat
+    /// (`OpenChat`); a hit on an actual history row selects that message
+    /// (`SelectMessageAt`) — both looked up from the row maps the last render
+    /// recorded ([`ChatRows`](crate::ui::ChatRows), [`HistoryRows`](crate::ui::HistoryRows)).
+    /// A hit in the composer places the cursor at the clicked visual row/column
+    /// (`ComposerClickAt`, #215) — the composer's rect always passed
+    /// `focus_at`'s containment check, so the position is already known to be
+    /// inside it; the text starts one column/row past the border
+    /// (`Block::bordered()`).
+    /// A chat-list/history click with no row under it (empty list/history space
+    /// below the last row) falls back to #161's plain focus-only click; outside
+    /// any pane is `Noop`. Pure, like [`on_mouse`](Self::on_mouse).
+    fn on_click(&self, pane: Option<Focus>, column: u16, row: u16) -> Action {
+        match pane {
+            Some(Focus::ChatList) => self
+                .chat_rows
+                .chat_at(row)
+                .map_or(Action::SetFocus(Focus::ChatList), Action::OpenChat),
+            Some(Focus::History) => self
+                .history_rows
+                .message_at(row)
+                .map_or(Action::SetFocus(Focus::History), Action::SelectMessageAt),
+            Some(Focus::Composer) => {
+                let inner_x = self.pane_layout.composer.x + 1;
+                let inner_y = self.pane_layout.composer.y + 1;
+                Action::ComposerClickAt {
+                    row: row.saturating_sub(inner_y) as usize,
+                    col: column.saturating_sub(inner_x) as usize,
+                }
+            }
+            None => Action::Noop,
+        }
+    }
+
+    /// The composer's current inner (border-excluded) width in display
+    /// columns, from the last render's recorded pane rect (#215) — the same
+    /// rect [`on_click`](Self::on_click) already reads, so a click and a
+    /// keyboard vertical move always agree on wrapping.
+    fn composer_inner_width(&self) -> usize {
+        self.pane_layout.composer.width.saturating_sub(2).max(1) as usize
+    }
+
+    /// A left-click's action while a modal list overlay is open: a hit on an
+    /// actual row selects and confirms it (`OverlayRowClick`), looked up from the
+    /// overlay row map the last render recorded ([`OverlayRows`](crate::ui::OverlayRows)),
+    /// which already rejects a column outside the popup's list area. An overlay
+    /// with no selectable list (help, a text-entry line, a confirm prompt) has an
+    /// empty row map, so every click on it is `Noop`. Pure, like
+    /// [`on_mouse`](Self::on_mouse).
+    fn on_overlay_click(&self, column: u16, row: u16) -> Action {
+        self.overlay_rows
+            .index_at(column, row)
+            .map_or(Action::Noop, Action::OverlayRowClick)
     }
 
     /// Map a core [`AppEvent`] to an [`Action`]. Pure: the live source already
@@ -684,6 +1425,7 @@ impl App {
             AppEvent::Connection(state) => Action::SetConnection(state),
             AppEvent::Auth
             | AppEvent::Chats
+            | AppEvent::ChatReadOutbox
             | AppEvent::Messages
             | AppEvent::File
             | AppEvent::Secret
@@ -700,16 +1442,69 @@ impl App {
             Action::SetConnection(state) => self.set_connection(state),
             Action::FocusNext => {
                 self.focus = self.focus.next();
+                // Collapsed, the chat-list pane isn't a cycle stop (#213):
+                // step past it in the same direction.
+                if self.chat_list_collapsed && self.focus == Focus::ChatList {
+                    self.focus = self.focus.next();
+                }
                 self.dirty = true;
             }
             Action::FocusPrev => {
                 self.focus = self.focus.prev();
+                if self.chat_list_collapsed && self.focus == Focus::ChatList {
+                    self.focus = self.focus.prev();
+                }
                 self.dirty = true;
             }
             Action::SetFocus(focus) => {
                 self.focus = focus;
                 self.dirty = true;
             }
+            Action::ToggleChatListCollapse => {
+                self.chat_list_collapsed = !self.chat_list_collapsed;
+                // The pane can't hold focus once it has zero width.
+                if self.chat_list_collapsed && self.focus == Focus::ChatList {
+                    self.focus = Focus::History;
+                }
+                self.dirty = true;
+            }
+            Action::OpenChat(chat_id) => {
+                // Mirrors `ResultOpen`'s "select + focus history" (#117) minus the
+                // message jump: a chat-row click has no target message, just the chat.
+                self.chat_list.select_chat(chat_id);
+                self.focus = Focus::History;
+                self.dirty = true;
+            }
+            Action::SelectMessageAt(message_id) => {
+                self.conversation.select_message(message_id);
+                self.focus = Focus::History;
+                self.dirty = true;
+            }
+            Action::ComposerClickAt { row, col } => {
+                self.focus = Focus::Composer;
+                let width = self.composer_inner_width();
+                self.composer.set_cursor_at_row_col(row, col, width);
+                self.dirty = true;
+            }
+            Action::OverlayRowClick(index) => match self.overlay {
+                Overlay::SearchResults => {
+                    self.search.select(index);
+                    self.confirm_search_result();
+                }
+                Overlay::Forward => {
+                    self.forward.select(index);
+                    self.confirm_forward();
+                }
+                Overlay::Reaction => {
+                    self.reaction.select(index);
+                    self.confirm_reaction();
+                }
+                Overlay::ContactSearchResults => {
+                    self.contacts.select(index);
+                    self.confirm_contact_result();
+                }
+                _ => {}
+            },
             Action::ToggleHelp => {
                 // Toggles between no overlay and the help cheatsheet; the keymap
                 // only emits this from browsing or while help is already open. A
@@ -754,20 +1549,54 @@ impl App {
                 self.dirty = true;
             }
             Action::ScrollUp => {
-                // A scroll-up that can't move (already at the oldest loaded message)
-                // is the request to page older history; the loop services it (#114).
-                if self.conversation.offset() == 0 && !self.conversation.is_empty() {
+                // A scroll-up that can't move (already at the oldest loaded row)
+                // is the request to page older history; the loop services it
+                // (#114). #222: "can't move" now means offset 0 *and* row_skip 0 —
+                // a scroll-up while still partway into the oldest message's own
+                // rows has somewhere to go first.
+                if self.conversation.offset() == 0
+                    && self.conversation.row_skip() == 0
+                    && !self.conversation.is_empty()
+                {
                     self.wants_older_history = true;
                 }
                 self.conversation.scroll_up();
                 self.dirty = true;
             }
+            Action::PageDown => {
+                self.conversation.page_down();
+                self.dirty = true;
+            }
+            Action::PageUp => {
+                // Same "reached the oldest loaded row, request more" signal as
+                // ScrollUp (#222) — PageUp can reach it too.
+                if self.conversation.offset() == 0
+                    && self.conversation.row_skip() == 0
+                    && !self.conversation.is_empty()
+                {
+                    self.wants_older_history = true;
+                }
+                self.conversation.page_up();
+                self.dirty = true;
+            }
+            Action::JumpToNewest => {
+                self.conversation.jump_to_newest();
+                self.dirty = true;
+            }
             Action::ComposerInput(c) => {
                 self.composer.insert(c);
+                // A character was just inserted, so the buffer can't be empty (#197).
+                self.wants_typing_ping = true;
                 self.dirty = true;
             }
             Action::ComposerBackspace => {
                 self.composer.backspace();
+                // Only ping while there's still unsent text to indicate (#197); a
+                // backspace that empties the buffer lets the action expire on its
+                // own rather than sending one more ping for nothing left to type.
+                if !self.composer.is_empty() {
+                    self.wants_typing_ping = true;
+                }
                 self.dirty = true;
             }
             Action::ComposerLeft => {
@@ -784,6 +1613,21 @@ impl App {
             }
             Action::ComposerEnd => {
                 self.composer.move_end();
+                self.dirty = true;
+            }
+            Action::ComposerUp => {
+                let width = self.composer_inner_width();
+                self.composer.move_up(width);
+                self.dirty = true;
+            }
+            Action::ComposerDown => {
+                let width = self.composer_inner_width();
+                self.composer.move_down(width);
+                self.dirty = true;
+            }
+            Action::ComposerNewline => {
+                self.composer.insert('\n');
+                self.wants_typing_ping = true;
                 self.dirty = true;
             }
             Action::ComposerSubmit => {
@@ -857,22 +1701,7 @@ impl App {
                 self.search.select_prev();
                 self.dirty = true;
             }
-            Action::ResultOpen => {
-                // Jump to the selected hit (#117): select its chat in the list, focus
-                // the history so the loop opens and pages it, and record the target so
-                // the next projection of that chat scrolls to the message if it is
-                // loaded. A hit whose chat is not in the active list (a global hit in a
-                // folder/archive) still closes the overlay and focuses the history; the
-                // chat just stays whatever was selected. No selected hit is a no-op.
-                if let Some(hit) = self.search.selected_hit() {
-                    let (chat_id, message_id) = (hit.chat_id, hit.message_id);
-                    self.pending_jump = Some((chat_id, message_id));
-                    self.chat_list.select_chat(chat_id);
-                    self.focus = Focus::History;
-                    self.overlay = Overlay::None;
-                    self.dirty = true;
-                }
-            }
+            Action::ResultOpen => self.confirm_search_result(),
             Action::ForwardOpen => {
                 // Forward the selected hit. The picker reuses a snapshot of the
                 // chat list as its target list; the hit's chat is the source the
@@ -903,21 +1732,7 @@ impl App {
                 self.forward.select_prev();
                 self.dirty = true;
             }
-            Action::ForwardConfirm => {
-                // Record the forward as a pure intent for the loop to send through
-                // `forward_messages` (#118), then close the picker back to browsing.
-                // An empty picker (no target chat) has nowhere to send, so it just
-                // closes without recording an intent.
-                if let Some(to_chat_id) = self.forward.selected_target().map(|c| c.id) {
-                    self.pending_forward = Some(ForwardIntent {
-                        from_chat_id: self.forward.source_chat_id(),
-                        message_ids: self.forward.message_ids().to_vec(),
-                        to_chat_id,
-                    });
-                }
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
+            Action::ForwardConfirm => self.confirm_forward(),
             Action::ForwardCancel => {
                 // Back to wherever the forward was started from — the search results
                 // (forward from a hit) or the conversation (forward from history).
@@ -998,31 +1813,7 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::ReactionConfirm => {
-                // React with the effective emoji — the typed custom one, or the
-                // highlighted palette one — then close. The optimistic flip updates the
-                // `{emoji×n*}` chips directly; the intent it records drives the core
-                // add/remove (#119), whose real counts fold in later. Whether we already
-                // had that reaction (pre-toggle) decides add vs remove. An empty custom
-                // line has nothing to send, so it just closes.
-                if let Some(emoji) = self.reaction.confirmed_emoji()
-                    && let Some((chat_id, id)) = self
-                        .conversation
-                        .selected_message()
-                        .map(|m| (m.chat_id, m.id))
-                {
-                    let add = !self.conversation.has_own_reaction(id, &emoji);
-                    self.conversation.toggle_reaction(id, &emoji);
-                    self.pending_reaction = Some(ReactionIntent {
-                        chat_id,
-                        message_id: id,
-                        emoji,
-                        add,
-                    });
-                }
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
+            Action::ReactionConfirm => self.confirm_reaction(),
             Action::ReactionCancel => {
                 // Esc backs out of the custom line to the palette first; a second Esc
                 // (now in palette mode) closes the overlay.
@@ -1114,10 +1905,68 @@ impl App {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
+            Action::ContactSearchOpen => {
+                // A fresh search each time, so a previous query never leaks in (#197).
+                self.contacts.reset();
+                self.overlay = Overlay::ContactSearchInput;
+                self.dirty = true;
+            }
+            Action::ContactSearchInput(c) => {
+                self.contacts.insert(c);
+                self.dirty = true;
+            }
+            Action::ContactSearchBackspace => {
+                self.contacts.backspace();
+                self.dirty = true;
+            }
+            Action::ContactSearchLeft => {
+                self.contacts.move_left();
+                self.dirty = true;
+            }
+            Action::ContactSearchRight => {
+                self.contacts.move_right();
+                self.dirty = true;
+            }
+            Action::ContactSearchHome => {
+                self.contacts.move_home();
+                self.dirty = true;
+            }
+            Action::ContactSearchEnd => {
+                self.contacts.move_end();
+                self.dirty = true;
+            }
+            Action::ContactSearchSubmit => {
+                // Record the query as a pure intent the loop drains and runs against
+                // `search_contacts` (#197); `App` never touches the `Client`, so the
+                // hits arrive later via `set_contact_results`. Clear any stale hits
+                // now so the overlay is empty until they land. A blank query is a
+                // no-op that stays on the input line.
+                let query = self.contacts.query().trim().to_owned();
+                if !query.is_empty() {
+                    self.pending_contact_search = Some(query);
+                    self.contacts.set_results(Vec::new());
+                    self.overlay = Overlay::ContactSearchResults;
+                    self.dirty = true;
+                }
+            }
+            Action::ContactSearchCancel => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::ContactResultNext => {
+                self.contacts.select_next();
+                self.dirty = true;
+            }
+            Action::ContactResultPrev => {
+                self.contacts.select_prev();
+                self.dirty = true;
+            }
+            Action::ContactResultConfirm => self.confirm_contact_result(),
             Action::SettingsOpen => {
                 // Open the editor pre-filled with the policy in effect, so the fields
-                // show the live values a Tab-and-type edits (#146).
-                self.settings = SettingsDraft::from_settings(self.storage);
+                // show the live values a Tab-and-type edits (#146, plus the graphics
+                // toggle, #209).
+                self.settings = SettingsDraft::from_settings(self.storage, self.graphics_enabled);
                 self.overlay = Overlay::Settings;
                 self.dirty = true;
             }
@@ -1150,18 +1999,179 @@ impl App {
                 self.dirty = true;
             }
             Action::SettingsConfirm => {
-                // Validate the four fields through core's parsers. A valid edit
-                // updates the in-memory policy (so a reopen shows the new values) and
-                // lands it for the loop to apply live and persist (#146); an invalid
-                // value keeps the overlay open with the reason shown in place.
-                if let Some(updated) = self.settings.confirm() {
+                // Validate every field through core's parsers. A valid edit updates
+                // the in-memory policy (so a reopen shows the new values) and lands
+                // it for the loop to apply live and persist (#146); an invalid value
+                // keeps the overlay open with the reason shown in place. The
+                // graphics toggle (#209) applies immediately via
+                // `set_graphics_enabled` (so the very next frame reflects it) and is
+                // only recorded for the loop to persist when it actually changed.
+                if let Some((updated, graphics)) = self.settings.confirm() {
                     self.storage = updated;
                     self.pending_settings = Some(updated);
+                    if graphics != self.graphics_enabled {
+                        self.set_graphics_enabled(graphics);
+                        self.pending_graphics = Some(graphics);
+                    }
                     self.overlay = Overlay::None;
                 }
                 self.dirty = true;
             }
             Action::SettingsCancel => {
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::ReplyMessage => {
+                // Put the composer into reply mode against the selected message and
+                // jump to it (#195). The reply body is sent through the already-wired
+                // send seam on submit (#116). A no-op on an empty history.
+                let target = self.conversation.selected_message().map(|m| {
+                    let label = self.conversation.sender_label(m);
+                    (m.id, message_preview(&label.label, m))
+                });
+                if let Some((id, preview)) = target {
+                    self.composer.reply_to(id, preview);
+                    self.focus = Focus::Composer;
+                    self.dirty = true;
+                }
+            }
+            Action::EditMessage => {
+                // Pre-fill the composer with the selected message's text and jump to
+                // it (#195); submitting replaces the message through the edit seam
+                // (#116). Only our own text messages are editable — anything else
+                // explains why with a toast and does nothing.
+                let target = self
+                    .conversation
+                    .selected_message()
+                    .map(|m| (m.id, m.is_outgoing, m.text().map(str::to_owned)));
+                if let Some((id, own, text)) = target {
+                    match (own, text) {
+                        (true, Some(text)) => {
+                            self.composer.edit(id, text);
+                            self.focus = Focus::Composer;
+                        }
+                        (false, _) => {
+                            self.notify(Notice::info("You can only edit your own messages."));
+                        }
+                        (true, None) => {
+                            self.notify(Notice::info("Only text messages can be edited."));
+                        }
+                    }
+                    self.dirty = true;
+                }
+            }
+            Action::JumpToQuoted => {
+                // Follow the selected message's reply to its target (#210) — only
+                // within the same chat, since the target is always in the currently
+                // open chat's own loaded window, never a different one to switch to.
+                // `select_message` already no-ops cleanly for an id it can't find (not
+                // loaded, deleted, or a story reply), matching this action's own
+                // "quiet no-op otherwise".
+                let target = self.conversation.selected_message().and_then(|m| {
+                    let ReplyTo::Message {
+                        chat_id,
+                        message_id,
+                        ..
+                    } = m.reply_to.as_ref()?
+                    else {
+                        return None;
+                    };
+                    // TDLib documents `chat_id` as "may be 0 if the replied message is
+                    // in unknown chat" — treat that as same-chat too, same reasoning as
+                    // `ui::quote_lines`.
+                    (*chat_id == 0 || *chat_id == m.chat_id).then_some(*message_id)
+                });
+                if let Some(message_id) = target
+                    && self.conversation.select_message(message_id)
+                {
+                    self.dirty = true;
+                }
+            }
+            Action::DeleteMessage => {
+                // Open the delete confirm for the selected message (#195). Reads the
+                // message's ownership so the confirm can offer "for everyone" only for
+                // our own messages. A no-op on an empty history.
+                let target = self.conversation.selected_message().map(|m| {
+                    let label = self.conversation.sender_label(m);
+                    (
+                        m.chat_id,
+                        m.id,
+                        m.is_outgoing,
+                        message_preview(&label.label, m),
+                    )
+                });
+                if let Some((chat_id, id, own, preview)) = target {
+                    self.delete = Some(DeletePrompt::new(chat_id, id, own, preview));
+                    self.overlay = Overlay::DeleteConfirm;
+                    self.dirty = true;
+                }
+            }
+            Action::DeleteToggleScope => {
+                if let Some(prompt) = self.delete.as_mut() {
+                    prompt.toggle_revoke();
+                    self.dirty = true;
+                }
+            }
+            Action::DeleteConfirm => {
+                // Record the delete as a pure intent for the loop (#195), then close.
+                // No optimistic removal — the real `updateDeleteMessages` folds and
+                // re-projects the history.
+                if let Some(prompt) = self.delete.take() {
+                    self.pending_delete = Some(prompt.into_intent());
+                }
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::DeleteCancel => {
+                self.delete = None;
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::SaveMedia => {
+                // Record the selected message's file id for the loop to reveal or
+                // download (#195). `App` cannot read the file store, so it only
+                // resolves the id here; a message with no downloadable media (id 0 or
+                // a non-media body) explains why with a toast.
+                let file_id = self
+                    .conversation
+                    .selected_message()
+                    .and_then(|m| m.content.file())
+                    .map(|f| f.id)
+                    .filter(|id| *id != 0);
+                match file_id {
+                    Some(id) => self.pending_save = Some(id),
+                    None => self.notify(Notice::info("The selected message has no media to save.")),
+                }
+                self.dirty = true;
+            }
+            Action::CopyMessage => {
+                // Copy the selected message's text (`y`, #197). `App` cannot reach
+                // the OS clipboard, so it only resolves the text here; a non-text
+                // message explains why with a toast, the same shape as
+                // `EditMessage`'s restriction. A no-op on an empty history.
+                match self.conversation.selected_message().map(|m| m.text()) {
+                    Some(Some(text)) => {
+                        self.pending_copy = Some(text.to_owned());
+                        self.dirty = true;
+                    }
+                    Some(None) => self.notify(Notice::info("Only text messages can be copied.")),
+                    None => {}
+                }
+            }
+            Action::Resync => {
+                self.pending_resync = true;
+                self.dirty = true;
+            }
+            Action::LogoutOpen => {
+                self.overlay = Overlay::LogoutConfirm;
+                self.dirty = true;
+            }
+            Action::LogoutConfirm => {
+                self.pending_logout = true;
+                self.overlay = Overlay::None;
+                self.dirty = true;
+            }
+            Action::LogoutCancel => {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -1175,6 +2185,44 @@ impl App {
             }
             Action::Quit => self.should_quit = true,
         }
+    }
+}
+
+/// A short one-line label of a message for the reply and delete prompts (#195):
+/// the sender label and a trimmed snippet of the body, or a bracketed media kind
+/// for a non-text message. Kept to a single line so it fits the composer's reply
+/// indicator and the delete confirm.
+fn message_preview(sender: &str, message: &Message) -> String {
+    const MAX: usize = 40;
+    let body = match message.text() {
+        Some(text) if !text.trim().is_empty() => {
+            let text = text.trim();
+            let mut out: String = text.chars().take(MAX).collect();
+            if text.chars().count() > MAX {
+                out.push('…');
+            }
+            out
+        }
+        _ => format!("<{}>", media_kind(&message.content)),
+    };
+    format!("{sender}: {body}")
+}
+
+/// The bracketed kind label for a non-text message body (#195).
+fn media_kind(content: &MessageContent) -> &'static str {
+    match content {
+        MessageContent::Text(_) | MessageContent::Unsupported(_) => "message",
+        MessageContent::Photo(_) => "photo",
+        MessageContent::Video(_) => "video",
+        MessageContent::Document(_) => "document",
+        MessageContent::Audio(_) => "audio",
+        MessageContent::Voice(_) => "voice",
+        MessageContent::Sticker(_) => "sticker",
+        MessageContent::Animation(_) => "animation",
+        MessageContent::Location(_) => "location",
+        MessageContent::Venue(_) => "venue",
+        MessageContent::Contact(_) => "contact",
+        MessageContent::Poll(_) => "poll",
     }
 }
 
@@ -1226,6 +2274,292 @@ mod tests {
     fn resize_requests_render() {
         let app = App::new();
         assert_eq!(app.on_terminal_event(Event::Resize(80, 24)), Action::Render);
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// An app whose recorded pane rects match an 80×24 frame — the geometry the
+    /// render tests use — so the coordinates below hit-test to real panes
+    /// (#161/#162). Chat list: left column; history: right column, rows 0..19;
+    /// composer: rows 20..22; status: row 23.
+    fn app_with_panes() -> App {
+        let mut app = App::new();
+        app.set_pane_layout(crate::ui::pane_layout(
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+            app.composer().text(),
+            app.chat_list_collapsed(),
+        ));
+        app
+    }
+
+    const LEFT_CLICK: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+
+    #[test]
+    fn left_click_focuses_the_pane_under_the_pointer() {
+        let mut app = app_with_panes();
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 1, 1)),
+            Action::SetFocus(Focus::ChatList)
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 50, 1)),
+            Action::SetFocus(Focus::History)
+        );
+        // The composer resolves to a cursor-placement action rather than a plain
+        // focus one (#217) — dispatching it still focuses the pane, with the
+        // cursor landed at the clicked column too.
+        let composer_click = app.on_terminal_event(mouse(LEFT_CLICK, 50, 21));
+        assert!(matches!(composer_click, Action::ComposerClickAt { .. }));
+        app.dispatch(composer_click);
+        assert_eq!(app.focus(), Focus::Composer);
+    }
+
+    #[test]
+    fn a_click_on_the_status_bar_or_empty_space_is_ignored() {
+        let app = app_with_panes();
+        // The status strip is not a focus target.
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 0, 23)),
+            Action::Noop
+        );
+        // Past the right edge hits nothing.
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 100, 5)),
+            Action::Noop
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_chat_list_moves_its_selection() {
+        // Regardless of focus: the app lands focused on the chat list, but the
+        // pointer is what selects the target pane (#162).
+        let app = app_with_panes();
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 1, 1)),
+            Action::SelectNext
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollUp, 1, 1)),
+            Action::SelectPrev
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_history_pane_scrolls_it() {
+        let app = app_with_panes();
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 50, 1)),
+            Action::ScrollDown
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollUp, 50, 1)),
+            Action::ScrollUp
+        );
+    }
+
+    #[test]
+    fn wheel_over_the_composer_is_ignored() {
+        // Only the chat list and history scroll on the wheel (#162); the composer
+        // and status bar do not.
+        let app = app_with_panes();
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 50, 21)),
+            Action::Noop
+        );
+    }
+
+    #[test]
+    fn mouse_events_are_ignored_while_a_modal_overlay_is_open() {
+        // An overlay captures input, so a click/wheel falls through to nothing
+        // rather than reaching the panes underneath (#161).
+        let mut app = app_with_panes();
+        app.dispatch(Action::ToggleHelp);
+        assert_ne!(app.overlay(), Overlay::None, "help overlay should be open");
+        assert_eq!(app.on_terminal_event(mouse(LEFT_CLICK, 1, 1)), Action::Noop);
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 50, 1)),
+            Action::Noop
+        );
+    }
+
+    /// Render `app` (real chat/message data, not the synthetic rects
+    /// `app_with_panes` uses) into an 80×24 `TestBackend` frame and record the
+    /// pane rects, chat/message row maps, and overlay row map onto it — the same
+    /// calls the live loop makes after every `draw` (see `main.rs`), so a click
+    /// test exercises the exact hit-testing a real session would.
+    fn render_and_record(app: &mut App) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut output = crate::ui::RenderOutput::default();
+        terminal
+            .draw(|frame| output = crate::ui::ui(frame, app))
+            .unwrap();
+        app.set_pane_layout(output.panes);
+        app.set_chat_rows(output.chat_rows);
+        app.set_history_rows(output.history_rows);
+        app.set_overlay_rows(output.overlay_rows);
+    }
+
+    #[test]
+    fn left_click_on_a_chat_row_opens_that_chat() {
+        use crate::chat_list::{ChatList, ChatListView, sample_chat};
+        use tuigram_core::model::ChatListKind;
+
+        // Two chats so the click can target the second row specifically,
+        // proving the hit follows the row clicked rather than just whatever
+        // happens to already be selected.
+        let view = ChatListView::from_lists(vec![ChatList {
+            kind: ChatListKind::Main,
+            label: "Main".to_owned(),
+            chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
+        }]);
+        let mut app = App::with_chat_list(view);
+        render_and_record(&mut app);
+
+        let row = (0..24)
+            .find(|&r| {
+                matches!(
+                    app.on_terminal_event(mouse(LEFT_CLICK, 1, r)),
+                    Action::OpenChat(2)
+                )
+            })
+            .expect("Bob's row resolves to OpenChat(2)");
+
+        app.dispatch(Action::OpenChat(2));
+        assert_eq!(
+            app.focus(),
+            Focus::History,
+            "click opens into the history pane"
+        );
+        assert_eq!(app.chat_list().selected_chat().map(|c| c.id), Some(2));
+
+        // A click on a row that maps to no chat (empty list space) still just
+        // focuses the pane — #161's original behavior is preserved there.
+        let below_last_row = row + 1;
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 1, below_last_row)),
+            Action::SetFocus(Focus::ChatList)
+        );
+    }
+
+    #[test]
+    fn left_click_on_a_history_row_selects_that_message() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let text = |id: i64| {
+            sample_message(
+                id,
+                MessageContent::Text(FormattedText {
+                    text: format!("m{id}"),
+                    entities: Vec::new(),
+                }),
+            )
+        };
+        let mut app = App::new();
+        // A tall viewport so both messages fit and the open bottom-anchors at the
+        // top, same as `projecting_a_conversation_fills_the_history_and_dirties`.
+        app.set_conversation_viewport(40);
+        app.project_conversation(
+            10,
+            vec![text(1), text(2)],
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        render_and_record(&mut app);
+
+        (0..24)
+            .find(|&r| {
+                matches!(
+                    app.on_terminal_event(mouse(LEFT_CLICK, 50, r)),
+                    Action::SelectMessageAt(2)
+                )
+            })
+            .expect("message 2's row resolves to SelectMessageAt(2)");
+
+        app.dispatch(Action::SelectMessageAt(2));
+        assert_eq!(app.focus(), Focus::History);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(2));
+
+        // Message 1's header sits on the history pane's first inner row.
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 50, 1)),
+            Action::SelectMessageAt(1)
+        );
+    }
+
+    #[test]
+    fn left_click_in_the_composer_moves_the_cursor_there() {
+        let mut composer = Composer::default();
+        for c in "hello world".chars() {
+            composer.insert(c);
+        }
+        let mut app = App::with_composer(composer);
+        render_and_record(&mut app);
+
+        // The composer's inner text starts one column past its left border
+        // (`Block::bordered()`); its inner row is one row past its top border.
+        let panes = crate::ui::pane_layout(
+            ratatui::layout::Rect::new(0, 0, 80, 24),
+            "hello world",
+            false,
+        );
+        let inner_x = panes.composer.x + 1;
+        let row = panes.composer.y + 1;
+
+        // Click 3 columns into "hello world" — the cursor should land between
+        // the "hel" and "lo world" it split, i.e. character index 3.
+        let action = app.on_terminal_event(mouse(LEFT_CLICK, inner_x + 3, row));
+        assert_eq!(action, Action::ComposerClickAt { row: 0, col: 3 });
+
+        app.dispatch(action);
+        assert_eq!(app.focus(), Focus::Composer, "click focuses the composer");
+        assert_eq!(app.composer().cursor(), 3);
+    }
+
+    #[test]
+    fn left_click_on_a_search_result_row_selects_and_opens_it() {
+        // #217: clicking a hit should behave exactly like navigating to it and
+        // pressing Enter (`ResultOpen`, see `opening_a_hit_jumps_to_its_chat_and_focuses_the_history`).
+        let mut app = app_on_results(); // chats Alice(1)/Bob(2); hits (1,10),(2,20)
+        render_and_record(&mut app);
+
+        // Column 40 sits inside the centred results popup at this width.
+        let (hit_row, action) = (0..24)
+            .find_map(|r| match app.on_terminal_event(mouse(LEFT_CLICK, 40, r)) {
+                Action::OverlayRowClick(1) => Some((r, Action::OverlayRowClick(1))),
+                _ => None,
+            })
+            .expect("Bob's hit (index 1) resolves to OverlayRowClick(1)");
+
+        // A click at that same row but off to the side of the centred popup
+        // (column 1, over the panes underneath) must not hit the overlay —
+        // checked before dispatching, while the overlay is still open.
+        assert_eq!(
+            app.on_terminal_event(mouse(LEFT_CLICK, 1, hit_row)),
+            Action::Noop
+        );
+
+        app.dispatch(action);
+        assert_eq!(app.overlay(), Overlay::None, "overlay closed on jump");
+        assert_eq!(app.focus(), Focus::History);
+        assert_eq!(
+            app.chat_list().selected_chat().map(|c| c.id),
+            Some(2),
+            "the clicked hit's chat is selected"
+        );
     }
 
     #[test]
@@ -1318,6 +2652,67 @@ mod tests {
     }
 
     #[test]
+    fn toggle_chat_list_collapse_flips_state_and_marks_dirty() {
+        let mut app = App::new();
+        assert!(!app.chat_list_collapsed());
+        app.clear_dirty();
+        app.dispatch(Action::ToggleChatListCollapse);
+        assert!(app.chat_list_collapsed());
+        assert!(app.is_dirty());
+        app.dispatch(Action::ToggleChatListCollapse);
+        assert!(!app.chat_list_collapsed());
+    }
+
+    #[test]
+    fn collapsing_the_chat_list_while_focused_moves_focus_to_history() {
+        let mut app = App::new();
+        assert_eq!(app.focus(), Focus::ChatList);
+        app.dispatch(Action::ToggleChatListCollapse);
+        assert_eq!(
+            app.focus(),
+            Focus::History,
+            "a zero-width pane can't hold focus"
+        );
+    }
+
+    #[test]
+    fn focus_next_and_prev_skip_the_collapsed_chat_list() {
+        let mut app = App::new();
+        app.dispatch(Action::ToggleChatListCollapse);
+        assert_eq!(app.focus(), Focus::History);
+
+        app.dispatch(Action::FocusNext);
+        assert_eq!(app.focus(), Focus::Composer);
+        app.dispatch(Action::FocusNext);
+        assert_eq!(
+            app.focus(),
+            Focus::History,
+            "cycles straight past ChatList back to History"
+        );
+
+        app.dispatch(Action::FocusPrev);
+        assert_eq!(app.focus(), Focus::Composer);
+        app.dispatch(Action::FocusPrev);
+        assert_eq!(app.focus(), Focus::History, "same going the other way");
+    }
+
+    #[test]
+    fn expanding_the_chat_list_restores_its_selection() {
+        let mut app = App::new();
+        app.dispatch(Action::SelectNext);
+        let selected_before = app.chat_list().selected();
+
+        app.dispatch(Action::ToggleChatListCollapse);
+        app.dispatch(Action::ToggleChatListCollapse);
+
+        assert_eq!(
+            app.chat_list().selected(),
+            selected_before,
+            "collapsing/expanding never touches chat_list's own state"
+        );
+    }
+
+    #[test]
     fn toggle_help_shows_then_hides_the_overlay_and_a_stray_key_is_ignored() {
         let mut app = App::new();
         assert!(!app.help_visible());
@@ -1377,7 +2772,12 @@ mod tests {
             App::with_conversation(ConversationView::from_messages(messages, HashSet::new()));
         app.clear_dirty();
 
-        app.dispatch(Action::ScrollDown);
+        // #222: ScrollDown is now a row step; each plain-text message here is
+        // 3 rows (header, body, blank separator), so 3 steps advance the
+        // offset by exactly one message.
+        for _ in 0..3 {
+            app.dispatch(Action::ScrollDown);
+        }
         assert_eq!(app.conversation().offset(), 1);
         assert!(app.is_dirty());
     }
@@ -1394,8 +2794,95 @@ mod tests {
         assert_eq!(mapped(KeyCode::Home), Action::ComposerHome);
         assert_eq!(mapped(KeyCode::End), Action::ComposerEnd);
         assert_eq!(mapped(KeyCode::Esc), Action::ComposerCancel);
+        assert_eq!(mapped(KeyCode::Up), Action::ComposerUp);
+        assert_eq!(mapped(KeyCode::Down), Action::ComposerDown);
         // An unbound printable key inserts rather than running a command.
         assert_eq!(mapped(KeyCode::Char('q')), Action::ComposerInput('q'));
+
+        // Alt-Enter (and Shift-Enter, best-effort where the terminal reports
+        // it) insert a newline instead of submitting (#215).
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Enter, KeyModifiers::ALT)),
+            Action::ComposerNewline
+        );
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Enter, KeyModifiers::SHIFT)),
+            Action::ComposerNewline
+        );
+        // Plain Enter still sends.
+        assert_eq!(mapped(KeyCode::Enter), Action::ComposerSubmit);
+    }
+
+    #[test]
+    fn composer_newline_action_inserts_a_literal_newline_without_submitting() {
+        let mut app = App::new();
+        app.dispatch(Action::ComposerInput('a'));
+        app.dispatch(Action::ComposerNewline);
+        app.dispatch(Action::ComposerInput('b'));
+        assert_eq!(app.composer().text(), "a\nb");
+        // A newline is not a submit — nothing queued to send.
+        assert_eq!(app.take_outbound(), None);
+    }
+
+    #[test]
+    fn composer_up_and_down_actions_round_trip_across_a_wrapped_row() {
+        let mut app = App::new();
+        app.dispatch(Action::SetFocus(Focus::Composer));
+        render_and_record(&mut app);
+
+        // A full first row (real newline, not a wrap seam, so the row split
+        // is unambiguous) followed by a short second row.
+        let width = app.composer_inner_width();
+        let draft = format!("{}\nab", "x".repeat(width));
+        for c in draft.chars() {
+            app.dispatch(Action::ComposerInput(c));
+        }
+        let end_cursor = app.composer().cursor();
+
+        app.dispatch(Action::ComposerUp);
+        assert_ne!(
+            app.composer().cursor(),
+            end_cursor,
+            "moved off the last row"
+        );
+
+        app.dispatch(Action::ComposerDown);
+        assert_eq!(
+            app.composer().cursor(),
+            end_cursor,
+            "the remembered goal column returns to the same spot"
+        );
+    }
+
+    #[test]
+    fn left_click_on_a_wrapped_composer_row_moves_the_cursor_there() {
+        let width = crate::ui::pane_layout(ratatui::layout::Rect::new(0, 0, 80, 24), "", false)
+            .composer
+            .width as usize
+            - 2;
+        let mut composer = Composer::default();
+        for c in format!("{}\nab", "x".repeat(width)).chars() {
+            composer.insert(c);
+        }
+        let mut app = App::with_composer(composer);
+        render_and_record(&mut app);
+
+        let panes = app.pane_layout();
+        let inner_x = panes.composer.x + 1;
+        let inner_y = panes.composer.y + 1;
+
+        // Click on the second visual row, 1 column into "ab".
+        let action = app.on_terminal_event(mouse(LEFT_CLICK, inner_x + 1, inner_y + 1));
+        assert_eq!(action, Action::ComposerClickAt { row: 1, col: 1 });
+
+        app.dispatch(action);
+        assert_eq!(app.focus(), Focus::Composer);
+        // Cursor lands between 'a' and 'b' on the second (short) row, not
+        // wherever character index 1 would fall in the flat buffer.
+        assert_eq!(
+            app.composer().text().chars().nth(app.composer().cursor()),
+            Some('b')
+        );
     }
 
     #[test]
@@ -1485,11 +2972,64 @@ mod tests {
         };
         // Stands in for the loop's read-back of the open chat's MessageStore.
         let mut app = App::new();
+        // A tall viewport (the loop records it after each render) so the whole
+        // two-message history fits: the open bottom-anchors, which for a history that
+        // fits is the top — message 1 at the top of the pane (#158).
+        app.set_conversation_viewport(40);
         app.clear_dirty();
-        app.project_conversation(10, vec![text(1), text(2)], HashSet::new());
+        app.project_conversation(
+            10,
+            vec![text(1), text(2)],
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
         assert!(app.is_dirty());
         assert_eq!(app.conversation().len(), 2);
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    #[test]
+    fn jump_to_newest_bottom_anchors_the_history_and_dirties() {
+        use crate::conversation::sample_message;
+        use tuigram_core::model::{FormattedText, MessageContent};
+
+        let text = |id: i64| {
+            sample_message(
+                id,
+                MessageContent::Text(FormattedText {
+                    text: format!("m{id}"),
+                    entities: Vec::new(),
+                }),
+            )
+        };
+        // Five 3-row messages in a two-message viewport: opening bottom-anchors, so
+        // scrolling up and pressing G returns to the newest anchor (#158).
+        let mut app = App::new();
+        app.set_conversation_viewport(6);
+        app.project_conversation(
+            10,
+            (1..=5).map(text).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        let anchor = app.conversation().offset();
+        assert!(anchor > 0, "a long history opens away from the top");
+
+        app.dispatch(Action::ScrollUp);
+        app.clear_dirty();
+        app.dispatch(Action::JumpToNewest);
+        assert_eq!(
+            app.conversation().offset(),
+            anchor,
+            "G returns to the newest"
+        );
+        assert!(app.is_dirty());
     }
 
     #[test]
@@ -1688,7 +3228,15 @@ mod tests {
         app.dispatch(Action::ResultOpen); // first hit: chat 1, message 10
 
         // The first projection of chat 1 does not carry message 10 yet: no jump.
-        app.project_conversation(1, text_history(&[1, 2]), HashSet::new());
+        app.project_conversation(
+            1,
+            text_history(&[1, 2]),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
         assert_ne!(
             app.conversation().selected_message().map(|m| m.id),
             Some(10),
@@ -1696,7 +3244,15 @@ mod tests {
         );
 
         // The page carrying message 10 lands: the jump applies and clears.
-        app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
+        app.project_conversation(
+            1,
+            text_history(&[9, 10, 11]),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
         assert_eq!(
             app.conversation().selected_message().map(|m| m.id),
             Some(10)
@@ -1706,13 +3262,33 @@ mod tests {
     #[test]
     fn a_jump_is_dropped_when_a_different_chat_is_opened_first() {
         let mut app = app_on_results();
+        // A viewport tall enough to hold the short history, so bottom-anchoring puts
+        // the oldest loaded message at the top of the pane (#158).
+        app.set_conversation_viewport(40);
         app.dispatch(Action::ResultOpen); // hit for chat 1, message 10
 
         // The user opens chat 2 before chat 1's history arrives: the stale jump drops.
-        app.project_conversation(2, text_history(&[7, 8]), HashSet::new());
+        app.project_conversation(
+            2,
+            text_history(&[7, 8]),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
         // Chat 1's history (with message 10) arrives later, but the jump is gone, so
-        // the view lands fresh at the top (message 9) rather than chasing message 10.
-        app.project_conversation(1, text_history(&[9, 10, 11]), HashSet::new());
+        // the view opens bottom-anchored (message 9 at the pane top, the whole history
+        // fitting) rather than chasing message 10.
+        app.project_conversation(
+            1,
+            text_history(&[9, 10, 11]),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(9));
     }
 
@@ -1791,7 +3367,15 @@ mod tests {
             chats: vec![sample_chat(1, "Alice", 0), sample_chat(2, "Bob", 0)],
         }]);
         let mut app = App::with_chat_list(view);
-        app.project_conversation(1, text_history(&[10, 11]), HashSet::new());
+        app.project_conversation(
+            1,
+            text_history(&[10, 11]),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
         app
     }
 
@@ -1944,6 +3528,38 @@ mod tests {
             })
         );
         assert_eq!(app.take_reaction(), None, "the intent is drained once");
+    }
+
+    #[test]
+    fn left_click_on_a_reaction_palette_row_selects_and_confirms_it() {
+        // #217: a click on a palette emoji should behave exactly like navigating
+        // to it and pressing Enter, same as the search-result click.
+        let mut app = app_with_history();
+        let id = app.conversation().selected_message().unwrap().id;
+        app.dispatch(Action::ReactionOpen);
+        render_and_record(&mut app);
+
+        let chosen = app.reaction().palette()[2];
+        let action = (0..24)
+            .find_map(|r| match app.on_terminal_event(mouse(LEFT_CLICK, 40, r)) {
+                Action::OverlayRowClick(2) => Some(Action::OverlayRowClick(2)),
+                _ => None,
+            })
+            .expect("the third palette emoji resolves to OverlayRowClick(2)");
+
+        app.dispatch(action);
+        assert_eq!(app.overlay(), Overlay::None, "confirm closes the picker");
+        let message = app
+            .conversation()
+            .messages()
+            .iter()
+            .find(|m| m.id == id)
+            .unwrap();
+        assert_eq!(message.reactions.len(), 1);
+        assert_eq!(
+            message.reactions[0].kind,
+            ReactionKind::Emoji(chosen.to_owned())
+        );
     }
 
     #[test]
@@ -2273,6 +3889,46 @@ mod tests {
         assert_eq!(app.settings().value(SettingsField::KeepPrivate), "forever");
     }
 
+    #[test]
+    fn confirming_a_graphics_toggle_applies_it_live_and_hands_it_to_the_loop() {
+        let mut app = App::new();
+        assert!(app.graphics_enabled(), "on by default");
+        app.dispatch(Action::SettingsOpen);
+        app.dispatch(Action::SettingsToggleField); // groups
+        app.dispatch(Action::SettingsToggleField); // channels
+        app.dispatch(Action::SettingsToggleField); // max cache
+        app.dispatch(Action::SettingsToggleField); // graphics
+        clear_field(&mut app);
+        for c in "off".chars() {
+            app.dispatch(Action::SettingsInput(c));
+        }
+        app.dispatch(Action::SettingsConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(
+            !app.graphics_enabled(),
+            "applied live the instant it is confirmed, no restart"
+        );
+        assert_eq!(
+            app.take_graphics(),
+            Some(false),
+            "handed to the loop to persist"
+        );
+        assert!(app.take_graphics().is_none(), "drained once");
+    }
+
+    #[test]
+    fn confirming_settings_with_graphics_unchanged_records_nothing_to_persist() {
+        let mut app = App::new();
+        app.dispatch(Action::SettingsOpen);
+        // Leave every field, including graphics, at its pre-filled value.
+        app.dispatch(Action::SettingsConfirm);
+        assert!(app.graphics_enabled(), "unchanged");
+        assert!(
+            app.take_graphics().is_none(),
+            "nothing changed, nothing to persist"
+        );
+    }
+
     // --- secret chats & chat-action indicators (#87) ---
 
     use crate::secret::SecretLifecycle;
@@ -2403,6 +4059,84 @@ mod tests {
         );
     }
 
+    // --- #197: contact-search picker for new secret chats ---
+
+    #[test]
+    fn contact_search_open_resets_and_opens_the_query_overlay() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        assert_eq!(app.overlay(), Overlay::ContactSearchInput);
+        assert_eq!(app.contacts().query(), "");
+    }
+
+    #[test]
+    fn contact_search_submit_records_the_query_and_switches_to_results() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        for c in "ada".chars() {
+            app.dispatch(Action::ContactSearchInput(c));
+        }
+        app.dispatch(Action::ContactSearchSubmit);
+        assert_eq!(app.overlay(), Overlay::ContactSearchResults);
+        assert_eq!(app.take_contact_search().as_deref(), Some("ada"));
+    }
+
+    #[test]
+    fn contact_search_submit_on_a_blank_query_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        app.dispatch(Action::ContactSearchSubmit);
+        assert_eq!(
+            app.overlay(),
+            Overlay::ContactSearchInput,
+            "stays on the input line"
+        );
+        assert!(app.take_contact_search().is_none());
+    }
+
+    #[test]
+    fn confirming_a_contact_hit_opens_the_shared_secret_chat_confirm() {
+        use crate::contact_picker::ContactHit;
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        app.set_contact_results(vec![ContactHit::new(7, "Ada Lovelace")]);
+        app.dispatch(Action::ContactResultConfirm);
+        assert_eq!(app.overlay(), Overlay::SecretChat);
+        assert_eq!(
+            app.secret().map(|p| p.lifecycle()),
+            Some(SecretLifecycle::Start { user_id: 7 })
+        );
+        assert!(app.secret().unwrap().prompt().contains("Ada Lovelace"));
+    }
+
+    #[test]
+    fn confirming_with_no_contact_hits_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        app.dispatch(Action::ContactResultConfirm);
+        assert_eq!(app.overlay(), Overlay::ContactSearchInput);
+        assert!(app.secret().is_none());
+    }
+
+    #[test]
+    fn contact_search_cancel_closes_the_overlay() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        app.dispatch(Action::ContactSearchCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+    }
+
+    #[test]
+    fn contact_search_keys_resolve_through_the_overlay_not_the_panes() {
+        let mut app = App::new();
+        app.dispatch(Action::ContactSearchOpen);
+        // `n` would reopen the picker in the chat list; inside the input line it types.
+        assert_eq!(
+            app.on_terminal_event(key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            Action::ContactSearchInput('n')
+        );
+    }
+
     #[test]
     fn history_keys_resolve_through_the_send_media_overlay() {
         let mut app = app_with_history();
@@ -2501,5 +4235,271 @@ mod tests {
             app.on_terminal_event(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
             Action::NoticeDismiss
         );
+    }
+
+    // ---- #195: REPL→TUI command-parity actions ----
+
+    /// Build an app whose open conversation is a single `message`, selected.
+    fn app_with_message(message: Message) -> App {
+        use crate::conversation::ConversationView;
+        App::with_conversation(ConversationView::from_messages(
+            vec![message],
+            HashSet::new(),
+        ))
+    }
+
+    /// A text message with `id`; `own` marks it as ours (outgoing).
+    fn text_message(id: i64, body: &str, own: bool) -> Message {
+        use tuigram_core::model::{FormattedText, MessageContent};
+        let mut m = crate::conversation::sample_message(
+            id,
+            MessageContent::Text(FormattedText {
+                text: body.to_owned(),
+                entities: Vec::new(),
+            }),
+        );
+        m.is_outgoing = own;
+        m
+    }
+
+    #[test]
+    fn reply_message_enters_reply_mode_and_focuses_the_composer() {
+        use crate::composer::ComposerMode;
+        let mut app = app_with_message(text_message(42, "hello", false));
+        app.dispatch(Action::ReplyMessage);
+        assert_eq!(app.focus(), Focus::Composer);
+        assert!(matches!(
+            app.composer().mode(),
+            ComposerMode::Reply { message_id: 42, .. }
+        ));
+    }
+
+    #[test]
+    fn edit_message_prefills_only_for_our_own_text_messages() {
+        use crate::composer::ComposerMode;
+        // Someone else's message: not editable — composer stays in compose, focus
+        // stays on the (default) chat list, and a toast explains why.
+        let mut app = app_with_message(text_message(7, "hi", false));
+        app.dispatch(Action::EditMessage);
+        assert_eq!(app.focus(), Focus::ChatList);
+        assert!(matches!(app.composer().mode(), ComposerMode::Compose));
+        assert!(app.notifications.current().is_some());
+
+        // Our own text message: editable — the composer pre-fills and focuses.
+        let mut app = app_with_message(text_message(9, "mine", true));
+        app.dispatch(Action::EditMessage);
+        assert_eq!(app.focus(), Focus::Composer);
+        assert!(matches!(
+            app.composer().mode(),
+            ComposerMode::Edit { message_id: 9 }
+        ));
+        assert_eq!(app.composer().text(), "mine");
+    }
+
+    /// #210: jumping from a reply moves the selection onto its (loaded)
+    /// target, wherever it sits in the loaded history.
+    #[test]
+    fn jump_to_quoted_moves_the_selection_onto_the_replied_to_message() {
+        use crate::conversation::ConversationView;
+
+        let mut reply = text_message(2, "sure thing", false);
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: reply.chat_id,
+            message_id: 1,
+            quote: None,
+        });
+        let target = text_message(1, "original message", false);
+        // `reply` at offset 0 so it starts out selected.
+        let mut app = App::with_conversation(ConversationView::from_messages(
+            vec![reply, target],
+            HashSet::new(),
+        ));
+        app.dispatch(Action::JumpToQuoted);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    /// #210: TDLib documents `chat_id` as "may be 0 if the replied message is
+    /// in unknown chat" — a same-chat reply must still jump rather than
+    /// always no-op if TDLib reports `0` instead of the real chat id here.
+    #[test]
+    fn jump_to_quoted_resolves_a_reply_whose_chat_id_is_reported_as_zero() {
+        use crate::conversation::ConversationView;
+
+        let mut reply = text_message(2, "sure thing", false);
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: 0,
+            message_id: 1,
+            quote: None,
+        });
+        let target = text_message(1, "original message", false);
+        let mut app = App::with_conversation(ConversationView::from_messages(
+            vec![reply, target],
+            HashSet::new(),
+        ));
+        app.dispatch(Action::JumpToQuoted);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    /// A plain (non-reply) selected message has nothing to jump to.
+    #[test]
+    fn jump_to_quoted_is_a_noop_for_a_non_reply_message() {
+        let mut app = app_with_message(text_message(1, "hi", false));
+        app.dispatch(Action::JumpToQuoted);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
+    }
+
+    /// A reply whose target is not loaded (paged out, or a different chat's
+    /// message id) is a quiet no-op, not an error or a stale jump.
+    #[test]
+    fn jump_to_quoted_is_a_noop_for_an_unloaded_target() {
+        let mut reply = text_message(2, "sure thing", false);
+        reply.reply_to = Some(ReplyTo::Message {
+            chat_id: reply.chat_id,
+            message_id: 999,
+            quote: None,
+        });
+        let mut app = app_with_message(reply);
+        app.dispatch(Action::JumpToQuoted);
+        assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(2));
+    }
+
+    #[test]
+    fn delete_message_opens_the_confirm_and_records_the_scoped_intent() {
+        let mut msg = text_message(5, "x", true);
+        msg.chat_id = 77;
+        let mut app = app_with_message(msg);
+        app.dispatch(Action::DeleteMessage);
+        assert_eq!(app.overlay(), Overlay::DeleteConfirm);
+        // Defaults to the safe scope (for me); Tab flips it to for everyone since the
+        // message is ours.
+        assert!(!app.delete().expect("prompt open").revoke());
+        app.dispatch(Action::DeleteToggleScope);
+        assert!(app.delete().expect("prompt open").revoke());
+        app.dispatch(Action::DeleteConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+        let intent = app.take_delete().expect("recorded delete");
+        assert_eq!(intent.chat_id, 77);
+        assert_eq!(intent.message_ids, vec![5]);
+        assert!(intent.revoke);
+    }
+
+    #[test]
+    fn delete_scope_stays_for_me_on_someone_elses_message() {
+        let mut app = app_with_message(text_message(3, "x", false));
+        app.dispatch(Action::DeleteMessage);
+        // Not ours: "for everyone" is unavailable, so the toggle never revokes.
+        assert!(!app.delete().expect("prompt open").can_revoke());
+        app.dispatch(Action::DeleteToggleScope);
+        assert!(!app.delete().expect("prompt open").revoke());
+        // Cancel drops the prompt without recording an intent.
+        app.dispatch(Action::DeleteCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.delete().is_none());
+        assert!(app.take_delete().is_none());
+    }
+
+    #[test]
+    fn save_media_records_a_file_id_for_media_and_toasts_otherwise() {
+        use tuigram_core::model::{FileRef, MessageContent, Photo};
+        // A media message: the file id is recorded for the loop to save.
+        let mut photo = crate::conversation::sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: Default::default(),
+                file: FileRef::new(99),
+                width: 1,
+                height: 1,
+            }),
+        );
+        photo.is_outgoing = false;
+        let mut app = app_with_message(photo);
+        app.dispatch(Action::SaveMedia);
+        assert_eq!(app.take_save(), Some(99));
+
+        // A text message has no media: nothing recorded, a toast instead.
+        let mut app = app_with_message(text_message(2, "hi", false));
+        app.dispatch(Action::SaveMedia);
+        assert_eq!(app.take_save(), None);
+        assert!(app.notifications.current().is_some());
+    }
+
+    #[test]
+    fn copy_message_records_text_for_a_text_message_and_toasts_otherwise() {
+        use tuigram_core::model::{FileRef, MessageContent, Photo};
+        // A text message: its text is recorded for the loop to copy.
+        let mut app = app_with_message(text_message(1, "hello there", false));
+        app.dispatch(Action::CopyMessage);
+        assert_eq!(app.take_copy().as_deref(), Some("hello there"));
+
+        // A media message has no text: nothing recorded, a toast instead.
+        let mut photo = crate::conversation::sample_message(
+            2,
+            MessageContent::Photo(Photo {
+                caption: Default::default(),
+                file: FileRef::new(9),
+                width: 1,
+                height: 1,
+            }),
+        );
+        photo.is_outgoing = false;
+        let mut app = app_with_message(photo);
+        app.dispatch(Action::CopyMessage);
+        assert_eq!(app.take_copy(), None);
+        assert!(app.notifications.current().is_some());
+    }
+
+    #[test]
+    fn copy_message_on_an_empty_history_is_a_noop() {
+        let mut app = App::new();
+        app.dispatch(Action::CopyMessage);
+        assert_eq!(app.take_copy(), None);
+        assert!(app.notifications.current().is_none());
+    }
+
+    #[test]
+    fn composer_input_pings_typing_but_backspace_to_empty_does_not() {
+        let mut app = App::new();
+        assert!(!app.take_wants_typing_ping(), "nothing typed yet");
+
+        app.dispatch(Action::ComposerInput('h'));
+        assert!(app.take_wants_typing_ping());
+        // Draining clears the pulse until the next edit.
+        assert!(!app.take_wants_typing_ping());
+
+        app.dispatch(Action::ComposerBackspace);
+        // The buffer is empty again: nothing left to indicate.
+        assert!(!app.take_wants_typing_ping());
+
+        app.dispatch(Action::ComposerInput('h'));
+        app.dispatch(Action::ComposerInput('i'));
+        app.take_wants_typing_ping();
+        app.dispatch(Action::ComposerBackspace);
+        // Still "hi" -> "h" left in the buffer: still worth a ping.
+        assert!(app.take_wants_typing_ping());
+    }
+
+    #[test]
+    fn resync_records_a_request_drained_once() {
+        let mut app = App::new();
+        app.dispatch(Action::Resync);
+        assert!(app.take_resync(), "the request is recorded");
+        assert!(!app.take_resync(), "and cleared after one drain");
+    }
+
+    #[test]
+    fn logout_confirm_flow_records_a_request_and_cancel_does_not() {
+        let mut app = App::new();
+        app.dispatch(Action::LogoutOpen);
+        assert_eq!(app.overlay(), Overlay::LogoutConfirm);
+        // Cancel closes the confirm without recording a logout.
+        app.dispatch(Action::LogoutCancel);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(!app.take_logout());
+        // Confirm records the logout for the loop and closes.
+        app.dispatch(Action::LogoutOpen);
+        app.dispatch(Action::LogoutConfirm);
+        assert_eq!(app.overlay(), Overlay::None);
+        assert!(app.take_logout());
+        assert!(!app.take_logout(), "cleared after one drain");
     }
 }

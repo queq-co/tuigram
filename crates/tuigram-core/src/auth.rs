@@ -62,6 +62,21 @@ pub trait AuthRequests {
     /// credential-bearing request (see [`Login::set_parameters`]).
     async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError>;
 
+    /// Redirect TDLib's native log stream to `path`, off stderr entirely.
+    ///
+    /// Display-relevant, not just security-relevant: TDLib's log stream
+    /// defaults to stderr, which the TUI's raw-mode/alternate-screen terminal
+    /// inherits as its own fd 2. TDLib's C++ logger writes there directly and
+    /// unbuffered, with no coordination with ratatui's own screen buffer — so
+    /// any line it logs (plausible even at [`SECURE_LOG_VERBOSITY`], and far
+    /// likelier during a cold first launch's heavier initialization) bleeds
+    /// raw, ANSI-colored text straight over whatever the TUI has drawn,
+    /// visually surviving until the next full repaint overwrites it. Lowering
+    /// verbosity alone (`set_log_verbosity_level`) still leaves this fd open;
+    /// only redirecting the stream itself closes it. Called alongside that,
+    /// before any credential-bearing request (see [`Login::set_parameters`]).
+    async fn set_log_stream(&self, path: String) -> Result<(), TdError>;
+
     /// Answer `WaitTdlibParameters` — initialize the client.
     async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError>;
 
@@ -122,7 +137,65 @@ pub trait AuthRequests {
     /// exits so the on-disk database is never left mid-write (which would leave it
     /// malformed for the next run to open). Carries no payload.
     async fn close(&self) -> Result<(), TdError>;
+
+    // --- Whole-operation teardown (#195) ---
+    //
+    // `log_out` and `close` above are the raw *seams* — they only issue the
+    // request. The two operations below bundle each with the **wait for `Closed`**
+    // it requires to be correct, so that requirement lives in one place and every
+    // front-end (the REPL harness and the TUI, whatever their execution model) gets
+    // it for free rather than each re-deriving it and drifting. They are the
+    // operations callers should reach for; the bare `log_out`/`close` are the
+    // primitives they build on.
+
+    /// Wait until TDLib reaches [`AuthorizationState::Closed`] — the signal that a
+    /// preceding [`log_out`](Self::log_out) has finished destroying local data, or a
+    /// [`close`](Self::close) has finished flushing the database. Bounded
+    /// (~[`WAIT_CLOSED_POLLS`] × [`WAIT_CLOSED_INTERVAL`] ≈ 5s) so a stuck teardown
+    /// can never wedge a caller; a query that errors (the client is already gone)
+    /// counts as closed.
+    async fn wait_until_closed(&self) {
+        for _ in 0..WAIT_CLOSED_POLLS {
+            match self.authorization_state().await {
+                Ok(AuthorizationState::Closed) | Err(_) => return,
+                Ok(_) => tokio::time::sleep(WAIT_CLOSED_INTERVAL).await,
+            }
+        }
+    }
+
+    /// Log out **and wait for the logout to complete** — the whole operation.
+    ///
+    /// [`log_out`](Self::log_out) only *acknowledges* the request; TDLib then
+    /// asynchronously destroys all local data and drives authorization to `Closed`.
+    /// A caller that quits or [`close`](Self::close)s before `Closed` strands a
+    /// half-cleared session the next run can neither resume nor cleanly replace — so
+    /// the wait is a **requirement of the operation**, not an optional extra, and
+    /// living here it holds for every front-end. A failed `log_out` (nothing was
+    /// torn down, so nothing to wait for) is propagated.
+    async fn log_out_and_wait(&self) -> Result<(), TdError> {
+        self.log_out().await?;
+        self.wait_until_closed().await;
+        Ok(())
+    }
+
+    /// Close **and wait for the close to complete** — the whole clean-shutdown
+    /// operation, the counterpart to [`log_out_and_wait`](Self::log_out_and_wait).
+    ///
+    /// [`close`](Self::close) only initiates the flush; returning before `Closed`
+    /// can exit with the database mid-write, malformed for the next run. An
+    /// already-closing/closed client rejects `close`, which is exactly the desired
+    /// end state — so the result is ignored and the wait returns at once.
+    async fn close_and_wait(&self) {
+        let _ = self.close().await;
+        self.wait_until_closed().await;
+    }
 }
+
+/// How many times [`AuthRequests::wait_until_closed`] polls before giving up
+/// (~5s at [`WAIT_CLOSED_INTERVAL`]), so a stuck teardown cannot hang the caller.
+const WAIT_CLOSED_POLLS: u32 = 50;
+/// The delay between [`AuthRequests::wait_until_closed`] polls.
+const WAIT_CLOSED_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl AuthRequests for Bridge {
     async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
@@ -131,6 +204,18 @@ impl AuthRequests for Bridge {
 
     async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError> {
         tdlib_rs::functions::set_log_verbosity_level(level, self.id()).await
+    }
+
+    async fn set_log_stream(&self, path: String) -> Result<(), TdError> {
+        tdlib_rs::functions::set_log_stream(
+            tdlib_rs::enums::LogStream::File(tdlib_rs::types::LogStreamFile {
+                path,
+                max_file_size: LOG_FILE_MAX_BYTES,
+                redirect_stderr: false,
+            }),
+            self.id(),
+        )
+        .await
     }
 
     async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
@@ -204,6 +289,25 @@ impl AuthRequests for Bridge {
 /// are never written to TDLib's stderr log (see the threat model). `1` keeps
 /// genuine errors visible while silencing the default info-level logging.
 pub const SECURE_LOG_VERBOSITY: i32 = 1;
+
+/// Cap on TDLib's log file before it truncates and starts over (TDLib's own
+/// `logStreamFile` rotation, not tuigram's). Generous for a single-account
+/// debug trail without growing unbounded across a long-running session.
+const LOG_FILE_MAX_BYTES: i64 = 10 * 1024 * 1024;
+
+/// Where TDLib's log file lives for a given `database_directory` — a sibling
+/// of the database, so both land under the same session data dir without
+/// needing a separate path threaded in. Falls back to a relative path in the
+/// unexpected case `database_directory` has no parent (e.g. it was literally
+/// "/" or empty).
+fn log_file_path(database_directory: &str) -> String {
+    std::path::Path::new(database_directory)
+        .parent()
+        .map(|dir| dir.join("tdlib.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("tdlib.log"))
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// tuigram's view of the login flow — a reduced projection of TDLib's
 /// [`AuthorizationState`] covering the states Phase 2 acts on.
@@ -327,10 +431,14 @@ impl<'a, C: AuthRequests> Login<'a, C> {
     /// Answer [`AuthState::WaitTdlibParameters`].
     ///
     /// `setTdlibParameters` is the first request of every login, so this is
-    /// where we first silence TDLib's logging ([`SECURE_LOG_VERBOSITY`]) —
-    /// before any credential-bearing request, including the `api_id`/`api_hash`
-    /// in `params` itself.
+    /// where we first silence TDLib's logging — redirecting its stream off
+    /// stderr ([`AuthRequests::set_log_stream`]) and lowering its verbosity
+    /// ([`SECURE_LOG_VERBOSITY`]) — before any credential-bearing request,
+    /// including the `api_id`/`api_hash` in `params` itself.
     pub async fn set_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
+        self.client
+            .set_log_stream(log_file_path(&params.database_directory))
+            .await?;
         self.client
             .set_log_verbosity_level(SECURE_LOG_VERBOSITY)
             .await?;
@@ -387,7 +495,7 @@ impl<'a, C: AuthRequests> Login<'a, C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use tdlib_rs::enums::AuthenticationCodeType;
     use tdlib_rs::types::{
         AuthenticationCodeInfo, AuthenticationCodeTypeSms, AuthorizationStateWaitCode,
@@ -563,6 +671,12 @@ mod tests {
                 .push(format!("set_log_verbosity_level({level})"));
             Ok(())
         }
+        async fn set_log_stream(&self, path: String) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("set_log_stream({path})"));
+            Ok(())
+        }
         async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
             self.calls
                 .borrow_mut()
@@ -630,6 +744,166 @@ mod tests {
         }
     }
 
+    /// A client that models TDLib's asynchronous teardown: it reports a non-closed
+    /// state for the first few `authorization_state` polls after a `log_out`/`close`,
+    /// then `Closed` — so a caller that does not wait would observe the pre-`Closed`
+    /// state. Only the teardown surface is implemented; the rest is unreachable here.
+    #[derive(Default)]
+    struct ClosingSpy {
+        tearing_down: Cell<bool>,
+        polls: Cell<u32>,
+    }
+
+    impl AuthRequests for ClosingSpy {
+        async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
+            if !self.tearing_down.get() {
+                return Ok(AuthorizationState::Ready);
+            }
+            let n = self.polls.get();
+            self.polls.set(n + 1);
+            // Ready for the first few polls (destruction in progress), then Closed.
+            Ok(if n >= 3 {
+                AuthorizationState::Closed
+            } else {
+                AuthorizationState::Ready
+            })
+        }
+        async fn log_out(&self) -> Result<(), TdError> {
+            self.tearing_down.set(true);
+            Ok(())
+        }
+        async fn close(&self) -> Result<(), TdError> {
+            self.tearing_down.set(true);
+            Ok(())
+        }
+        async fn set_log_verbosity_level(&self, _: i32) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn set_log_stream(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn set_tdlib_parameters(&self, _: ClientParameters) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn set_phone_number(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn check_authentication_code(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn check_authentication_password(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn register_user(&self, _: String, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn set_authentication_email_address(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+        async fn check_authentication_email_code(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
+    }
+
+    /// `log_out_and_wait` must not return until authorization has reached `Closed` —
+    /// the requirement that keeps a front-end from stranding a half-cleared session
+    /// (#195). Paused time makes the poll sleeps advance instantly.
+    #[tokio::test(start_paused = true)]
+    async fn log_out_and_wait_blocks_until_closed() {
+        let spy = ClosingSpy::default();
+        spy.log_out_and_wait().await.expect("logout succeeds");
+        assert!(spy.tearing_down.get(), "log_out was issued");
+        assert!(
+            spy.polls.get() >= 4,
+            "it polled through the pre-Closed states rather than returning early"
+        );
+    }
+
+    /// `close_and_wait` waits the same way and, like the real clean shutdown,
+    /// tolerates a never-closing client by returning once the bound is hit rather
+    /// than hanging (#195).
+    #[tokio::test(start_paused = true)]
+    async fn close_and_wait_is_bounded_when_never_closing() {
+        // A client that reports `Ready` forever (close is a no-op here): the wait is
+        // bounded, so this returns instead of spinning.
+        struct NeverCloses;
+        impl AuthRequests for NeverCloses {
+            async fn authorization_state(&self) -> Result<AuthorizationState, TdError> {
+                Ok(AuthorizationState::Ready)
+            }
+            async fn close(&self) -> Result<(), TdError> {
+                Ok(())
+            }
+            async fn log_out(&self) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_log_verbosity_level(&self, _: i32) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_log_stream(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_tdlib_parameters(&self, _: ClientParameters) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_phone_number(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn request_qr_code_authentication(&self) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn check_authentication_code(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn check_authentication_password(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn register_user(&self, _: String, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn set_authentication_email_address(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+            async fn check_authentication_email_code(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
+        }
+        // Completes (the bound is hit) rather than hanging the test.
+        NeverCloses.close_and_wait().await;
+    }
+
+    #[test]
+    fn log_file_path_sits_beside_the_database_directory() {
+        // Expected values are built through the same `Path::join`, not a
+        // hardcoded `/`-joined literal: `PathBuf`'s `Display` renders with the
+        // platform's native separator (`\` on Windows), so a literal forward
+        // slash here would mismatch off this crate's own output on Windows
+        // even though the path is otherwise correct.
+        let expect = |dir: &str| {
+            std::path::Path::new(dir)
+                .parent()
+                .unwrap()
+                .join("tdlib.log")
+        };
+        assert_eq!(
+            log_file_path("/tmp/db"),
+            expect("/tmp/db").to_string_lossy()
+        );
+        assert_eq!(
+            log_file_path("/home/user/.local/share/tuigram/database"),
+            expect("/home/user/.local/share/tuigram/database").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn log_file_path_falls_back_when_there_is_no_parent() {
+        assert_eq!(log_file_path(""), "tdlib.log");
+        assert_eq!(log_file_path("/"), "tdlib.log");
+    }
+
     fn params() -> ClientParameters {
         ClientParameters {
             api_id: 42,
@@ -686,9 +960,17 @@ mod tests {
 
         // Logging is silenced before the very first request — ahead of any
         // credential, including the api_id/api_hash in setTdlibParameters.
+        // The expected log path is built via `log_file_path` itself (already
+        // covered on its own by `log_file_path_sits_beside_the_database_directory`)
+        // rather than a hardcoded `/`-joined literal, so this assertion isn't
+        // sensitive to the platform's native path separator.
         assert_eq!(
             client.calls(),
             vec![
+                format!(
+                    "set_log_stream({})",
+                    log_file_path(&params().database_directory)
+                ),
                 "set_log_verbosity_level(1)".to_owned(),
                 "set_tdlib_parameters(api_id=42)".to_owned(),
                 "set_phone_number(+15551234567)".to_owned(),

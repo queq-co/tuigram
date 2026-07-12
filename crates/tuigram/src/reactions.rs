@@ -151,6 +151,12 @@ impl ReactionPicker {
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }
+
+    /// Move the selection directly to a palette index (a click on an emoji),
+    /// clamping at the last.
+    pub fn select(&mut self, index: usize) {
+        self.selected = index.min(PALETTE.len() - 1);
+    }
 }
 
 #[cfg(test)]

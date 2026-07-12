@@ -101,6 +101,11 @@ impl ForwardView {
     pub fn select_prev(&mut self) {
         self.targets.select_prev();
     }
+
+    /// Move the target selection directly to a row index (a click on a target).
+    pub fn select(&mut self, index: usize) {
+        self.targets.select(index);
+    }
 }
 
 #[cfg(test)]

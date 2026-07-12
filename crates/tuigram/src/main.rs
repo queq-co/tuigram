@@ -34,16 +34,23 @@
 //! ever started.
 
 mod app;
+mod avatar;
 mod bootstrap;
 mod chat_list;
 mod composer;
+mod contact_picker;
 mod conversation;
 mod event;
 mod forward;
 mod keymap;
 mod login;
 mod mediaform;
+// Test-only command-surface parity guard (#197): no runtime code, so it's
+// compiled only for `cargo test`, avoiding a dead-code warning on the plain bin.
+#[cfg(test)]
+mod parity;
 mod reactions;
+mod richtext;
 mod search;
 mod secret;
 mod settingsform;
@@ -51,6 +58,7 @@ mod status;
 mod terminal;
 mod textinput;
 mod ui;
+mod wrap;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -59,26 +67,35 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::EventStream;
+use ratatui::layout::Size;
+use ratatui_image::Resize;
+use ratatui_image::protocol::Protocol;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
-use tuigram_core::model::{ChatKind, ChatListKind, Message};
+use tuigram_core::model::{
+    ChatAction, ChatKind, ChatListKind, Message, MessageContent, Sender, User, UserKind,
+};
 use tuigram_core::{
-    Client, DOWNLOAD_PRIORITY, EditRequests, FileRequests, FormattedText, ForwardRequests,
-    HistoryRequests, NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests,
-    SendRequests, StorageRequests, StorageSettings, load_archive_list, load_folder_list,
-    load_main_list, search_chat, search_global,
+    AuthRequests, ChatActionRequests, ChatLifecycleRequests, Client, ContactRequests,
+    DOWNLOAD_PRIORITY, DeleteRequests, FileRequests, ForwardRequests, HistoryRequests,
+    InterfaceSettings, NEWEST, PinRequests, ReactionRequests, ReadRequests, SecretChatRequests,
+    SendRequests, StorageRequests, StorageSettings, UserRequests, edit_formatted_text,
+    load_archive_list, load_folder_list, load_main_list, search_chat, search_global,
+    send_formatted_text,
 };
 
 use crate::app::{Action, App};
 use crate::chat_list::{project_lists, project_secret_states};
 use crate::composer::Submission;
+use crate::contact_picker::ContactHit;
+use crate::conversation::{SenderLabel, sender_label_for};
 use crate::event::{AppEvent, spawn_core_source};
 use crate::keymap::Focus;
 use crate::login::{LoginEnd, run_login};
 use crate::search::SearchHit;
 use crate::status::Notice;
-use crate::terminal::{TerminalGuard, install_panic_hook};
+use crate::terminal::{AvatarSupport, TerminalGuard, install_panic_hook};
 
 /// Render cadence cap (~30 FPS). Bounds repaint rate independently of network
 /// latency, so the UI stays smooth while core is mid-request.
@@ -130,6 +147,33 @@ const SEARCH_PAGE: i32 = 50;
 /// channel suffices.
 const SEARCH_CHANNEL_DEPTH: usize = 8;
 
+/// How many contacts to request per `search_contacts` call (#197). A picker list,
+/// not a paged history — one page is plenty for a name search.
+const CONTACT_SEARCH_LIMIT: i32 = 50;
+
+/// Depth of the contact-search → loop completion channel (#197). A submit spawns
+/// one search that delivers a single resolved result set when it finishes, so a
+/// shallow channel suffices, matching [`SEARCH_CHANNEL_DEPTH`].
+const CONTACT_SEARCH_CHANNEL_DEPTH: usize = 8;
+
+/// Depth of the avatar-encode → loop completion channel (#201). Each distinct
+/// sender is encoded at most once per `AvatarCache` lifetime (or once more on
+/// a decode/encode failure's retry), so a shallow channel suffices.
+const AVATAR_CHANNEL_DEPTH: usize = 16;
+
+/// Depth of the inline-media-encode → loop completion channel (#208). Same
+/// shape as [`AVATAR_CHANNEL_DEPTH`]: each message's media is encoded at most
+/// once per `MediaCache` lifetime (or once more on a decode/encode failure's
+/// retry).
+const MEDIA_CHANNEL_DEPTH: usize = 16;
+
+/// How often the outbound typing action is re-broadcast while composing (#197).
+/// TDLib/Telegram's `typing` action expires on its own a few seconds after the
+/// last broadcast, so a real client refreshes it periodically rather than once;
+/// this bounds how often a keystroke actually reaches the network, rather than
+/// firing `sendChatAction` on every character.
+const TYPING_RESEND: Duration = Duration::from_secs(4);
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Phase 1 — initialize TDLib on the plain terminal (credentials, secure
@@ -144,7 +188,12 @@ async fn main() -> ExitCode {
     };
 
     install_panic_hook();
-    let mut guard = match TerminalGuard::new() {
+    // Read the mouse toggle before entering the terminal so capture is enabled (or
+    // not) from the first frame (#161). A missing/malformed settings file defaults
+    // to mouse on; `StorageSettings::load` (in `run`) surfaces a parse warning, so
+    // this stays quiet.
+    let interface = InterfaceSettings::load();
+    let mut guard = match TerminalGuard::new(interface.mouse) {
         Ok(guard) => guard,
         Err(err) => {
             eprintln!("tuigram: could not initialize the terminal: {err}");
@@ -199,6 +248,9 @@ async fn main() -> ExitCode {
 /// loop reads the folded chat list back from it to project the left pane (#113).
 async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> {
     let mut app = App::new();
+    // Seed once from what `TerminalGuard::new` already detected (#201); `guard`
+    // keeps its own copy (needed nowhere else yet), so this is a clone, not a move.
+    app.set_avatar_support(guard.avatar_support().clone());
     let mut input = EventStream::new();
     let mut tick = tokio::time::interval(FRAME);
     // Ages a showing toast once a second (#139), independent of the render tick, so
@@ -216,6 +268,12 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // editor opens pre-filled with the values in effect.
     let mut storage_settings = StorageSettings::load();
     app.set_storage_settings(storage_settings);
+    // The graphics toggle (#209): same "mutable local, live-swappable via the
+    // in-app editor" shape as `storage_settings` above, read fresh here (rather
+    // than reusing `main`'s pre-login `interface` read) since a user could edit
+    // the file by hand between that read and here.
+    let mut interface_settings = InterfaceSettings::load();
+    app.set_graphics_enabled(interface_settings.graphics);
     let mut sweep_tick = tokio::time::interval(STORAGE_SWEEP_INTERVAL);
     // The lists whose `loadChats` paging has been kicked off, so each is loaded
     // at most once per run. A handful of entries (Main, Archive, a few folders),
@@ -230,6 +288,13 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // progress and the projection reflects it, without the loop re-requesting on
     // every re-projection.
     let mut downloading: HashSet<i32> = HashSet::new();
+    // The user ids whose avatar photo is being decoded+encoded off the render
+    // thread this run (#201), so a re-scan of the open chat never spawns a
+    // second encode for the same sender while one is already in flight.
+    let mut avatar_encoding: HashSet<i64> = HashSet::new();
+    // The message ids whose inline media is being decoded+encoded off the
+    // render thread this run (#208), same dedup shape as `avatar_encoding`.
+    let mut media_encoding: HashSet<i64> = HashSet::new();
     let (history_tx, mut history_rx) = mpsc::channel::<HistoryPage>(HISTORY_CHANNEL_DEPTH);
     // A spawned send/edit (#116) reports a seam-level rejection back here as a toast;
     // the loop surfaces it through the notification queue.
@@ -237,15 +302,97 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // A spawned search (#117) reports its projected hits back here; the loop feeds
     // them into the search overlay. (A failed search reuses `outbound_tx`'s toast.)
     let (search_tx, mut search_rx) = mpsc::channel::<Vec<SearchHit>>(SEARCH_CHANNEL_DEPTH);
+    // A spawned contact search (#197) reports its resolved hits back here; the loop
+    // feeds them into the contact-search overlay. (A failed search reuses
+    // `outbound_tx`'s toast.)
+    let (contact_tx, mut contact_rx) =
+        mpsc::channel::<Vec<ContactHit>>(CONTACT_SEARCH_CHANNEL_DEPTH);
+    // A spawned avatar encode (#201) reports the built protocol back here (or
+    // `None` on a decode/encode failure); the loop caches it and clears the
+    // sender's in-flight marker either way.
+    let (avatar_tx, mut avatar_rx) = mpsc::channel::<(i64, Option<Protocol>)>(AVATAR_CHANNEL_DEPTH);
+    // A spawned inline-media encode (#208) reports the built protocol back here
+    // (or `None` on a decode/encode failure); the loop caches it and clears the
+    // message's in-flight marker either way. No reproject needed on receipt —
+    // see `drive_inline_media`'s doc for why.
+    let (media_tx, mut media_rx) = mpsc::channel::<(i64, Option<Protocol>)>(MEDIA_CHANNEL_DEPTH);
 
     // Kick off the landing list (Main) before the first frame; the rest load on
     // demand as the user switches to them.
     ensure_active_list_loaded(&app, client, &mut requested);
 
+    // The open chat and overlay as of the last drawn frame (#229), so a change in
+    // either can be detected before the next `draw` — see `should_clear_for_graphics`.
+    let mut last_open_chat: Option<i64> = None;
+    let mut last_overlay = app.overlay();
+
     while !app.should_quit() {
         if app.is_dirty() {
-            guard.terminal_mut().draw(|frame| ui::ui(frame, &app))?;
+            // UNVERIFIED mitigation (#229): reported as leftover/garbled
+            // characters on a chat switch or overlay open. `Kitty::render`'s
+            // cell-level `Skip` marking turned out NOT to be the mechanism — a
+            // `TestBackend` regression test proved ratatui's own cell-diffing
+            // (`Cell::eq` compares `diff_option`, so a cell reverting from
+            // `Skip` to ordinary content is always detected as changed) already
+            // repaints correctly for Kitty. What's actually documented upstream
+            // is real-terminal-side: some Sixel and iTerm2 protocol
+            // implementations don't reliably clear previously-painted pixels
+            // even when ratatui rewrites the underlying cell, since those
+            // protocols paint raw pixels with no cell-level linkage (unlike
+            // Kitty's unicode-placeholder trick). A real clear (`ClearType::All`
+            // + resetting ratatui's own back-buffer) is the standard workaround
+            // for that class of issue, but isn't guaranteed on every terminal
+            // (e.g. Contour+Sixel is reported not to clear even then) — this
+            // is a best-effort mitigation pending real-terminal confirmation,
+            // not a verified fix.
+            //
+            // Forced via `resize()` to the current size, not `Terminal::clear()`
+            // (#234 hotfix): `clear()` snapshots the cursor position first via a
+            // blocking DSR query (`ESC[6n`, crossterm's `cursor::position()`),
+            // which reads the terminal's reply from stdin — the same stdin our
+            // `EventStream` is concurrently draining in the background. Under
+            // active input (scrolling generates a steady stream of key/mouse
+            // events) that reader reliably wins the race and steals the DSR
+            // reply, so `position()` times out and `clear()` returns a fatal
+            // `io::Error` ("cursor position could not be read"), crashing the
+            // whole app via `?`. `resize()` to an unchanged size performs the
+            // exact same clear + back-buffer-reset ratatui's own resize path
+            // does internally (see `clear_viewport`) but never touches cursor
+            // position, so it can't race the event reader.
+            if should_clear_for_graphics(
+                app.graphics_active(),
+                history.open != last_open_chat,
+                app.overlay() != last_overlay,
+            ) {
+                let area = guard.terminal_mut().size()?.into();
+                guard.terminal_mut().resize(area)?;
+            }
+            last_open_chat = history.open;
+            last_overlay = app.overlay();
+
+            // The draw reports the history pane's inner height; record it on the view
+            // so an open/`G`/tail-follow can bottom-anchor against the real number of
+            // visible rows (#158). A first measurement or a resize while following
+            // re-anchors and re-dirties, so the corrected frame paints next iteration.
+            let mut render_out = ui::RenderOutput::default();
+            guard
+                .terminal_mut()
+                .draw(|frame| render_out = ui::ui(frame, &app))?;
             app.clear_dirty();
+            app.set_conversation_viewport(render_out.convo_viewport);
+            // Record the history pane's measured body width too (#214), so message
+            // bodies wrap against the real column budget and a resize re-anchors.
+            app.set_conversation_width(render_out.convo_width);
+            // Record the pane rectangles this frame drew into, so a mouse event can
+            // be hit-tested to a pane without re-running layout (#161/#162).
+            app.set_pane_layout(render_out.panes);
+            // Record the chat/message row maps this frame drew, so a mouse click on
+            // an actual row can open the chat or select the message directly.
+            app.set_chat_rows(render_out.chat_rows);
+            app.set_history_rows(render_out.history_rows);
+            // Record the open overlay's row map this frame drew, so a mouse click
+            // on an actual overlay row can select-and-confirm it directly (#217).
+            app.set_overlay_rows(render_out.overlay_rows);
         }
 
         tokio::select! {
@@ -278,27 +425,36 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         // client, so it lives here rather than in the pure `App` —
                         // which only receives the owned result.
                         AppEvent::Chats => {
-                            let lists = client.read(|s| project_lists(s.chats()));
-                            app.project_chats(lists);
+                            reproject_chats(&mut app, client);
                             // A new secret chat arrives as updateNewChat; re-project
                             // its lifecycle state so the fresh row shows it (#121).
                             reproject_secret_states(&mut app, client);
                         }
+                        // The peer read one of our messages (#163): everything
+                        // `Chats` does, plus a conversation reproject so the open
+                        // pane's read-receipt glyph (✓ → ✓✓) advances live — the one
+                        // chat-list update the open pane itself depends on.
+                        AppEvent::ChatReadOutbox => {
+                            reproject_chats(&mut app, client);
+                            reproject_secret_states(&mut app, client);
+                            project_conversation(&mut app, client, history.open, false);
+                        }
                         // A message change in some chat: refresh the open chat's
                         // history (a no-op projection if nothing it shows changed).
-                        AppEvent::Messages => project_conversation(&mut app, client, history.open),
+                        AppEvent::Messages => {
+                            project_conversation(&mut app, client, history.open, false);
+                        }
                         // A file transfer advanced (#120): re-project so the open
                         // chat's download-progress lines reflect the newest `updateFile`.
-                        AppEvent::File => project_conversation(&mut app, client, history.open),
+                        AppEvent::File => project_conversation(&mut app, client, history.open, false),
                         // A secret chat's lifecycle advanced (#121): re-project the
                         // secret-state map so the row reflects pending → ready → closed.
                         AppEvent::Secret => reproject_secret_states(&mut app, client),
                         // A dropped-update gap: re-project both panes to be safe.
                         AppEvent::Lagged => {
-                            let lists = client.read(|s| project_lists(s.chats()));
-                            app.project_chats(lists);
+                            reproject_chats(&mut app, client);
                             reproject_secret_states(&mut app, client);
-                            project_conversation(&mut app, client, history.open);
+                            project_conversation(&mut app, client, history.open, false);
                         }
                         // Connection folds into the status bar; the rest repaint
                         // until their own projection lands.
@@ -318,7 +474,7 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         history.exhausted.insert(page.chat_id);
                     }
                     if history.open == Some(page.chat_id) {
-                        project_conversation(&mut app, client, history.open);
+                        project_conversation(&mut app, client, history.open, false);
                     }
                 }
             }
@@ -330,10 +486,41 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                     app.notify(notice);
                 }
             }
+            // A spawned contact search finished (#197): fill the overlay with its hits.
+            maybe_contacts = contact_rx.recv() => {
+                if let Some(hits) = maybe_contacts {
+                    app.set_contact_results(hits);
+                }
+            }
             // A spawned search finished (#117): fill the overlay with its hits.
             maybe_hits = search_rx.recv() => {
                 if let Some(hits) = maybe_hits {
                     app.set_search_results(hits);
+                }
+            }
+            // A spawned avatar encode finished (#201): clear its in-flight marker
+            // and cache the protocol so the next frame draws it instead of a
+            // blank gutter. `None` (a decode/encode failure) just clears the
+            // marker — that sender keeps its blank gutter this run.
+            maybe_avatar = avatar_rx.recv() => {
+                if let Some((user_id, protocol)) = maybe_avatar {
+                    avatar_encoding.remove(&user_id);
+                    if let Some(protocol) = protocol {
+                        app.cache_avatar(user_id, protocol);
+                    }
+                }
+            }
+            // A spawned inline-media encode finished (#208): clear its in-flight
+            // marker and cache the protocol so the next frame draws it in the
+            // space `message_height` already reserved. `None` (a decode/encode
+            // failure) just clears the marker — that message keeps its
+            // placeholder this run.
+            maybe_media = media_rx.recv() => {
+                if let Some((message_id, protocol)) = maybe_media {
+                    media_encoding.remove(&message_id);
+                    if let Some(protocol) = protocol {
+                        app.cache_media(message_id, protocol);
+                    }
                 }
             }
         }
@@ -350,6 +537,8 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         drive_outbound(&mut app, client, &history, &outbound_tx);
         // A submitted search query runs against core, in-chat or global by context (#117).
         drive_search(&mut app, client, &history, &search_tx, &outbound_tx);
+        // A submitted contact-search query resolves matching contacts by name (#197).
+        drive_contact_search(&mut app, client, &contact_tx, &outbound_tx);
         // A confirmed forward copies its messages into the picked target chat (#118).
         drive_forward(&mut app, client, &outbound_tx);
         // A confirmed reaction/pin toggle hits Telegram; the real update reconciles
@@ -365,9 +554,35 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
         // A confirmed retention edit swaps the live sweep policy and writes it back to
         // settings.toml, taking effect on the next sweep with no restart (#146).
         drive_settings(&mut app, &mut storage_settings);
+        // A confirmed graphics toggle already took effect in-memory (the reducer
+        // applies it on confirm); this only persists it to settings.toml (#209).
+        drive_graphics_setting(&mut app, &mut interface_settings);
         // Pull down the open chat's incoming media, each file once, so the progress
         // lines and saved markers resolve as `updateFile` folds (#120).
         drive_downloads(client, &history, &mut downloading);
+        // Encode the open chat's sender avatars, each user once, so the gutter
+        // fills in as `Picker::new_protocol` finishes off the render thread (#201).
+        drive_avatars(&app, client, &history, &mut avatar_encoding, &avatar_tx);
+        // Encode the open chat's ready inline media, each message once, so the
+        // media box fills in as `Picker::new_protocol` finishes off the render
+        // thread (#208).
+        drive_inline_media(&app, client, &history, &mut media_encoding, &media_tx);
+        // A confirmed delete removes the message for us or everyone; the real
+        // `updateDeleteMessages` folds and re-projects the history (#195).
+        drive_delete(&mut app, client, &outbound_tx);
+        // A save request reveals the media's local path (already downloaded) or
+        // starts its download (#195).
+        drive_save(&mut app, client);
+        // A copy request writes the selected message's text to the OS clipboard (#197).
+        drive_copy(&mut app);
+        // Unsent composer text broadcasts a typing action for the open chat,
+        // throttled so it isn't refired on every keystroke (#197).
+        drive_typing(&mut app, client, &mut history);
+        // A resync re-queries the chat list after a dropped-update gap (#195).
+        drive_resync(&mut app, client, &outbound_tx);
+        // A confirmed logout ends the session and quits; awaited (not spawned)
+        // since the whole session is going away and the exit waits on it (#195).
+        drive_logout(&mut app, client).await;
     }
 
     Ok(())
@@ -401,6 +616,9 @@ struct HistoryState {
     /// call to one per new horizon — without it the loop would re-send the same
     /// view on every frame until the fold caught up.
     read_through: HashMap<i64, i64>,
+    /// Per-chat timestamp of the last outbound typing broadcast (#197), throttling
+    /// [`drive_typing`] to [`TYPING_RESEND`] instead of firing on every keystroke.
+    typing_sent: HashMap<i64, std::time::Instant>,
 }
 
 /// The chat to show in the conversation pane: the chat-list selection while the
@@ -431,11 +649,26 @@ fn drive_open_chat(
 ) {
     let open = open_chat_id(app);
     if open != history.open {
+        let previous = history.open;
         history.open = open;
+        // Tell TDLib the previously open chat no longer is (#207) — the `openChat`
+        // lifecycle's close half, fired on every transition away, including onto a
+        // different chat becoming open.
+        if let Some(chat_id) = previous {
+            spawn_close_chat(client, chat_id);
+        }
         if let Some(chat_id) = open {
+            // Mark this chat open (#207) before anything else: several update
+            // families TDLib streams (message reactions, edits) are only
+            // guaranteed for a chat it considers open, so this must precede the
+            // projection and paging below that depend on those updates arriving.
+            spawn_open_chat(client, chat_id);
             // Project whatever the store already holds (possibly empty, then filled
             // as the landing page lands), and fetch that page once per chat per run.
-            project_conversation(app, client, Some(chat_id));
+            // This is the one genuine "opened this chat" moment (#164) — including a
+            // re-open of the same chat after focus left and came back, which #158's
+            // own chat_id check alone cannot distinguish from a mere continuation.
+            project_conversation(app, client, Some(chat_id), true);
             if history.first_paged.insert(chat_id) {
                 history.loading.insert(chat_id);
                 spawn_history_page(client, chat_id, NEWEST, history_tx.clone());
@@ -502,7 +735,8 @@ fn drive_read_state(client: &Arc<Client>, history: &mut HistoryState) {
 /// Dispatch a submitted composer buffer to Telegram (#116). `App` records the
 /// submission as a pure intent; here the loop pairs it with the open chat and routes
 /// it to the matching seam — a new message or reply through
-/// [`SendRequests::send_text`], an edit through [`EditRequests::edit_text`].
+/// [`send_formatted_text`], an edit through [`edit_formatted_text`] — each parsing
+/// the buffer as markdown before it goes out (#212).
 ///
 /// The send is fire-and-forget, like the read path (#115): TDLib streams the
 /// optimistic `Pending` message (and later its `Sent`/`Failed` resolution) as
@@ -530,22 +764,23 @@ fn drive_outbound(
     let client = Arc::clone(client);
     let outbound_tx = outbound_tx.clone();
     tokio::spawn(async move {
+        // #212: the composer's text is parsed as MarkdownV2 before it goes out
+        // — `send_formatted_text`/`edit_formatted_text` fall back to plain text
+        // themselves on a parse error, so this never blocks on malformed markup.
         let result = match submission {
-            Submission::Send { text } => client
-                .bridge()
-                .send_text(chat_id, None, plain_text(text))
+            Submission::Send { text } => send_formatted_text(client.bridge(), chat_id, None, text)
                 .await
                 .map(|_| ()),
-            Submission::Reply { reply_to, text } => client
-                .bridge()
-                .send_text(chat_id, Some(reply_to), plain_text(text))
-                .await
-                .map(|_| ()),
-            Submission::Edit { message_id, text } => client
-                .bridge()
-                .edit_text(chat_id, message_id, plain_text(text))
-                .await
-                .map(|_| ()),
+            Submission::Reply { reply_to, text } => {
+                send_formatted_text(client.bridge(), chat_id, Some(reply_to), text)
+                    .await
+                    .map(|_| ())
+            }
+            Submission::Edit { message_id, text } => {
+                edit_formatted_text(client.bridge(), chat_id, message_id, text)
+                    .await
+                    .map(|_| ())
+            }
         };
         if let Err(err) = result {
             // The TDLib message is a fixed error code (e.g. CHAT_WRITE_FORBIDDEN),
@@ -556,16 +791,6 @@ fn drive_outbound(
                 .await;
         }
     });
-}
-
-/// A plain [`FormattedText`] (no formatting entities) for a composer send or edit
-/// (#116). The composer is a single-line plain-text input today; rich entities
-/// arrive with a later formatting pass.
-fn plain_text(text: String) -> FormattedText {
-    FormattedText {
-        text,
-        entities: Vec::new(),
-    }
 }
 
 /// Run a submitted search query against core (#117). `App` records the query as a
@@ -622,6 +847,66 @@ fn drive_search(
             Err(err) => {
                 let _ = outbound_tx
                     .send(Notice::from_core_error("search", &err.message))
+                    .await;
+            }
+        }
+    });
+}
+
+/// Run a submitted contact-search query against core (#197). `App` records the
+/// query as a pure intent; here the loop drains it, searches this account's
+/// contacts, and resolves each returned id to a display name — reading the
+/// folded user store back, backfilling via `get_user` for any id the update
+/// stream hasn't announced yet, the same backfill any other id-only result
+/// (a message sender, a private chat's peer) goes through. Spawned off an
+/// `Arc<Client>` clone so the round-trips never block the loop.
+///
+/// On success the hits land on `contact_tx`, which the loop drains into the
+/// overlay. A failed search reuses the `outbound_tx` toast path (#116) to
+/// surface an error naming the action.
+fn drive_contact_search(
+    app: &mut App,
+    client: &Arc<Client>,
+    contact_tx: &mpsc::Sender<Vec<ContactHit>>,
+    outbound_tx: &mpsc::Sender<Notice>,
+) {
+    let Some(query) = app.take_contact_search() else {
+        return;
+    };
+    let client = Arc::clone(client);
+    let contact_tx = contact_tx.clone();
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        match client
+            .bridge()
+            .search_contacts(query, CONTACT_SEARCH_LIMIT)
+            .await
+        {
+            Ok(ids) => {
+                let mut hits = Vec::with_capacity(ids.len());
+                for user_id in ids {
+                    let known = client.read(|state| state.users().get(user_id).cloned());
+                    let name = match known {
+                        Some(user) => user.display_name(),
+                        None => match client.bridge().get_user(user_id).await {
+                            Ok(user) => user.display_name(),
+                            // A lookup failure for one contact shouldn't drop the
+                            // whole result set — fall back to the bare id, the same
+                            // graceful degradation `UserStore::display_name` uses
+                            // for an unresolved sender.
+                            Err(_) => format!("User {user_id}"),
+                        },
+                    };
+                    hits.push(ContactHit::new(user_id, name));
+                }
+                let _ = contact_tx.send(hits).await;
+            }
+            // The TDLib message is a fixed error code, never the user's query —
+            // safe to show; `from_core_error` normalizes it to a readable phrase
+            // (#122).
+            Err(err) => {
+                let _ = outbound_tx
+                    .send(Notice::from_core_error("contact search", &err.message))
                     .await;
             }
         }
@@ -820,6 +1105,20 @@ fn drive_secret(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<
     });
 }
 
+/// Whether the loop should force a full terminal repaint before the next
+/// `draw` (#229): only when graphics are actually in play (a graphics-capable
+/// terminal *and* the user's setting on, [`App::graphics_active`]) and the
+/// open chat or overlay just changed. Pure and independent of the tokio loop
+/// so the decision itself is unit-testable without a real terminal — see
+/// `run`'s call site for the full (and still not fully confirmed) rationale.
+fn should_clear_for_graphics(
+    graphics_active: bool,
+    chat_changed: bool,
+    overlay_changed: bool,
+) -> bool {
+    graphics_active && (chat_changed || overlay_changed)
+}
+
 /// Apply a confirmed retention edit from the in-app editor (#146). The editor
 /// validates the four knobs on `App` and lands the resulting
 /// [`StorageSettings`](tuigram_core::StorageSettings); here the loop drains it,
@@ -842,6 +1141,50 @@ fn drive_settings(app: &mut App, storage_settings: &mut StorageSettings) {
         // phrase, never the user's typed values, the same rule the send paths follow.
         app.notify(Notice::error("settings save", None));
     }
+}
+
+/// Persist a confirmed graphics-toggle edit from the in-app editor (#209). Unlike
+/// [`drive_settings`], the in-memory swap already happened at confirm time
+/// (`App::set_graphics_enabled`, so the very next frame reflects it with no
+/// restart) — this only writes the local mirror through to `settings.toml`,
+/// mirroring `drive_settings`'s error handling.
+fn drive_graphics_setting(app: &mut App, interface_settings: &mut InterfaceSettings) {
+    let Some(enabled) = app.take_graphics() else {
+        return;
+    };
+    interface_settings.graphics = enabled;
+    if interface_settings.save().is_err() {
+        app.notify(Notice::error("settings save", None));
+    }
+}
+
+/// Re-read the folded chat lists from the client and re-project the pane (#113),
+/// resolving in the same read which private chats have a **bot** peer (#160) so
+/// their rows can carry the 🤖 marker — the chat's [`ChatKind`] says "private", only
+/// the [`UserStore`](tuigram_core::UserStore) says "bot". The projection needs the
+/// client, so it lives here rather than in the pure `App`, which only receives the
+/// owned results (lists, then the bot-id set).
+fn reproject_chats(app: &mut App, client: &Arc<Client>) {
+    let (lists, bots) = client.read(|s| {
+        let lists = project_lists(s.chats());
+        let bots: HashSet<i64> = lists
+            .iter()
+            .flat_map(|list| &list.chats)
+            .filter_map(|chat| match chat.kind {
+                ChatKind::Private { user_id }
+                    if s.users()
+                        .get(user_id)
+                        .is_some_and(|user| matches!(user.kind, UserKind::Bot)) =>
+                {
+                    Some(chat.id)
+                }
+                _ => None,
+            })
+            .collect();
+        (lists, bots)
+    });
+    app.project_chats(lists);
+    app.project_bot_chats(bots);
 }
 
 /// Re-read the folded secret-chat states from the client and re-project them onto
@@ -870,17 +1213,29 @@ fn reproject_secret_states(app: &mut App, client: &Arc<Client>) {
 /// fetch.
 fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &mut HashSet<i32>) {
     let Some(chat_id) = history.open else { return };
-    // The ids to start: files the history references that the store knows, are not
-    // yet present or active, and have not been requested this run. Photos with no
-    // sizes carry a 0 ref, which is not downloadable — skip it.
+    // The ids to start: files the history references that are not already present
+    // or actively transferring, and have not been requested this run. Photos with
+    // no sizes carry a 0 ref, which is not downloadable — skip it.
+    //
+    // A file the store has not folded an `updateFile` for yet reads as "unknown",
+    // not "definitely fine" — TDLib does not proactively announce every file a
+    // loaded history references, only ones a client has shown interest in, so an
+    // unknown file must still be attempted or it would never be requested at all
+    // (a chicken-and-egg gap: the first `updateFile` only arrives *because* a
+    // download started). `is_none_or` treats "unknown" the same as "not present,
+    // not active" — attempt it — while a *known* file still skips correctly once
+    // it settles into present or actively downloading.
     let to_start: Vec<i32> = client.read(|s| {
         s.messages()
             .history(chat_id)
             .into_iter()
             .filter_map(|m| m.content.file())
             .filter(|file| file.id != 0 && !downloading.contains(&file.id))
-            .filter_map(|file| s.files().get(file.id))
-            .filter(|file| !file.is_present() && !file.is_downloading_active)
+            .filter(|file| {
+                s.files()
+                    .get(file.id)
+                    .is_none_or(|f| !f.is_present() && !f.is_downloading_active)
+            })
             .map(|file| file.id)
             .collect()
     });
@@ -893,6 +1248,360 @@ fn drive_downloads(client: &Arc<Client>, history: &HistoryState, downloading: &m
                 .download_file(file_id, DOWNLOAD_PRIORITY)
                 .await;
         });
+    }
+}
+
+/// The source image for one sender's avatar bubble (#201): a real photo's
+/// minithumbnail JPEG bytes, or — Stage 4 — the sender's own `User` record to
+/// build a generated fallback bubble from when they have no photo.
+enum AvatarSource {
+    Photo(Vec<u8>),
+    Fallback(User),
+}
+
+/// Kick off avatar encoding for the open chat's user senders (#201): for each
+/// distinct [`Sender::User`] the history references, not yet cached on `App`
+/// and not already in flight this run, build a [`Protocol`] — from a decoded
+/// minithumbnail if the sender has one, else a generated fallback bubble
+/// (Stage 4) — off the render thread, reporting it back on `avatar_tx`. A
+/// no-op with graphics support off (#201's scope decision — nowhere to draw
+/// the result), the user's `graphics` setting off (#209 — same reasoning,
+/// nothing will render even though the terminal could), or no chat open.
+///
+/// Like [`drive_downloads`], this dedups per-run via `encoding`; unlike it, a
+/// decode/encode failure still reports back (as `None`) so its in-flight
+/// marker clears rather than wedging that sender permanently skipped.
+fn drive_avatars(
+    app: &App,
+    client: &Arc<Client>,
+    history: &HistoryState,
+    encoding: &mut HashSet<i64>,
+    avatar_tx: &mpsc::Sender<(i64, Option<Protocol>)>,
+) {
+    if !app.graphics_enabled() {
+        return;
+    }
+    let AvatarSupport::Graphics(picker) = app.avatar_support() else {
+        return;
+    };
+    let font_size = picker.font_size();
+    let gutter_cols = app.avatar_gutter_cols();
+    // The exact cell area the render path reserves for the bubble (#201) — the
+    // same `gutter_cols()` the header's leading span is sized to — so the
+    // encoded image fills the gutter rather than a fixed, possibly-mismatched
+    // guess.
+    let size = Size::new(gutter_cols as u16, 2);
+    let Some(chat_id) = history.open else { return };
+    // Distinct user senders in the loaded history, not already cached or in
+    // flight — read once as a batch rather than spawning a lookup per message.
+    let to_start: Vec<(i64, AvatarSource)> = client.read(|s| {
+        let senders: HashSet<i64> = s
+            .messages()
+            .history(chat_id)
+            .into_iter()
+            .filter_map(|m| match m.sender {
+                Sender::User(id) => Some(id),
+                Sender::Chat(_) => None,
+            })
+            .filter(|id| app.cached_avatar(*id).is_none() && !encoding.contains(id))
+            .collect();
+        senders
+            .into_iter()
+            .filter_map(|id| {
+                let user = s.users().get(id)?;
+                let source = match &user.avatar_minithumbnail {
+                    Some(bytes) => AvatarSource::Photo(bytes.clone()),
+                    None => AvatarSource::Fallback(user.clone()),
+                };
+                Some((id, source))
+            })
+            .collect()
+    });
+
+    for (user_id, source) in to_start {
+        encoding.insert(user_id);
+        let picker = picker.clone();
+        let avatar_tx = avatar_tx.clone();
+        tokio::spawn(async move {
+            let protocol = tokio::task::spawn_blocking(move || {
+                let image = match source {
+                    AvatarSource::Photo(bytes) => image::load_from_memory(&bytes).ok()?,
+                    AvatarSource::Fallback(user) => {
+                        avatar::fallback_bubble(font_size, gutter_cols, &user)
+                    }
+                };
+                // `Fit` only ever shrinks (`min(target, image_size)` in its
+                // pixel math) — a minithumbnail is typically far smaller in
+                // pixels than one terminal cell, so `Fit` would render it at
+                // its tiny native size instead of filling the gutter. `Scale`
+                // resizes in both directions to hit `size`, upscaling a small
+                // source image the way this always-tiny minithumbnail needs.
+                picker.new_protocol(image, size, Resize::Scale(None)).ok()
+            })
+            .await
+            .unwrap_or(None);
+            let _ = avatar_tx.send((user_id, protocol)).await;
+        });
+    }
+}
+
+/// The source bytes for one message's inline-media still (#208): a downloaded
+/// file's local path (`Photo`, a static `Sticker` — read once decoding starts,
+/// off the render thread), or an embedded minithumbnail needing no download at
+/// all (`Video`, `Animation`).
+enum MediaSource {
+    File(String),
+    Bytes(Vec<u8>),
+}
+
+/// Kick off inline-media encoding for the open chat's visible messages
+/// (#208): for each message not yet cached on `App` and not already in flight
+/// this run, whose content is [`media_ready`](crate::conversation::media_ready),
+/// decode its bytes and build a [`Protocol`] off the render thread, reporting
+/// it back on `media_tx`. A no-op with graphics support off, the user's
+/// `graphics` setting off (#209), or no chat open — same shape as
+/// [`drive_avatars`], deduping per-run via `encoding` and reporting a decode
+/// failure back as `None` so its in-flight marker still clears.
+///
+/// Unlike `drive_avatars`, this never triggers a new download itself: a
+/// `Photo`/static `Sticker`'s file is already fetched by [`drive_downloads`]
+/// (the same file `message_height`'s readiness check already watches), and a
+/// `Video`/`Animation` still needs none. So there is no reproject call in the
+/// receiving loop arm either — the row space was already reserved the moment
+/// the file became present (which itself already triggers a reproject via
+/// `AppEvent::File`); this only fills in the pixels.
+fn drive_inline_media(
+    app: &App,
+    client: &Arc<Client>,
+    history: &HistoryState,
+    encoding: &mut HashSet<i64>,
+    media_tx: &mpsc::Sender<(i64, Option<Protocol>)>,
+) {
+    if !app.graphics_enabled() {
+        return;
+    }
+    let AvatarSupport::Graphics(picker) = app.avatar_support() else {
+        return;
+    };
+    let picker = picker.clone();
+    // Match `render_conversation`'s own clamp (`ui.rs`) rather than always
+    // encoding at the fixed `MEDIA_COLS` — otherwise a terminal narrower than
+    // that (a common width, not an edge case) gets its media's right edge
+    // silently, permanently cropped by `allow_clipping` (#222) at render time
+    // regardless of scroll position (#226).
+    let gutter_cols = app.avatar_gutter_cols();
+    let media_cols = crate::ui::media_cols(app.pane_layout().history.width, gutter_cols);
+    let size = Size::new(media_cols as u16, crate::conversation::MEDIA_ROWS as u16);
+    let Some(chat_id) = history.open else { return };
+
+    let to_start: Vec<(i64, MediaSource)> = client.read(|s| {
+        s.messages()
+            .history(chat_id)
+            .into_iter()
+            .filter(|m| app.cached_media(m.id).is_none() && !encoding.contains(&m.id))
+            .filter_map(|m| {
+                let source = match &m.content {
+                    MessageContent::Photo(p) => {
+                        let file = s.files().get(p.file.id)?;
+                        file.is_present()
+                            .then(|| MediaSource::File(file.local_path.clone()))?
+                    }
+                    MessageContent::Sticker(sticker) if sticker.is_static => {
+                        let file = s.files().get(sticker.file.id)?;
+                        file.is_present()
+                            .then(|| MediaSource::File(file.local_path.clone()))?
+                    }
+                    MessageContent::Video(v) => MediaSource::Bytes(v.minithumbnail.clone()?),
+                    MessageContent::Animation(a) => MediaSource::Bytes(a.minithumbnail.clone()?),
+                    _ => return None,
+                };
+                Some((m.id, source))
+            })
+            .collect()
+    });
+
+    for (message_id, source) in to_start {
+        encoding.insert(message_id);
+        let picker = picker.clone();
+        let media_tx = media_tx.clone();
+        tokio::spawn(async move {
+            let protocol = tokio::task::spawn_blocking(move || {
+                // `File` is a downloaded `Photo`/static `Sticker` — normal-or-larger
+                // than the box, so `Fit` (shrink-only) is correct. `Bytes` is always
+                // a `Video`/`Animation` minithumbnail — TDLib caps these at a few
+                // dozen pixels, far smaller than the reserved cell area, so (like
+                // the avatar path above, for the same reason) it needs `Scale` to
+                // upscale into the box; `Fit` would leave it at its tiny native
+                // size, rendering as a mini-thumbnail inside the empty reservation.
+                let (bytes, resize) = match source {
+                    MediaSource::File(path) => (std::fs::read(path).ok()?, Resize::Fit(None)),
+                    MediaSource::Bytes(bytes) => (bytes, Resize::Scale(None)),
+                };
+                let image = image::load_from_memory(&bytes).ok()?;
+                picker.new_protocol(image, size, resize).ok()
+            })
+            .await
+            .unwrap_or(None);
+            let _ = media_tx.send((message_id, protocol)).await;
+        });
+    }
+}
+
+/// Dispatch a confirmed delete to Telegram (#195). `App` records the target and
+/// scope as a pure [`DeleteIntent`](crate::conversation::DeleteIntent) from the
+/// delete confirm; here the loop drains it and calls
+/// [`DeleteRequests::delete`](tuigram_core::DeleteRequests).
+///
+/// Fire-and-forget like the send/forward paths: there is no optimistic local
+/// removal — TDLib streams `updateDeleteMessages`, folded by the message store and
+/// re-projected onto the open chat's history, so the message vanishes through the
+/// normal pipeline. Only a seam-level rejection reports back, as an error toast on
+/// `outbound_tx`.
+fn drive_delete(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Notice>) {
+    let Some(intent) = app.take_delete() else {
+        return;
+    };
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = client
+            .bridge()
+            .delete(intent.chat_id, intent.message_ids, intent.revoke)
+            .await
+        {
+            // A fixed TDLib error code (e.g. MESSAGE_DELETE_FORBIDDEN), never user
+            // content — safe to show; `from_core_error` normalizes it (#122).
+            let _ = outbound_tx
+                .send(Notice::from_core_error("delete", &err.message))
+                .await;
+        }
+    });
+}
+
+/// Service a save/download request for a message's media (#195). `App` records the
+/// file id from the selected message; here the loop reads the file store back:
+/// a file already on disk (the auto-download of incoming media, #120, usually has
+/// it) is **revealed** by toasting its local path, so the user knows where to open
+/// it; a file not yet present starts the download and says so, its progress then
+/// tracked by the conversation's download line — a second `S` once complete reveals
+/// the path.
+fn drive_save(app: &mut App, client: &Arc<Client>) {
+    let Some(file_id) = app.take_save() else {
+        return;
+    };
+    let present_path = client.read(|state| {
+        state
+            .files()
+            .get(file_id)
+            .filter(|file| file.is_present())
+            .map(|file| file.local_path.clone())
+    });
+    match present_path {
+        Some(path) if !path.is_empty() => app.notify(Notice::success(format!("Saved to {path}"))),
+        _ => {
+            let client = Arc::clone(client);
+            tokio::spawn(async move {
+                let _ = client
+                    .bridge()
+                    .download_file(file_id, DOWNLOAD_PRIORITY)
+                    .await;
+            });
+            app.notify(Notice::info(
+                "Downloading… progress shows in the conversation; press S again when it completes.",
+            ));
+        }
+    }
+}
+
+/// Write the selected message's text to the OS clipboard (`y`, #197). `App`
+/// records the text (it cannot reach the OS clipboard and stays pure); the loop
+/// drains it and writes it out here, toasting either result. Best-effort: no
+/// clipboard on this host (e.g. a headless Linux session with no X11/Wayland
+/// server) surfaces as a failure toast rather than a panic.
+fn drive_copy(app: &mut App) {
+    let Some(text) = app.take_copy() else {
+        return;
+    };
+    match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+        Ok(()) => app.notify(Notice::success("Copied to clipboard")),
+        Err(_) => app.notify(Notice::error("copy", None)),
+    }
+}
+
+/// Broadcast a typing action for the open chat while the composer holds unsent
+/// text (#197), mirroring a normal client. `App` only pulses that an edit left
+/// text in the buffer — it never touches the `Client` and doesn't know the open
+/// chat id, which lives in `history` — so this pairs the pulse with the open
+/// chat and throttles the actual broadcast to once per [`TYPING_RESEND`] per
+/// chat, so a burst of keystrokes sends one `sendChatAction`, not one per
+/// character. Fire-and-forget, like the read path (#115) — advisory, never
+/// blocks composing.
+fn drive_typing(app: &mut App, client: &Arc<Client>, history: &mut HistoryState) {
+    if !app.take_wants_typing_ping() {
+        return;
+    }
+    let Some(chat_id) = history.open else { return };
+    let now = std::time::Instant::now();
+    let due = history
+        .typing_sent
+        .get(&chat_id)
+        .is_none_or(|&last| now.duration_since(last) >= TYPING_RESEND);
+    if !due {
+        return;
+    }
+    history.typing_sent.insert(chat_id, now);
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        let _ = client
+            .bridge()
+            .send_chat_action(chat_id, Some(ChatAction::Typing))
+            .await;
+    });
+}
+
+/// Re-query the chat list after a dropped-update gap (#195). `App` records the
+/// request (`Ctrl-R`); here the loop drains it and calls [`Client::resync`], the
+/// same recovery the status bar's "run resync" hint points at. Spawned off an
+/// `Arc<Client>` clone so the round-trip never blocks the loop; the recovered list
+/// folds back and re-projects on its own. A seam-level failure reports as a toast.
+fn drive_resync(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Notice>) {
+    if !app.take_resync() {
+        return;
+    }
+    app.notify(Notice::info("Resyncing the chat list…"));
+    let client = Arc::clone(client);
+    let outbound_tx = outbound_tx.clone();
+    tokio::spawn(async move {
+        if let Err(err) = client.resync().await {
+            let _ = outbound_tx
+                .send(Notice::from_core_error("resync", &err.message))
+                .await;
+        }
+    });
+}
+
+/// Log out and exit on a confirmed logout (#195). Unlike the fire-and-forget seams
+/// this is **awaited** in the loop: logout is terminal — the whole session is going
+/// away — so on success the app quits (the outer teardown in `main` then waits for
+/// TDLib to reach `Closed` and flushes the database, exactly as on any exit),
+/// wiping the local session so the next launch starts at a fresh login. A rejected
+/// logout stays in the app and surfaces why, rather than stranding a half-torn-down
+/// session.
+async fn drive_logout(app: &mut App, client: &Arc<Client>) {
+    if !app.take_logout() {
+        return;
+    }
+    // `log_out_and_wait` is the shared whole-operation (#195): it issues the logOut
+    // and then waits for `Closed`, so TDLib's asynchronous local-data destruction
+    // fully completes before we quit. Quitting early would let the outer teardown's
+    // `close` race the in-flight logout and strand a half-cleared session, which the
+    // next run opens straight into Closed (no login UI, silent exit). The wait is
+    // bounded (~5s), so a stuck teardown never wedges the exit. The REPL harness
+    // drives the identical operation, so the two clients cannot drift on it.
+    match client.bridge().log_out_and_wait().await {
+        Ok(()) => app.dispatch(Action::Quit),
+        // A fixed TDLib error code, never user content — safe to show (#122).
+        Err(err) => app.notify(Notice::from_core_error("logout", &err.message)),
     }
 }
 
@@ -995,15 +1704,27 @@ fn drive_storage_sweep(client: &Arc<Client>, settings: &StorageSettings) {
 /// project them onto the conversation pane (#114). The projection needs the client,
 /// so it lives here rather than in the pure `App`, which only receives the owned
 /// snapshot. A `None` open chat (the user is browsing the list) is a no-op.
-fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) {
+///
+/// `fresh_open` is `true` only from [`drive_open_chat`]'s own open-transition —
+/// the one call that is a genuine "the user opened this chat" (#164), as opposed
+/// to a live-update or history-page reproject of an already-open chat. It is *not*
+/// derivable from `open`/`chat_id` alone: focus leaving and returning to the same
+/// chat is not a fresh open (#158 deliberately preserves the cursor for that), but
+/// it must still reset the unread-separator watermark so a chat that has since
+/// been fully read no longer shows a stale rule — see [`ConversationView::project`].
+fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>, fresh_open: bool) {
     let Some(chat_id) = open else { return };
-    let (messages, pinned, files) = client.read(|s| {
+    let (messages, pinned, files, senders, last_read_inbox, last_read_outbox) = client.read(|s| {
         let messages: Vec<Message> = s.messages().history(chat_id).into_iter().cloned().collect();
-        let pinned = s
-            .chats()
-            .get(chat_id)
+        let chat = s.chats().get(chat_id);
+        let pinned = chat
             .map(|chat| chat.pinned_message_ids.iter().copied().collect())
             .unwrap_or_default();
+        // The chat's read watermarks (#163, #164), fetched from the same record —
+        // last_read_inbox for the unread separator, last_read_outbox for outgoing
+        // messages' read-receipt glyph.
+        let last_read_inbox = chat.map_or(0, |chat| chat.last_read_inbox_message_id);
+        let last_read_outbox = chat.map_or(0, |chat| chat.last_read_outbox_message_id);
         // The download state of every file the history's media references, read back
         // from the file store so the progress lines project alongside the messages
         // (#120). A file the store has not folded yet is simply absent until it does.
@@ -1012,9 +1733,45 @@ fn project_conversation(app: &mut App, client: &Arc<Client>, open: Option<i64>) 
             .filter_map(|m| m.content.file())
             .filter_map(|file| s.files().get(file.id).cloned())
             .collect();
-        (messages, pinned, files)
+        // Resolve each distinct sender to its display label (#160, #194): a user's
+        // "Name (@handle)" tinted with their accent color via the user store, or a
+        // chat's untinted title. A sender whose record has not been folded yet is
+        // left out — the view then falls back to a bare `User {id}` / `Chat {id}`
+        // and a later `updateUser` repaints the header.
+        let mut senders: HashMap<Sender, SenderLabel> = HashMap::new();
+        for sender in messages.iter().map(|m| &m.sender) {
+            if senders.contains_key(sender) {
+                continue;
+            }
+            let label = match *sender {
+                Sender::User(id) => s.users().get(id).map(sender_label_for),
+                Sender::Chat(id) => s.chats().get(id).map(|chat| SenderLabel {
+                    label: chat.title.clone(),
+                    color: None,
+                }),
+            };
+            if let Some(label) = label {
+                senders.insert(sender.clone(), label);
+            }
+        }
+        (
+            messages,
+            pinned,
+            files,
+            senders,
+            last_read_inbox,
+            last_read_outbox,
+        )
     });
-    app.project_conversation(chat_id, messages, pinned);
+    app.project_conversation(
+        chat_id,
+        messages,
+        pinned,
+        senders,
+        last_read_inbox,
+        last_read_outbox,
+        fresh_open,
+    );
     app.project_downloads(files);
 }
 
@@ -1051,6 +1808,28 @@ fn spawn_history_page(
                 reached_start,
             })
             .await;
+    });
+}
+
+/// Tell TDLib a chat is now open (#207), fire-and-forget like the reaction and
+/// pin drivers — the loop never blocks a chat switch on this acknowledging.
+/// TDLib only guarantees delivery of some live updates (message reactions,
+/// edits) for a chat it considers open, so this must run for the open chat's
+/// live updates to be trusted; see [`drive_open_chat`].
+fn spawn_open_chat(client: &Arc<Client>, chat_id: i64) {
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        let _ = client.bridge().open_chat(chat_id).await;
+    });
+}
+
+/// The close counterpart to [`spawn_open_chat`] (#207), fired when a chat stops
+/// being the open one. Best-effort, like the open call: a failure just means
+/// TDLib keeps treating it as open a little longer.
+fn spawn_close_chat(client: &Arc<Client>, chat_id: i64) {
+    let client = Arc::clone(client);
+    tokio::spawn(async move {
+        let _ = client.bridge().close_chat(chat_id).await;
     });
 }
 
@@ -1121,5 +1900,37 @@ mod tests {
         assert!(groups.private.is_empty());
         assert!(groups.groups.is_empty());
         assert!(groups.channels.is_empty());
+    }
+
+    // --- ghosting-fix clear decision (#229) ---
+
+    #[test]
+    fn never_clears_when_graphics_are_not_active() {
+        // No images were ever drawn, so there is nothing to ghost — regardless of
+        // whether the chat or overlay changed.
+        assert!(!should_clear_for_graphics(false, false, false));
+        assert!(!should_clear_for_graphics(false, true, false));
+        assert!(!should_clear_for_graphics(false, false, true));
+        assert!(!should_clear_for_graphics(false, true, true));
+    }
+
+    #[test]
+    fn never_clears_when_graphics_are_active_but_nothing_changed() {
+        // No structural transition happened, so nothing could have been left
+        // behind since the last frame.
+        assert!(!should_clear_for_graphics(true, false, false));
+    }
+
+    #[test]
+    fn clears_when_graphics_are_active_and_the_chat_or_overlay_changed() {
+        assert!(should_clear_for_graphics(true, true, false), "chat changed");
+        assert!(
+            should_clear_for_graphics(true, false, true),
+            "overlay changed"
+        );
+        assert!(
+            should_clear_for_graphics(true, true, true),
+            "both changed at once"
+        );
     }
 }

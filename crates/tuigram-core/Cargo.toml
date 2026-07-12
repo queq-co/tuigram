@@ -38,7 +38,12 @@ toml = { workspace = true }
 # to generate it. See src/session.rs.
 keyring = { workspace = true }
 getrandom = { workspace = true }
+# Decodes TDLib's base64 minithumbnail bytes for the raster mini-avatar (#201).
+base64 = { workspace = true }
 
 [dev-dependencies]
 # Isolated temp dirs for credential filesystem tests.
 tempfile = { workspace = true }
+# `test-util` enables tokio's paused clock (`start_paused`) so the bounded
+# wait-for-Closed teardown tests (#195) advance their poll sleeps instantly.
+tokio = { workspace = true, features = ["test-util"] }

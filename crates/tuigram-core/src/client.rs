@@ -511,6 +511,7 @@ mod tests {
             content: MessageContent::Text(FormattedText::default()),
             send_state: SendState::Sent,
             reactions: vec![],
+            reply_to: None,
         };
 
         let mut state = AccountState::default();
