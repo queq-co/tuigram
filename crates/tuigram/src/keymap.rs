@@ -129,6 +129,15 @@ enum Trigger {
     Plain(&'static [KeyCode]),
     /// A specific key code with Ctrl held.
     Ctrl(KeyCode),
+    /// A specific key code with Alt held (and not Ctrl) — e.g. Alt-Enter to
+    /// insert a composer newline (#215) without also matching a Ctrl chord.
+    Alt(KeyCode),
+    /// A specific key code with Shift held — best-effort: crossterm only
+    /// reports Shift on a key like Enter when the terminal supports and the
+    /// app has enabled the Kitty keyboard-enhancement protocol, which this
+    /// crate does not enable, so this fires only on terminals that report it
+    /// unprompted (#215).
+    Shift(KeyCode),
 }
 
 impl Trigger {
@@ -140,6 +149,12 @@ impl Trigger {
                     && codes.contains(&key.code)
             }
             Self::Ctrl(code) => key.modifiers.contains(KeyModifiers::CONTROL) && key.code == *code,
+            Self::Alt(code) => {
+                key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == *code
+            }
+            Self::Shift(code) => key.modifiers.contains(KeyModifiers::SHIFT) && key.code == *code,
         }
     }
 }
@@ -375,6 +390,28 @@ const BINDINGS: &[Binding] = &[
         description: "copy the selected message's text",
     },
     // Composer — editing keys; any other printable character inserts (see resolve).
+    //
+    // Alt/Shift-Enter must be checked *before* the plain Enter binding below:
+    // `Trigger::Plain` is deliberately Shift-agnostic (so shifted glyphs and
+    // capital letters still match plain bindings elsewhere), which means a
+    // Shift-Enter also satisfies `Trigger::Plain(&[KeyCode::Enter])` — were
+    // that binding listed first, `resolve_panes`'s first-match walk would
+    // resolve Shift-Enter to `ComposerSubmit` and this line-break binding
+    // would never fire (#215).
+    Binding {
+        context: Context::Composer,
+        trigger: Trigger::Alt(KeyCode::Enter),
+        action: Action::ComposerNewline,
+        keys: "Alt-Enter",
+        description: "insert a line break",
+    },
+    Binding {
+        context: Context::Composer,
+        trigger: Trigger::Shift(KeyCode::Enter),
+        action: Action::ComposerNewline,
+        keys: "Shift-Enter",
+        description: "insert a line break (where the terminal reports it)",
+    },
     Binding {
         context: Context::Composer,
         trigger: Trigger::Plain(&[KeyCode::Enter]),
@@ -423,6 +460,20 @@ const BINDINGS: &[Binding] = &[
         action: Action::ComposerEnd,
         keys: "End",
         description: "end of line",
+    },
+    Binding {
+        context: Context::Composer,
+        trigger: Trigger::Plain(&[KeyCode::Up]),
+        action: Action::ComposerUp,
+        keys: "↑",
+        description: "cursor up a wrapped row",
+    },
+    Binding {
+        context: Context::Composer,
+        trigger: Trigger::Plain(&[KeyCode::Down]),
+        action: Action::ComposerDown,
+        keys: "↓",
+        description: "cursor down a wrapped row",
     },
     // Navigation panes (chat list + history): commands that read, not type.
     Binding {
