@@ -1098,6 +1098,9 @@ mod tests {
         async fn set_log_verbosity_level(&self, _level: i32) -> Result<(), TdError> {
             Ok(())
         }
+        async fn set_log_stream(&self, _path: String) -> Result<(), TdError> {
+            Ok(())
+        }
         async fn set_tdlib_parameters(&self, _params: ClientParameters) -> Result<(), TdError> {
             Ok(())
         }

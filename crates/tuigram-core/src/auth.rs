@@ -62,6 +62,21 @@ pub trait AuthRequests {
     /// credential-bearing request (see [`Login::set_parameters`]).
     async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError>;
 
+    /// Redirect TDLib's native log stream to `path`, off stderr entirely.
+    ///
+    /// Display-relevant, not just security-relevant: TDLib's log stream
+    /// defaults to stderr, which the TUI's raw-mode/alternate-screen terminal
+    /// inherits as its own fd 2. TDLib's C++ logger writes there directly and
+    /// unbuffered, with no coordination with ratatui's own screen buffer — so
+    /// any line it logs (plausible even at [`SECURE_LOG_VERBOSITY`], and far
+    /// likelier during a cold first launch's heavier initialization) bleeds
+    /// raw, ANSI-colored text straight over whatever the TUI has drawn,
+    /// visually surviving until the next full repaint overwrites it. Lowering
+    /// verbosity alone (`set_log_verbosity_level`) still leaves this fd open;
+    /// only redirecting the stream itself closes it. Called alongside that,
+    /// before any credential-bearing request (see [`Login::set_parameters`]).
+    async fn set_log_stream(&self, path: String) -> Result<(), TdError>;
+
     /// Answer `WaitTdlibParameters` — initialize the client.
     async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError>;
 
@@ -191,6 +206,18 @@ impl AuthRequests for Bridge {
         tdlib_rs::functions::set_log_verbosity_level(level, self.id()).await
     }
 
+    async fn set_log_stream(&self, path: String) -> Result<(), TdError> {
+        tdlib_rs::functions::set_log_stream(
+            tdlib_rs::enums::LogStream::File(tdlib_rs::types::LogStreamFile {
+                path,
+                max_file_size: LOG_FILE_MAX_BYTES,
+                redirect_stderr: false,
+            }),
+            self.id(),
+        )
+        .await
+    }
+
     async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
         tdlib_rs::functions::set_tdlib_parameters(
             params.use_test_dc,
@@ -262,6 +289,25 @@ impl AuthRequests for Bridge {
 /// are never written to TDLib's stderr log (see the threat model). `1` keeps
 /// genuine errors visible while silencing the default info-level logging.
 pub const SECURE_LOG_VERBOSITY: i32 = 1;
+
+/// Cap on TDLib's log file before it truncates and starts over (TDLib's own
+/// `logStreamFile` rotation, not tuigram's). Generous for a single-account
+/// debug trail without growing unbounded across a long-running session.
+const LOG_FILE_MAX_BYTES: i64 = 10 * 1024 * 1024;
+
+/// Where TDLib's log file lives for a given `database_directory` — a sibling
+/// of the database, so both land under the same session data dir without
+/// needing a separate path threaded in. Falls back to a relative path in the
+/// unexpected case `database_directory` has no parent (e.g. it was literally
+/// "/" or empty).
+fn log_file_path(database_directory: &str) -> String {
+    std::path::Path::new(database_directory)
+        .parent()
+        .map(|dir| dir.join("tdlib.log"))
+        .unwrap_or_else(|| std::path::PathBuf::from("tdlib.log"))
+        .to_string_lossy()
+        .into_owned()
+}
 
 /// tuigram's view of the login flow — a reduced projection of TDLib's
 /// [`AuthorizationState`] covering the states Phase 2 acts on.
@@ -385,10 +431,14 @@ impl<'a, C: AuthRequests> Login<'a, C> {
     /// Answer [`AuthState::WaitTdlibParameters`].
     ///
     /// `setTdlibParameters` is the first request of every login, so this is
-    /// where we first silence TDLib's logging ([`SECURE_LOG_VERBOSITY`]) —
-    /// before any credential-bearing request, including the `api_id`/`api_hash`
-    /// in `params` itself.
+    /// where we first silence TDLib's logging — redirecting its stream off
+    /// stderr ([`AuthRequests::set_log_stream`]) and lowering its verbosity
+    /// ([`SECURE_LOG_VERBOSITY`]) — before any credential-bearing request,
+    /// including the `api_id`/`api_hash` in `params` itself.
     pub async fn set_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
+        self.client
+            .set_log_stream(log_file_path(&params.database_directory))
+            .await?;
         self.client
             .set_log_verbosity_level(SECURE_LOG_VERBOSITY)
             .await?;
@@ -621,6 +671,12 @@ mod tests {
                 .push(format!("set_log_verbosity_level({level})"));
             Ok(())
         }
+        async fn set_log_stream(&self, path: String) -> Result<(), TdError> {
+            self.calls
+                .borrow_mut()
+                .push(format!("set_log_stream({path})"));
+            Ok(())
+        }
         async fn set_tdlib_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
             self.calls
                 .borrow_mut()
@@ -723,6 +779,9 @@ mod tests {
         async fn set_log_verbosity_level(&self, _: i32) -> Result<(), TdError> {
             unimplemented!()
         }
+        async fn set_log_stream(&self, _: String) -> Result<(), TdError> {
+            unimplemented!()
+        }
         async fn set_tdlib_parameters(&self, _: ClientParameters) -> Result<(), TdError> {
             unimplemented!()
         }
@@ -784,6 +843,9 @@ mod tests {
             async fn set_log_verbosity_level(&self, _: i32) -> Result<(), TdError> {
                 unimplemented!()
             }
+            async fn set_log_stream(&self, _: String) -> Result<(), TdError> {
+                unimplemented!()
+            }
             async fn set_tdlib_parameters(&self, _: ClientParameters) -> Result<(), TdError> {
                 unimplemented!()
             }
@@ -811,6 +873,21 @@ mod tests {
         }
         // Completes (the bound is hit) rather than hanging the test.
         NeverCloses.close_and_wait().await;
+    }
+
+    #[test]
+    fn log_file_path_sits_beside_the_database_directory() {
+        assert_eq!(log_file_path("/tmp/db"), "/tmp/tdlib.log");
+        assert_eq!(
+            log_file_path("/home/user/.local/share/tuigram/database"),
+            "/home/user/.local/share/tuigram/tdlib.log"
+        );
+    }
+
+    #[test]
+    fn log_file_path_falls_back_when_there_is_no_parent() {
+        assert_eq!(log_file_path(""), "tdlib.log");
+        assert_eq!(log_file_path("/"), "tdlib.log");
     }
 
     fn params() -> ClientParameters {
@@ -872,6 +949,7 @@ mod tests {
         assert_eq!(
             client.calls(),
             vec![
+                "set_log_stream(/tmp/tdlib.log)".to_owned(),
                 "set_log_verbosity_level(1)".to_owned(),
                 "set_tdlib_parameters(api_id=42)".to_owned(),
                 "set_phone_number(+15551234567)".to_owned(),
