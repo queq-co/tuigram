@@ -13,10 +13,6 @@ on:
     tags: ['v20*']
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version to use for a workflow_dispatch run (e.g. 2026.99.0-test1). Ignored on a tag push, where the tag itself is authoritative.'
-        required: false
-        default: '0.0.0-dispatch'
       simulate_broken_macos:
         description: 'Package the macOS artifact without lib/, to prove the smoke test (#169) catches it. Never true on a real tag push.'
         type: boolean
@@ -53,13 +49,23 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Resolves the version string every later job uses, and — on a real tag
-  # push — asserts it matches Cargo.toml so a mistagged release fails fast
-  # instead of shipping a mismatched artifact. tuigram_core::version() has no
-  # `v` prefix (CalVer, unpadded, so Cargo accepts it as SemVer — see root
-  # Cargo.toml); tags do (`vYYYY.M.P`). This is the ONLY place that strips it —
-  # every other job/step reads `needs.preflight.outputs.version`, never
-  # `github.ref_name` directly, so the strip happens exactly once.
+  # Resolves the version string every later job uses. This is ALWAYS
+  # Cargo.toml's real `[workspace.package] version` — the one baked into the
+  # binary at compile time via CARGO_PKG_VERSION, which is what
+  # `tuigram --version` prints regardless of what triggered this build. (An
+  # earlier version of this job fabricated a placeholder like "0.0.0-dispatch"
+  # on non-push triggers, which #169's first real CI run caught immediately:
+  # every smoke job failed because the placeholder could never match the
+  # binary's real output — the package/sums/smoke jobs all key off this
+  # output, so it must be the truth, not a label.) On a real tag push, also
+  # assert the tag's base version (before any `-` prerelease suffix) matches
+  # Cargo.toml, so a mistagged release fails fast; a prerelease/throwaway tag
+  # like `v2026.7.1-test1` is allowed as long as its base (`2026.7.1`) still
+  # matches what's actually checked out — see docs/releasing.md's dry-run
+  # section. The `release`/`publish` jobs still reference `github.ref_name`
+  # directly for the literal tag name (they need the exact pushed ref, `-test1`
+  # suffix and all, not this resolved package version) — this output is for
+  # everything else that needs the compiled version, not the tag string.
   preflight:
     runs-on: ubuntu-latest
     outputs:
@@ -70,17 +76,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          pkg=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           if [ "${{ github.event_name }}" = "push" ]; then
             tag="${GITHUB_REF_NAME#v}"
-            pkg=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-            if [ "$tag" != "$pkg" ]; then
-              echo "FAIL: tag v$tag does not match Cargo.toml version $pkg" >&2
+            tag_base="${tag%%-*}"
+            if [ "$tag_base" != "$pkg" ]; then
+              echo "FAIL: tag ${GITHUB_REF_NAME}'s base version ($tag_base) does not match Cargo.toml version ($pkg)" >&2
               exit 1
             fi
-            echo "version=$tag" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=${{ inputs.version || '0.0.0-dispatch' }}" >> "$GITHUB_OUTPUT"
           fi
+          echo "version=$pkg" >> "$GITHUB_OUTPUT"
 
   build:
     name: build (${{ matrix.name }})
@@ -303,10 +308,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          v="${{ needs.preflight.outputs.version }}"
+          # The real pushed tag (e.g. v2026.7.1 or a v2026.7.1-test1 dry run),
+          # not a reconstruction from needs.preflight.outputs.version — that
+          # output is the compiled package version, which drops any prerelease
+          # suffix the tag itself carries.
           extra=()
-          case "$v" in *-*) extra+=(--prerelease) ;; esac
-          gh release create "v$v" --draft --generate-notes "${extra[@]}" \
+          case "${GITHUB_REF_NAME}" in *-*) extra+=(--prerelease) ;; esac
+          gh release create "${GITHUB_REF_NAME}" --draft --generate-notes "${extra[@]}" \
             --repo "${{ github.repository }}" \
             tuigram-* SHA256SUMS
 
@@ -402,5 +410,8 @@ jobs:
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release edit "v${{ needs.preflight.outputs.version }}" \
+          # The real pushed tag, matching how `release` named it — see that
+          # job's step for why this isn't reconstructed from
+          # needs.preflight.outputs.version.
+          gh release edit "${GITHUB_REF_NAME}" \
             --repo "${{ github.repository }}" --draft=false --latest

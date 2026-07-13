@@ -17,7 +17,8 @@ actual build/package/publish once a matching tag lands.
    git push origin v<version>
    ```
    The tag carries the `v`; the package version does not. `release.yml`'s
-   `preflight` job asserts they match and fails fast if they've drifted.
+   `preflight` job asserts the tag's base version (before any `-suffix`)
+   matches `Cargo.toml` and fails fast if they've drifted.
 6. The tag push triggers `.github/workflows/release.yml`:
    `build` (release, `--features tuigram/static`, per target) → `package`
    (assembles `tuigram-<version>-<target>.tar.gz`/`.zip` with `LICENSE` +
@@ -28,18 +29,23 @@ actual build/package/publish once a matching tag lands.
    - The release page shows three artifacts + `SHA256SUMS`, and is marked
      "Latest".
    - Download the Linux tarball, `sha256sum -c SHA256SUMS` against it, unpack,
-     run `tuigram --version` — confirm it prints the tagged version.
+     run `tuigram --version` — confirm it prints `Cargo.toml`'s version (which
+     for a real release equals the tag, minus its `v`).
 8. **If a smoke test fails**: the Release stays a draft and is never marked
    latest — the artifacts are still there to inspect. Investigate the failing
    job's log on that run, fix forward on `develop`, bump to a new patch version
    and re-tag. Never force-move an existing tag.
 9. **Dry run without affecting real users**: push a prerelease-style tag
-   matching `v20*` with a `-` suffix, e.g. `v2026.99.0-test1` — `release`
-   passes `--prerelease` automatically when the version string contains `-`.
-   Delete the tag and the (draft or published) release afterward:
+   matching `v20*` with a `-` suffix appended to the **current**
+   `Cargo.toml` version, e.g. `v2026.7.1-test1` if `Cargo.toml` says
+   `2026.7.1` — `preflight` only checks the tag's base version (everything
+   before the first `-`) against `Cargo.toml`, so the suffix is free-form,
+   but the base still has to match what's actually checked out. `release`
+   passes `--prerelease` automatically when the tag contains `-`. Delete the
+   tag and the (draft or published) release afterward:
    ```sh
-   git push --delete origin v2026.99.0-test1
-   gh release delete v2026.99.0-test1 --yes
+   git push --delete origin v2026.7.1-test1
+   gh release delete v2026.7.1-test1 --yes
    ```
 
 ## macOS distribution note
