@@ -6,7 +6,7 @@
 //! binary and from default CI. Run it against a real account with:
 //!
 //! ```text
-//! cargo run -p tuigram --example repl --features login-harness
+//! cargo run -p tuigram-client --example repl --features login-harness
 //! ```
 //!
 //! It first wires the four Phase 2 pieces together — credential resolution

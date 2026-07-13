@@ -200,6 +200,6 @@ eventually drives.
 
 ## Trying it
 
-`cargo run -p tuigram` launches the skeleton: Tab cycles focus, `?` opens the
+`cargo run -p tuigram-client` launches the skeleton: Tab cycles focus, `?` opens the
 help overlay (generated from the keymap), `q` quits, and the heartbeat counter
 ticks in the conversation pane as proof the core-event arm is live.
