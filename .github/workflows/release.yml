@@ -410,8 +410,14 @@ jobs:
       - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           # The real pushed tag, matching how `release` named it — see that
           # job's step for why this isn't reconstructed from
-          # needs.preflight.outputs.version.
+          # needs.preflight.outputs.version. Only a non-prerelease tag is
+          # promoted to "Latest" — a v20*-test1 dry run (docs/releasing.md)
+          # is deliberately a --prerelease Release (see `release`'s step) and
+          # must never eclipse the repo's real latest release, even briefly.
+          latest=()
+          case "${GITHUB_REF_NAME}" in *-*) ;; *) latest+=(--latest) ;; esac
           gh release edit "${GITHUB_REF_NAME}" \
-            --repo "${{ github.repository }}" --draft=false --latest
+            --repo "${{ github.repository }}" --draft=false "${latest[@]}"
