@@ -1,0 +1,125 @@
+name: Release
+
+# Release packaging pipeline. Grows across #167 (this trigger: workflow_dispatch
+# only, to empirically validate the static release build per target before
+# anything ships), #168 (adds the v20* tag trigger + packaging/Release jobs),
+# and #169 (adds the clean-machine smoke tests that gate "latest"). See
+# docs/research/tdlib.md for the native-deps contract this validates, and
+# docs/releasing.md (added in #168) for the release checklist that drives this
+# workflow.
+
+on:
+  workflow_dispatch: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  # No cancel-in-progress: a half-created artifact/Release set must not be
+  # torn down mid-run by a second trigger.
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-latest }
+          - { name: macos-arm64,    os: macos-15 }
+          - { name: windows-x86_64, os: windows-latest }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Matches ci.yml's dynamic-build provisioning. Whether static tdjson
+      # still needs libc++ at *runtime* is exactly what the informational
+      # check below determines; this step stays until that's answered and
+      # recorded in docs/research/tdlib.md.
+      - name: Install Linux native deps (libc++)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libc++1 libc++abi1
+
+      - name: Check native deps (OpenSSL 3 + zlib + libc++)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/check-native-deps.sh
+
+      # download-tdlib + static (#167): the release mode docs/research/tdlib.md
+      # decided on, built here for the first time — ci.yml only ever builds the
+      # dynamic dev mode. `tuigram/static` is the binary crate's forwarding
+      # feature (crates/tuigram/Cargo.toml) so this doesn't reach into
+      # tuigram-core's feature namespace directly.
+      - name: Build (release, static)
+        run: cargo build --release --workspace --features tuigram/static
+
+      # ---------------------------------------------------------------------
+      # Binary-level linkage audit (#167): the inverse of ci.yml's lib-level
+      # audit. That audit asserts required deps ARE present on the *dynamic*
+      # libtdjson; this asserts tdjson is ABSENT from the *release binary's*
+      # dynamic deps, i.e. it was actually statically linked in. Uses the new
+      # scripts/assert-not-linked.sh|.ps1 rather than touching ci.yml's
+      # currently-green inline steps, since those check the opposite polarity.
+      # ---------------------------------------------------------------------
+      - name: Binary linkage audit (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/assert-not-linked.sh linux target/release/tuigram libtdjson
+          echo "== informational: does the static binary still reference libc++? =="
+          echo "(first run's answer gets hand-recorded in docs/research/tdlib.md, then"
+          echo " hardened into a real assert-linked/assert-not-linked check once known)"
+          ldd target/release/tuigram | grep -i 'libc++' \
+            && echo "libc++ IS referenced by the binary" \
+            || echo "libc++ is NOT referenced by the binary"
+
+      - name: Binary linkage audit + native-dep bundling (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/assert-not-linked.sh macos target/release/tuigram libtdjson
+          echo "== otool -L target/release/tuigram (pre-bundle) =="
+          otool -L target/release/tuigram
+          # Relocates any absolute Homebrew openssl@3 dylibs beside the binary
+          # and rewrites load commands to @loader_path; asserts internally that
+          # no absolute Homebrew path survives (exits 1 if one does) — that
+          # assertion IS the "confirm bundle-native-deps.sh works on the
+          # binary, not just the dylib" check #167 asks for.
+          ./scripts/bundle-native-deps.sh target/release/tuigram
+          echo "== otool -L target/release/tuigram (post-bundle) =="
+          otool -L target/release/tuigram
+
+      - name: Binary linkage audit (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/assert-not-linked.ps1 -Artifact target/release/tuigram.exe `
+            -Needles 'libssl,libcrypto,ssleay,libeay,zlib1?\.dll,tdjson'
+
+      - name: Upload release binary (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bin-${{ matrix.name }}
+          path: |
+            target/release/tuigram
+            target/release/lib/
+          if-no-files-found: error
+
+      - name: Upload release binary (Linux/Windows)
+        if: runner.os != 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bin-${{ matrix.name }}
+          path: target/release/tuigram${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error

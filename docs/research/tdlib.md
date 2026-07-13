@@ -167,6 +167,33 @@ dependency. `bundle-native-deps.sh` is a no-op on Linux/Windows by design, and
 finishes by re-running the linkage audit to assert no absolute Homebrew paths
 remain.
 
+### Release (static) build — measured (#167)
+
+All of the above was measured on the **dynamic** `download-tdlib` build. The
+`download-tdlib + static` build releases actually ship was designed but never
+built or measured until #167. First data point, macOS arm64:
+
+> **Measured on this M4 (aarch64-apple-darwin), `cargo build --release
+> --features tuigram/static` (→ `tuigram-core/static` → `tdlib-rs/static`,
+> confirmed via `cargo tree -e features -i tdlib-rs`), tdlib-rs 1.4.0 / TDLib
+> 1.8.61.** `otool -L target/release/tuigram` shows **no** `libssl`,
+> `libcrypto`, `libz`, or `libtdjson` reference at all — only system
+> frameworks (AppKit, Foundation, CoreGraphics, Security, libc++, libiconv,
+> libSystem). This **contradicts the assumption above** (carried over from the
+> dynamic build) that a static macOS build still references Homebrew OpenSSL
+> by absolute path: it does not. `scripts/bundle-native-deps.sh` run against
+> this binary confirms it — "No absolute openssl@3 references ... already
+> bundled or statically resolved" — and exits 0 as a no-op. The macOS
+> `static` prebuilt appears to statically link OpenSSL and zlib alongside
+> tdjson itself, not just tdjson. **Practical effect:** the macOS release
+> artifact needs no `lib/` bundling step and no Homebrew at build *or* run
+> time; `bundle-native-deps.sh` stays in the release pipeline as a no-op
+> safety net (harmless if a future TDLib/tdlib-rs bump changes this) rather
+> than as a required step. Linux and Windows static-build linkage (in
+> particular, whether Linux static tdjson still needs runtime `libc++`) are
+> pending CI measurement — see `.github/workflows/release.yml`'s
+> `workflow_dispatch` build job.
+
 ### Provisioning & verification
 
 - **One place per OS, not scattered assumptions:** [`check-native-deps.sh`](../../scripts/check-native-deps.sh)
