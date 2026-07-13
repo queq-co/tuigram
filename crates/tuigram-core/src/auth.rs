@@ -151,7 +151,7 @@ pub trait AuthRequests {
     /// Wait until TDLib reaches [`AuthorizationState::Closed`] — the signal that a
     /// preceding [`log_out`](Self::log_out) has finished destroying local data, or a
     /// [`close`](Self::close) has finished flushing the database. Bounded
-    /// (~[`WAIT_CLOSED_POLLS`] × [`WAIT_CLOSED_INTERVAL`] ≈ 5s) so a stuck teardown
+    /// (~`WAIT_CLOSED_POLLS` × `WAIT_CLOSED_INTERVAL` ≈ 5s) so a stuck teardown
     /// can never wedge a caller; a query that errors (the client is already gone)
     /// counts as closed.
     async fn wait_until_closed(&self) {
@@ -321,17 +321,26 @@ pub enum AuthState {
     WaitCode,
     /// 2FA is enabled; needs the account password. Carries the user's hint
     /// (may be empty) for display — never the password itself.
-    WaitPassword { hint: String },
+    WaitPassword {
+        /// The user's password hint (may be empty). Never the password itself.
+        hint: String,
+    },
     /// QR login was requested; TDLib is waiting for the link to be scanned on an
     /// already signed-in device. Carries the `tg://login` link to render as a QR
     /// code. No input is taken here — the confirmation happens on the other
     /// device — so the flow advances on the next `updateAuthorizationState`.
-    WaitOtherDeviceConfirmation { link: String },
+    WaitOtherDeviceConfirmation {
+        /// The `tg://login` link to render as a QR code.
+        link: String,
+    },
     /// New-user registration: the phone number isn't tied to an account yet, so
     /// TDLib needs a first and last name to create one. Carries the
     /// terms-of-service text the user must accept before [`Login::register`]
     /// submits the name.
-    WaitRegistration { terms_of_service: String },
+    WaitRegistration {
+        /// Terms-of-service text the user must accept before registering.
+        terms_of_service: String,
+    },
     /// Email-based login: TDLib needs the user's email address, answered with
     /// [`Login::submit_email_address`]. (Apple/Google ID sign-in — the other
     /// answers TDLib would take here — is out of scope for a headless client.)
@@ -339,12 +348,18 @@ pub enum AuthState {
     /// An email authentication code was sent; needs the code, answered with
     /// [`Login::submit_email_code`]. Carries the masked address pattern (e.g.
     /// `a***@example.com`) so the UI can show which inbox to check — never a code.
-    WaitEmailCode { email_pattern: String },
+    WaitEmailCode {
+        /// Masked email address pattern (e.g. `a***@example.com`).
+        email_pattern: String,
+    },
     /// Login requires buying Telegram Premium as an in-store (App Store / Play)
     /// purchase, which a headless client can't perform. Modeled and surfaced
     /// explicitly — carrying the store product id — so the flow reports a dead end
     /// rather than hanging; there is no request that answers it here.
-    WaitPremiumPurchase { store_product_id: String },
+    WaitPremiumPurchase {
+        /// The in-store product id required to complete the purchase.
+        store_product_id: String,
+    },
     /// Logged in; normal updates flow.
     Ready,
     /// Logging out, closing, or closed — terminal; tear down the session.
@@ -395,7 +410,7 @@ impl AuthState {
     }
 }
 
-/// Drives login over a [`TgClient`], tracking the current [`AuthState`].
+/// Drives login over a [`TgClient`](crate::TgClient), tracking the current [`AuthState`].
 ///
 /// The owning loop feeds each `updateAuthorizationState` to [`Login::on_update`]
 /// and, when the state needs input, calls the matching handler. The driver does
