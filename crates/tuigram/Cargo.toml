@@ -7,9 +7,37 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["telegram", "tui", "ratatui", "terminal", "chat"]
+categories = ["command-line-utilities", "asynchronous"]
 
 [lints]
 workspace = true
+
+# release.yml's matrix names (linux-x86_64/macos-arm64/windows-x86_64) aren't
+# real Rust target triples, and each archive nests the binary one directory
+# in (tuigram-<version>-<name>/tuigram) rather than at the archive root — so
+# binstall's default {target}-keyed template can't resolve any of our
+# artifacts without explicit per-triple overrides.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/tuigram-{ version }-linux-x86_64.{ archive-format }"
+bin-dir = "tuigram-{ version }-linux-x86_64/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/tuigram-{ version }-linux-x86_64.tar.gz"
+bin-dir = "tuigram-{ version }-linux-x86_64/{ bin }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.aarch64-apple-darwin]
+pkg-url = "{ repo }/releases/download/v{ version }/tuigram-{ version }-macos-arm64.tar.gz"
+bin-dir = "tuigram-{ version }-macos-arm64/{ bin }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/tuigram-{ version }-windows-x86_64.zip"
+bin-dir = "tuigram-{ version }-windows-x86_64/{ bin }{ binary-ext }"
+pkg-fmt = "zip"
 
 [[bin]]
 name = "tuigram"
@@ -38,7 +66,11 @@ name = "repl"
 required-features = ["login-harness"]
 
 [dependencies]
-tuigram-core = { path = "../tuigram-core" }
+# NOTE: the `version` requirement is NOT kept in sync automatically by
+# `version.workspace = true` (that only equalizes the two crates' own package
+# versions) — bump this by hand alongside every workspace version bump, or
+# tuigram's crates.io publish will fail to resolve. See docs/releasing.md.
+tuigram-core = { version = "=2026.7.1", path = "../tuigram-core" }
 # Async runtime for the central tokio::select! event loop (Phase 5). The TUI is
 # I/O-bound on terminal events + core updates, not CPU-bound, but the multi-thread
 # runtime lets blocking core work run off the render thread. `time` drives the

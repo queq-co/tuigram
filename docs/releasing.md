@@ -7,7 +7,13 @@ actual build/package/publish once a matching tag lands.
 1. Confirm `develop` is green (CI passing).
 2. Bump `[workspace.package] version` in the root `Cargo.toml` to the new
    `YYYY.M.P` (current year, release month, patch within that month — no
-   leading zeros; Cargo rejects those as invalid SemVer).
+   leading zeros; Cargo rejects those as invalid SemVer). **Also** bump the
+   `tuigram-core = { version = "=X.Y.Z", ... }` dependency string in
+   `crates/tuigram/Cargo.toml` to match, in the same commit — this does
+   **not** update automatically (`version.workspace = true` only equalizes
+   the two crates' own package versions, not a hardcoded dependency
+   requirement like this one), and a stale one fails `tuigram`'s crates.io
+   publish (see "Publishing to crates.io" below).
 3. Open a PR with just the version bump, merge to `develop`.
 4. Open the periodic `develop` → `main` release PR (existing practice — see
    `docs/branch-model.md`), merge.
@@ -55,3 +61,41 @@ so an unsigned browser-downloaded binary hits Gatekeeper quarantine. macOS
 users should install via `brew` (once #170 lands) or `cargo install`. Linux
 users may take the released tarball directly, per the runtime deps
 `docs/research/tdlib.md` documents for that target.
+
+## Publishing to crates.io
+
+`tuigram-core` must publish first, `tuigram` second — `tuigram`'s manifest
+depends on it via `tuigram-core = { version = "=X.Y.Z", path = "../tuigram-core" }`,
+which crates.io resolves against the registry (the `path` component only
+applies to local/workspace builds), so `tuigram`'s publish fails until that
+exact version is live on the index.
+
+1. Do this **after** a real GitHub Release tag has been pushed and verified
+   (steps 1–7 above), not before — crates.io renders whatever rustdoc exists
+   at publish time, and a stale/broken build there is far more visible than
+   a GitHub Release artifact problem.
+2. `cargo publish --dry-run -p tuigram-core`, then `cargo publish -p tuigram-core`.
+3. Wait for it to appear at <https://crates.io/crates/tuigram-core> (usually
+   under a minute) — `tuigram`'s publish will fail to resolve the dependency
+   until it does.
+4. `cargo publish --dry-run -p tuigram`, then `cargo publish -p tuigram`.
+5. **This is irrevocable.** crates.io has no delete, only `cargo yank` (hides
+   a version from new dependents' resolution; existing lockfiles still work).
+   If something's wrong post-publish, yank the bad version and publish a new
+   patch — never assume a publish can be undone.
+
+**`cargo install tuigram` recommendation**: the default (dynamic,
+`download-tdlib`) build is **not** reliable for `cargo install`. tdlib-rs's
+build script bakes an rpath pointing at the build-time `OUT_DIR`
+(`target/.../build/tdlib-rs-<hash>/out/tdlib/lib`) into the compiled binary,
+but `cargo install` discards everything except the final binary from its temp
+build directory — so the installed binary's rpath points at a directory that
+no longer exists, and it fails to find `libtdjson` at runtime. Always
+recommend:
+```sh
+cargo install tuigram --features static
+```
+which statically links tdjson into the binary instead (see
+`docs/research/tdlib.md`'s "Release (static) build — measured" section for
+what that build needs per platform). `cargo binstall tuigram` sidesteps this
+entirely by fetching the prebuilt release artifact instead of compiling.
