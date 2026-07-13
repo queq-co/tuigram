@@ -1,0 +1,16 @@
+# tuigram
+
+A terminal UI ([Ratatui](https://ratatui.rs)) Telegram client, built on
+[TDLib](https://core.telegram.org/tdlib) via [`tuigram-core`](https://crates.io/crates/tuigram-core).
+
+```
+cargo install tuigram --features static
+```
+
+The default (dynamic) build isn't reliable for `cargo install` — see the
+[repository README](https://github.com/queq-co/tuigram#readme) and
+[`docs/releasing.md`](https://github.com/queq-co/tuigram/blob/main/docs/releasing.md)
+for why, plus prebuilt binaries and other install channels (Homebrew, tarball/
+zip downloads).
+
+License: MIT

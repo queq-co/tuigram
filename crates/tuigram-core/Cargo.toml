@@ -7,9 +7,24 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
+readme = "README.md"
+keywords = ["telegram", "tdlib", "chat", "async"]
+categories = ["asynchronous", "api-bindings"]
 
 [lints]
 workspace = true
+
+# docs.rs builds run with no network access, but the default `download-tdlib`
+# feature's build.rs fetches a prebuilt tdjson archive over HTTP — that would
+# fail there. tdlib-rs ships a `docs` feature for exactly this: it skips the
+# download/link step entirely and only generates the pure-Rust `enums`/
+# `functions`/`types` bindings from its bundled `.tl` schema (no tdjson
+# needed to build an rlib — only a final binary link needs the real library).
+# Verified locally: `cargo doc --no-deps -p tuigram-core --no-default-features
+# --features tdlib-rs/docs` compiles cleanly with no network and no linking.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["tdlib-rs/docs"]
 
 [features]
 # tdjson supply (see docs/research/tdlib.md). Exactly one source mode must be

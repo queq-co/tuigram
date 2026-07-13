@@ -4,6 +4,8 @@
 //! unit-tested without a TTY. Phases 2–3 (auth, chats, messages) live here;
 //! the Ratatui front-end (Phases 4–5) depends on this crate.
 
+#![warn(missing_docs)]
+
 pub mod actions;
 pub mod auth;
 pub mod bridge;
@@ -70,6 +72,11 @@ pub use tdlib_rs::{enums, functions, types};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Returns the `tuigram-core` version string.
+///
+/// ```
+/// let v = tuigram_core::version();
+/// assert_eq!(v, env!("CARGO_PKG_VERSION"));
+/// ```
 #[must_use]
 pub fn version() -> &'static str {
     VERSION

@@ -152,12 +152,12 @@ async fn load_list<C: ChatRequests>(
     }
 }
 
-/// Page the entire **Main** chat list to exhaustion. See [`load_list`].
+/// Page the entire **Main** chat list to exhaustion. See `load_list`.
 pub async fn load_main_list<C: ChatRequests>(client: &C, page: i32) -> Result<(), TdError> {
     load_list(client, ChatListKind::Main, page).await
 }
 
-/// Page the entire **Archive** chat list to exhaustion (#48). See [`load_list`].
+/// Page the entire **Archive** chat list to exhaustion (#48). See `load_list`.
 pub async fn load_archive_list<C: ChatRequests>(client: &C, page: i32) -> Result<(), TdError> {
     load_list(client, ChatListKind::Archive, page).await
 }
@@ -165,7 +165,7 @@ pub async fn load_archive_list<C: ChatRequests>(client: &C, page: i32) -> Result
 /// Page the user-defined **folder** `folder_id` to exhaustion (#49). The folder
 /// metadata arrives separately as `updateChatFolders` (see
 /// [`ChatStore::folders`]); this pages the chats positioned in it, which fold
-/// into [`ChatStore::folder_list`]. See [`load_list`].
+/// into [`ChatStore::folder_list`]. See `load_list`.
 pub async fn load_folder_list<C: ChatRequests>(
     client: &C,
     folder_id: i32,

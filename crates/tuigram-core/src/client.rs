@@ -2,7 +2,7 @@
 //!
 //! A live tuigram session is: a [`Bridge`] (the `tdjson` transport), the account
 //! content folded from its updates ([`AccountState`]), and the single
-//! [`Router`](crate::router::Router) task that does the folding. This module ties
+//! [`Router`] task that does the folding. This module ties
 //! those together so the rest of the app holds one handle instead of wiring the
 //! broadcast stream, the router task, and the shared state by hand.
 //!
@@ -28,7 +28,7 @@
 //! ([`Client::search_chat`], [`Client::search_messages`]) returns its hits — like
 //! history — directly rather than as updates, but must **never** fold into the
 //! account state, so the facade pages them into a transient
-//! [`SearchResults`](crate::messages::SearchResults) it returns instead of through
+//! [`SearchResults`] it returns instead of through
 //! `merge_history`. Forwarding ([`Client::forward_messages`]) is a write whose
 //! results *do* reconcile through the router (as `updateNewMessage`), exposed here
 //! for symmetry; its returned copies are the optimistic entries, not a fold.
@@ -338,7 +338,7 @@ impl Client {
     /// Recover from a dropped-update gap by re-querying the chat lists.
     ///
     /// When the router reports a broadcast overflow the folded snapshot may be
-    /// missing updates, surfaced as [`needs_resync`](Self::needs_resync). This
+    /// missing updates, surfaced as [`needs_resync`](AccountState::needs_resync). This
     /// reloads the Main chat list over the bridge — TDLib re-emits the current
     /// chats as updates the router folds — then clears the flag. Re-paging the
     /// *open* chat's history is the caller's complementary job (the core does not

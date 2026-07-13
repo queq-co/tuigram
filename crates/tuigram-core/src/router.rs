@@ -7,7 +7,7 @@
 //! dispatches it O(1) to the owning domain's reducer behind the [`UpdateSink`]
 //! seam.
 //!
-//! The router holds **no business logic**. [`classify`] only tags an update with
+//! The router holds **no business logic**. `classify` only tags an update with
 //! the domain that owns it; the actual fold (which field changes, how state is
 //! ordered) lives in the domain reducer the tag points at. That keeps the
 //! reducers independently unit-testable — a domain test drives its reducer with

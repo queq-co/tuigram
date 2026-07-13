@@ -30,7 +30,7 @@
 //! The key is never logged: [`EncryptionKey`] redacts itself in `Debug`, and no
 //! error in this module embeds it.
 //!
-//! The storage backends sit behind the [`KeyStore`] seam so resolution
+//! The storage backends sit behind the `KeyStore` seam so resolution
 //! (keyring-then-file, generate-on-first-use) is unit-tested without touching the
 //! real OS keyring.
 
@@ -101,7 +101,7 @@ impl std::fmt::Debug for EncryptionKey {
 
 /// Resolved, owner-only locations and key for a TDLib client's persistent state.
 ///
-/// Build with [`SessionStorage::open`] for real use; [`SessionStorage::open_at`]
+/// Build with [`SessionStorage::open`] for real use; `SessionStorage::open_at`
 /// takes an explicit data dir and keyring seam for tests.
 pub struct SessionStorage {
     data_dir: PathBuf,
