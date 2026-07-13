@@ -102,13 +102,19 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Matches ci.yml's dynamic-build provisioning. Whether static tdjson
-      # still needs libc++ at *runtime* is exactly what the informational
-      # check below determines; this step stays until that's answered and
-      # recorded in docs/research/tdlib.md.
-      - name: Install Linux native deps (libc++)
+      # #167 finding: ci.yml's dynamic-build provisioning (libc++1/libc++abi1,
+      # the *runtime* packages) is not enough for the static build — linking a
+      # statically-linked tdjson.a into the final binary needs the linker to
+      # resolve `-lc++`/`-lc++abi` at *link time*, which requires the
+      # unversioned `.so` symlinks that only the `-dev` packages provide (a
+      # static .a carries no DT_NEEDED tags the way a .so does, so the Rust
+      # build must supply these explicitly — confirmed by a real CI failure:
+      # "rust-lld: error: unable to find library -lc++"). Whether the
+      # resulting *binary* still needs libc++ at runtime (as opposed to link
+      # time) is what the informational check below determines.
+      - name: Install Linux native deps (libc++ dev, for linking)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libc++1 libc++abi1
+        run: sudo apt-get update && sudo apt-get install -y libc++-dev libc++abi-dev
 
       - name: Check native deps (OpenSSL 3 + zlib + libc++)
         if: runner.os != 'Windows'
