@@ -9,7 +9,14 @@ name: Release
 # workflow.
 
 on:
-  workflow_dispatch: {}
+  push:
+    tags: ['v20*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to use for a workflow_dispatch run (e.g. 2026.99.0-test1). Ignored on a tag push, where the tag itself is authoritative.'
+        required: false
+        default: '0.0.0-dispatch'
   # GitHub only allows `workflow_dispatch` to be triggered via API/CLI once a
   # workflow file has been merged to the default branch (main) — a brand-new
   # workflow on a feature branch can't be dispatched that way yet. `pull_request`
@@ -32,10 +39,45 @@ concurrency:
   # No cancel-in-progress: a half-created artifact/Release set must not be
   # torn down mid-run by a second trigger.
 
+# Needed for the `release` job's `gh release create`/`edit` (#168/#169).
+# Harmless on the pull_request/workflow_dispatch-without-tag paths, which
+# never reach that job (see its `if:`).
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Resolves the version string every later job uses, and — on a real tag
+  # push — asserts it matches Cargo.toml so a mistagged release fails fast
+  # instead of shipping a mismatched artifact. tuigram_core::version() has no
+  # `v` prefix (CalVer, unpadded, so Cargo accepts it as SemVer — see root
+  # Cargo.toml); tags do (`vYYYY.M.P`). This is the ONLY place that strips it —
+  # every other job/step reads `needs.preflight.outputs.version`, never
+  # `github.ref_name` directly, so the strip happens exactly once.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            pkg=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            if [ "$tag" != "$pkg" ]; then
+              echo "FAIL: tag v$tag does not match Cargo.toml version $pkg" >&2
+              exit 1
+            fi
+            echo "version=$tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version || '0.0.0-dispatch' }}" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -139,3 +181,113 @@ jobs:
           name: release-bin-${{ matrix.name }}
           path: target/release/tuigram${{ runner.os == 'Windows' && '.exe' || '' }}
           if-no-files-found: error
+
+  # Assembles each target's binary (+ macOS's lib/, if bundling produced one —
+  # docs/research/tdlib.md's #167 finding is that it currently doesn't, but the
+  # copy step tolerates either) plus LICENSE/README into the shipped archive
+  # layout (#168). No duplicate bundling here — that already happened once in
+  # `build`; this only packages what it produced.
+  package:
+    needs: [preflight, build]
+    name: package (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-latest,  archive: tar.gz }
+          - { name: macos-arm64,    os: macos-15,       archive: tar.gz }
+          - { name: windows-x86_64, os: windows-latest, archive: zip }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            LICENSE
+            README.md
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bin-${{ matrix.name }}
+          path: dl
+
+      - name: Assemble and archive (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ needs.preflight.outputs.version }}"
+          dir="tuigram-$v-${{ matrix.name }}"
+          mkdir "$dir"
+          chmod +x dl/tuigram
+          cp dl/tuigram "$dir/"
+          # #167's macOS finding: bundle-native-deps.sh is currently a no-op
+          # there (static build already self-contained), so dl/lib often won't
+          # exist — that's expected, not an error. `set -e` would otherwise
+          # abort on the bare `[ -d ... ] && ...` form when the test is false.
+          if [ -d dl/lib ]; then
+            cp -r dl/lib "$dir/lib"
+          fi
+          cp LICENSE README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Assemble and archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = "${{ needs.preflight.outputs.version }}"
+          $dir = "tuigram-$v-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item dl/tuigram.exe "$dir/"
+          Copy-Item LICENSE, README.md "$dir/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.name }}
+          path: tuigram-*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  # One SHA256SUMS covering every packaged archive (#168).
+  sums:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          merge-multiple: true
+      - run: sha256sum tuigram-* > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums
+          path: SHA256SUMS
+          if-no-files-found: error
+
+  # Creates the GitHub Release as a draft (#168) — only on a real tag push,
+  # never on workflow_dispatch, so ad hoc/test dispatches can never create a
+  # real Release. #169 adds the `publish` job that flips this to
+  # published+latest, gated on the smoke tests, so a failing smoke test leaves
+  # this draft (and its artifacts, for inspection) without ever going live.
+  release:
+    if: github.event_name == 'push'
+    needs: [preflight, sums]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'package-*'
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v="${{ needs.preflight.outputs.version }}"
+          extra=()
+          case "$v" in *-*) extra+=(--prerelease) ;; esac
+          gh release create "v$v" --draft --generate-notes "${extra[@]}" \
+            --repo "${{ github.repository }}" \
+            tuigram-* SHA256SUMS
