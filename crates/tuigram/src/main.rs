@@ -37,6 +37,7 @@ mod app;
 mod avatar;
 mod bootstrap;
 mod chat_list;
+mod cli;
 mod composer;
 mod contact_picker;
 mod conversation;
@@ -176,6 +177,14 @@ const TYPING_RESEND: Duration = Duration::from_secs(4);
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // argv check (#166): before any terminal-mode or TDLib work, so
+    // `--version`/`--help`/an unknown argument exit cleanly with no TTY and no
+    // `~/.config/tuigram/` access — required for packaging smoke tests and the
+    // Homebrew formula's `test do` block.
+    if let cli::Action::Exit(code) = cli::parse(std::env::args().skip(1)) {
+        return code;
+    }
+
     // Phase 1 — initialize TDLib on the plain terminal (credentials, secure
     // storage, setTdlibParameters), before raw mode. A failure here prints and
     // exits without ever touching the TUI. Login happens later, in the TUI.

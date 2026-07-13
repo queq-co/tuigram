@@ -167,6 +167,77 @@ dependency. `bundle-native-deps.sh` is a no-op on Linux/Windows by design, and
 finishes by re-running the linkage audit to assert no absolute Homebrew paths
 remain.
 
+### Release (static) build — measured (#167)
+
+All of the above was measured on the **dynamic** `download-tdlib` build. The
+`download-tdlib + static` build releases actually ship was designed but never
+built or measured until #167. First data point, macOS arm64:
+
+> **Measured on this M4 (aarch64-apple-darwin), `cargo build --release
+> --features tuigram/static` (→ `tuigram-core/static` → `tdlib-rs/static`,
+> confirmed via `cargo tree -e features -i tdlib-rs`), tdlib-rs 1.4.0 / TDLib
+> 1.8.61.** `otool -L target/release/tuigram` shows **no** `libssl`,
+> `libcrypto`, `libz`, or `libtdjson` reference at all — only system
+> frameworks (AppKit, Foundation, CoreGraphics, Security, libc++, libiconv,
+> libSystem). This **contradicts the assumption above** (carried over from the
+> dynamic build) that a static macOS build still references Homebrew OpenSSL
+> by absolute path: it does not. `scripts/bundle-native-deps.sh` run against
+> this binary confirms it — "No absolute openssl@3 references ... already
+> bundled or statically resolved" — and exits 0 as a no-op. The macOS
+> `static` prebuilt appears to statically link OpenSSL and zlib alongside
+> tdjson itself, not just tdjson. **Practical effect:** the macOS release
+> artifact needs no `lib/` bundling step and no Homebrew at build *or* run
+> time; `bundle-native-deps.sh` stays in the release pipeline as a no-op
+> safety net (harmless if a future TDLib/tdlib-rs bump changes this) rather
+> than as a required step. Windows static-build linkage is still pending CI
+> measurement — see `.github/workflows/release.yml`'s `build` job.
+
+> **Measured in CI (ubuntu-latest x86_64), same build command/pin as above.**
+> Two distinct findings, one at link time and one at run time:
+>
+> - **Link time**: the plain `libc++1`/`libc++abi1` runtime packages this repo
+>   already provisions for the *dynamic* build are **not sufficient to link**
+>   the static build. First CI attempt failed: `rust-lld: error: unable to
+>   find library -lc++` / `-lc++abi`. A statically-linked `tdjson.a` carries no
+>   `DT_NEEDED` tags the way a `.so` does, so the final Rust link step must
+>   resolve `-lc++`/`-lc++abi` itself — which needs the *unversioned* `.so`
+>   symlinks that only `libc++-dev`/`libc++abi-dev` provide, not the versioned
+>   `.so.1` files `libc++1`/`libc++abi1` ship. Fixed by installing the `-dev`
+>   packages in the release build job.
+> - **Run time**: once linked, `ldd target/release/tuigram` shows
+>   `libc++.so.1` and `libc++abi.so.1` as dynamic dependencies of the binary
+>   itself (`libtdjson` is absent, confirming it *is* statically linked in, as
+>   intended). So unlike macOS, **Linux's static build is not fully
+>   self-contained w.r.t. libc++** — the runtime contract from the dynamic
+>   build (needs `libc++1`/`libc++abi1` provisioned on the host, e.g. via
+>   `apt-get install libc++1 libc++abi1`) carries over unchanged to the static
+>   build. `.github/workflows/release.yml`'s `smoke-linux` job installs
+>   exactly this pair (plus `libssl3`/`zlib1g`, per the table above) on a bare
+>   `debian:stable-slim` container and confirms `tuigram --version` runs.
+>
+> **Practical effect:** the Linux release build job needs `libc++-dev` +
+> `libc++abi-dev` (not just the runtime `-1` packages) to link; the
+> **artifact** still needs `libc++1`/`libc++abi1` at the end user's runtime,
+> same as the dynamic build — Linux release tarball users are not fully
+> dependency-free the way macOS's are.
+
+> **Measured in CI (windows-latest x86_64), same build command/pin as above.**
+> `dumpbin /DEPENDENTS target/release/tuigram.exe` shows no import matching
+> `libssl`/`libcrypto`/`zlib1.dll`/`tdjson`, confirming the expectation from
+> the dynamic-build table above: Windows's prebuilt already bundles OpenSSL,
+> zlib, and the MSVC runtime, and `static` additionally links tdjson itself
+> in. **Practical effect:** the Windows release artifact needs nothing at
+> build or run time beyond what the prebuilt already carries — no bundling
+> step, matching macOS's self-contained result (for a different reason: macOS
+> because its prebuilt's OpenSSL/zlib turned out statically linked too,
+> Windows because it always bundled them).
+
+**Summary across all three targets (#167):** macOS and Windows release
+artifacts are fully self-contained (no OpenSSL/zlib/tdjson runtime deps);
+Linux is the one target where the static build still needs
+`libc++1`/`libc++abi1` provisioned on the end user's machine — `docs/releasing.md`
+and the README's installing section reflect this asymmetry.
+
 ### Provisioning & verification
 
 - **One place per OS, not scattered assumptions:** [`check-native-deps.sh`](../../scripts/check-native-deps.sh)

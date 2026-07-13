@@ -26,6 +26,12 @@ path = "src/main.rs"
 # Pulls in rustyline (readline editing + command completion, #156–#157) solely
 # for the example; a default `cargo build --workspace` never compiles it.
 login-harness = ["dep:rustyline"]
+# Forwards to tuigram-core's `static` feature (#167): release builds pass
+# `--features tuigram/static` on the binary crate rather than reaching into a
+# dependency's feature namespace (`--features tuigram-core/static`). Statically
+# links tdjson into the binary; OpenSSL/zlib/libc++ remain dynamic per-target
+# runtime deps — see docs/research/tdlib.md.
+static = ["tuigram-core/static"]
 
 [[example]]
 name = "repl"
