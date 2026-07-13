@@ -1,15 +1,31 @@
 name: Release
 
-# Release packaging pipeline. Grows across #167 (this trigger: workflow_dispatch
-# only, to empirically validate the static release build per target before
-# anything ships), #168 (adds the v20* tag trigger + packaging/Release jobs),
-# and #169 (adds the clean-machine smoke tests that gate "latest"). See
+# Release packaging pipeline. Grows across #167 (this build job, to
+# empirically validate the static release build per target before anything
+# ships), #168 (adds the v20* tag trigger + packaging/Release jobs), and #169
+# (adds the clean-machine smoke tests that gate "latest"). See
 # docs/research/tdlib.md for the native-deps contract this validates, and
 # docs/releasing.md (added in #168) for the release checklist that drives this
 # workflow.
 
 on:
   workflow_dispatch: {}
+  # GitHub only allows `workflow_dispatch` to be triggered via API/CLI once a
+  # workflow file has been merged to the default branch (main) — a brand-new
+  # workflow on a feature branch can't be dispatched that way yet. `pull_request`
+  # has no such restriction (it reads the workflow from the PR branch itself),
+  # so this path-filtered trigger is what actually exercises the build job
+  # during review, before this file ever reaches main. Once merged,
+  # workflow_dispatch becomes usable for ad hoc re-validation and the #169
+  # `simulate_broken_macos` input.
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/assert-not-linked.*'
+      - 'scripts/bundle-native-deps.sh'
+      - 'crates/tuigram/Cargo.toml'
+      - 'crates/tuigram-core/Cargo.toml'
 
 concurrency:
   group: release-${{ github.ref }}
