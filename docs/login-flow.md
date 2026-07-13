@@ -168,7 +168,7 @@ The login path has no UI yet (that is Phase 5). A feature-gated harness drives i
 end to end against a real account over stdin:
 
 ```text
-cargo run -p tuigram --example login --features login-harness
+cargo run -p tuigram-client --example login --features login-harness
 ```
 
 It is off by default — excluded from the product binary and from default CI — and

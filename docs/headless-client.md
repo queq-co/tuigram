@@ -357,7 +357,7 @@ archive and folders, react and pin, send a typing action, create/list/close secr
 chats, and log out.
 
 ```text
-cargo run -p tuigram --example repl --features login-harness
+cargo run -p tuigram-client --example repl --features login-harness
 ```
 
 It is off by default — excluded from the product binary and from default CI — and

@@ -3,8 +3,12 @@
 A terminal UI ([Ratatui](https://ratatui.rs)) Telegram client, built on
 [TDLib](https://core.telegram.org/tdlib) via [`tuigram-core`](https://crates.io/crates/tuigram-core).
 
+Published as `tuigram-client` — the name `tuigram` was already taken on
+crates.io by an unrelated crate. The installed binary is still named
+`tuigram`.
+
 ```
-cargo install tuigram --features static
+cargo install tuigram-client --features static
 ```
 
 The default (dynamic) build isn't reliable for `cargo install` — see the

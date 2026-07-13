@@ -26,7 +26,7 @@ actual build/package/publish once a matching tag lands.
    `preflight` job asserts the tag's base version (before any `-suffix`)
    matches `Cargo.toml` and fails fast if they've drifted.
 6. The tag push triggers `.github/workflows/release.yml`:
-   `build` (release, `--features tuigram/static`, per target) → `package`
+   `build` (release, `--features tuigram-client/static`, per target) → `package`
    (assembles `tuigram-<version>-<target>.tar.gz`/`.zip` with `LICENSE` +
    `README.md`) → `sums` (`SHA256SUMS` over every archive) → the clean-machine
    smoke tests (#169) → a **draft** Release with everything attached → `publish`
@@ -64,11 +64,21 @@ users may take the released tarball directly, per the runtime deps
 
 ## Publishing to crates.io
 
-`tuigram-core` must publish first, `tuigram` second — `tuigram`'s manifest
-depends on it via `tuigram-core = { version = "=X.Y.Z", path = "../tuigram-core" }`,
-which crates.io resolves against the registry (the `path` component only
-applies to local/workspace builds), so `tuigram`'s publish fails until that
-exact version is live on the index.
+The binary crate (`crates/tuigram/`) publishes under the package name
+**`tuigram-client`**, not `tuigram` — the name `tuigram` was already
+registered on crates.io by an unrelated crate (a TUI sequence diagram
+editor, unaffiliated with this project) by the time #171 went to publish
+it, so this repo's binary crate had to pick a different registry name.
+Only the *package* name changed: the installed executable is still named
+`tuigram` (the `[[bin]]` name in `crates/tuigram/Cargo.toml` is unchanged),
+and the repository/directory (`crates/tuigram/`) keeps its existing name too.
+
+`tuigram-core` must publish first, `tuigram-client` second —
+`tuigram-client`'s manifest depends on it via `tuigram-core = { version =
+"=X.Y.Z", path = "../tuigram-core" }`, which crates.io resolves against the
+registry (the `path` component only applies to local/workspace builds), so
+`tuigram-client`'s publish fails until that exact version is live on the
+index.
 
 1. Do this **after** a real GitHub Release tag has been pushed and verified
    (steps 1–7 above), not before — crates.io renders whatever rustdoc exists
@@ -76,15 +86,15 @@ exact version is live on the index.
    a GitHub Release artifact problem.
 2. `cargo publish --dry-run -p tuigram-core`, then `cargo publish -p tuigram-core`.
 3. Wait for it to appear at <https://crates.io/crates/tuigram-core> (usually
-   under a minute) — `tuigram`'s publish will fail to resolve the dependency
-   until it does.
-4. `cargo publish --dry-run -p tuigram`, then `cargo publish -p tuigram`.
+   under a minute) — `tuigram-client`'s publish will fail to resolve the
+   dependency until it does.
+4. `cargo publish --dry-run -p tuigram-client`, then `cargo publish -p tuigram-client`.
 5. **This is irrevocable.** crates.io has no delete, only `cargo yank` (hides
    a version from new dependents' resolution; existing lockfiles still work).
    If something's wrong post-publish, yank the bad version and publish a new
    patch — never assume a publish can be undone.
 
-**`cargo install tuigram` recommendation**: the default (dynamic,
+**`cargo install tuigram-client` recommendation**: the default (dynamic,
 `download-tdlib`) build is **not** reliable for `cargo install`. tdlib-rs's
 build script bakes an rpath pointing at the build-time `OUT_DIR`
 (`target/.../build/tdlib-rs-<hash>/out/tdlib/lib`) into the compiled binary,
@@ -93,9 +103,11 @@ build directory — so the installed binary's rpath points at a directory that
 no longer exists, and it fails to find `libtdjson` at runtime. Always
 recommend:
 ```sh
-cargo install tuigram --features static
+cargo install tuigram-client --features static
 ```
 which statically links tdjson into the binary instead (see
 `docs/research/tdlib.md`'s "Release (static) build — measured" section for
-what that build needs per platform). `cargo binstall tuigram` sidesteps this
-entirely by fetching the prebuilt release artifact instead of compiling.
+what that build needs per platform). This installs a binary still named
+`tuigram` — only the package you pass to `cargo install` is `tuigram-client`.
+`cargo binstall tuigram-client` sidesteps this entirely by fetching the
+prebuilt release artifact instead of compiling.

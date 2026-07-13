@@ -128,11 +128,12 @@ jobs:
 
       # download-tdlib + static (#167): the release mode docs/research/tdlib.md
       # decided on, built here for the first time — ci.yml only ever builds the
-      # dynamic dev mode. `tuigram/static` is the binary crate's forwarding
-      # feature (crates/tuigram/Cargo.toml) so this doesn't reach into
+      # dynamic dev mode. `tuigram-client/static` is the binary crate's forwarding
+      # feature (crates/tuigram/Cargo.toml; the package is named "tuigram-client"
+      # on crates.io, see docs/releasing.md) so this doesn't reach into
       # tuigram-core's feature namespace directly.
       - name: Build (release, static)
-        run: cargo build --release --workspace --features tuigram/static
+        run: cargo build --release --workspace --features tuigram-client/static
 
       # ---------------------------------------------------------------------
       # Binary-level linkage audit (#167): the inverse of ci.yml's lib-level

@@ -1,5 +1,9 @@
 [package]
-name = "tuigram"
+# Published to crates.io as "tuigram-client" — the name "tuigram" was already
+# taken by an unrelated crate (a TUI sequence diagram editor). The installed
+# *binary* is unaffected and still named `tuigram` (see the [[bin]] section
+# below); only the package/crate name changes. See docs/releasing.md.
+name = "tuigram-client"
 description = "A terminal UI (Ratatui) Telegram client written in Rust."
 version.workspace = true
 edition.workspace = true
@@ -50,13 +54,13 @@ path = "src/main.rs"
 # chats, open a chat, send/reply/edit/delete/read). The async deps it needs are
 # now always present (the TUI itself runs on tokio), so this is a build-gate
 # marker only. Run it with:
-#   cargo run -p tuigram --example repl --features login-harness
+#   cargo run -p tuigram-client --example repl --features login-harness
 # Pulls in rustyline (readline editing + command completion, #156–#157) solely
 # for the example; a default `cargo build --workspace` never compiles it.
 login-harness = ["dep:rustyline"]
 # Forwards to tuigram-core's `static` feature (#167): release builds pass
-# `--features tuigram/static` on the binary crate rather than reaching into a
-# dependency's feature namespace (`--features tuigram-core/static`). Statically
+# `--features tuigram-client/static` on the binary crate rather than reaching
+# into a dependency's feature namespace (`--features tuigram-core/static`). Statically
 # links tdjson into the binary; OpenSSL/zlib/libc++ remain dynamic per-target
 # runtime deps — see docs/research/tdlib.md.
 static = ["tuigram-core/static"]
@@ -69,7 +73,7 @@ required-features = ["login-harness"]
 # NOTE: the `version` requirement is NOT kept in sync automatically by
 # `version.workspace = true` (that only equalizes the two crates' own package
 # versions) — bump this by hand alongside every workspace version bump, or
-# tuigram's crates.io publish will fail to resolve. See docs/releasing.md.
+# tuigram-client's crates.io publish will fail to resolve. See docs/releasing.md.
 tuigram-core = { version = "=2026.7.1", path = "../tuigram-core" }
 # Async runtime for the central tokio::select! event loop (Phase 5). The TUI is
 # I/O-bound on terminal events + core updates, not CPU-bound, but the multi-thread
