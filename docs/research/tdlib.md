@@ -145,6 +145,15 @@ Build deps split into two layers, handled uniformly everywhere:
 > Windows prebuilt bundles its runtime. This is exactly the kind of host-specific
 > gap the "verify empirically per target" stance is meant to catch.
 
+> **Measured in CI (ubuntu-24.04-arm, linux-arm64, #173).** A plain
+> `download-tdlib` build linked, compiled, and passed the full linkage audit on
+> the first run — `ldd libtdjson.so.1.8.61` resolves the identical dependency
+> set as x86_64 (`libssl.so.3`, `libcrypto.so.3`, `libz.so.1`, `libc++.so.1`,
+> `libc++abi.so.1`), just from `/lib/aarch64-linux-gnu/` instead of
+> `/lib/x86_64-linux-gnu/`. tdlib-rs 1.4.0's aarch64 prebuilt tdjson needs no
+> extra provisioning beyond what x86_64 already required, confirming the
+> combined "linux x86_64 / arm64" table row above.
+
 ### Distribution strategy: native, one place per OS/arch
 
 Principle: resolve deps **as natively as possible** (stay dynamically linked the

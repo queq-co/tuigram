@@ -32,7 +32,7 @@ actual build/package/publish once a matching tag lands.
    smoke tests (#169) → a **draft** Release with everything attached → `publish`
    flips it to published + latest, but **only if every smoke test passed**.
 7. Post-release verification (human):
-   - The release page shows three artifacts + `SHA256SUMS`, and is marked
+   - The release page shows four artifacts + `SHA256SUMS`, and is marked
      "Latest".
    - Download the Linux tarball, `sha256sum -c SHA256SUMS` against it, unpack,
      run `tuigram --version` — confirm it prints `Cargo.toml`'s version (which
