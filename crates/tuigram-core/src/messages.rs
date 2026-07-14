@@ -180,13 +180,18 @@ pub trait EditRequests {
 /// Parse composer text into formatting entities before it is sent (#212).
 #[allow(async_fn_in_trait)]
 pub trait FormatRequests {
-    /// Parse `text` as Telegram's MarkdownV2 (`*bold*`, `_italic_`,
-    /// `__underline__`, `~strikethrough~`, `` `code` ``, ```` ```pre``` ````,
-    /// `[text](url)`, `||spoiler||`), TDLib's `parseTextEntities` with
-    /// `TextParseMode::Markdown { version: 2 }`. MarkdownV2 requires escaping
-    /// reserved punctuation anywhere it appears, so ordinary prose containing
-    /// unescaped punctuation commonly errors here — callers must treat that as
-    /// expected and fall back to sending `text` plain
+    /// Parse `text` as markdown and send it through TDLib's
+    /// `parseTextEntities` with `TextParseMode::Markdown { version: 2 }`
+    /// (Telegram's MarkdownV2: `*bold*`, `_italic_`, `__underline__`,
+    /// `~strikethrough~`, `` `code` ``, ```` ```pre``` ````, `[text](url)`,
+    /// `||spoiler||`). Implementations should first rewrite the common
+    /// "doubled-marker" convention (`**bold**`, `~~strikethrough~~`, plain
+    /// `*italic*`) into that syntax — see `to_markdown_v2` in this module —
+    /// since MarkdownV2 alone has no doubled-marker forms and a literal
+    /// `**bold**` fails to parse. MarkdownV2 still requires escaping reserved
+    /// punctuation anywhere it appears, so ordinary prose containing
+    /// unescaped punctuation can still error here — callers must treat that
+    /// as expected and fall back to sending `text` plain
     /// ([`send_formatted_text`]/[`edit_formatted_text`] already do), never as
     /// a reason to block the send.
     async fn parse_markdown(&self, text: String) -> Result<FormattedText, TdError>;
@@ -500,13 +505,112 @@ impl FormatRequests for Bridge {
     async fn parse_markdown(&self, text: String) -> Result<FormattedText, TdError> {
         let tdlib_rs::enums::FormattedText::FormattedText(parsed) =
             tdlib_rs::functions::parse_text_entities(
-                text,
+                to_markdown_v2(&text),
                 TextParseMode::Markdown(TextParseModeMarkdown { version: 2 }),
                 self.id(),
             )
             .await?;
         Ok(FormattedText::from_tdlib(&parsed))
     }
+}
+
+/// Length of the run of `marker` starting at `chars[start]` (0 if
+/// `chars[start]` isn't `marker`).
+fn run_length(chars: &[char], start: usize, marker: char) -> usize {
+    chars[start..].iter().take_while(|&&c| c == marker).count()
+}
+
+/// Index of the next run of exactly `len` consecutive `marker` chars at or
+/// after `start`, skipping over shorter/longer runs (a code span's closing
+/// backtick fence must match the opening fence's length exactly, per
+/// CommonMark).
+fn find_exact_run(chars: &[char], start: usize, marker: char, len: usize) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == marker {
+            let n = run_length(chars, i, marker);
+            if n == len {
+                return Some(i);
+            }
+            i += n;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Rewrite the common "doubled-marker" markdown convention (`**bold**`,
+/// `~~strikethrough~~`, plain `*italic*`) into the MarkdownV2 syntax TDLib's
+/// `parseTextEntities` actually expects (`*bold*`, `~strikethrough~`,
+/// `_italic_`). Users commonly type the GitHub/Discord-style convention
+/// double-`*` for bold, single-`*` for italic — but MarkdownV2 has no
+/// doubled-marker forms and reserves single `*` for bold, so a literal
+/// `**bold**` fails to parse (two adjacent `*` close an empty entity) and
+/// the whole send falls back to plain text (see [`FormatRequests::
+/// parse_markdown`]).
+///
+/// `_italic_`, `__underline__`, `||spoiler||`, code spans/blocks, and links
+/// are already identical between the two conventions, so only `*`/`**` and
+/// `~`/`~~` runs need remapping; everything else passes through unchanged.
+/// A run of 3+ consecutive markers (e.g. `***text***`) is treated the same
+/// as a run of 2 (bold/strikethrough) — nested bold+italic via a tripled
+/// marker isn't supported, the same as plain MarkdownV2 today.
+///
+/// Code spans (`` `...` ``) and pre blocks (```` ```...``` ````) are copied
+/// through verbatim, however long their backtick run, so markers inside
+/// code are never rewritten or treated as entity delimiters. A
+/// backslash-escaped char (MarkdownV2's own escape, e.g. `\*` for a literal
+/// asterisk) is likewise copied through untouched, so an explicit escape
+/// still suppresses formatting after this rewrite.
+fn to_markdown_v2(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '`' => {
+                let fence_len = run_length(&chars, i, '`');
+                let fence: String = chars[i..i + fence_len].iter().collect();
+                out.push_str(&fence);
+                i += fence_len;
+                // Unmatched fence falls through with nothing more to skip —
+                // let TDLib's own parser handle (and likely reject) it.
+                if let Some(close) = find_exact_run(&chars, i, '`', fence_len) {
+                    out.extend(&chars[i..close]);
+                    out.push_str(&fence);
+                    i = close + fence_len;
+                }
+            }
+            '*' => {
+                let run = run_length(&chars, i, '*');
+                out.push(if run >= 2 { '*' } else { '_' });
+                i += run;
+            }
+            '~' => {
+                let run = run_length(&chars, i, '~');
+                out.push('~');
+                i += run;
+            }
+            '\\' => {
+                // A backslash-escaped char (MarkdownV2's own escape, e.g.
+                // `\*` for a literal asterisk) is copied verbatim, both
+                // chars at once, so the escaped marker never reaches the
+                // `*`/`~` arms above and gets reinterpreted as formatting.
+                out.push('\\');
+                i += 1;
+                if let Some(&escaped) = chars.get(i) {
+                    out.push(escaped);
+                    i += 1;
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// Parse `text` as markdown ([`FormatRequests::parse_markdown`]) and send it,
@@ -1094,6 +1198,106 @@ impl MessageStore {
         {
             message.reactions = reactions;
         }
+    }
+}
+
+#[cfg(test)]
+mod markdown_v2_tests {
+    use super::to_markdown_v2;
+
+    #[test]
+    fn doubled_asterisk_becomes_single_asterisk_bold() {
+        assert_eq!(to_markdown_v2("**bold**"), "*bold*");
+    }
+
+    #[test]
+    fn single_asterisk_becomes_underscore_italic() {
+        assert_eq!(to_markdown_v2("*italic*"), "_italic_");
+    }
+
+    #[test]
+    fn doubled_tilde_becomes_single_tilde_strikethrough() {
+        assert_eq!(to_markdown_v2("~~strike~~"), "~strike~");
+    }
+
+    #[test]
+    fn single_tilde_passes_through() {
+        assert_eq!(to_markdown_v2("~strike~"), "~strike~");
+    }
+
+    #[test]
+    fn underscore_forms_pass_through_unchanged() {
+        assert_eq!(to_markdown_v2("_italic_"), "_italic_");
+        assert_eq!(to_markdown_v2("__underline__"), "__underline__");
+    }
+
+    #[test]
+    fn spoiler_code_and_links_pass_through_unchanged() {
+        assert_eq!(to_markdown_v2("||spoiler||"), "||spoiler||");
+        assert_eq!(to_markdown_v2("`code`"), "`code`");
+        assert_eq!(
+            to_markdown_v2("[text](https://example.com)"),
+            "[text](https://example.com)"
+        );
+    }
+
+    #[test]
+    fn markers_inside_a_code_span_are_left_untouched() {
+        assert_eq!(to_markdown_v2("`a**b~~c`"), "`a**b~~c`");
+    }
+
+    #[test]
+    fn markers_inside_a_pre_block_are_left_untouched() {
+        assert_eq!(
+            to_markdown_v2("```\n**not bold**\n```"),
+            "```\n**not bold**\n```"
+        );
+    }
+
+    #[test]
+    fn mixed_message_translates_each_run_independently() {
+        assert_eq!(
+            to_markdown_v2("**bold** and *italic* and ~~strike~~ and `code**not bold**`"),
+            "*bold* and _italic_ and ~strike~ and `code**not bold**`"
+        );
+    }
+
+    #[test]
+    fn triple_run_degrades_to_the_doubled_meaning() {
+        // A run of 3+ maps the same as a run of exactly 2 (bold), which
+        // itself translates to a single MarkdownV2 `*` — so both a doubled
+        // and a tripled run collapse to the same single-asterisk output.
+        assert_eq!(to_markdown_v2("***text***"), "*text*");
+        assert_eq!(to_markdown_v2("**text**"), "*text*");
+    }
+
+    #[test]
+    fn unmatched_backtick_is_left_as_is() {
+        assert_eq!(to_markdown_v2("a ` b"), "a ` b");
+    }
+
+    #[test]
+    fn backslash_escaped_markers_are_left_untouched() {
+        // `\*` is MarkdownV2's own escape for a literal asterisk — must
+        // survive the rewrite unconverted, or the escape gets silently
+        // broken (a lone `*` would otherwise become `_`).
+        assert_eq!(to_markdown_v2(r"5 \* 3 = 15"), r"5 \* 3 = 15");
+        assert_eq!(
+            to_markdown_v2(r"\~not strikethrough\~"),
+            r"\~not strikethrough\~"
+        );
+        assert_eq!(
+            to_markdown_v2(r"trailing backslash\"),
+            r"trailing backslash\"
+        );
+    }
+
+    #[test]
+    fn plain_prose_is_unaffected() {
+        assert_eq!(
+            to_markdown_v2("hello world, no markup here."),
+            "hello world, no markup here."
+        );
     }
 }
 
