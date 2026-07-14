@@ -32,10 +32,11 @@ jobs:
       matrix:
         include:
           - { name: linux-x86_64,  os: ubuntu-latest }
+          - { name: linux-arm64,   os: ubuntu-24.04-arm } # GA hosted arm64 runner (#173)
           - { name: macos-arm64,   os: macos-15 }      # Apple Silicon (only macOS target we support); current GA arm64 image
           - { name: windows-x86_64, os: windows-latest }
-          # Deferred (no GitHub-hosted runner): linux-arm64 and windows-arm64.
-          # Cover these via cross-compilation / self-hosted runners in Phase 2+.
+          # Deferred (no GitHub-hosted runner): windows-arm64.
+          # Cover this via cross-compilation / self-hosted runners in Phase 2+.
           # macOS Intel (x86_64) is intentionally not supported.
 
     steps:
