@@ -3820,7 +3820,7 @@ checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
 name = "tuigram-client"
-version = "2026.7.1"
+version = "2026.7.2"
 dependencies = [
  "ab_glyph",
  "arboard",
@@ -3840,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "tuigram-core"
-version = "2026.7.1"
+version = "2026.7.2"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
