@@ -2,6 +2,10 @@
 
 A terminal UI (Ratatui) Telegram client, written in Rust.
 
+![tuigram: a three-pane chat list, conversation, and composer skeleton over a status bar](docs/assets/screenshot.svg)
+
+*(mockup rendered from synthetic data, not a live session)*
+
 ## Installing
 
 - **macOS**: direct binary download is **not supported** — the release
