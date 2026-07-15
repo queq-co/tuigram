@@ -6,8 +6,11 @@ A terminal UI (Ratatui) Telegram client, written in Rust.
 
 - **macOS**: direct binary download is **not supported** — the release
   artifact ships unsigned, so a browser download hits Gatekeeper quarantine.
-  Install via Homebrew (`queq-co/homebrew-tap`, see #170 — tap details land in
-  a follow-up doc pass once it's live) or:
+  Install via Homebrew:
+  ```sh
+  brew install queq-co/tuigram/tuigram
+  ```
+  or:
   ```sh
   cargo install tuigram-client --features static
   ```
