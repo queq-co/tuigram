@@ -58,9 +58,17 @@ actual build/package/publish once a matching tag lands.
 
 Direct macOS binary download is **unsupported** — no code-signing identity,
 so an unsigned browser-downloaded binary hits Gatekeeper quarantine. macOS
-users should install via `brew` (once #170 lands) or `cargo install`. Linux
-users may take the released tarball directly, per the runtime deps
-`docs/research/tdlib.md` documents for that target.
+users should install via `brew install queq-co/tuigram/tuigram` (#170;
+tap: [queq-co/homebrew-tuigram](https://github.com/queq-co/homebrew-tuigram))
+or `cargo install`. Linux users may take the released tarball directly, per
+the runtime deps `docs/research/tdlib.md` documents for that target.
+
+The tap's `Formula/tuigram.rb` is bumped automatically by this workflow's
+`bump-homebrew-tap` job on every real (non-dry-run) release: it opens a PR
+against the tap with the new `download-url`/`download-sha256`, then
+auto-merges once the tap's own `tests.yml` (`brew audit`/`style`/`install`/
+`test`) passes. Dry-run tags (step 9 below) are skipped by this job on
+purpose — only a real release should ever touch the tap.
 
 ## Publishing to crates.io
 

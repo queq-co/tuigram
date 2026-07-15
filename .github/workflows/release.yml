@@ -445,3 +445,65 @@ jobs:
           case "${GITHUB_REF_NAME}" in *-*) ;; *) latest+=(--latest) ;; esac
           gh release edit "${GITHUB_REF_NAME}" \
             --repo "${{ github.repository }}" --draft=false "${latest[@]}"
+
+  # Opens (and auto-merges) a formula-bump PR against queq-co/homebrew-tuigram
+  # (#170) once a real release is fully published. Restricted to non-prerelease
+  # push tags (`!contains(github.ref_name, '-')`) so a dry-run tag
+  # (docs/releasing.md) never touches the real tap — see that doc's note. Needs
+  # `publish` (not just `release`) so the tap is only bumped once the release
+  # actually cleared every smoke test and went live as latest. Uses a
+  # short-lived clankqueq App installation token (CLANKQUEQ_APP_ID/
+  # CLANKQUEQ_APP_PRIVATE_KEY secrets), scoped to just homebrew-tuigram, rather
+  # than this workflow's own GITHUB_TOKEN — a repo-scoped token can't push to a
+  # different repo. This job can't be exercised by the release that introduces
+  # it (homebrew-tuigram doesn't have a bump PR to react to yet) — it's proven
+  # at the next release after this lands, same deferred-verification pattern
+  # #173 used for its binstall check.
+  bump-homebrew-tap:
+    if: github.event_name == 'push' && !contains(github.ref_name, '-')
+    needs: [preflight, sums, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+
+      - id: sha
+        run: |
+          set -euo pipefail
+          echo "sha256=$(grep macos-arm64 SHA256SUMS | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.CLANKQUEQ_APP_ID }}
+          private-key: ${{ secrets.CLANKQUEQ_APP_PRIVATE_KEY }}
+          owner: queq-co
+          repositories: homebrew-tuigram
+
+      - uses: mislav/bump-homebrew-formula-action@v4
+        with:
+          formula-name: tuigram
+          homebrew-tap: queq-co/homebrew-tuigram
+          download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/tuigram-${{ needs.preflight.outputs.version }}-macos-arm64.tar.gz
+          download-sha256: ${{ steps.sha.outputs.sha256 }}
+        env:
+          COMMITTER_TOKEN: ${{ steps.app-token.outputs.token }}
+
+      # bump-homebrew-formula-action doesn't output the PR it opens, so this
+      # picks the tap's single newest open PR rather than matching a branch
+      # name (its naming isn't part of the action's documented contract).
+      # `--auto` waits on homebrew-tuigram's own required `test` check
+      # (.github/workflows/tests.yml there) rather than merging blind.
+      - name: Auto-merge the tap PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          pr=$(gh pr list --repo queq-co/homebrew-tuigram --state open \
+            --json number,createdAt --jq 'sort_by(.createdAt) | last | .number')
+          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
+            echo "No open PR found on homebrew-tuigram to auto-merge" >&2
+            exit 1
+          fi
+          gh pr merge "$pr" --repo queq-co/homebrew-tuigram --auto --squash
