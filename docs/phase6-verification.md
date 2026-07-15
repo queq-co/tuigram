@@ -16,7 +16,7 @@ The harness is [`crates/tuigram/examples/repl.rs`](../crates/tuigram/examples/re
 a feature-gated manual tool, off in the product binary and default CI:
 
 ```text
-cargo run -p tuigram --example repl --features login-harness
+cargo run -p tuigram-client --example repl --features login-harness
 ```
 
 On first run it captures your Telegram API credentials (`api_id` / `api_hash`,

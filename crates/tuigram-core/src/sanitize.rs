@@ -47,10 +47,21 @@ pub const MAX_LINE_CHARS: usize = 1_024;
 /// Neutralize a multi-line body (message text, caption, poll question) for
 /// display: line breaks are preserved, tabs become a single space (a tab has no
 /// defined width in a ratatui cell and would misalign the grid), every other C0
-/// control, the C1 range, and DEL become [`REPLACEMENT`], and the result is
+/// control, the C1 range, and DEL become `REPLACEMENT`, and the result is
 /// capped at [`MAX_PROSE_CHARS`]. Bidi and zero-width characters are left as-is;
 /// they are legitimate in prose and cannot, unlike ESC, introduce a terminal
 /// control sequence.
+///
+/// ```
+/// use tuigram_core::scrub_prose;
+///
+/// // A hostile OSC window-title escape is neutralized...
+/// let clean = scrub_prose("before\u{1b}]0;pwned\u{07}after");
+/// assert!(!clean.contains('\u{1b}'));
+///
+/// // ...but ordinary newlines survive, since prose keeps its line structure.
+/// assert_eq!(scrub_prose("line one\nline two"), "line one\nline two");
+/// ```
 #[must_use]
 pub fn scrub_prose(input: &str) -> String {
     scrub(input, MAX_PROSE_CHARS, Shape::Prose)
@@ -58,9 +69,18 @@ pub fn scrub_prose(input: &str) -> String {
 
 /// Neutralize a single-line identifier (file name, chat title, user name,
 /// reaction emoji) for display: everything [`scrub_prose`] does, plus line
-/// breaks become [`REPLACEMENT`] (a newline in a "file name" is a fake second
+/// breaks become `REPLACEMENT` (a newline in a "file name" is a fake second
 /// line) and Unicode bidi overrides are replaced (Trojan-Source-style spoofing).
 /// Capped at [`MAX_LINE_CHARS`].
+///
+/// ```
+/// use tuigram_core::scrub_line;
+///
+/// // The classic Trojan-Source filename spoof (`report_exe.txt` reading as
+/// // `report_txt.exe`) loses its bidi override.
+/// let clean = scrub_line("report_e\u{202e}xe.txt");
+/// assert!(!clean.contains('\u{202e}'));
+/// ```
 #[must_use]
 pub fn scrub_line(input: &str) -> String {
     scrub(input, MAX_LINE_CHARS, Shape::Line)

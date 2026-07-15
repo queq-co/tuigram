@@ -76,7 +76,7 @@ impl UserStore {
     ///
     /// - `updateUser` — the full user record; inserted or replaced.
     /// - `updateUserStatus` — presence only; updates a known user's status (an
-    ///   unknown user is ignored, see [`set_status`](Self::set_status)).
+    ///   unknown user is ignored, see `set_status`).
     ///
     /// The catch-all stays inert — the router owns classification, this owns only
     /// the fold — so any other variant reaching here is a harmless no-op.

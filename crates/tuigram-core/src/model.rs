@@ -88,9 +88,15 @@ pub enum Presence {
     /// Status never set, or hidden from us entirely.
     Never,
     /// Online until `expires` (Unix timestamp).
-    Online { expires: i32 },
+    Online {
+        /// Unix timestamp the online status expires at.
+        expires: i32,
+    },
     /// Offline; last seen at `was_online` (Unix timestamp).
-    Offline { was_online: i32 },
+    Offline {
+        /// Unix timestamp of when the user was last online.
+        was_online: i32,
+    },
     /// Online recently — within a few days — with the exact time hidden.
     Recently,
     /// Online within the last week, with the exact time hidden.
@@ -365,15 +371,33 @@ impl User {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatKind {
     /// One-to-one chat with a user.
-    Private { user_id: i64 },
+    Private {
+        /// TDLib id of the other user in the chat.
+        user_id: i64,
+    },
     /// Basic group (up to 200 members).
-    BasicGroup { basic_group_id: i64 },
+    BasicGroup {
+        /// TDLib id of the basic group.
+        basic_group_id: i64,
+    },
     /// Supergroup (large group).
-    Supergroup { supergroup_id: i64 },
+    Supergroup {
+        /// TDLib id of the supergroup.
+        supergroup_id: i64,
+    },
     /// Broadcast channel — a supergroup flagged as a channel.
-    Channel { supergroup_id: i64 },
+    Channel {
+        /// TDLib id of the underlying supergroup (channels share the
+        /// supergroup id space).
+        supergroup_id: i64,
+    },
     /// End-to-end encrypted secret chat. Out of Phase 3 messaging scope.
-    Secret { secret_chat_id: i32, user_id: i64 },
+    Secret {
+        /// TDLib id of the secret chat.
+        secret_chat_id: i32,
+        /// TDLib id of the other user in the secret chat.
+        user_id: i64,
+    },
 }
 
 impl ChatKind {
@@ -428,7 +452,7 @@ impl SecretChatState {
 
 /// An end-to-end encrypted secret chat — tuigram's projection of TDLib's
 /// `SecretChat`, the encryption state behind a
-/// [`ChatKind::Secret`](ChatKind::Secret) chat in the snapshot.
+/// [`ChatKind::Secret`] chat in the snapshot.
 ///
 /// A secret chat has its own id space (`i32`, distinct from a chat's `i64`); a
 /// `ChatKind::Secret` carries the `secret_chat_id` that keys back to this record.
@@ -576,7 +600,12 @@ pub enum SendState {
     /// Optimistically created locally, awaiting the server's acknowledgement.
     Pending,
     /// The server rejected the send; carries the error for display and retry.
-    Failed { code: i32, message: String },
+    Failed {
+        /// TDLib error code.
+        code: i32,
+        /// Human-readable error message.
+        message: String,
+    },
 }
 
 impl SendState {
@@ -630,19 +659,34 @@ pub enum EntityKind {
     /// A preformatted block.
     Pre,
     /// A preformatted block tagged with a programming language.
-    PreCode { language: String },
+    PreCode {
+        /// The programming language tag.
+        language: String,
+    },
     /// A block quote.
     BlockQuote,
     /// A collapsible block quote.
     ExpandableBlockQuote,
     /// A text link to `url`.
-    TextUrl { url: String },
+    TextUrl {
+        /// The link target.
+        url: String,
+    },
     /// A mention of a user with no username, by id.
-    MentionName { user_id: i64 },
+    MentionName {
+        /// TDLib id of the mentioned user.
+        user_id: i64,
+    },
     /// A custom emoji, by sticker id.
-    CustomEmoji { custom_emoji_id: i64 },
+    CustomEmoji {
+        /// TDLib id of the custom emoji sticker.
+        custom_emoji_id: i64,
+    },
     /// A clickable media timestamp, in seconds.
-    MediaTimestamp { media_timestamp: i32 },
+    MediaTimestamp {
+        /// Offset into the media, in seconds.
+        media_timestamp: i32,
+    },
 }
 
 impl EntityKind {
@@ -810,7 +854,7 @@ impl FormattedText {
 /// `store.get(file_ref)` — rather than duplicated into every message snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileRef {
-    /// TDLib's per-session file id (the key into the [`FileStore`]).
+    /// TDLib's per-session file id (the key into the [`FileStore`](crate::files::FileStore)).
     pub id: i32,
 }
 

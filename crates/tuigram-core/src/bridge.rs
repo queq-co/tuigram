@@ -175,7 +175,7 @@ impl Drop for Bridge {
 
 /// A [`Stream`] of unsolicited TDLib [`Update`]s for one subscriber.
 ///
-/// Lagged events (the consumer fell more than [`UPDATE_BUFFER`] behind) are
+/// Lagged events (the consumer fell more than `UPDATE_BUFFER` behind) are
 /// skipped rather than surfaced as errors: the stream's contract is "the next
 /// update", and a stalled consumer is a higher-layer concern.
 pub struct UpdateStream(BroadcastStream<Update>);
@@ -226,7 +226,7 @@ impl Stream for UpdateStream {
 pub enum RouterEvent {
     /// An unsolicited update to fold into account state.
     Update(Update),
-    /// The subscriber fell more than [`UPDATE_BUFFER`] behind; this many updates
+    /// The subscriber fell more than `UPDATE_BUFFER` behind; this many updates
     /// were dropped before it caught up. State may now be stale.
     Lagged(u64),
 }

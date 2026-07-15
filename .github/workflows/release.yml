@@ -1,0 +1,447 @@
+name: Release
+
+# Release packaging pipeline. Grows across #167 (this build job, to
+# empirically validate the static release build per target before anything
+# ships), #168 (adds the v20* tag trigger + packaging/Release jobs), and #169
+# (adds the clean-machine smoke tests that gate "latest"). See
+# docs/research/tdlib.md for the native-deps contract this validates, and
+# docs/releasing.md (added in #168) for the release checklist that drives this
+# workflow.
+
+on:
+  push:
+    tags: ['v20*']
+  workflow_dispatch:
+    inputs:
+      simulate_broken_macos:
+        description: 'Package the macOS artifact without lib/, to prove the smoke test (#169) catches it. Never true on a real tag push.'
+        type: boolean
+        default: false
+  # GitHub only allows `workflow_dispatch` to be triggered via API/CLI once a
+  # workflow file has been merged to the default branch (main) — a brand-new
+  # workflow on a feature branch can't be dispatched that way yet. `pull_request`
+  # has no such restriction (it reads the workflow from the PR branch itself),
+  # so this path-filtered trigger is what actually exercises the build job
+  # during review, before this file ever reaches main. Once merged,
+  # workflow_dispatch becomes usable for ad hoc re-validation and the #169
+  # `simulate_broken_macos` input.
+  pull_request:
+    branches: [develop, main]
+    paths:
+      - '.github/workflows/release.yml'
+      - 'scripts/assert-not-linked.*'
+      - 'scripts/bundle-native-deps.sh'
+      - 'crates/tuigram/Cargo.toml'
+      - 'crates/tuigram-core/Cargo.toml'
+
+concurrency:
+  group: release-${{ github.ref }}
+  # No cancel-in-progress: a half-created artifact/Release set must not be
+  # torn down mid-run by a second trigger.
+
+# Needed for the `release` job's `gh release create`/`edit` (#168/#169).
+# Harmless on the pull_request/workflow_dispatch-without-tag paths, which
+# never reach that job (see its `if:`).
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Resolves the version string every later job uses. This is ALWAYS
+  # Cargo.toml's real `[workspace.package] version` — the one baked into the
+  # binary at compile time via CARGO_PKG_VERSION, which is what
+  # `tuigram --version` prints regardless of what triggered this build. (An
+  # earlier version of this job fabricated a placeholder like "0.0.0-dispatch"
+  # on non-push triggers, which #169's first real CI run caught immediately:
+  # every smoke job failed because the placeholder could never match the
+  # binary's real output — the package/sums/smoke jobs all key off this
+  # output, so it must be the truth, not a label.) On a real tag push, also
+  # assert the tag's base version (before any `-` prerelease suffix) matches
+  # Cargo.toml, so a mistagged release fails fast; a prerelease/throwaway tag
+  # like `v2026.7.1-test1` is allowed as long as its base (`2026.7.1`) still
+  # matches what's actually checked out — see docs/releasing.md's dry-run
+  # section. The `release`/`publish` jobs still reference `github.ref_name`
+  # directly for the literal tag name (they need the exact pushed ref, `-test1`
+  # suffix and all, not this resolved package version) — this output is for
+  # everything else that needs the compiled version, not the tag string.
+  preflight:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            tag_base="${tag%%-*}"
+            if [ "$tag_base" != "$pkg" ]; then
+              echo "FAIL: tag ${GITHUB_REF_NAME}'s base version ($tag_base) does not match Cargo.toml version ($pkg)" >&2
+              exit 1
+            fi
+          fi
+          echo "version=$pkg" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-latest }
+          - { name: linux-arm64,    os: ubuntu-24.04-arm } # GA hosted arm64 runner (#173)
+          - { name: macos-arm64,    os: macos-15 }
+          - { name: windows-x86_64, os: windows-latest }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      # #167 finding: ci.yml's dynamic-build provisioning (libc++1/libc++abi1,
+      # the *runtime* packages) is not enough for the static build — linking a
+      # statically-linked tdjson.a into the final binary needs the linker to
+      # resolve `-lc++`/`-lc++abi` at *link time*, which requires the
+      # unversioned `.so` symlinks that only the `-dev` packages provide (a
+      # static .a carries no DT_NEEDED tags the way a .so does, so the Rust
+      # build must supply these explicitly — confirmed by a real CI failure:
+      # "rust-lld: error: unable to find library -lc++"). Whether the
+      # resulting *binary* still needs libc++ at runtime (as opposed to link
+      # time) is what the informational check below determines.
+      - name: Install Linux native deps (libc++ dev, for linking)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libc++-dev libc++abi-dev
+
+      - name: Check native deps (OpenSSL 3 + zlib + libc++)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ./scripts/check-native-deps.sh
+
+      # download-tdlib + static (#167): the release mode docs/research/tdlib.md
+      # decided on, built here for the first time — ci.yml only ever builds the
+      # dynamic dev mode. `tuigram-client/static` is the binary crate's forwarding
+      # feature (crates/tuigram/Cargo.toml; the package is named "tuigram-client"
+      # on crates.io, see docs/releasing.md) so this doesn't reach into
+      # tuigram-core's feature namespace directly.
+      - name: Build (release, static)
+        run: cargo build --release --workspace --features tuigram-client/static
+
+      # ---------------------------------------------------------------------
+      # Binary-level linkage audit (#167): the inverse of ci.yml's lib-level
+      # audit. That audit asserts required deps ARE present on the *dynamic*
+      # libtdjson; this asserts tdjson is ABSENT from the *release binary's*
+      # dynamic deps, i.e. it was actually statically linked in. Uses the new
+      # scripts/assert-not-linked.sh|.ps1 rather than touching ci.yml's
+      # currently-green inline steps, since those check the opposite polarity.
+      # ---------------------------------------------------------------------
+      - name: Binary linkage audit (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/assert-not-linked.sh linux target/release/tuigram libtdjson
+          echo "== informational: does the static binary still reference libc++? =="
+          echo "(first run's answer gets hand-recorded in docs/research/tdlib.md, then"
+          echo " hardened into a real assert-linked/assert-not-linked check once known)"
+          ldd target/release/tuigram | grep -i 'libc++' \
+            && echo "libc++ IS referenced by the binary" \
+            || echo "libc++ is NOT referenced by the binary"
+
+      - name: Binary linkage audit + native-dep bundling (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/assert-not-linked.sh macos target/release/tuigram libtdjson
+          echo "== otool -L target/release/tuigram (pre-bundle) =="
+          otool -L target/release/tuigram
+          # Relocates any absolute Homebrew openssl@3 dylibs beside the binary
+          # and rewrites load commands to @loader_path; asserts internally that
+          # no absolute Homebrew path survives (exits 1 if one does) — that
+          # assertion IS the "confirm bundle-native-deps.sh works on the
+          # binary, not just the dylib" check #167 asks for.
+          ./scripts/bundle-native-deps.sh target/release/tuigram
+          echo "== otool -L target/release/tuigram (post-bundle) =="
+          otool -L target/release/tuigram
+
+      - name: Binary linkage audit (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/assert-not-linked.ps1 -Artifact target/release/tuigram.exe `
+            -Needles 'libssl,libcrypto,ssleay,libeay,zlib1?\.dll,tdjson'
+
+      - name: Upload release binary (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bin-${{ matrix.name }}
+          path: |
+            target/release/tuigram
+            target/release/lib/
+          if-no-files-found: error
+
+      - name: Upload release binary (Linux/Windows)
+        if: runner.os != 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bin-${{ matrix.name }}
+          path: target/release/tuigram${{ runner.os == 'Windows' && '.exe' || '' }}
+          if-no-files-found: error
+
+  # Assembles each target's binary (+ macOS's lib/, if bundling produced one —
+  # docs/research/tdlib.md's #167 finding is that it currently doesn't, but the
+  # copy step tolerates either) plus LICENSE/README into the shipped archive
+  # layout (#168). No duplicate bundling here — that already happened once in
+  # `build`; this only packages what it produced.
+  package:
+    needs: [preflight, build]
+    name: package (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64,   os: ubuntu-latest,     archive: tar.gz }
+          - { name: linux-arm64,    os: ubuntu-24.04-arm,  archive: tar.gz }
+          - { name: macos-arm64,    os: macos-15,          archive: tar.gz }
+          - { name: windows-x86_64, os: windows-latest,    archive: zip }
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            LICENSE
+            README.md
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bin-${{ matrix.name }}
+          path: dl
+
+      # Debug-only path (#169): proves the smoke test actually catches a
+      # broken macOS artifact. Never true on a real tag push — the
+      # `simulate_broken_macos` input only exists on workflow_dispatch.
+      - name: Simulate broken macOS artifact (debug only)
+        if: matrix.name == 'macos-arm64' && inputs.simulate_broken_macos == true
+        shell: bash
+        run: rm -rf dl/lib
+
+      - name: Assemble and archive (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          v="${{ needs.preflight.outputs.version }}"
+          dir="tuigram-$v-${{ matrix.name }}"
+          mkdir "$dir"
+          chmod +x dl/tuigram
+          cp dl/tuigram "$dir/"
+          # #167's macOS finding: bundle-native-deps.sh is currently a no-op
+          # there (static build already self-contained), so dl/lib often won't
+          # exist — that's expected, not an error. `set -e` would otherwise
+          # abort on the bare `[ -d ... ] && ...` form when the test is false.
+          if [ -d dl/lib ]; then
+            cp -r dl/lib "$dir/lib"
+          fi
+          cp LICENSE README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+
+      - name: Assemble and archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = "${{ needs.preflight.outputs.version }}"
+          $dir = "tuigram-$v-${{ matrix.name }}"
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          Copy-Item dl/tuigram.exe "$dir/"
+          Copy-Item LICENSE, README.md "$dir/"
+          Compress-Archive -Path $dir -DestinationPath "$dir.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.name }}
+          path: tuigram-*.${{ matrix.archive }}
+          if-no-files-found: error
+
+  # One SHA256SUMS covering every packaged archive (#168).
+  sums:
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          merge-multiple: true
+      - run: sha256sum tuigram-* > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sha256sums
+          path: SHA256SUMS
+          if-no-files-found: error
+
+  # Creates the GitHub Release as a draft (#168) — only on a real tag push,
+  # never on workflow_dispatch, so ad hoc/test dispatches can never create a
+  # real Release. #169 adds the `publish` job that flips this to
+  # published+latest, gated on the smoke tests, so a failing smoke test leaves
+  # this draft (and its artifacts, for inspection) without ever going live.
+  release:
+    if: github.event_name == 'push'
+    needs: [preflight, sums]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: 'package-*'
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: sha256sums
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The real pushed tag (e.g. v2026.7.1 or a v2026.7.1-test1 dry run),
+          # not a reconstruction from needs.preflight.outputs.version — that
+          # output is the compiled package version, which drops any prerelease
+          # suffix the tag itself carries.
+          extra=()
+          case "${GITHUB_REF_NAME}" in *-*) extra+=(--prerelease) ;; esac
+          gh release create "${GITHUB_REF_NAME}" --draft --generate-notes "${extra[@]}" \
+            --repo "${{ github.repository }}" \
+            tuigram-* SHA256SUMS
+
+  # ---------------------------------------------------------------------
+  # Clean-machine smoke tests (#169): run the *packaged artifact* — not a
+  # freshly cargo-built binary — on a machine deliberately not provisioned
+  # like a dev box, and assert `tuigram --version` (#166) works. Only the
+  # Linux leg is a genuinely bare machine (a container image, not the
+  # ubuntu-latest runner itself, which already ships libssl3/zlib1g and would
+  # pass even on a broken artifact); macOS/Windows can't practically be
+  # containerized this way on GitHub-hosted runners, so those two run
+  # directly on the runner as a pragmatic, not fully "bare", stand-in.
+  # ---------------------------------------------------------------------
+  smoke-linux:
+    needs: [preflight, package]
+    runs-on: ubuntu-latest
+    # debian:stable-slim, not ubuntu-latest: the runner itself already carries
+    # libssl3/zlib1g, which would make this pass even on a broken artifact and
+    # defeat the point. Installs exactly the packages docs/research/tdlib.md's
+    # #167 measurement settled on for the static build, nothing more.
+    container: debian:stable-slim
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-linux-x86_64
+      - run: |
+          set -euo pipefail
+          apt-get update
+          # NOTE: copied from docs/research/tdlib.md's #167 "Release (static)
+          # build — measured" Linux finding — libc++1/libc++abi1 included
+          # pending that measurement; drop them here if #167 finds the static
+          # binary doesn't need them at runtime.
+          apt-get install -y --no-install-recommends libssl3 zlib1g libc++1 libc++abi1
+          tar xzf tuigram-*.tar.gz
+          out=$(./tuigram-*/tuigram --version)
+          echo "$out"
+          [ "$out" = "tuigram ${{ needs.preflight.outputs.version }}" ]
+
+  # Same rationale as smoke-linux (#169), for the arm64 leg added in #173:
+  # ubuntu-24.04-arm is itself hosted-runner-clean, but the debian:stable-slim
+  # container (pulled as its arm64 image automatically) keeps this a genuine
+  # clean-machine check rather than relying on whatever the runner preinstalls.
+  smoke-linux-arm64:
+    needs: [preflight, package]
+    runs-on: ubuntu-24.04-arm
+    container: debian:stable-slim
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-linux-arm64
+      - run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends libssl3 zlib1g libc++1 libc++abi1
+          tar xzf tuigram-*.tar.gz
+          out=$(./tuigram-*/tuigram --version)
+          echo "$out"
+          [ "$out" = "tuigram ${{ needs.preflight.outputs.version }}" ]
+
+  smoke-macos:
+    needs: [preflight, package]
+    runs-on: macos-15
+    # No brew/provisioning step at all: macOS's contract (per #167) is
+    # "self-contained, nothing required at runtime" — this is the test of
+    # that claim, not a setup step to skip.
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-macos-arm64
+      - shell: bash
+        run: |
+          set -euo pipefail
+          # Unpacked into a path containing spaces (#169): catches an
+          # @loader_path/rpath mistake that a plain path would hide.
+          dir="$RUNNER_TEMP/tuigram smoke test/release dir"
+          mkdir -p "$dir"
+          tar xzf tuigram-*.tar.gz -C "$dir"
+          bin=$(find "$dir" -name tuigram -type f)
+          chmod +x "$bin"
+          out=$("$bin" --version)
+          echo "$out"
+          [ "$out" = "tuigram ${{ needs.preflight.outputs.version }}" ]
+
+  smoke-windows:
+    needs: [preflight, package]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-windows-x86_64
+      - shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Expand-Archive tuigram-*.zip -DestinationPath .
+          $bin = (Get-ChildItem -Recurse -Filter tuigram.exe | Select-Object -First 1).FullName
+          $out = & $bin --version
+          Write-Host $out
+          if ($out -ne "tuigram ${{ needs.preflight.outputs.version }}") {
+            Write-Error "version mismatch: got '$out'"
+            exit 1
+          }
+
+  # Promotes the draft Release to published + latest (#169) — but only once
+  # every smoke test has passed. If any of them fails, this job is skipped by
+  # Actions' default needs-failure propagation: the draft Release and its
+  # artifacts stay up for inspection, but nothing is ever marked latest. This
+  # is the concrete mechanism behind "failure blocks the release from being
+  # marked latest" — artifacts aren't hidden, only promotion is gated.
+  publish:
+    if: github.event_name == 'push'
+    needs: [preflight, release, smoke-linux, smoke-linux-arm64, smoke-macos, smoke-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The real pushed tag, matching how `release` named it — see that
+          # job's step for why this isn't reconstructed from
+          # needs.preflight.outputs.version. Only a non-prerelease tag is
+          # promoted to "Latest" — a v20*-test1 dry run (docs/releasing.md)
+          # is deliberately a --prerelease Release (see `release`'s step) and
+          # must never eclipse the repo's real latest release, even briefly.
+          latest=()
+          case "${GITHUB_REF_NAME}" in *-*) ;; *) latest+=(--latest) ;; esac
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${{ github.repository }}" --draft=false "${latest[@]}"

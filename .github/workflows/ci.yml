@@ -32,10 +32,11 @@ jobs:
       matrix:
         include:
           - { name: linux-x86_64,  os: ubuntu-latest }
+          - { name: linux-arm64,   os: ubuntu-24.04-arm } # GA hosted arm64 runner (#173)
           - { name: macos-arm64,   os: macos-15 }      # Apple Silicon (only macOS target we support); current GA arm64 image
           - { name: windows-x86_64, os: windows-latest }
-          # Deferred (no GitHub-hosted runner): linux-arm64 and windows-arm64.
-          # Cover these via cross-compilation / self-hosted runners in Phase 2+.
+          # Deferred (no GitHub-hosted runner): windows-arm64.
+          # Cover this via cross-compilation / self-hosted runners in Phase 2+.
           # macOS Intel (x86_64) is intentionally not supported.
 
     steps:
@@ -152,3 +153,54 @@ jobs:
       # shipped binary self-contained so end users need no Homebrew —
       #   ./scripts/bundle-native-deps.sh target/release/tuigram
       # (no-op on Linux/Windows). See docs/research/tdlib.md, "Distribution strategy".
+
+  # rustdoc pass (#175). `missing_docs` itself is already a hard error via the
+  # `build` job's `cargo clippy -- -D warnings` (missing_docs is a rustc lint,
+  # promoted by -D warnings same as any clippy lint). This job's job is what
+  # that doesn't check: broken/redundant intra-doc links, and that the crate's
+  # doctests actually compile and pass.
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo doc (intra-doc links)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps -p tuigram-core
+      - name: Doctests
+        run: cargo test --doc -p tuigram-core
+
+  # crates.io publish readiness (#171/#175): guards tuigram-core's public API
+  # against accidental breaking changes. cargo-semver-checks compares against
+  # the last version published to crates.io, so there is no baseline until
+  # #171's first publish lands — self-gate on that rather than fail every run
+  # until then. Once tuigram-core is live on the index this starts doing real
+  # work automatically, with no follow-up change needed here.
+  semver-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check whether tuigram-core has a published baseline
+        id: baseline
+        run: |
+          if curl -sf https://crates.io/api/v1/crates/tuigram-core >/dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+            echo "tuigram-core is not yet published to crates.io — skipping cargo-semver-checks. This activates automatically once #171's first publish lands."
+          fi
+      - name: Install Rust toolchain
+        if: steps.baseline.outputs.published == 'true'
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        if: steps.baseline.outputs.published == 'true'
+      - uses: taiki-e/install-action@cargo-semver-checks
+        if: steps.baseline.outputs.published == 'true'
+      - name: cargo semver-checks
+        if: steps.baseline.outputs.published == 'true'
+        run: cargo semver-checks check-release -p tuigram-core
