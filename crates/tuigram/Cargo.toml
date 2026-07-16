@@ -52,6 +52,18 @@ pkg-fmt = "zip"
 name = "tuigram"
 path = "src/main.rs"
 
+[[bench]]
+name = "chat_list"
+harness = false
+
+[[bench]]
+name = "conversation"
+harness = false
+
+[[bench]]
+name = "wrap"
+harness = false
+
 [features]
 # Manual, interactive headless harness (#9, #22; examples/repl.rs). Off by default
 # so it is excluded from default CI — it needs a real account and a TTY. It logs
@@ -113,3 +125,8 @@ imageproc = { workspace = true }
 ab_glyph = { workspace = true }
 # Display-column measurement for word-wrapping (#214, #215).
 unicode-width = { workspace = true }
+
+[dev-dependencies]
+# Benchmark harness (#183) and its shared synthetic-data generators.
+criterion = { workspace = true }
+tuigram-fixtures = { path = "../tuigram-fixtures" }

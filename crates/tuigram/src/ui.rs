@@ -880,7 +880,8 @@ fn render_toast(frame: &mut Frame, area: Rect, app: &App) {
 /// caller overlays afterward — the marker/pin prefix that used to start in
 /// column 0 now starts just past the gutter instead. `gutter_cols == 0`
 /// renders byte-identical to pre-#201 output.
-fn message_lines(
+#[must_use]
+pub fn message_lines(
     view: &ConversationView,
     message: &Message,
     selected: bool,

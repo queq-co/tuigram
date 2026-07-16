@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/tuigram-core", "crates/tuigram"]
+members = ["crates/tuigram-core", "crates/tuigram", "crates/tuigram-fixtures"]
 
 [workspace.package]
 # CalVer (month-based): YYYY.MINOR.MICRO, unpadded so Cargo accepts it as valid
@@ -88,6 +88,13 @@ ab_glyph = { version = "0.2" }
 # (#214, #215) — already in the graph transitively via ratatui; promoted to
 # direct since `wrap.rs` calls it to measure display width, not byte/char count.
 unicode-width = { version = "0.2" }
+# Benchmark harness (#183), dev-only in both crates: baseline numbers for the
+# hot paths named in the issue, not wired into default CI (bench noise on
+# shared runners is worse than no gate — see each crate's benches/ for how to
+# run them locally). `html_reports` gives the `target/criterion/` report the
+# closing baseline numbers are read from; async features are all off since
+# nothing benched here awaits.
+criterion = { version = "0.8", default-features = false, features = ["html_reports", "cargo_bench_support"] }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.

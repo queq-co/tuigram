@@ -553,7 +553,7 @@ impl ConversationView {
     /// Scroll one row toward the newest (#222): advances within the current
     /// message's own rows, rolling onto the next message once they are
     /// exhausted. Clamps at the bottom-anchored position
-    /// ([`newest_anchor`](Self::newest_anchor)) rather than allowing an
+    /// (`newest_anchor`) rather than allowing an
     /// overscroll past it — a real pager's "you're at the end." A no-op on an
     /// empty history.
     pub fn scroll_down(&mut self) {
@@ -661,7 +661,7 @@ impl ConversationView {
     /// Set whether graphics are capable *and* enabled (#201/#208, live since
     /// #209 — `App` combines the terminal's detected capability with the user's
     /// `graphics` setting before calling this), so
-    /// [`message_height`](Self::message_height) knows whether to reserve rows
+    /// `message_height` knows whether to reserve rows
     /// for inline media. Toggling this while pinned to the newest message
     /// re-anchors the same way [`set_viewport_height`](Self::set_viewport_height)
     /// does, since every message's height changes at once. Returns whether the
@@ -681,7 +681,7 @@ impl ConversationView {
     }
 
     /// Record the history pane's measured body width (#214) — the column
-    /// budget [`content_rows`] wraps message bodies against. Re-anchors while
+    /// budget `content_rows` wraps message bodies against. Re-anchors while
     /// pinned to the newest message the same way
     /// [`set_viewport_height`](Self::set_viewport_height) does, since a width
     /// change (a resize) changes every wrapped message's height at once.
@@ -953,7 +953,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// (#194). `color` is `None` for senders that get no accent tint — "You", a
 /// chat (channel/anonymous-admin post), or an unresolved fallback id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SenderLabel {
+pub struct SenderLabel {
     pub(crate) label: String,
     pub(crate) color: Option<Color>,
 }
