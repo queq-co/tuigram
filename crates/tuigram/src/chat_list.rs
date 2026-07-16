@@ -237,7 +237,7 @@ impl ChatListView {
     /// Replace the secret-chat lifecycle states wholesale from a fresh core
     /// projection (#121): the loop reads each secret chat's folded
     /// [`SecretChatState`] joined to its chat id (via the free
-    /// [`project_secret_states`]) and hands the owned pairs here. A full replace,
+    /// `project_secret_states`) and hands the owned pairs here. A full replace,
     /// not a merge, so the view converges on the store rather than accreting stale
     /// rows. Keyed by chat id, spanning every list. The per-chat-id map survives a
     /// [`project`](Self::project) list swap, so this is the only path that clears it.

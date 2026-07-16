@@ -62,3 +62,10 @@ tempfile = { workspace = true }
 # `test-util` enables tokio's paused clock (`start_paused`) so the bounded
 # wait-for-Closed teardown tests (#195) advance their poll sleeps instantly.
 tokio = { workspace = true, features = ["test-util"] }
+# Benchmark harness (#183) and its shared synthetic-data generators.
+criterion = { workspace = true }
+tuigram-fixtures = { path = "../tuigram-fixtures" }
+
+[[bench]]
+name = "model_folding"
+harness = false

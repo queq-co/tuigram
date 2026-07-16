@@ -4,7 +4,7 @@
 //! builds its row/height math and its rendering on top of the *same* break
 //! points — never re-deriving them independently, which would risk drift.
 //!
-//! [`wrap_breaks`] operates on one logical line at a time (the caller splits
+//! `wrap_breaks` operates on one logical line at a time (the caller splits
 //! on literal `\n` first — a message or a composer draft can have several).
 //! Width is measured in terminal columns via [`unicode_width`], per the
 //! issues' request, not full grapheme-cluster segmentation.
@@ -19,7 +19,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// Byte offsets of `text` split into alternating whitespace / non-whitespace
 /// runs, e.g. `"a  bc"` -> `[(0,1), (1,3), (3,5)]`. Every byte of `text`
 /// belongs to exactly one run, so re-joining the runs reconstructs `text`
-/// exactly — [`wrap_breaks`] only ever chooses a run boundary as a break
+/// exactly — `wrap_breaks` only ever chooses a run boundary as a break
 /// point, never drops a byte.
 fn runs(text: &str) -> Vec<(usize, usize)> {
     let mut runs = Vec::new();
@@ -113,7 +113,7 @@ pub(crate) fn wrap_breaks(text: &str, width: usize) -> Vec<usize> {
     breaks
 }
 
-/// Number of rows [`wrap_breaks`] would wrap `text` into at `width` — used
+/// Number of rows `wrap_breaks` would wrap `text` into at `width` — used
 /// for height math where the wrapped content itself isn't needed.
 pub(crate) fn row_count(text: &str, width: usize) -> usize {
     wrap_breaks(text, width).len()
@@ -122,16 +122,16 @@ pub(crate) fn row_count(text: &str, width: usize) -> usize {
 /// A visual row's byte span within (possibly multi-line) text, half-open
 /// (`start..end`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Row {
+pub struct Row {
     pub start: usize,
     pub end: usize,
 }
 
 /// Visual rows for `text` (which may contain `'\n'`) wrapped at `width`
 /// display columns — the composer's row/cursor geometry (#215), built on the
-/// same [`wrap_breaks`] the conversation pane uses so both stay in lockstep.
+/// same `wrap_breaks` the conversation pane uses so both stay in lockstep.
 ///
-/// Splits on `'\n'` first, then windows each logical line's [`wrap_breaks`]
+/// Splits on `'\n'` first, then windows each logical line's `wrap_breaks`
 /// output into spans the same way `ui.rs`'s `content_lines`/`text_lines`
 /// slice `line[row_start..row_end]` — the break list always starts at `0`
 /// and the last break's row extends to the line's end.
@@ -140,7 +140,8 @@ pub(crate) struct Row {
 /// `conversation::content_rows`): one unwrapped `Row` per logical line.
 ///
 /// Always returns at least one `Row` — empty text yields a single empty row.
-pub(crate) fn layout_rows(text: &str, width: usize) -> Vec<Row> {
+#[must_use]
+pub fn layout_rows(text: &str, width: usize) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut line_start = 0usize;
     for line in text.split('\n') {
