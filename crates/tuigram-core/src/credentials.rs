@@ -38,12 +38,27 @@ pub const API_ID_PUBLISHED_FLOOD: &str = "API_ID_PUBLISHED_FLOOD";
 /// Low-value relative to the `TDLib` session (which is live account access), but
 /// still never committed to git. These map straight onto the `api_id`/`api_hash`
 /// fields of [`crate::ClientParameters`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `api_hash` is not [`zeroize`](https://docs.rs/zeroize)d on drop (#178):
+/// `TDLib` keeps its own copy on the C++ side for the client's lifetime, so
+/// scrubbing the Rust-side `String` would not remove the value from process
+/// memory — it would add a dependency for no real protection.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApiCredentials {
     /// Telegram API id (a positive integer).
     pub api_id: i32,
     /// Telegram API hash (a hex string).
     pub api_hash: String,
+}
+
+impl std::fmt::Debug for ApiCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the hash, even in logs/panics that format it (#178).
+        f.debug_struct("ApiCredentials")
+            .field("api_id", &self.api_id)
+            .field("api_hash", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Interactive first-run capture of freshly-registered credentials.
@@ -462,6 +477,18 @@ mod tests {
             resolver.resolve(&NeverPrompts),
             Err(CredentialError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn debug_redacts_the_api_hash() {
+        let creds = sample();
+        let shown = format!("{creds:?}");
+        assert!(
+            !shown.contains(&creds.api_hash),
+            "Debug must not leak the api_hash"
+        );
+        assert!(shown.contains("redacted"));
+        assert!(shown.contains(&creds.api_id.to_string()));
     }
 
     #[test]
