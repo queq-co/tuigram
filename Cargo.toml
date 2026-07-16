@@ -114,3 +114,9 @@ cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
 cast_sign_loss = "allow"
 cast_precision_loss = "allow"
+
+# #179b: ban `.unwrap()` outside tests. Every non-test call site becomes
+# `.expect("reason")` describing the invariant that makes the unwrap safe, or
+# (where the invariant doesn't actually hold — TDLib response parsing,
+# config/session file I/O, user input) proper `Result` propagation instead.
+unwrap_used = "warn"

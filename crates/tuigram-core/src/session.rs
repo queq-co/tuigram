@@ -414,6 +414,7 @@ impl From<io::Error> for SessionError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use std::cell::RefCell;

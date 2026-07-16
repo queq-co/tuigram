@@ -141,6 +141,7 @@ impl SecretChatStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use crate::model::{ChatKind, SecretChatState};
