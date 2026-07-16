@@ -224,7 +224,7 @@ jobs:
             README.md
           sparse-checkout-cone-mode: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-bin-${{ matrix.name }}
           path: dl
@@ -279,7 +279,7 @@ jobs:
     needs: package
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: package-*
           merge-multiple: true
@@ -300,11 +300,11 @@ jobs:
     needs: [preflight, sums]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: 'package-*'
           merge-multiple: true
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: sha256sums
       - env:
@@ -340,7 +340,7 @@ jobs:
     # #167 measurement settled on for the static build, nothing more.
     container: debian:stable-slim
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: package-linux-x86_64
       - run: |
@@ -365,7 +365,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     container: debian:stable-slim
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: package-linux-arm64
       - run: |
@@ -384,7 +384,7 @@ jobs:
     # "self-contained, nothing required at runtime" — this is the test of
     # that claim, not a setup step to skip.
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: package-macos-arm64
       - shell: bash
@@ -405,7 +405,7 @@ jobs:
     needs: [preflight, package]
     runs-on: windows-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: package-windows-x86_64
       - shell: pwsh
@@ -464,7 +464,7 @@ jobs:
     needs: [preflight, sums, publish]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: sha256sums
 
