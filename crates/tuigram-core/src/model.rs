@@ -2125,6 +2125,7 @@ impl Chat {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use tdlib_rs::enums::ChatAvailableReactions;

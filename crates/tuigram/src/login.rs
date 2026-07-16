@@ -808,6 +808,7 @@ fn error_line_widget(text: &str) -> Line<'static> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use ratatui::Terminal;

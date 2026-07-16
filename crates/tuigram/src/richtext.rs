@@ -135,6 +135,7 @@ pub fn styled_spans(text: &str, entities: &[TextEntity], selected: bool) -> Vec<
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use tuigram_core::model::TextEntity;
