@@ -223,6 +223,14 @@ pub struct ConversationView {
     /// as it did before #214. Carried across a chat switch the same way
     /// `viewport`/`graphics_capable` are, for the same reason.
     width: usize,
+    /// Whether a message has arrived at the tail while the reader was
+    /// scrolled away from the newest one — the official app's "new messages"
+    /// down-arrow. Set in [`project`](Self::project) when a same-chat refresh
+    /// appends a new newest message and the view was not following the tail;
+    /// cleared the moment the view reaches [`newest_anchor`](Self::newest_anchor)
+    /// again (scrolling down, paging down, or jumping to newest), so it never
+    /// lingers once the reader has actually caught up.
+    new_messages_below: bool,
 }
 
 impl ConversationView {
@@ -251,6 +259,7 @@ impl ConversationView {
             unread_separator: None,
             graphics_capable: false,
             width: 0,
+            new_messages_below: false,
         }
     }
 
@@ -303,11 +312,13 @@ impl ConversationView {
             // the selected message under the cursor by id.
             let following = self.is_at_newest();
             let anchor = self.selected_message().map(|m| m.id);
+            let old_newest = self.messages.last().map(|m| m.id);
             self.messages = messages;
             self.pinned = pinned;
             self.senders = senders;
             if following {
                 (self.offset, self.row_skip) = self.newest_anchor();
+                self.new_messages_below = false;
             } else {
                 self.offset = anchor
                     .and_then(|id| self.messages.iter().position(|m| m.id == id))
@@ -317,6 +328,12 @@ impl ConversationView {
                 // added, media finishing a download); land on its header rather
                 // than trying to preserve an exact row position across that.
                 self.row_skip = 0;
+                // A genuinely new message landed at the tail (not just an edit
+                // or deletion elsewhere) while the reader was scrolled away —
+                // show the down-arrow until they scroll or jump back down.
+                if self.messages.last().map(|m| m.id) != old_newest {
+                    self.new_messages_below = true;
+                }
             }
         } else {
             // A different chat opened: a fresh view, dropping the previous chat's
@@ -573,6 +590,9 @@ impl ConversationView {
             self.offset += 1;
             self.row_skip = 0;
         }
+        if self.is_at_newest() {
+            self.new_messages_below = false;
+        }
     }
 
     /// Scroll one row toward the oldest (#222): retreats within the current
@@ -629,6 +649,7 @@ impl ConversationView {
     /// the "message at offset" cursor); repeated `k` then walks upward from there.
     pub fn jump_to_newest(&mut self) {
         (self.offset, self.row_skip) = self.newest_anchor();
+        self.new_messages_below = false;
     }
 
     /// Whether the view is pinned to the newest message — sitting exactly at the
@@ -638,6 +659,14 @@ impl ConversationView {
     #[must_use]
     pub fn is_at_newest(&self) -> bool {
         (self.offset, self.row_skip) == self.newest_anchor()
+    }
+
+    /// Whether a message has arrived below the fold while the reader was
+    /// scrolled away from the newest message — drives the "new messages"
+    /// down-arrow drawn in the history pane's bottom-right corner.
+    #[must_use]
+    pub fn has_new_messages_below(&self) -> bool {
+        self.new_messages_below
     }
 
     /// Record the history pane's inner height (rows) measured by the last render
@@ -1616,6 +1645,146 @@ mod tests {
             3,
             "index shifted by the two prepended messages"
         );
+    }
+
+    #[test]
+    fn a_new_message_while_scrolled_up_shows_the_new_messages_indicator() {
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.scroll_up(); // off the newest anchor
+        assert!(!view.has_new_messages_below());
+
+        // A new message (5) arrives at the tail while scrolled away from it.
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(view.has_new_messages_below());
+    }
+
+    #[test]
+    fn following_the_tail_never_shows_the_new_messages_indicator() {
+        // Pinned to the newest message: new arrivals auto-follow, so there is
+        // nothing hidden below the fold to signal.
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        assert!(view.is_at_newest());
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(view.is_at_newest());
+        assert!(!view.has_new_messages_below());
+    }
+
+    #[test]
+    fn a_refresh_with_no_new_tail_message_does_not_show_the_indicator() {
+        // Scrolled away from the tail, but the refresh only edited an existing
+        // message (same newest id) — nothing new arrived, so no indicator.
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.scroll_up();
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m (edited)")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(!view.has_new_messages_below());
+    }
+
+    #[test]
+    fn the_new_messages_indicator_clears_on_jump_to_newest() {
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.scroll_up();
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(view.has_new_messages_below());
+        view.jump_to_newest();
+        assert!(!view.has_new_messages_below());
+    }
+
+    #[test]
+    fn the_new_messages_indicator_clears_on_scrolling_back_to_the_anchor() {
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.scroll_up();
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(view.has_new_messages_below());
+        for _ in 0..100 {
+            view.scroll_down();
+        }
+        assert!(view.is_at_newest());
+        assert!(!view.has_new_messages_below());
     }
 
     #[test]
