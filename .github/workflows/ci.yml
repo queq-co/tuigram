@@ -40,13 +40,13 @@ jobs:
           # macOS Intel (x86_64) is intentionally not supported.
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # Honors rust-toolchain.toml (channel + rustfmt/clippy).
       - name: Install Rust toolchain
         run: rustup show
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       # The Linux prebuilt tdjson links LLVM's libc++ (not libstdc++), which is
       # not preinstalled on ubuntu runners. OpenSSL 3 + zlib already are. Install
@@ -163,10 +163,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install Rust toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       - name: cargo doc (intra-doc links)
         env:
           RUSTDOCFLAGS: -D warnings
@@ -184,7 +184,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Check whether tuigram-core has a published baseline
         id: baseline
         run: |
@@ -197,10 +197,17 @@ jobs:
       - name: Install Rust toolchain
         if: steps.baseline.outputs.published == 'true'
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         if: steps.baseline.outputs.published == 'true'
-      - uses: taiki-e/install-action@cargo-semver-checks
+      # taiki-e/install-action's own README warns against hashing the
+      # `@<tool-name>` convenience tag directly (it moves on every tool
+      # release, so a hash of it can reference a commit later absent from the
+      # repo — an "impostor commit"). Pin the *action's* versioned release tag
+      # instead and select the tool via `with:`.
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
         if: steps.baseline.outputs.published == 'true'
+        with:
+          tool: cargo-semver-checks
       - name: cargo semver-checks
         if: steps.baseline.outputs.published == 'true'
         run: cargo semver-checks check-release -p tuigram-core
@@ -216,10 +223,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Install Rust toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@cargo-deny
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # See the semver-checks job above for why this pins the versioned
+      # release tag rather than hashing the `@cargo-deny` convenience tag.
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-deny
       - name: cargo deny check
         run: cargo deny check -A unmaintained -A notice

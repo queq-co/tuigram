@@ -54,6 +54,53 @@ actual build/package/publish once a matching tag lands.
    gh release delete v2026.7.1-test1 --yes
    ```
 
+## Vulnerability response (out-of-band patch releases)
+
+A RustSec advisory (or an OpenSSL/zlib/tdjson CVE — see below) can require a
+release outside the normal CalVer cadence. Triggers, in order of how they're
+usually noticed:
+
+- **The weekly advisory sweep** (`.github/workflows/deny-weekly.yml`, #176):
+  runs `cargo deny check advisories` every Monday against whatever's in
+  `Cargo.lock` at the time, independent of pushes. A new high/critical
+  advisory affecting a dependency actually compiled into a shipped binary is
+  the primary trigger for an out-of-band release.
+- **A GitHub Security Advisory / Dependabot alert** on this repo directly.
+- **An upstream OpenSSL, zlib, or tdjson advisory** — see the frozen-OpenSSL
+  note below; these don't necessarily show up in `cargo deny`'s Rust-crate
+  advisory database at all, since the vulnerable code isn't a Cargo
+  dependency.
+
+**Frozen-OpenSSL problem:** release artifacts do not link OpenSSL dynamically
+against whatever the end user's system provides at run time — they freeze a
+specific build of it:
+
+- **macOS** artifacts bundle the build machine's Homebrew `openssl@3` dylibs
+  directly into the archive (`scripts/bundle-native-deps.sh`), so an
+  OpenSSL patch on the *build* runner's Homebrew is invisible to already-shipped
+  users — that dylib only updates on the next build.
+- The **Windows** prebuilt and **release-mode static Linux** builds link
+  OpenSSL statically into `tdjson`/the binary at compile time (see
+  `docs/research/tdlib.md`), so a patched OpenSSL on the *runtime* host has no
+  effect either — the vulnerable code is baked into the artifact itself.
+
+Consequence: an OpenSSL (or zlib) advisory serious enough to act on requires a
+**rebuild and re-release**, even with zero application code changes — bumping
+the patch version and re-running the checklist above (step 2 onward) picks up
+whatever OpenSSL/zlib the build runners provide at that later date. There is
+no way to patch a shipped archive in place; the fix is always a new tagged
+release.
+
+`cargo-auditable` (#177): release builds run through `cargo auditable build`,
+which embeds the exact resolved Cargo dependency tree in a linker section of
+the binary. Given a shipped `tuigram` binary from any past release, `cargo
+audit bin tuigram` (from the [`cargo-audit`] tool, not `cargo-deny`) answers
+"is *this specific artifact* affected?" against RustSec's database without
+having to reconstruct which `Cargo.lock` it was built from — useful for
+triaging a report against an old release still in the wild.
+
+[`cargo-audit`]: https://github.com/rustsec/rustsec/tree/main/cargo-audit
+
 ## macOS distribution note
 
 Direct macOS binary download is **unsupported** — no code-signing identity,
