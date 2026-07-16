@@ -695,26 +695,27 @@ fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows 
         &mut scrollbar_state,
     );
 
-    // New-messages indicator: mirrors the official app's down-arrow, shown in
-    // the pane's bottom-right corner whenever a message has arrived below the
-    // fold while the reader was scrolled away from the newest one (cleared as
-    // soon as they scroll or jump back down — see `ConversationView::project`).
-    // Placed one column left of the scrollbar and one row above the bottom
-    // border so it never overlaps either.
-    if view.has_new_messages_below() && area.width > 2 && area.height > 2 {
+    // New-messages indicator: mirrors the official app's down-arrow, drawn as
+    // a small rounded badge in the pane's bottom-right corner whenever a
+    // message has arrived below the fold while the reader was scrolled away
+    // from the newest one (cleared as soon as they scroll or jump back down —
+    // see `ConversationView::project`). Anchored so its bottom-right cell
+    // sits one column left of the scrollbar and one row above the bottom
+    // border, the same spot the earlier single-glyph version occupied.
+    if view.has_new_messages_below() && area.width > 6 && area.height > 5 {
+        const BADGE: [&str; 3] = ["╭─╮", "│▼│", "╰─╯"];
         let rect = Rect {
-            x: area.x + area.width - 3,
-            y: area.y + area.height - 2,
-            width: 1,
-            height: 1,
+            x: area.x + area.width - 5,
+            y: area.y + area.height - 4,
+            width: 3,
+            height: 3,
         };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "▼",
-                Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )),
-            rect,
-        );
+        let style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+        let lines: Vec<Line> = BADGE
+            .iter()
+            .map(|row| Line::from(Span::styled(*row, style)))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), rect);
     }
 
     // Absolute-row rows for hit-testing (matches the avatar overlay's own
@@ -2961,8 +2962,8 @@ mod tests {
     fn the_new_messages_indicator_renders_in_the_bottom_right_corner_when_set() {
         // Scroll away from the newest message, then project a genuinely new
         // one arriving at the tail — `has_new_messages_below` is now set, and
-        // the render pass should draw the down-arrow one column left of the
-        // scrollbar and one row above the bottom border.
+        // the render pass should draw the rounded badge one column left of
+        // the scrollbar and one row above the bottom border.
         let mut view = ConversationView::default();
         view.set_viewport_height(6); // fits two 3-row messages
         view.project(
@@ -2990,9 +2991,13 @@ mod tests {
         let output = render_output(&app, 80, 24);
         let buffer = render(&app, 80, 24);
         let area = output.panes.history;
-        let x = area.x + area.width - 3;
-        let y = area.y + area.height - 2;
-        assert_eq!(buffer[(x, y)].symbol(), "▼");
+        let x = area.x + area.width - 5;
+        let y = area.y + area.height - 4;
+        assert_eq!(buffer[(x, y)].symbol(), "╭", "top-left corner");
+        assert_eq!(buffer[(x + 2, y)].symbol(), "╮", "top-right corner");
+        assert_eq!(buffer[(x + 1, y + 1)].symbol(), "▼", "centered arrow");
+        assert_eq!(buffer[(x, y + 2)].symbol(), "╰", "bottom-left corner");
+        assert_eq!(buffer[(x + 2, y + 2)].symbol(), "╯", "bottom-right corner");
     }
 
     #[test]
@@ -3000,9 +3005,10 @@ mod tests {
         let output = render_output(&app_with_history(vec![text_message(1, "m1")]), 80, 24);
         let buffer = render(&app_with_history(vec![text_message(1, "m1")]), 80, 24);
         let area = output.panes.history;
-        let x = area.x + area.width - 3;
-        let y = area.y + area.height - 2;
-        assert_ne!(buffer[(x, y)].symbol(), "▼");
+        let x = area.x + area.width - 5;
+        let y = area.y + area.height - 4;
+        assert_ne!(buffer[(x + 1, y + 1)].symbol(), "▼");
+        assert_ne!(buffer[(x, y)].symbol(), "╭");
     }
 
     #[test]
