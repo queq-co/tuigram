@@ -663,8 +663,8 @@ impl Message {
 
 /// A chat's unsent compose draft — tuigram's projection of `TDLib`'s
 /// `DraftMessage`. Telegram syncs this half-typed message across the account's
-/// devices, so it is **chat state, not history**: it lives on the [`Chat`]
-/// snapshot and never enters the message store.
+/// devices, so it is **chat state, not history**: it lives on the
+/// [`Chat`](super::chat::Chat) snapshot and never enters the message store.
 ///
 /// Phase 3 models a **text** draft — the realistic case for a keyboard-driven
 /// client. `TDLib` also allows voice/video-note drafts, which carry no text and

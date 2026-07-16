@@ -70,7 +70,8 @@ impl ChatKind {
 
 /// The lifecycle state of a [`SecretChat`] — tuigram's projection of `TDLib`'s
 /// `SecretChatState`. Total over the enum, no catch-all, the same discipline as
-/// [`Presence`]: a new state fails to compile here until it is classified.
+/// [`Presence`](super::user::Presence): a new state fails to compile here
+/// until it is classified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecretChatState {
     /// Not yet established — waiting for the partner to come online and complete

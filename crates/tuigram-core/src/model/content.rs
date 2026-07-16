@@ -10,7 +10,8 @@ use tdlib_rs::types::{
 use super::richtext::FormattedText;
 
 /// A geographic point — tuigram's projection of `TDLib`'s `Location`. Reused by
-/// both a [`MessageContent::Location`] message and a [`Venue`].
+/// both a [`MessageContent::Location`](super::message::MessageContent::Location)
+/// message and a [`Venue`].
 ///
 /// This is the static point only; `TDLib`'s live-location fields (update period,
 /// heading, proximity radius) live on the message wrapper and are dropped — a

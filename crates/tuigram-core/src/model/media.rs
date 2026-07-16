@@ -17,9 +17,10 @@ use super::user::decode_minithumbnail;
 /// Media (a photo, video, document, …) carries only this id; the bytes and the
 /// download/upload state live in the [`FileStore`](crate::files::FileStore),
 /// which the single update router keeps current from `updateFile`. This is the
-/// same indirection [`Sender::User`] uses for people: content stays a cheap,
-/// `Copy` reference and the mutable file state is resolved out of one store —
-/// `store.get(file_ref)` — rather than duplicated into every message snapshot.
+/// same indirection [`Sender::User`](super::user::Sender::User) uses for
+/// people: content stays a cheap, `Copy` reference and the mutable file state
+/// is resolved out of one store — `store.get(file_ref)` — rather than
+/// duplicated into every message snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileRef {
     /// `TDLib`'s per-session file id (the key into the [`FileStore`](crate::files::FileStore)).

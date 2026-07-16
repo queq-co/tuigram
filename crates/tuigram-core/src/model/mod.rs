@@ -19,8 +19,8 @@
 //! see [`Reaction`]) and so are **replies** (#210, see [`ReplyTo`]); forwards
 //! and service messages are still out of scope for this model.
 //!
-//! Split by domain (#182a) rather than kept as one file: [`user`], [`chat`],
-//! [`richtext`], [`media`], [`content`], [`message`]. Every path that was
+//! Split by domain (#182a) rather than kept as one file: `user`, `chat`,
+//! `richtext`, `media`, `content`, `message`. Every path that was
 //! previously `tuigram_core::model::X` still resolves — this module re-exports
 //! each domain's public items under the same names.
 
