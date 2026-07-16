@@ -183,7 +183,7 @@ jobs:
 
       - name: Upload release binary (macOS)
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-bin-${{ matrix.name }}
           path: |
@@ -193,7 +193,7 @@ jobs:
 
       - name: Upload release binary (Linux/Windows)
         if: runner.os != 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-bin-${{ matrix.name }}
           path: target/release/tuigram${{ runner.os == 'Windows' && '.exe' || '' }}
@@ -268,7 +268,7 @@ jobs:
           Copy-Item LICENSE, README.md "$dir/"
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: package-${{ matrix.name }}
           path: tuigram-*.${{ matrix.archive }}
@@ -284,7 +284,7 @@ jobs:
           pattern: package-*
           merge-multiple: true
       - run: sha256sum tuigram-* > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sha256sums
           path: SHA256SUMS
