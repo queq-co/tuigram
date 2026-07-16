@@ -1,6 +1,6 @@
-//! The connection-state projection: TDLib's transport link/sync status.
+//! The connection-state projection: `TDLib`'s transport link/sync status.
 //!
-//! TDLib reports its connection to Telegram through `updateConnectionState`,
+//! `TDLib` reports its connection to Telegram through `updateConnectionState`,
 //! cycling `waitingForNetwork`/`connecting` → `updating` (fetching the updates
 //! missed while offline) → `ready` (fully caught up). It is the honest answer to
 //! "is what I'm looking at current yet?" right after launch or a network blip —
@@ -14,18 +14,18 @@
 
 use tdlib_rs::enums::Update;
 
-/// TDLib's connection/sync status, projected from `updateConnectionState`.
+/// `TDLib`'s connection/sync status, projected from `updateConnectionState`.
 ///
 /// A reduced mirror of [`tdlib_rs::enums::ConnectionState`]. Only
 /// [`Ready`](Self::Ready) means the client is fully connected and caught up;
 /// every other state is a cue that the view may still be settling.
 ///
 /// Total by *exhaustive* match in [`from_tdlib`](Self::from_tdlib) — a state
-/// added by a future TDLib version is a compile error here, never a silent
+/// added by a future `TDLib` version is a compile error here, never a silent
 /// misclassification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConnectionState {
-    /// No network connectivity; TDLib is waiting for it. The startup default,
+    /// No network connectivity; `TDLib` is waiting for it. The startup default,
     /// before the first `updateConnectionState` arrives.
     #[default]
     WaitingForNetwork,
@@ -41,7 +41,7 @@ pub enum ConnectionState {
 }
 
 impl ConnectionState {
-    /// Project a TDLib [`ConnectionState`](tdlib_rs::enums::ConnectionState) onto
+    /// Project a `TDLib` [`ConnectionState`](tdlib_rs::enums::ConnectionState) onto
     /// tuigram's.
     #[must_use]
     pub fn from_tdlib(state: &tdlib_rs::enums::ConnectionState) -> Self {
@@ -67,7 +67,7 @@ impl ConnectionState {
 ///
 /// A single-value store: the most recent state wins. Defaults to
 /// [`WaitingForNetwork`](ConnectionState::WaitingForNetwork), the pre-connection
-/// state before TDLib has reported in.
+/// state before `TDLib` has reported in.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectionStore {
     state: ConnectionState,

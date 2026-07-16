@@ -1,4 +1,4 @@
-//! Per-chat message history — paged backward from TDLib and kept current by
+//! Per-chat message history — paged backward from `TDLib` and kept current by
 //! live updates, folded into one ordered, deduplicated view.
 //!
 //! A chat's messages reach tuigram two ways: **history** is *pulled* a page at a
@@ -8,7 +8,7 @@
 //! a single chronological view with no duplicates — a message seen live and then
 //! re-fetched in a history page is the same entry, not two.
 //!
-//! Ordering is by message id, which TDLib assigns monotonically within a chat, so
+//! Ordering is by message id, which `TDLib` assigns monotonically within a chat, so
 //! id-ascending is chronological (oldest first). A `BTreeMap` per chat gives that
 //! ordering and the dedupe for free: re-inserting an id replaces in place.
 //!
@@ -23,7 +23,7 @@
 //! production can fold under its lock per page, never across an await).
 //!
 //! Sending (#19) lives here too: [`SendRequests::send_text`] posts a text
-//! message (optionally a reply) and TDLib creates it optimistically with a
+//! message (optionally a reply) and `TDLib` creates it optimistically with a
 //! temporary id in [`SendState::Pending`]; the reducer then folds the lifecycle —
 //! `updateMessageSendSucceeded` swaps the temp id for the server's real one,
 //! `updateMessageSendFailed` flips the same entry to [`SendState::Failed`] — so a
@@ -105,7 +105,7 @@ use crate::model::{
 pub trait HistoryRequests {
     /// Fetch up to `limit` messages of a chat's history, older than the anchor
     /// `from_message_id` ([`NEWEST`] for the most recent). Returns the page
-    /// projected to [`Message`]s (TDLib's null entries dropped); an **empty**
+    /// projected to [`Message`]s (`TDLib`'s null entries dropped); an **empty**
     /// page means the chat's beginning was reached.
     async fn get_chat_history(
         &self,
@@ -119,10 +119,10 @@ pub trait HistoryRequests {
 #[allow(async_fn_in_trait)]
 pub trait SendRequests {
     /// Send `text` to a chat, optionally replying to `reply_to` (a message id in
-    /// the same chat; `None` for a plain message). Returns the message TDLib
+    /// the same chat; `None` for a plain message). Returns the message `TDLib`
     /// creates **optimistically** — a temporary id, [`SendState::Pending`] —
     /// which the lifecycle updates later reconcile in the store. Returns as soon
-    /// as TDLib accepts the request; it never waits for delivery.
+    /// as `TDLib` accepts the request; it never waits for delivery.
     async fn send_text(
         &self,
         chat_id: i64,
@@ -133,9 +133,9 @@ pub trait SendRequests {
     /// Send a file-backed media message (photo, video, document, audio, voice, or
     /// animation) from a local path, optionally replying to `reply_to` (a message
     /// id in the same chat). The [`OutgoingMedia`] carries the local path and an
-    /// optional caption; TDLib uploads the file and measures its metadata.
+    /// optional caption; `TDLib` uploads the file and measures its metadata.
     ///
-    /// Returns the message TDLib creates **optimistically** — a temporary id,
+    /// Returns the message `TDLib` creates **optimistically** — a temporary id,
     /// [`SendState::Pending`] — exactly like [`send_text`](Self::send_text). The
     /// upload then streams as `updateFile` (folded by the
     /// [`FileStore`](crate::files::FileStore)) and the send settles via
@@ -154,7 +154,7 @@ pub trait SendRequests {
 #[allow(async_fn_in_trait)]
 pub trait EditRequests {
     /// Replace the text of a message tuigram's account sent. Returns the edited
-    /// [`Message`] TDLib produces once the edit lands server-side; the matching
+    /// [`Message`] `TDLib` produces once the edit lands server-side; the matching
     /// `updateMessageContent` reconciles the stored copy. Errors if the message
     /// is not editable (not own, too old, not a text message).
     async fn edit_text(
@@ -165,7 +165,7 @@ pub trait EditRequests {
     ) -> Result<Message, TdError>;
 
     /// Replace the caption of a media message tuigram's account sent (an empty
-    /// `caption` clears it). Returns the edited [`Message`] TDLib produces once the
+    /// `caption` clears it). Returns the edited [`Message`] `TDLib` produces once the
     /// edit lands; the matching `updateMessageContent` reconciles the stored copy,
     /// the same fold as [`edit_text`](Self::edit_text). Errors if the message is
     /// not editable (not own, too old, not a captioned message).
@@ -180,15 +180,15 @@ pub trait EditRequests {
 /// Parse composer text into formatting entities before it is sent (#212).
 #[allow(async_fn_in_trait)]
 pub trait FormatRequests {
-    /// Parse `text` as markdown and send it through TDLib's
+    /// Parse `text` as markdown and send it through `TDLib`'s
     /// `parseTextEntities` with `TextParseMode::Markdown { version: 2 }`
-    /// (Telegram's MarkdownV2: `*bold*`, `_italic_`, `__underline__`,
+    /// (Telegram's `MarkdownV2`: `*bold*`, `_italic_`, `__underline__`,
     /// `~strikethrough~`, `` `code` ``, ```` ```pre``` ````, `[text](url)`,
     /// `||spoiler||`). Implementations should first rewrite the common
     /// "doubled-marker" convention (`**bold**`, `~~strikethrough~~`, plain
     /// `*italic*`) into that syntax — see `to_markdown_v2` in this module —
-    /// since MarkdownV2 alone has no doubled-marker forms and a literal
-    /// `**bold**` fails to parse. MarkdownV2 still requires escaping reserved
+    /// since `MarkdownV2` alone has no doubled-marker forms and a literal
+    /// `**bold**` fails to parse. `MarkdownV2` still requires escaping reserved
     /// punctuation anywhere it appears, so ordinary prose containing
     /// unescaped punctuation can still error here — callers must treat that
     /// as expected and fall back to sending `text` plain
@@ -202,7 +202,7 @@ pub trait FormatRequests {
 pub trait DeleteRequests {
     /// Delete messages from a chat. With `revoke` true the messages are removed
     /// for **everyone** (revoke for all members); with it false they are removed
-    /// only for tuigram's account. TDLib rejects a revoke it does not permit. The
+    /// only for tuigram's account. `TDLib` rejects a revoke it does not permit. The
     /// matching `updateDeleteMessages` removes them from the store.
     async fn delete(
         &self,
@@ -215,7 +215,7 @@ pub trait DeleteRequests {
 /// Acknowledge messages as read.
 #[allow(async_fn_in_trait)]
 pub trait ReadRequests {
-    /// Mark `message_ids` in a chat as read (TDLib's `viewMessages`). **Advisory**
+    /// Mark `message_ids` in a chat as read (`TDLib`'s `viewMessages`). **Advisory**
     /// — it acknowledges the messages to the server and lets the unread count
     /// settle, but the read path never waits on the result: the new count returns
     /// asynchronously as `updateChatReadInbox`, folded by the chat store. An empty
@@ -233,9 +233,9 @@ pub trait ForwardRequests {
     /// the usual forward header naming the original sender. `remove_caption` drops
     /// any caption when copying (only meaningful with `send_copy`).
     ///
-    /// Returns the messages TDLib creates **optimistically** in the target chat —
+    /// Returns the messages `TDLib` creates **optimistically** in the target chat —
     /// temporary ids, [`SendState::Pending`] — exactly like
-    /// [`send_text`](SendRequests::send_text). TDLib also streams each as
+    /// [`send_text`](SendRequests::send_text). `TDLib` also streams each as
     /// `updateNewMessage`, so the store gains them through the router on the same
     /// lifecycle path as a normal send; these returned copies are for the caller's
     /// reference, not a second insert.
@@ -262,7 +262,7 @@ pub trait SearchRequests {
     /// [`SearchResults`], never the live [`MessageStore`], so a search leaves the
     /// loaded history untouched.
     ///
-    /// Media-type filtering (TDLib's `SearchMessagesFilter`) is out of scope here
+    /// Media-type filtering (`TDLib`'s `SearchMessagesFilter`) is out of scope here
     /// — this searches all message types; filtering by content kind is a
     /// follow-up alongside the non-text content model.
     async fn search_chat_messages(
@@ -294,7 +294,7 @@ pub trait SearchRequests {
 #[allow(async_fn_in_trait)]
 pub trait ReactionRequests {
     /// Add tuigram's account's reaction to a message — a standard `emoji`
-    /// (e.g. `"👍"`), TDLib's `addMessageReaction`. **Advisory**, like
+    /// (e.g. `"👍"`), `TDLib`'s `addMessageReaction`. **Advisory**, like
     /// [`view_messages`](ReadRequests::view_messages): it acknowledges the reaction to the
     /// server and never blocks; the resulting reaction counts arrive as
     /// `updateMessageInteractionInfo`, which the [`MessageStore`] folds onto the
@@ -308,7 +308,7 @@ pub trait ReactionRequests {
         emoji: String,
     ) -> Result<(), TdError>;
 
-    /// Remove tuigram's account's emoji reaction from a message, TDLib's
+    /// Remove tuigram's account's emoji reaction from a message, `TDLib`'s
     /// `removeMessageReaction`. The counterpart to
     /// [`add_message_reaction`](Self::add_message_reaction); the matching
     /// `updateMessageInteractionInfo` folds the new counts.
@@ -323,7 +323,7 @@ pub trait ReactionRequests {
 /// Pin and unpin a chat's messages.
 #[allow(async_fn_in_trait)]
 pub trait PinRequests {
-    /// Pin a message in a chat, TDLib's `pinChatMessage`. `disable_notification`
+    /// Pin a message in a chat, `TDLib`'s `pinChatMessage`. `disable_notification`
     /// pins silently; `only_for_self` pins only for tuigram's account (a private
     /// pin). The resulting `updateMessageIsPinned` folds the chat's pinned-message
     /// set ([`Chat::pinned_message_ids`](crate::model::Chat::pinned_message_ids)).
@@ -335,7 +335,7 @@ pub trait PinRequests {
         only_for_self: bool,
     ) -> Result<(), TdError>;
 
-    /// Unpin a message in a chat, TDLib's `unpinChatMessage`. The counterpart to
+    /// Unpin a message in a chat, `TDLib`'s `unpinChatMessage`. The counterpart to
     /// [`pin_chat_message`](Self::pin_chat_message); the matching
     /// `updateMessageIsPinned` (with `is_pinned` false) folds the message out of
     /// the chat's pinned set.
@@ -379,10 +379,10 @@ impl<T> MessageRequests for T where
 
 impl Bridge {
     /// Shared send plumbing: post `content` to `chat_id` with an optional reply
-    /// target and return the optimistic message TDLib creates. The text and media
+    /// target and return the optimistic message `TDLib` creates. The text and media
     /// send paths differ only in the `content` they build, so the `send_message`
     /// call — reply mapping, the defaulted topic/options, the `from_tdlib`
-    /// projection — lives here once. TDLib also streams the message as
+    /// projection — lives here once. `TDLib` also streams the message as
     /// `updateNewMessage`, so the store gains the `Pending` entry via the router;
     /// the returned copy is for the caller's reference (its temp id), not a second
     /// insert.
@@ -523,7 +523,7 @@ fn run_length(chars: &[char], start: usize, marker: char) -> usize {
 /// Index of the next run of exactly `len` consecutive `marker` chars at or
 /// after `start`, skipping over shorter/longer runs (a code span's closing
 /// backtick fence must match the opening fence's length exactly, per
-/// CommonMark).
+/// `CommonMark`).
 fn find_exact_run(chars: &[char], start: usize, marker: char, len: usize) -> Option<usize> {
     let mut i = start;
     while i < chars.len() {
@@ -541,10 +541,10 @@ fn find_exact_run(chars: &[char], start: usize, marker: char, len: usize) -> Opt
 }
 
 /// Rewrite the common "doubled-marker" markdown convention (`**bold**`,
-/// `~~strikethrough~~`, plain `*italic*`) into the MarkdownV2 syntax TDLib's
+/// `~~strikethrough~~`, plain `*italic*`) into the `MarkdownV2` syntax `TDLib`'s
 /// `parseTextEntities` actually expects (`*bold*`, `~strikethrough~`,
 /// `_italic_`). Users commonly type the GitHub/Discord-style convention
-/// double-`*` for bold, single-`*` for italic — but MarkdownV2 has no
+/// double-`*` for bold, single-`*` for italic — but `MarkdownV2` has no
 /// doubled-marker forms and reserves single `*` for bold, so a literal
 /// `**bold**` fails to parse (two adjacent `*` close an empty entity) and
 /// the whole send falls back to plain text (see [`FormatRequests::
@@ -555,12 +555,12 @@ fn find_exact_run(chars: &[char], start: usize, marker: char, len: usize) -> Opt
 /// `~`/`~~` runs need remapping; everything else passes through unchanged.
 /// A run of 3+ consecutive markers (e.g. `***text***`) is treated the same
 /// as a run of 2 (bold/strikethrough) — nested bold+italic via a tripled
-/// marker isn't supported, the same as plain MarkdownV2 today.
+/// marker isn't supported, the same as plain `MarkdownV2` today.
 ///
 /// Code spans (`` `...` ``) and pre blocks (```` ```...``` ````) are copied
 /// through verbatim, however long their backtick run, so markers inside
 /// code are never rewritten or treated as entity delimiters. A
-/// backslash-escaped char (MarkdownV2's own escape, e.g. `\*` for a literal
+/// backslash-escaped char (`MarkdownV2`'s own escape, e.g. `\*` for a literal
 /// asterisk) is likewise copied through untouched, so an explicit escape
 /// still suppresses formatting after this rewrite.
 fn to_markdown_v2(text: &str) -> String {
@@ -615,10 +615,14 @@ fn to_markdown_v2(text: &str) -> String {
 
 /// Parse `text` as markdown ([`FormatRequests::parse_markdown`]) and send it,
 /// optionally as a reply to `reply_to`. A parse failure — expected for
-/// ordinary prose containing unescaped MarkdownV2 punctuation, not just
+/// ordinary prose containing unescaped `MarkdownV2` punctuation, not just
 /// malformed input — must never block the send, so it falls back to sending
 /// `text` plain, with no entities, exactly as an unparsed composer send did
 /// before #212.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` rejects the send.
 pub async fn send_formatted_text<C: FormatRequests + SendRequests>(
     client: &C,
     chat_id: i64,
@@ -638,6 +642,10 @@ pub async fn send_formatted_text<C: FormatRequests + SendRequests>(
 /// Parse `text` as markdown and edit a message's text with it — the edit
 /// counterpart to [`send_formatted_text`], with the same parse-failure
 /// fallback to plain text.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` rejects the edit.
 pub async fn edit_formatted_text<C: FormatRequests + EditRequests>(
     client: &C,
     chat_id: i64,
@@ -847,7 +855,7 @@ impl PinRequests for Bridge {
 
 /// A page of message-search hits plus the cursor for the next page.
 ///
-/// Generic over the cursor `C` because TDLib pages the two searches differently:
+/// Generic over the cursor `C` because `TDLib` pages the two searches differently:
 /// an in-chat search resumes from a message id (`C = i64`), a global search from
 /// an opaque string offset (`C = String`). [`next`](Self::next) is `None` at the
 /// end of results — the loop stop condition either way.
@@ -858,9 +866,9 @@ impl PinRequests for Bridge {
 // Not `Eq`: a hit's [`Message`] may carry `f64` location coordinates.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchPage<C> {
-    /// The normalized hits on this page, in the order TDLib ranked them.
+    /// The normalized hits on this page, in the order `TDLib` ranked them.
     pub messages: Vec<Message>,
-    /// Approximate total number of matches; `-1` when TDLib does not know.
+    /// Approximate total number of matches; `-1` when `TDLib` does not know.
     pub total_count: i32,
     /// Cursor for the next page, or `None` when results are exhausted.
     pub next: Option<C>,
@@ -872,7 +880,7 @@ pub struct SearchPage<C> {
 /// live) in the [`MessageStore`]; this keeps them **separate** so a search never
 /// mutates loaded history. Hits are deduplicated by `(chat_id, message_id)` — so
 /// overlapping pages, or a hit that also appears in the history already on
-/// screen, collapse onto one entry — while preserving TDLib's result ordering.
+/// screen, collapse onto one entry — while preserving `TDLib`'s result ordering.
 #[derive(Debug, Default)]
 pub struct SearchResults {
     messages: Vec<Message>,
@@ -925,17 +933,26 @@ impl SearchResults {
 }
 
 /// Anchor passed to [`HistoryRequests::get_chat_history`] to start from a chat's
-/// most recent message. TDLib reads message id `0` as "the newest".
+/// most recent message. `TDLib` reads message id `0` as "the newest".
 pub const NEWEST: i64 = 0;
 
 /// Page a chat's history backward, from the newest message to the start, folding
 /// each page through `fold`.
 ///
 /// The next anchor is the oldest message id in the page just received, so each
-/// request asks for the messages before it; paging stops when TDLib returns an
+/// request asks for the messages before it; paging stops when `TDLib` returns an
 /// empty page. Folding is left to the caller — production folds into the shared
 /// store under its lock per page (never held across the awaits here), while a
 /// test folds into a local [`MessageStore`]. Any request error is propagated.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page request.
+///
+/// # Panics
+///
+/// Never in practice: the internal `.expect()` is guarded by the preceding
+/// empty-batch check, so it only runs on a non-empty page.
 pub async fn load_history<C, F>(
     client: &C,
     chat_id: i64,
@@ -971,6 +988,10 @@ where
 /// [`NEWEST`]) and stops when the cursor comes back `None`; the hits accumulate —
 /// deduplicated by `(chat_id, message_id)` — in the returned [`SearchResults`], so
 /// a search leaves loaded history untouched. Any request error is propagated.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page of the search.
 pub async fn search_chat<C>(
     client: &C,
     chat_id: i64,
@@ -1001,10 +1022,14 @@ where
 /// a transient [`SearchResults`].
 ///
 /// The account-wide counterpart to [`search_chat`]: it resumes from the opaque
-/// string offset TDLib returns (the first page from the empty string) and stops
+/// string offset `TDLib` returns (the first page from the empty string) and stops
 /// when [`SearchPage::next`] comes back `None`. Hits across different chats stay
 /// distinct — the dedupe keys on `(chat_id, message_id)` — and, as with the
 /// in-chat search, never fold into the live [`MessageStore`]. Errors propagate.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page of the search.
 pub async fn search_global<C>(
     client: &C,
     query: String,
@@ -1172,7 +1197,7 @@ impl MessageStore {
     }
 
     /// Replace a known message's content in place (the `updateMessageContent`
-    /// fold). A no-op if the message is unknown: TDLib only edits the content of
+    /// fold). A no-op if the message is unknown: `TDLib` only edits the content of
     /// a message it already delivered, and a content-only update carries no
     /// sender/date, so we never synthesize a partial entry from one.
     fn edit_content(&mut self, chat_id: i64, message_id: i64, content: MessageContent) {
@@ -1334,7 +1359,7 @@ mod tests {
         }
     }
 
-    /// A TDLib `Message` with every field zeroed but id/chat and a text body, for
+    /// A `TDLib` `Message` with every field zeroed but id/chat and a text body, for
     /// driving the live `updateNewMessage` reducer. `sending_state` lets a test
     /// build an optimistic (Pending) message for the send lifecycle.
     fn td_message(chat_id: i64, id: i64) -> tdlib_rs::types::Message {
@@ -1402,7 +1427,7 @@ mod tests {
     }
 
     /// An optimistically-sent message: a live `updateNewMessage` carrying a temp
-    /// id and a Pending sending state, as TDLib emits right after `sendMessage`.
+    /// id and a Pending sending state, as `TDLib` emits right after `sendMessage`.
     fn pending_message(chat_id: i64, temp_id: i64) -> Update {
         Update::NewMessage(UpdateNewMessage {
             message: td_message_state(
@@ -1639,7 +1664,7 @@ mod tests {
     }
 
     /// A spy that captures the arguments of the most recent `send_text` and
-    /// echoes back the optimistic Pending message TDLib would return.
+    /// echoes back the optimistic Pending message `TDLib` would return.
     struct SendSpy {
         last: RefCell<Option<(i64, Option<i64>, FormattedText)>>,
     }
@@ -2025,7 +2050,7 @@ mod tests {
         assert_eq!(*spy.viewed.borrow(), Some((10, vec![1, 2, 3])));
     }
 
-    /// A forward as TDLib emits it: the same messages re-appear in the target chat
+    /// A forward as `TDLib` emits it: the same messages re-appear in the target chat
     /// under fresh temp ids and Pending state.
     fn forwarded_pending(target_chat: i64, temp_id: i64) -> Update {
         pending_message(target_chat, temp_id)
@@ -2042,7 +2067,7 @@ mod tests {
     }
 
     /// Captures the most recent `forward_messages` arguments and echoes back the
-    /// optimistic Pending messages TDLib would create in the target chat.
+    /// optimistic Pending messages `TDLib` would create in the target chat.
     #[derive(Default)]
     struct ForwardSpy {
         last: RefCell<Option<ForwardCall>>,
@@ -2326,7 +2351,7 @@ mod tests {
         );
     }
 
-    /// A TDLib `Message` carrying a photo with `caption`, reusing the zeroed
+    /// A `TDLib` `Message` carrying a photo with `caption`, reusing the zeroed
     /// scaffold the text helper builds and swapping only the content. `sending_state`
     /// drives the optimistic (Pending) vs settled distinction the send lifecycle
     /// needs.
@@ -2348,7 +2373,7 @@ mod tests {
     }
 
     /// A spy that captures the arguments of the most recent `send_media` /
-    /// `edit_caption` and echoes back the optimistic Pending photo TDLib returns.
+    /// `edit_caption` and echoes back the optimistic Pending photo `TDLib` returns.
     #[derive(Default)]
     struct MediaSpy {
         sent: RefCell<Option<(i64, Option<i64>, OutgoingMedia)>>,
@@ -2532,7 +2557,7 @@ mod tests {
     }
 
     /// An `updateMessageInteractionInfo` carrying `reactions` as
-    /// `(emoji, count, is_chosen)` triples — the reaction-count change TDLib
+    /// `(emoji, count, is_chosen)` triples — the reaction-count change `TDLib`
     /// streams after a reaction is added or removed.
     fn reaction_update(chat_id: i64, message_id: i64, reactions: &[(&str, i32, bool)]) -> Update {
         use tdlib_rs::types::{
@@ -2562,7 +2587,7 @@ mod tests {
         })
     }
 
-    /// An `updateMessageInteractionInfo` with no interaction info at all — TDLib's
+    /// An `updateMessageInteractionInfo` with no interaction info at all — `TDLib`'s
     /// signal that a message's last reaction (and other interactions) is gone.
     fn reaction_cleared(chat_id: i64, message_id: i64) -> Update {
         Update::MessageInteractionInfo(tdlib_rs::types::UpdateMessageInteractionInfo {

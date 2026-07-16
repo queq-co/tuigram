@@ -1,6 +1,6 @@
 //! The chat-list view-model: the projection the left pane renders from.
 //!
-//! The core [`ChatStore`](tuigram_core::ChatStore) folds TDLib's update stream
+//! The core [`ChatStore`](tuigram_core::ChatStore) folds `TDLib`'s update stream
 //! into the authoritative chat state and reads back each list already ordered
 //! ([`main_list`](tuigram_core::ChatStore::main_list),
 //! [`archive_list`](tuigram_core::ChatStore::archive_list),
@@ -80,7 +80,7 @@ pub fn project_secret_states(
 /// title, and its chats in the order the store handed them back.
 #[derive(Debug, Clone)]
 pub struct ChatList {
-    /// Which TDLib list this is (Main, Archive, or a folder by id). Read by
+    /// Which `TDLib` list this is (Main, Archive, or a folder by id). Read by
     /// [`ChatListView::project`] to preserve the active list across a
     /// re-projection (by kind, not index) and by the loop to load it on demand.
     pub kind: ChatListKind,

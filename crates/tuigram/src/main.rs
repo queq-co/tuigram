@@ -29,7 +29,7 @@
 //! and its hits fill the overlay; opening a hit jumps to its chat and scrolls to the
 //! message when it is loaded. Forwarding a hit copies its message into the picked
 //! target chat through the forward seam (#118), the copies arriving back as updates
-//! like a normal send. `main` closes TDLib
+//! like a normal send. `main` closes `TDLib`
 //! cleanly on every exit path, including a login the user quit before the facade
 //! ever started.
 
@@ -113,11 +113,11 @@ const NOTICE_TICK: Duration = Duration::from_secs(1);
 /// keeps the maintenance out of the way; each pass re-reads the loaded chats, so
 /// coverage widens as the user browses. The first tick fires at startup, when few
 /// chats are loaded, so the first effective sweep is roughly one interval in.
-const STORAGE_SWEEP_INTERVAL: Duration = Duration::from_secs(30 * 60);
+const STORAGE_SWEEP_INTERVAL: Duration = Duration::from_mins(30);
 
 /// How many chats to request per `loadChats` page when filling a list (#113).
 /// The core pager loops a list to exhaustion at this granularity, so this only
-/// sizes each batch — TDLib streams the chats back as updates the router folds.
+/// sizes each batch — `TDLib` streams the chats back as updates the router folds.
 const CHAT_PAGE: i32 = 100;
 
 /// How many messages to request per `getChatHistory` page when filling the open
@@ -214,7 +214,7 @@ async fn main() -> ExitCode {
     // Phase 2 — drive login inside the TUI. Only on `Ready` does the bridge become
     // a live `Client` and the three-pane loop run; quitting or a closed session
     // before then skips straight to shutdown.
-    let result = match run_login(&mut guard, &bridge).await {
+    let result = match Box::pin(run_login(&mut guard, &bridge)).await {
         Ok(LoginEnd::Ready) => {
             // `Arc` so the run loop can spawn background chat-list loads that each
             // hold a clone (#113); the bridge stays reachable for shutdown below.
@@ -459,7 +459,11 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                         // A secret chat's lifecycle advanced (#121): re-project the
                         // secret-state map so the row reflects pending → ready → closed.
                         AppEvent::Secret => reproject_secret_states(&mut app, client),
-                        // A dropped-update gap: re-project both panes to be safe.
+                        // A dropped-update gap: re-project both panes to be safe. Same
+                        // recovery as `ChatReadOutbox` today by coincidence, not by
+                        // shared meaning — kept as a separate arm so the two can diverge
+                        // independently.
+                        #[allow(clippy::match_same_arms)]
                         AppEvent::Lagged => {
                             reproject_chats(&mut app, client);
                             reproject_secret_states(&mut app, client);
@@ -703,7 +707,7 @@ fn drive_open_chat(
 /// Acknowledge the open chat's unread messages to Telegram (#115). When a chat is
 /// open and its newest loaded incoming message is newer than the chat's read
 /// horizon, send the unread ids through [`ReadRequests::view_messages`]
-/// (`force_read`, the `ChatHistory` source): TDLib advances the read marker and
+/// (`force_read`, the `ChatHistory` source): `TDLib` advances the read marker and
 /// replies with `updateChatReadInbox`, which the chat store folds and the loop
 /// re-projects, clearing the unread badge here and on the user's other clients.
 ///
@@ -747,7 +751,7 @@ fn drive_read_state(client: &Arc<Client>, history: &mut HistoryState) {
 /// [`send_formatted_text`], an edit through [`edit_formatted_text`] — each parsing
 /// the buffer as markdown before it goes out (#212).
 ///
-/// The send is fire-and-forget, like the read path (#115): TDLib streams the
+/// The send is fire-and-forget, like the read path (#115): `TDLib` streams the
 /// optimistic `Pending` message (and later its `Sent`/`Failed` resolution) as
 /// updates the router folds and the loop re-projects, so the composer's feedback
 /// arrives through the normal pipeline rather than this call's return. Only a
@@ -929,7 +933,7 @@ fn drive_contact_search(
 ///
 /// The forward keeps the usual "forwarded from" attribution (`send_copy` false, so no
 /// caption to strip either) — an MVP forward, not a copy-as-own. Like the send path
-/// (#116) it is fire-and-forget: TDLib streams the optimistic `Pending` copies (and
+/// (#116) it is fire-and-forget: `TDLib` streams the optimistic `Pending` copies (and
 /// their `Sent`/`Failed` resolution) into the target chat as updates the router folds,
 /// so the forward surfaces through the normal projection pipeline rather than this
 /// call's return. Only a seam-level rejection reports back, as an error toast on
@@ -1041,7 +1045,7 @@ fn drive_pin(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<Not
 /// and calls [`SendRequests::send_media`], uploading the local file into the open
 /// chat.
 ///
-/// Fire-and-forget like the text send (#116): TDLib returns an optimistic `Pending`
+/// Fire-and-forget like the text send (#116): `TDLib` returns an optimistic `Pending`
 /// message immediately, streams the upload as `updateFile` (folded by the file
 /// store, so the progress line moves), and settles the send via
 /// `updateMessageSendSucceeded`/`Failed` — all arriving back as updates the loop
@@ -1212,7 +1216,7 @@ fn reproject_secret_states(app: &mut App, client: &Arc<Client>) {
 /// requested yet this run, is downloaded at [`DOWNLOAD_PRIORITY`] and its id recorded
 /// in `downloading` so a later re-projection never re-requests it.
 ///
-/// The download runs asynchronously: TDLib streams progress as `updateFile`, folded
+/// The download runs asynchronously: `TDLib` streams progress as `updateFile`, folded
 /// by the store and re-projected onto the conversation's progress line (via
 /// [`AppEvent::File`]), so this only starts the transfer and never awaits it. A file
 /// the store has not folded yet is skipped this pass and picked up once its first
@@ -1462,7 +1466,7 @@ fn drive_inline_media(
 /// [`DeleteRequests::delete`](tuigram_core::DeleteRequests).
 ///
 /// Fire-and-forget like the send/forward paths: there is no optimistic local
-/// removal — TDLib streams `updateDeleteMessages`, folded by the message store and
+/// removal — `TDLib` streams `updateDeleteMessages`, folded by the message store and
 /// re-projected onto the open chat's history, so the message vanishes through the
 /// normal pipeline. Only a seam-level rejection reports back, as an error toast on
 /// `outbound_tx`.
@@ -1592,7 +1596,7 @@ fn drive_resync(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<
 /// Log out and exit on a confirmed logout (#195). Unlike the fire-and-forget seams
 /// this is **awaited** in the loop: logout is terminal — the whole session is going
 /// away — so on success the app quits (the outer teardown in `main` then waits for
-/// TDLib to reach `Closed` and flushes the database, exactly as on any exit),
+/// `TDLib` to reach `Closed` and flushes the database, exactly as on any exit),
 /// wiping the local session so the next launch starts at a fresh login. A rejected
 /// logout stays in the app and surfaces why, rather than stranding a half-torn-down
 /// session.
@@ -1820,9 +1824,9 @@ fn spawn_history_page(
     });
 }
 
-/// Tell TDLib a chat is now open (#207), fire-and-forget like the reaction and
+/// Tell `TDLib` a chat is now open (#207), fire-and-forget like the reaction and
 /// pin drivers — the loop never blocks a chat switch on this acknowledging.
-/// TDLib only guarantees delivery of some live updates (message reactions,
+/// `TDLib` only guarantees delivery of some live updates (message reactions,
 /// edits) for a chat it considers open, so this must run for the open chat's
 /// live updates to be trusted; see [`drive_open_chat`].
 fn spawn_open_chat(client: &Arc<Client>, chat_id: i64) {
@@ -1834,7 +1838,7 @@ fn spawn_open_chat(client: &Arc<Client>, chat_id: i64) {
 
 /// The close counterpart to [`spawn_open_chat`] (#207), fired when a chat stops
 /// being the open one. Best-effort, like the open call: a failure just means
-/// TDLib keeps treating it as open a little longer.
+/// `TDLib` keeps treating it as open a little longer.
 fn spawn_close_chat(client: &Arc<Client>, chat_id: i64) {
     let client = Arc::clone(client);
     tokio::spawn(async move {

@@ -106,8 +106,7 @@ mod tests {
             let bound = bound_action(name);
             let divergent = DIVERGENT.iter().find(|(n, _)| n == name);
             match (bound, divergent) {
-                (Some(_), None) => {}
-                (None, Some(_)) => {}
+                (Some(_), None) | (None, Some(_)) => {}
                 (Some(action), Some((_, reason))) => panic!(
                     "REPL command `{name}` is both bound to {action:?} and listed in DIVERGENT \
                      ({reason:?}) — pick one",

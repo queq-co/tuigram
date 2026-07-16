@@ -1,7 +1,7 @@
 //! The ambient-feedback layer (#88): the persistent status bar's connection state
 //! and the transient toast/notification queue.
 //!
-//! [`ConnectionState`] is the core link's lifecycle, mirrored from TDLib's
+//! [`ConnectionState`] is the core link's lifecycle, mirrored from `TDLib`'s
 //! `connectionState` — the status bar's left field. The toasts are short-lived
 //! one-off messages (a send failed, a download finished, an auth error *code*):
 //! they float over the panes **without capturing input**, so the loop never
@@ -14,10 +14,10 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 
-/// The core link's connection lifecycle, mirrored from TDLib's `connectionState`.
+/// The core link's connection lifecycle, mirrored from `TDLib`'s `connectionState`.
 /// A total set, so a status read is always classified. The real
 /// `updateConnectionState` folds into it live (#112): the core source projects
-/// every TDLib connection state onto a variant here
+/// every `TDLib` connection state onto a variant here
 /// ([`project_connection`](crate::event)), so each one is constructed in the
 /// binary, not just the tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,7 +118,7 @@ impl Notice {
     }
 
     /// An error toast naming a failed `action` and an optional core error `code`
-    /// (e.g. `error("send", Some("FLOOD_WAIT"))` → "send failed (FLOOD_WAIT)").
+    /// (e.g. `error("send", Some("FLOOD_WAIT"))` → "send failed (`FLOOD_WAIT`)").
     /// Built only from a fixed action phrase and a core code — never the user's
     /// typed input, the same rule the login flow follows.
     #[must_use]
@@ -131,7 +131,7 @@ impl Notice {
     }
 
     /// Build an error toast for a failed core request (#122): the fixed `action`
-    /// phrase plus the raw TDLib error `message`, folded through
+    /// phrase plus the raw `TDLib` error `message`, folded through
     /// [`normalize_error`] into a short readable code. This is the single entry
     /// point every Phase-6 send path funnels through, so a flood-wait, a
     /// permission denial, or a dropped link all read the same way regardless of
@@ -166,10 +166,10 @@ impl Notice {
     }
 }
 
-/// Fold a raw TDLib error message into a short, readable code for an error toast
+/// Fold a raw `TDLib` error message into a short, readable code for an error toast
 /// (#122).
 ///
-/// TDLib names a rejection with a fixed code or phrase — `FLOOD_WAIT_42`,
+/// `TDLib` names a rejection with a fixed code or phrase — `FLOOD_WAIT_42`,
 /// `CHAT_WRITE_FORBIDDEN`, `USER_PRIVACY_RESTRICTED` — never the user's input, so
 /// the raw string is always safe to show; it just doesn't read well in a toast.
 /// This collapses the common families (rate limits, permission/privacy denials,
@@ -177,7 +177,7 @@ impl Notice {
 /// a family's variants (`FLOOD_WAIT`, `SLOWMODE_WAIT`; the several `*_FORBIDDEN`s)
 /// all normalize together. Anything unrecognized keeps its original message — still
 /// a safe fixed code — so no failure is ever swallowed into a silent toast. An
-/// empty message (TDLib gave only a numeric code) yields an empty code, which
+/// empty message (`TDLib` gave only a numeric code) yields an empty code, which
 /// [`Notice::from_core_error`] renders as a bare "… failed".
 ///
 /// Ordering matters where families overlap: `USER_PRIVACY_RESTRICTED` is caught by

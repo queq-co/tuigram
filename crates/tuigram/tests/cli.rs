@@ -2,7 +2,7 @@
 //! observes (stdout/stderr/exit code) invoking the real binary, complementing
 //! `cli::parse`'s unit tests in `src/cli.rs`. Headless-safe by construction —
 //! `--version`/`--help`/an unknown argument all return before any
-//! terminal-mode or TDLib work, so this needs no TTY and holds in CI.
+//! terminal-mode or `TDLib` work, so this needs no TTY and holds in CI.
 
 use std::process::Command;
 

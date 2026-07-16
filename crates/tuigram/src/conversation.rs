@@ -1,6 +1,6 @@
 //! The conversation view-model: the projection the history pane renders from.
 //!
-//! The core [`MessageStore`](tuigram_core::messages::MessageStore) folds TDLib's
+//! The core [`MessageStore`](tuigram_core::messages::MessageStore) folds `TDLib`'s
 //! per-chat history; this is the TUI side of it — a display snapshot of the open
 //! chat's [`Message`]s plus the cursor state the store has no opinion on: the set
 //! of pinned message ids (carried by the chat, see
@@ -169,7 +169,7 @@ pub struct ConversationView {
     /// first frame measures it; the anchor then falls back to the newest message
     /// alone and the next render re-anchors against the real height.
     viewport: usize,
-    /// Download state of media files referenced by the messages, keyed by TDLib
+    /// Download state of media files referenced by the messages, keyed by `TDLib`
     /// file id, for the download-progress indicator (#85). Phase 6 projects this
     /// from the core [`FileStore`](tuigram_core::files::FileStore); empty until then.
     downloads: HashMap<i32, File>,
@@ -200,6 +200,11 @@ pub struct ConversationView {
     /// mark-read can never erase the rule the instant it appears — but a genuine
     /// re-open (see `fresh_open` on [`project`](Self::project)) resets it to
     /// pending so reopening a now-fully-read chat correctly shows no rule.
+    // The nested Option *is* the 3-state enum clippy's `option_option` suggests —
+    // spelled with `Option<Option<_>>` because `.flatten()` in
+    // `unread_separator_before` reads more plainly than a bespoke tri-state type
+    // would for this single field.
+    #[allow(clippy::option_option)]
     unread_separator: Option<Option<i64>>,
     /// Whether graphics are capable *and* enabled (#208, live since #209), set
     /// via [`set_graphics_capable`](Self::set_graphics_capable) from `App`'s
@@ -510,7 +515,7 @@ impl ConversationView {
         }
     }
 
-    /// The download state of the file with TDLib id `file_id`, if known — the
+    /// The download state of the file with `TDLib` id `file_id`, if known — the
     /// source of the media download-progress indicator.
     #[must_use]
     pub fn download(&self, file_id: i32) -> Option<&File> {
@@ -768,14 +773,16 @@ impl ConversationView {
                 .messages
                 .iter()
                 .find(|m| m.id == *message_id)
-                .map(|quoted| {
-                    let sender = self.sender_label(quoted).label;
-                    format!(
-                        ">{sender}: {}",
-                        truncate(&content_snippet(&quoted.content), 60)
-                    )
-                })
-                .unwrap_or_else(|| ">reply".to_owned()),
+                .map_or_else(
+                    || ">reply".to_owned(),
+                    |quoted| {
+                        let sender = self.sender_label(quoted).label;
+                        format!(
+                            ">{sender}: {}",
+                            truncate(&content_snippet(&quoted.content), 60)
+                        )
+                    },
+                ),
             ReplyTo::Message { .. } | ReplyTo::Unsupported(_) => ">reply".to_owned(),
         };
         if self.width == 0 {
@@ -838,7 +845,7 @@ pub(crate) const MEDIA_COLS: usize = 48;
 ///   existing download driver already fetches is present.
 /// - `Video` and `Animation` are ready as soon as they carry a minithumbnail —
 ///   embedded with the message, no download needed.
-/// - Everything else (animated stickers included — TDLib gives those no
+/// - Everything else (animated stickers included — `TDLib` gives those no
 ///   minithumbnail, and rendering their `thumbnail` would need a new
 ///   download-trigger path out of scope for #208) is never ready.
 pub(crate) fn media_ready(content: &MessageContent, downloads: &HashMap<i32, File>) -> bool {

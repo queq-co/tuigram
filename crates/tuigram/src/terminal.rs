@@ -111,9 +111,8 @@ impl TerminalGuard {
         // caller starts its event loop. A query failure (no real TTY: CI, piped
         // output) falls back to `AvatarSupport::None` rather than propagating,
         // since a missing avatar is not a fatal condition for the rest of the app.
-        let avatar_support = Picker::from_query_stdio()
-            .map(AvatarSupport::detect)
-            .unwrap_or(AvatarSupport::None);
+        let avatar_support =
+            Picker::from_query_stdio().map_or(AvatarSupport::None, AvatarSupport::detect);
         Ok(Self {
             terminal,
             avatar_support,
@@ -196,9 +195,8 @@ mod tests {
         if !std::io::stdin().is_terminal() {
             return;
         }
-        let _support = Picker::from_query_stdio()
-            .map(AvatarSupport::detect)
-            .unwrap_or(AvatarSupport::None);
+        let _support =
+            Picker::from_query_stdio().map_or(AvatarSupport::None, AvatarSupport::detect);
     }
 
     #[test]
