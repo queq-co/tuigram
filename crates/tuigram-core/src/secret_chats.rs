@@ -4,13 +4,13 @@
 //! carries only a `secret_chat_id`; the encryption state behind it — whether the
 //! key exchange is pending, the chat is ready, or it has been closed, plus the key
 //! hash for fingerprint verification — lives in a separate `secretChat` record
-//! TDLib streams as `updateSecretChat`. [`SecretChatStore`] is that kept state: the
+//! `TDLib` streams as `updateSecretChat`. [`SecretChatStore`] is that kept state: the
 //! single update router folds each secret-chat update into it via
 //! [`SecretChatStore::reduce`], and [`SecretChatStore::get`] resolves the
 //! `secret_chat_id` a `ChatKind::Secret` holds back to its [`SecretChat`] — the
 //! join that surfaces a secret chat's lifecycle in the chat snapshot.
 //!
-//! Folding is **idempotent**: TDLib re-announces a `secretChat` on every state
+//! Folding is **idempotent**: `TDLib` re-announces a `secretChat` on every state
 //! change (and on reconnect), so re-applying converges on the latest record rather
 //! than accreting. A chat advances pending → ready → closed; the store always
 //! holds the most recent state for each id.
@@ -133,7 +133,7 @@ impl SecretChatStore {
         self.chats.is_empty()
     }
 
-    /// Insert or replace a secret chat from `updateSecretChat`. TDLib sends the
+    /// Insert or replace a secret chat from `updateSecretChat`. `TDLib` sends the
     /// full record on every change, so a replace is correct.
     fn upsert(&mut self, chat: SecretChat) {
         self.chats.insert(chat.id, chat);
@@ -170,7 +170,7 @@ mod tests {
     }
 
     /// An `updateSecretChat` carrying a record in `state` (key hash present only
-    /// once ready, as TDLib does).
+    /// once ready, as `TDLib` does).
     fn secret_chat(id: i32, user_id: i64, state: TdSecretChatState, is_outbound: bool) -> Update {
         let key_hash = if matches!(state, TdSecretChatState::Ready) {
             "fingerprint".to_owned()

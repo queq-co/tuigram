@@ -406,6 +406,9 @@ pub enum Action {
 
 /// The whole app's state. Phase 5/6 widgets and real data hang off this; for now
 /// it carries only what the spine needs to prove the loop is alive.
+// Each bool is an independent, non-mutually-exclusive state dimension (quit vs.
+// dirty vs. collapsed, ...); they don't collapse into one enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct App {
     /// Set once a quit action is seen; the loop checks it and breaks.
@@ -1305,6 +1308,9 @@ impl App {
     /// Key events are resolved through the central [`keymap`] against the current
     /// focus and help-overlay state, so this stays a thin adapter and the bindings
     /// live in one place.
+    // `Event` is `Copy` here (no `bracketed-paste` feature) and this is a
+    // dispatch entry point called from 40+ sites; by-value is the natural fit.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn on_terminal_event(&self, event: Event) -> Action {
         match event {
             Event::Key(key) => keymap::resolve(self.focus, self.overlay, &key),
@@ -1420,6 +1426,9 @@ impl App {
     /// [`project_conversation`](Self::project_conversation) (#114) directly, since
     /// the projection needs the `Client` and `App` stays pure. Every remaining
     /// signal (files/auth) is a repaint nudge until its own projection lands.
+    // `&self` is unused today but kept for API symmetry with the sibling
+    // `on_terminal_event`; by-value `AppEvent` matches that method's convention.
+    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
     pub fn on_app_event(&self, event: AppEvent) -> Action {
         match event {
             AppEvent::Connection(state) => Action::SetConnection(state),
@@ -1689,7 +1698,11 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::SearchCancel => {
+            Action::SearchCancel
+            | Action::AttachCancel
+            | Action::ContactSearchCancel
+            | Action::SettingsCancel
+            | Action::LogoutCancel => {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -1869,10 +1882,6 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::AttachCancel => {
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
             Action::SecretOpen => {
                 // Offer the lifecycle action for the selected chat — start a secret
                 // chat with a private chat's user, or close an open one. The
@@ -1949,10 +1958,6 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::ContactSearchCancel => {
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
             Action::ContactResultNext => {
                 self.contacts.select_next();
                 self.dirty = true;
@@ -2015,10 +2020,6 @@ impl App {
                     }
                     self.overlay = Overlay::None;
                 }
-                self.dirty = true;
-            }
-            Action::SettingsCancel => {
-                self.overlay = Overlay::None;
                 self.dirty = true;
             }
             Action::ReplyMessage => {
@@ -2168,10 +2169,6 @@ impl App {
             }
             Action::LogoutConfirm => {
                 self.pending_logout = true;
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
-            Action::LogoutCancel => {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -3962,7 +3959,8 @@ mod tests {
         app.dispatch(Action::SecretOpen);
         assert_eq!(app.overlay(), Overlay::SecretChat);
         assert_eq!(
-            app.secret().map(|p| p.lifecycle()),
+            app.secret()
+                .map(super::super::secret::SecretChatPrompt::lifecycle),
             Some(SecretLifecycle::Start { user_id: 7 })
         );
     }
@@ -3980,7 +3978,8 @@ mod tests {
         app.dispatch(Action::SecretOpen);
         assert_eq!(app.overlay(), Overlay::SecretChat);
         assert_eq!(
-            app.secret().map(|p| p.lifecycle()),
+            app.secret()
+                .map(super::super::secret::SecretChatPrompt::lifecycle),
             Some(SecretLifecycle::Close { secret_chat_id: 9 })
         );
     }
@@ -4103,7 +4102,8 @@ mod tests {
         app.dispatch(Action::ContactResultConfirm);
         assert_eq!(app.overlay(), Overlay::SecretChat);
         assert_eq!(
-            app.secret().map(|p| p.lifecycle()),
+            app.secret()
+                .map(super::super::secret::SecretChatPrompt::lifecycle),
             Some(SecretLifecycle::Start { user_id: 7 })
         );
         assert!(app.secret().unwrap().prompt().contains("Ada Lovelace"));
@@ -4318,9 +4318,9 @@ mod tests {
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
     }
 
-    /// #210: TDLib documents `chat_id` as "may be 0 if the replied message is
+    /// #210: `TDLib` documents `chat_id` as "may be 0 if the replied message is
     /// in unknown chat" — a same-chat reply must still jump rather than
-    /// always no-op if TDLib reports `0` instead of the real chat id here.
+    /// always no-op if `TDLib` reports `0` instead of the real chat id here.
     #[test]
     fn jump_to_quoted_resolves_a_reply_whose_chat_id_is_reported_as_zero() {
         use crate::conversation::ConversationView;
@@ -4400,12 +4400,12 @@ mod tests {
 
     #[test]
     fn save_media_records_a_file_id_for_media_and_toasts_otherwise() {
-        use tuigram_core::model::{FileRef, MessageContent, Photo};
+        use tuigram_core::model::{FileRef, FormattedText, MessageContent, Photo};
         // A media message: the file id is recorded for the loop to save.
         let mut photo = crate::conversation::sample_message(
             1,
             MessageContent::Photo(Photo {
-                caption: Default::default(),
+                caption: FormattedText::default(),
                 file: FileRef::new(99),
                 width: 1,
                 height: 1,
@@ -4425,7 +4425,7 @@ mod tests {
 
     #[test]
     fn copy_message_records_text_for_a_text_message_and_toasts_otherwise() {
-        use tuigram_core::model::{FileRef, MessageContent, Photo};
+        use tuigram_core::model::{FileRef, FormattedText, MessageContent, Photo};
         // A text message: its text is recorded for the loop to copy.
         let mut app = app_with_message(text_message(1, "hello there", false));
         app.dispatch(Action::CopyMessage);
@@ -4435,7 +4435,7 @@ mod tests {
         let mut photo = crate::conversation::sample_message(
             2,
             MessageContent::Photo(Photo {
-                caption: Default::default(),
+                caption: FormattedText::default(),
                 file: FileRef::new(9),
                 width: 1,
                 height: 1,

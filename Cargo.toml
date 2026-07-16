@@ -96,3 +96,21 @@ unsafe_code = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Function-length is a module-cohesion call, not a lint-hygiene one: today's
+# flagged functions (`dispatch`, `from_tdlib`, `run`, render/view builders) are
+# single cohesive match/switch bodies, not accidental sprawl. #182 is the
+# tracked place to revisit that call as part of its module cohesion review.
+too_many_lines = "allow"
+# Every cast site reviewed (#179) is domain-bounded in a way clippy can't see
+# statically: terminal dimensions and string lengths cast to `u16` (ratatui
+# geometry, always far under `u16::MAX`), palette indices bounded by a `%` by
+# a small constant, hash functions that intentionally reinterpret bits, values
+# already clamped to `>= 0` before the cast, and test-only loop counters/ids.
+# Real truncation risk (e.g. a `TDLib` id that could exceed the target width)
+# gets a comment and, where warranted, a `try_from`/checked conversion instead
+# of relying on this allow — it is a baseline, not a blanket exemption.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"

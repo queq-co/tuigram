@@ -52,7 +52,7 @@ use crate::users::UserStore;
 
 /// How many chats [`Client::resync`] re-requests for the Main list when
 /// recovering from a dropped-update gap. Matches the harness's startup page size;
-/// TDLib re-emits the current chats as updates the router folds.
+/// `TDLib` re-emits the current chats as updates the router folds.
 const RESYNC_CHATS_PAGE: i32 = 100;
 
 /// The account content the router folds updates into: the chat list (#17) and
@@ -314,6 +314,11 @@ impl Client {
     /// The router folds updates into the same state on its own task; this is the
     /// facade's read side. The domain snapshot accessors (the chat list in #17,
     /// a chat's messages in #18) are thin wrappers over this.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account state mutex is poisoned (a prior holder panicked
+    /// while holding the lock).
     pub fn read<R>(&self, reader: impl FnOnce(&AccountState) -> R) -> R {
         reader(&self.state.lock().expect("account state mutex poisoned"))
     }
@@ -328,6 +333,11 @@ impl Client {
     /// paging a chat's history hands each page here to merge it into the store the
     /// facade reads back. This is the "production fold" `load_history` leaves to
     /// its caller; merging is deduped, so an overlapping re-page is idempotent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account state mutex is poisoned (a prior holder panicked
+    /// while holding the lock).
     pub fn merge_history(&self, page: Vec<Message>) {
         self.state
             .lock()
@@ -339,7 +349,7 @@ impl Client {
     ///
     /// When the router reports a broadcast overflow the folded snapshot may be
     /// missing updates, surfaced as [`needs_resync`](AccountState::needs_resync). This
-    /// reloads the Main chat list over the bridge — TDLib re-emits the current
+    /// reloads the Main chat list over the bridge — `TDLib` re-emits the current
     /// chats as updates the router folds — then clears the flag. Re-paging the
     /// *open* chat's history is the caller's complementary job (the core does not
     /// track which chat the UI has open); this restores the always-present chat
@@ -347,6 +357,16 @@ impl Client {
     ///
     /// On a failed reload the flag is left set so the caller can retry; the error
     /// is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` fails a page load for a reason other than the
+    /// list being exhausted, leaving `needs_resync` set for a retry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account state mutex is poisoned (a prior holder panicked
+    /// while holding the lock).
     pub async fn resync(&self) -> Result<(), TdError> {
         crate::chats::load_main_list(&self.bridge, RESYNC_CHATS_PAGE).await?;
         self.state
@@ -366,6 +386,10 @@ impl Client {
     /// untouched. `sender` optionally restricts hits to one sender. The paging
     /// itself lives in [`search_chat`](crate::messages::search_chat); the facade
     /// only binds it to this session's bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` fails a page of the search.
     pub async fn search_chat(
         &self,
         chat_id: i64,
@@ -383,6 +407,10 @@ impl Client {
     /// the same discipline: the hits are a transient view and never fold into the
     /// live [`MessageStore`]. Paging lives in
     /// [`search_global`](crate::messages::search_global).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` fails a page of the search.
     pub async fn search_messages(
         &self,
         query: String,
@@ -395,14 +423,18 @@ impl Client {
     ///
     /// `send_copy` forwards a fresh copy (no "forwarded from" attribution);
     /// `remove_caption` drops captions when copying. Unlike search, a forward is a
-    /// **write that reconciles through the router**: TDLib streams each forwarded
+    /// **write that reconciles through the router**: `TDLib` streams each forwarded
     /// message into the target chat as `updateNewMessage`, which the router folds
     /// into the [`MessageStore`] on the same optimistic-send lifecycle as
     /// [`SendRequests::send_text`](crate::messages::SendRequests::send_text). The
     /// returned [`Message`]s are the caller's
     /// reference copies of those optimistic entries (temporary ids,
     /// [`SendState::Pending`](crate::model::SendState::Pending)), not a second
-    /// insert. It returns as soon as TDLib accepts the request.
+    /// insert. It returns as soon as `TDLib` accepts the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` rejects the forward request.
     pub async fn forward_messages(
         &self,
         from_chat_id: i64,
@@ -443,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn shared_state_sink_drives_the_router() {
         let state: SharedState = Arc::new(Mutex::new(AccountState::default()));
-        let events = tokio_stream::iter([
+        let events = tokio_stream::iter(vec![
             RouterEvent::Update(Update::ChatReadInbox(UpdateChatReadInbox {
                 chat_id: 1,
                 last_read_inbox_message_id: 1,
@@ -452,7 +484,7 @@ mod tests {
             RouterEvent::Lagged(3),
         ]);
 
-        Router::new(Arc::clone(&state)).run(events).await;
+        Box::pin(Router::new(Arc::clone(&state)).run(events)).await;
 
         // Readable through the same lock the facade's `read` uses, and the lag was
         // recorded through the shared sink rather than swallowed.

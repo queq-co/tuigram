@@ -2,13 +2,13 @@
 //! into something a caller can download, observe, and open.
 //!
 //! A photo, video, or document carries only a [`FileRef`](crate::model::FileRef);
-//! the bytes and the live transfer state live here. TDLib streams every change to
+//! the bytes and the live transfer state live here. `TDLib` streams every change to
 //! a file's local/remote copy as `updateFile`, and expects the client to keep the
 //! latest. [`FileStore`] is that kept state: the single update router folds each
 //! file-route update into it via [`FileStore::reduce`], and [`FileStore::get`]
 //! reads back the current [`File`] for whatever id a media snapshot holds.
 //!
-//! Folding is **idempotent** — TDLib re-emits `updateFile` repeatedly as a
+//! Folding is **idempotent** — `TDLib` re-emits `updateFile` repeatedly as a
 //! transfer progresses and on resync — so re-applying any update converges on the
 //! newest record rather than accreting state.
 //!
@@ -28,7 +28,7 @@ use tdlib_rs::types::Error as TdError;
 use crate::bridge::Bridge;
 use crate::model::File;
 
-/// Default download priority for [`FileRequests::download_file`]. TDLib accepts
+/// Default download priority for [`FileRequests::download_file`]. `TDLib` accepts
 /// `1..=32` (higher downloads first when several are queued); a single
 /// interactive download has nothing to race, so the top priority is the simplest
 /// sensible default.
@@ -56,7 +56,7 @@ pub trait FileRequests {
     /// Start downloading a file, returning its state at the moment the request is
     /// accepted.
     ///
-    /// The download runs asynchronously: TDLib streams progress as `updateFile`,
+    /// The download runs asynchronously: `TDLib` streams progress as `updateFile`,
     /// which the router folds into the [`FileStore`], so a caller observes
     /// completion there rather than awaiting this. The returned [`File`] is the
     /// initial snapshot (typically `is_downloading_active`), for a caller that
@@ -133,7 +133,7 @@ pub trait StorageRequests {
     /// bound) and no file-type filter (all media). **`chat_ids` must be non-empty** —
     /// `optimizeStorage` treats an empty list as *every* chat, which would apply one
     /// kind's TTL globally, so the caller filters empty kinds out rather than passing
-    /// them here. The freed-space statistics TDLib returns are discarded; the sweep
+    /// them here. The freed-space statistics `TDLib` returns are discarded; the sweep
     /// is fire-and-forget maintenance.
     async fn sweep_chat_media(&self, ttl: i32, chat_ids: Vec<i64>) -> Result<(), TdError>;
 
@@ -143,7 +143,7 @@ pub trait StorageRequests {
     /// Maps to `optimizeStorage` with a size cap and no TTL or count bound, over an
     /// empty `chat_ids` — the "every chat" behaviour is deliberate here: this is the
     /// global backstop that bounds media in chats [`sweep_chat_media`](Self::sweep_chat_media)
-    /// never scopes over this session. TDLib evicts least-recently-used files first to
+    /// never scopes over this session. `TDLib` evicts least-recently-used files first to
     /// reach the ceiling. The freed-space statistics it returns are discarded; the
     /// sweep is fire-and-forget maintenance.
     async fn sweep_cache_to_size(&self, max_bytes: i64) -> Result<(), TdError>;
@@ -234,7 +234,7 @@ impl FileStore {
         self.files.is_empty()
     }
 
-    /// Insert or replace a file from `updateFile`. TDLib sends the full record on
+    /// Insert or replace a file from `updateFile`. `TDLib` sends the full record on
     /// every change, so a replace is correct — each emission supersedes the last.
     fn upsert(&mut self, file: File) {
         self.files.insert(file.id, file);
@@ -248,7 +248,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use tdlib_rs::types::{File as TdFile, LocalFile, RemoteFile, UpdateFile};
 
-    /// A TDLib `File` with the local/remote sub-records the projection reads.
+    /// A `TDLib` `File` with the local/remote sub-records the projection reads.
     fn td_file(id: i32, size: i64, path: &str, downloaded: i64, completed: bool) -> TdFile {
         TdFile {
             id,
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(store.len(), 1);
     }
 
-    /// A TDLib `File` mid-upload: bytes on the remote side, no local download
+    /// A `TDLib` `File` mid-upload: bytes on the remote side, no local download
     /// state. Mirrors what `updateFile` carries while an outgoing media message's
     /// file is being sent.
     fn td_uploading_file(id: i32, size: i64, uploaded: i64, completed: bool) -> TdFile {

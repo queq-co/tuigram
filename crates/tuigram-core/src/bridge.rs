@@ -1,4 +1,4 @@
-//! Async bridge between TDLib (`tdjson`) and tuigram's logic.
+//! Async bridge between `TDLib` (`tdjson`) and tuigram's logic.
 //!
 //! `tdjson` is driven by two C calls: a non-blocking `td_send` and a *blocking*
 //! `td_receive` poll. `tdlib-rs` already layers the request/response half on top
@@ -38,7 +38,7 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 /// Buffer of recent updates the broadcast channel retains per subscriber. A
 /// slow consumer that falls this far behind starts losing the oldest updates
-/// (surfaced as a lagged event the stream skips); generous because TDLib bursts
+/// (surfaced as a lagged event the stream skips); generous because `TDLib` bursts
 /// updates on startup and resync.
 const UPDATE_BUFFER: usize = 1024;
 
@@ -72,7 +72,7 @@ pub struct ClientParameters {
     pub use_test_dc: bool,
 }
 
-/// The update-subscription seam between TDLib and tuigram's logic.
+/// The update-subscription seam between `TDLib` and tuigram's logic.
 ///
 /// This is the transport's *read* side: a source of the unsolicited updates
 /// `tdjson` pushes. [`Bridge`] implements it over a live client; tests implement
@@ -90,7 +90,7 @@ pub struct ClientParameters {
 // is not a concern here.
 #[allow(async_fn_in_trait)]
 pub trait TgClient {
-    /// Subscribe to the stream of unsolicited updates pushed by TDLib.
+    /// Subscribe to the stream of unsolicited updates pushed by `TDLib`.
     ///
     /// Each call yields an independent subscription; updates emitted before a
     /// subscription is created are not replayed to it.
@@ -173,7 +173,7 @@ impl Drop for Bridge {
     }
 }
 
-/// A [`Stream`] of unsolicited TDLib [`Update`]s for one subscriber.
+/// A [`Stream`] of unsolicited `TDLib` [`Update`]s for one subscriber.
 ///
 /// Lagged events (the consumer fell more than `UPDATE_BUFFER` behind) are
 /// skipped rather than surfaced as errors: the stream's contract is "the next

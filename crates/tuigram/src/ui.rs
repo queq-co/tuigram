@@ -981,14 +981,16 @@ fn quote_lines(view: &ConversationView, message: &Message, width: usize) -> Vec<
             .messages()
             .iter()
             .find(|m| m.id == *message_id)
-            .map(|quoted| {
-                let sender = view.sender_label(quoted).label;
-                format!(
-                    ">{sender}: {}",
-                    truncate(&content_snippet(&quoted.content), 60)
-                )
-            })
-            .unwrap_or_else(|| ">reply".to_owned()),
+            .map_or_else(
+                || ">reply".to_owned(),
+                |quoted| {
+                    let sender = view.sender_label(quoted).label;
+                    format!(
+                        ">{sender}: {}",
+                        truncate(&content_snippet(&quoted.content), 60)
+                    )
+                },
+            ),
         ReplyTo::Message { .. } | ReplyTo::Unsupported(_) => ">reply".to_owned(),
     };
     if width == 0 {
@@ -1101,7 +1103,7 @@ fn unread_separator_line() -> Line<'static> {
     ))
 }
 
-/// The failed-send detail line (#163): TDLib's error code and message, shown
+/// The failed-send detail line (#163): `TDLib`'s error code and message, shown
 /// under one of our own messages whose send failed — always visible, not gated
 /// on selection, since a delivery failure is important to notice without hunting
 /// for it. No retry affordance here; that is explicitly out of scope (backlog),
@@ -1374,7 +1376,7 @@ fn render_composer(frame: &mut Frame, area: Rect, app: &App) {
 /// [`Line`] per row in `rows` (already laid out by
 /// [`crate::wrap::layout_rows`]), with the reverse-video cursor cell placed
 /// in `cursor_row`. Never used by the single-line fields `input_line` still
-/// serves (search/login/mediaform/settingsform/contact_picker) — those are
+/// serves (`search/login/mediaform/settingsform/contact_picker`) — those are
 /// unaffected by this addition.
 fn composer_lines(
     text: &str,
@@ -2464,9 +2466,9 @@ mod tests {
         assert!(quote_lines(&view, &message, 0).is_empty());
     }
 
-    /// #210: TDLib documents `MessageReplyToMessage.chat_id` as "may be 0 if
+    /// #210: `TDLib` documents `MessageReplyToMessage.chat_id` as "may be 0 if
     /// the replied message is in unknown chat" — a same-chat reply must still
-    /// resolve rather than always falling back to bare `>reply` if TDLib
+    /// resolve rather than always falling back to bare `>reply` if `TDLib`
     /// reports `0` here instead of the real (matching) chat id.
     #[test]
     fn quote_lines_resolves_a_reply_whose_chat_id_is_reported_as_zero() {
@@ -4184,7 +4186,7 @@ mod tests {
         );
         let buffer = render(&App::with_conversation(view), 80, 24);
         let row = row_containing(&buffer, "Ada Lovelace (@ada)");
-        let time_at = row.find(':').map(|colon| colon - 2).unwrap_or(usize::MAX);
+        let time_at = row.find(':').map_or(usize::MAX, |colon| colon - 2);
         let name_at = row.find("Ada").unwrap_or(usize::MAX);
         assert!(
             time_at < name_at,

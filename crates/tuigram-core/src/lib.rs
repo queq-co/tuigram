@@ -1,4 +1,4 @@
-//! Headless core for **tuigram** — Telegram client logic built on TDLib.
+//! Headless core for **tuigram** — Telegram client logic built on `TDLib`.
 //!
 //! This crate is intentionally free of any terminal/UI concerns so it can be
 //! unit-tested without a TTY. Phases 2–3 (auth, chats, messages) live here;
@@ -62,7 +62,7 @@ pub use session::{EncryptionKey, SessionError, SessionStorage};
 pub use settings::{CacheCap, InterfaceSettings, KeepMedia, StorageSettings};
 pub use users::{UserRequests, UserStore};
 
-/// TDLib's typed request API and data model, re-exported so callers depend on
+/// `TDLib`'s typed request API and data model, re-exported so callers depend on
 /// it through tuigram-core rather than reaching for `tdlib-rs` directly. Drive
 /// `functions::*` with a [`Bridge::id`]; the bridge's receive loop resolves the
 /// futures they return.

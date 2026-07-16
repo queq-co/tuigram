@@ -3,10 +3,10 @@
 //! The rest of the crate — and the Ratatui front-end in Phases 4–5 — depends on
 //! these types, not on `tdlib_rs` shapes directly. That is the same insulation
 //! [`AuthState`](crate::auth::AuthState) gives the login flow: a stable, minimal
-//! surface we own, projected from TDLib by a `from_tdlib` constructor.
+//! surface we own, projected from `TDLib` by a `from_tdlib` constructor.
 //!
-//! Each projection is **total** over its TDLib enum. Anything Phase 3 does not
-//! model maps to an explicit `Unsupported(name)` carrying TDLib's own type name,
+//! Each projection is **total** over its `TDLib` enum. Anything Phase 3 does not
+//! model maps to an explicit `Unsupported(name)` carrying `TDLib`'s own type name,
 //! and the projections use no catch-all `_` arm — so a `tdlib-rs` upgrade that
 //! adds a variant fails to compile here until it is classified, never silently
 //! dropped or misclassified.
@@ -55,7 +55,7 @@ pub enum Sender {
 }
 
 impl Sender {
-    /// Project TDLib's `MessageSender`.
+    /// Project `TDLib`'s `MessageSender`.
     #[must_use]
     pub fn from_tdlib(sender: &TdMessageSender) -> Self {
         match sender {
@@ -64,7 +64,7 @@ impl Sender {
         }
     }
 
-    /// Lower back to TDLib's `MessageSender`, for requests that filter by sender
+    /// Lower back to `TDLib`'s `MessageSender`, for requests that filter by sender
     /// (e.g. searching a chat for one person's messages). The inverse of
     /// [`from_tdlib`](Self::from_tdlib).
     #[must_use]
@@ -76,12 +76,12 @@ impl Sender {
     }
 }
 
-/// A user's online presence — tuigram's projection of TDLib's `UserStatus`.
+/// A user's online presence — tuigram's projection of `TDLib`'s `UserStatus`.
 ///
 /// Total over the enum with no catch-all, the same discipline as the message
 /// content projection: a new `UserStatus` variant fails to compile here until it
 /// is classified. The "recently / last week / last month" buckets carry no
-/// timestamp on purpose — TDLib hides the exact time for those and surfaces only
+/// timestamp on purpose — `TDLib` hides the exact time for those and surfaces only
 /// the bucket.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Presence {
@@ -106,7 +106,7 @@ pub enum Presence {
 }
 
 impl Presence {
-    /// Project TDLib's `UserStatus`.
+    /// Project `TDLib`'s `UserStatus`.
     #[must_use]
     pub fn from_tdlib(status: &TdUserStatus) -> Self {
         match status {
@@ -123,7 +123,7 @@ impl Presence {
 }
 
 /// A transient activity a sender is performing in a chat — tuigram's projection
-/// of TDLib's `ChatAction`, the "X is typing…" / "X is sending a photo…" status.
+/// of `TDLib`'s `ChatAction`, the "X is typing…" / "X is sending a photo…" status.
 ///
 /// Total over the enum with no catch-all, the same discipline as [`Presence`]: a
 /// new `ChatAction` variant fails to compile here until it is classified. Two
@@ -166,7 +166,7 @@ pub enum ChatAction {
 }
 
 impl ChatAction {
-    /// Project TDLib's `ChatAction`. Returns `None` for `chatActionCancel`, which
+    /// Project `TDLib`'s `ChatAction`. Returns `None` for `chatActionCancel`, which
     /// the [chat-action store](crate::actions::ChatActionStore) folds as "this
     /// sender stopped" rather than as an activity.
     #[must_use]
@@ -190,7 +190,7 @@ impl ChatAction {
         }
     }
 
-    /// Lower back to TDLib's `ChatAction`, for broadcasting our own activity over
+    /// Lower back to `TDLib`'s `ChatAction`, for broadcasting our own activity over
     /// [`ChatActionRequests::send_chat_action`](crate::actions::ChatActionRequests::send_chat_action).
     /// The dropped upload progress is sent as `0` and the watched emoji as empty —
     /// the model carries neither — which is harmless for an advisory status. The
@@ -236,7 +236,7 @@ impl ChatAction {
     }
 }
 
-/// What kind of account a [`User`] is — tuigram's projection of TDLib's
+/// What kind of account a [`User`] is — tuigram's projection of `TDLib`'s
 /// `UserType`. Total over the enum, no catch-all. The bot payload is dropped:
 /// the model only needs to know *that* an account is a bot, not its bot details.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,12 +248,12 @@ pub enum UserKind {
     /// A bot.
     Bot,
     /// An inaccessible account: not deleted, but with no information available.
-    /// TDLib says to treat it exactly like a deleted user.
+    /// `TDLib` says to treat it exactly like a deleted user.
     Unknown,
 }
 
 impl UserKind {
-    /// Project TDLib's `UserType`.
+    /// Project `TDLib`'s `UserType`.
     #[must_use]
     pub fn from_tdlib(kind: &TdUserType) -> Self {
         match kind {
@@ -265,7 +265,7 @@ impl UserKind {
     }
 }
 
-/// Decode a TDLib `Minithumbnail`'s base64 JPEG payload to raw bytes (#201,
+/// Decode a `TDLib` `Minithumbnail`'s base64 JPEG payload to raw bytes (#201,
 /// #208). Shared by every content type that carries one (`User`'s profile
 /// photo, `Video`, `Animation`) so the base64 handling lives in one place.
 /// `None` when there is no minithumbnail, or its payload fails to decode.
@@ -278,7 +278,7 @@ fn decode_minithumbnail(thumb: Option<&tdlib_rs::types::Minithumbnail>) -> Optio
     })
 }
 
-/// A user — tuigram's projection of TDLib's `User`, carrying what a sender line
+/// A user — tuigram's projection of `TDLib`'s `User`, carrying what a sender line
 /// and a private-chat header need to read as a name instead of a bare id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct User {
@@ -299,18 +299,18 @@ pub struct User {
     /// Current online presence.
     pub status: Presence,
     /// Identifier of the accent color for the user's name and header tint
-    /// (#194): TDLib's fixed built-in ids are `0..=6`; `>=7` are Telegram
+    /// (#194): `TDLib`'s fixed built-in ids are `0..=6`; `>=7` are Telegram
     /// Premium custom colors this crate does not resolve to an exact RGB yet.
     pub accent_color_id: i32,
     /// The user's profile-photo minithumbnail, decoded to raw JPEG bytes
-    /// (#201): a small inline preview TDLib delivers with the user record
+    /// (#201): a small inline preview `TDLib` delivers with the user record
     /// itself, needing no `downloadFile` round trip. `None` when the user has
     /// no profile photo, or has one with no minithumbnail attached.
     pub avatar_minithumbnail: Option<Vec<u8>>,
 }
 
 impl User {
-    /// Project TDLib's `User`. An empty phone number becomes `None`, and the
+    /// Project `TDLib`'s `User`. An empty phone number becomes `None`, and the
     /// usernames flatten to the active list (primary first).
     #[must_use]
     pub fn from_tdlib(user: &TdUser) -> Self {
@@ -367,42 +367,42 @@ impl User {
     }
 }
 
-/// A chat's classification, with the underlying TDLib id for its kind.
+/// A chat's classification, with the underlying `TDLib` id for its kind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatKind {
     /// One-to-one chat with a user.
     Private {
-        /// TDLib id of the other user in the chat.
+        /// `TDLib` id of the other user in the chat.
         user_id: i64,
     },
     /// Basic group (up to 200 members).
     BasicGroup {
-        /// TDLib id of the basic group.
+        /// `TDLib` id of the basic group.
         basic_group_id: i64,
     },
     /// Supergroup (large group).
     Supergroup {
-        /// TDLib id of the supergroup.
+        /// `TDLib` id of the supergroup.
         supergroup_id: i64,
     },
     /// Broadcast channel — a supergroup flagged as a channel.
     Channel {
-        /// TDLib id of the underlying supergroup (channels share the
+        /// `TDLib` id of the underlying supergroup (channels share the
         /// supergroup id space).
         supergroup_id: i64,
     },
     /// End-to-end encrypted secret chat. Out of Phase 3 messaging scope.
     Secret {
-        /// TDLib id of the secret chat.
+        /// `TDLib` id of the secret chat.
         secret_chat_id: i32,
-        /// TDLib id of the other user in the secret chat.
+        /// `TDLib` id of the other user in the secret chat.
         user_id: i64,
     },
 }
 
 impl ChatKind {
-    /// Project TDLib's `ChatType`. A supergroup with `is_channel` set becomes a
-    /// [`ChatKind::Channel`]; the two share TDLib's supergroup id space.
+    /// Project `TDLib`'s `ChatType`. A supergroup with `is_channel` set becomes a
+    /// [`ChatKind::Channel`]; the two share `TDLib`'s supergroup id space.
     #[must_use]
     pub fn from_tdlib(kind: &TdChatType) -> Self {
         match kind {
@@ -424,7 +424,7 @@ impl ChatKind {
     }
 }
 
-/// The lifecycle state of a [`SecretChat`] — tuigram's projection of TDLib's
+/// The lifecycle state of a [`SecretChat`] — tuigram's projection of `TDLib`'s
 /// `SecretChatState`. Total over the enum, no catch-all, the same discipline as
 /// [`Presence`]: a new state fails to compile here until it is classified.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -439,7 +439,7 @@ pub enum SecretChatState {
 }
 
 impl SecretChatState {
-    /// Project TDLib's `SecretChatState`.
+    /// Project `TDLib`'s `SecretChatState`.
     #[must_use]
     pub fn from_tdlib(state: &TdSecretChatState) -> Self {
         match state {
@@ -450,7 +450,7 @@ impl SecretChatState {
     }
 }
 
-/// An end-to-end encrypted secret chat — tuigram's projection of TDLib's
+/// An end-to-end encrypted secret chat — tuigram's projection of `TDLib`'s
 /// `SecretChat`, the encryption state behind a
 /// [`ChatKind::Secret`] chat in the snapshot.
 ///
@@ -476,7 +476,7 @@ pub struct SecretChat {
 }
 
 impl SecretChat {
-    /// Project TDLib's `SecretChat`.
+    /// Project `TDLib`'s `SecretChat`.
     #[must_use]
     pub fn from_tdlib(chat: &TdSecretChat) -> Self {
         Self {
@@ -491,7 +491,7 @@ impl SecretChat {
     /// Whether the chat is established and usable for messaging.
     ///
     /// Both text and media sends only succeed once the key exchange has
-    /// completed — TDLib rejects a send to a [`Pending`](SecretChatState::Pending)
+    /// completed — `TDLib` rejects a send to a [`Pending`](SecretChatState::Pending)
     /// or [`Closed`](SecretChatState::Closed) chat. A driver gates the compose path
     /// on this so it never posts into a chat the server will refuse; the message
     /// itself then flows through the ordinary
@@ -515,7 +515,7 @@ pub enum ChatListKind {
 }
 
 impl ChatListKind {
-    /// Project TDLib's `ChatList`.
+    /// Project `TDLib`'s `ChatList`.
     #[must_use]
     pub fn from_tdlib(list: &TdChatList) -> Self {
         match list {
@@ -525,7 +525,7 @@ impl ChatListKind {
         }
     }
 
-    /// Build TDLib's `ChatList`, for the request side (e.g. selecting which list
+    /// Build `TDLib`'s `ChatList`, for the request side (e.g. selecting which list
     /// to page with `loadChats`). Total, mirroring [`from_tdlib`](Self::from_tdlib):
     /// a new variant added here must be handled rather than defaulting.
     #[must_use]
@@ -556,7 +556,7 @@ pub struct ChatFolderInfo {
 }
 
 impl ChatFolderInfo {
-    /// Project TDLib's `chatFolderInfo` down to the id and display title tuigram
+    /// Project `TDLib`'s `chatFolderInfo` down to the id and display title tuigram
     /// lists. A partial projection by design — the icon, color, and share state
     /// are not modelled (follow-up issues); the title is the name's plain text.
     #[must_use]
@@ -581,7 +581,7 @@ pub struct ChatPosition {
 }
 
 impl ChatPosition {
-    /// Project TDLib's `ChatPosition`.
+    /// Project `TDLib`'s `ChatPosition`.
     #[must_use]
     pub fn from_tdlib(position: &TdChatPosition) -> Self {
         Self {
@@ -595,13 +595,13 @@ impl ChatPosition {
 /// The delivery state of a message tuigram is sending.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendState {
-    /// Delivered to the server — TDLib carries no sending state.
+    /// Delivered to the server — `TDLib` carries no sending state.
     Sent,
     /// Optimistically created locally, awaiting the server's acknowledgement.
     Pending,
     /// The server rejected the send; carries the error for display and retry.
     Failed {
-        /// TDLib error code.
+        /// `TDLib` error code.
         code: i32,
         /// Human-readable error message.
         message: String,
@@ -609,7 +609,7 @@ pub enum SendState {
 }
 
 impl SendState {
-    /// Project TDLib's optional `MessageSendingState` (`None` ⇒ delivered).
+    /// Project `TDLib`'s optional `MessageSendingState` (`None` ⇒ delivered).
     #[must_use]
     pub fn from_tdlib(state: Option<&TdMessageSendingState>) -> Self {
         match state {
@@ -623,7 +623,7 @@ impl SendState {
     }
 }
 
-/// The kind of a formatting [`TextEntity`] — tuigram's projection of TDLib's
+/// The kind of a formatting [`TextEntity`] — tuigram's projection of `TDLib`'s
 /// `TextEntityType`. Data-bearing entities keep their payload; the rest are
 /// pure styling or auto-detected spans.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -674,12 +674,12 @@ pub enum EntityKind {
     },
     /// A mention of a user with no username, by id.
     MentionName {
-        /// TDLib id of the mentioned user.
+        /// `TDLib` id of the mentioned user.
         user_id: i64,
     },
     /// A custom emoji, by sticker id.
     CustomEmoji {
-        /// TDLib id of the custom emoji sticker.
+        /// `TDLib` id of the custom emoji sticker.
         custom_emoji_id: i64,
     },
     /// A clickable media timestamp, in seconds.
@@ -690,7 +690,7 @@ pub enum EntityKind {
 }
 
 impl EntityKind {
-    /// Project TDLib's `TextEntityType`.
+    /// Project `TDLib`'s `TextEntityType`.
     #[must_use]
     pub fn from_tdlib(kind: &TdTextEntityType) -> Self {
         match kind {
@@ -725,7 +725,7 @@ impl EntityKind {
         }
     }
 
-    /// Project back to TDLib's `TextEntityType`, for entities on outgoing text.
+    /// Project back to `TDLib`'s `TextEntityType`, for entities on outgoing text.
     /// Total, mirroring [`EntityKind::from_tdlib`]: a new variant added here must
     /// be sendable too, or it fails to compile.
     #[must_use]
@@ -776,7 +776,7 @@ impl EntityKind {
 }
 
 /// One formatting span within a [`FormattedText`]. Offsets and lengths are in
-/// UTF-16 code units, as TDLib reports them.
+/// UTF-16 code units, as `TDLib` reports them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TextEntity {
     /// Start of the span, in UTF-16 code units.
@@ -788,7 +788,7 @@ pub struct TextEntity {
 }
 
 impl TextEntity {
-    /// Project TDLib's `TextEntity`.
+    /// Project `TDLib`'s `TextEntity`.
     #[must_use]
     pub fn from_tdlib(entity: &TdTextEntity) -> Self {
         Self {
@@ -798,7 +798,7 @@ impl TextEntity {
         }
     }
 
-    /// Project back to TDLib's `TextEntity`, for an outgoing formatted message.
+    /// Project back to `TDLib`'s `TextEntity`, for an outgoing formatted message.
     #[must_use]
     pub fn to_tdlib(&self) -> TdTextEntity {
         TdTextEntity {
@@ -809,7 +809,7 @@ impl TextEntity {
     }
 }
 
-/// Text with its formatting entities — tuigram's projection of TDLib's
+/// Text with its formatting entities — tuigram's projection of `TDLib`'s
 /// `FormattedText`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FormattedText {
@@ -820,7 +820,7 @@ pub struct FormattedText {
 }
 
 impl FormattedText {
-    /// Project TDLib's `FormattedText`.
+    /// Project `TDLib`'s `FormattedText`.
     #[must_use]
     pub fn from_tdlib(text: &TdFormattedText) -> Self {
         // Trust boundary: message bodies and captions are attacker-controlled and
@@ -833,7 +833,7 @@ impl FormattedText {
         }
     }
 
-    /// Project back to TDLib's `FormattedText`, for sending. A plain string with
+    /// Project back to `TDLib`'s `FormattedText`, for sending. A plain string with
     /// no entities round-trips as bare text.
     #[must_use]
     pub fn to_tdlib(&self) -> TdFormattedText {
@@ -844,7 +844,7 @@ impl FormattedText {
     }
 }
 
-/// A reference to a TDLib file, as held by media message content.
+/// A reference to a `TDLib` file, as held by media message content.
 ///
 /// Media (a photo, video, document, …) carries only this id; the bytes and the
 /// download/upload state live in the [`FileStore`](crate::files::FileStore),
@@ -854,12 +854,12 @@ impl FormattedText {
 /// `store.get(file_ref)` — rather than duplicated into every message snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FileRef {
-    /// TDLib's per-session file id (the key into the [`FileStore`](crate::files::FileStore)).
+    /// `TDLib`'s per-session file id (the key into the [`FileStore`](crate::files::FileStore)).
     pub id: i32,
 }
 
 impl FileRef {
-    /// Wrap a TDLib file id.
+    /// Wrap a `TDLib` file id.
     #[must_use]
     pub fn new(id: i32) -> Self {
         Self { id }
@@ -867,17 +867,21 @@ impl FileRef {
 }
 
 /// A file tuigram knows about — its size and its local/remote transfer state,
-/// flattened from TDLib's `File`/`LocalFile`/`RemoteFile` trio into the subset a
+/// flattened from `TDLib`'s `File`/`LocalFile`/`RemoteFile` trio into the subset a
 /// caller needs to show a thumbnail, a download/upload bar, or open the bytes.
 ///
 /// The projection is **total** (it reads every nested field it surfaces), and
 /// folding the same `updateFile` twice converges, so the [`FileStore`] can
-/// re-apply TDLib's repeated emissions idempotently.
+/// re-apply `TDLib`'s repeated emissions idempotently.
 ///
 /// [`FileStore`]: crate::files::FileStore
+// Each bool mirrors one independent `TDLib` field 1:1 (active/completed are not
+// mutually exclusive with their upload/download counterpart); folding them into
+// an enum would break that direct correspondence for no real benefit.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct File {
-    /// TDLib's per-session file id.
+    /// `TDLib`'s per-session file id.
     pub id: i32,
     /// File size in bytes; `0` if unknown (then [`expected_size`](Self::expected_size)
     /// approximates it).
@@ -901,7 +905,7 @@ pub struct File {
 }
 
 impl File {
-    /// Project TDLib's `File`, flattening its local and remote sub-records.
+    /// Project `TDLib`'s `File`, flattening its local and remote sub-records.
     #[must_use]
     pub fn from_tdlib(file: &TdFile) -> Self {
         Self {
@@ -932,7 +936,7 @@ impl File {
         self.is_downloading_completed && !self.local_path.is_empty()
     }
 
-    /// The best known total size in bytes: the exact `size` when TDLib has it,
+    /// The best known total size in bytes: the exact `size` when `TDLib` has it,
     /// else the `expected_size` estimate. The denominator for a progress bar.
     #[must_use]
     pub fn total_size(&self) -> i64 {
@@ -946,7 +950,7 @@ impl File {
 
 /// A photo message: its caption and the single best (largest) size to show.
 ///
-/// TDLib sends a photo as several pre-scaled [`sizes`](TdMessagePhoto); a
+/// `TDLib` sends a photo as several pre-scaled [`sizes`](TdMessagePhoto); a
 /// keyboard-driven client renders one, so this keeps the largest and drops the
 /// thumbnails. The bytes live in the [`FileStore`](crate::files::FileStore) under
 /// [`file`](Self::file) — content stays a cheap reference, same as elsewhere.
@@ -963,7 +967,7 @@ pub struct Photo {
 }
 
 impl Photo {
-    /// Project TDLib's `messagePhoto`, keeping its largest size.
+    /// Project `TDLib`'s `messagePhoto`, keeping its largest size.
     #[must_use]
     pub fn from_tdlib(m: &TdMessagePhoto) -> Self {
         // TDLib doesn't guarantee `sizes` order, so pick by pixel area rather
@@ -1004,14 +1008,14 @@ pub struct Video {
     /// MIME type, as given by the sender (may be empty).
     pub mime_type: String,
     /// The video's minithumbnail, decoded to raw JPEG bytes (#208): a small
-    /// inline preview TDLib delivers with the video itself, needing no
+    /// inline preview `TDLib` delivers with the video itself, needing no
     /// `downloadFile` round trip — used as the video's static still. `None`
-    /// when TDLib attached none.
+    /// when `TDLib` attached none.
     pub minithumbnail: Option<Vec<u8>>,
 }
 
 impl Video {
-    /// Project TDLib's `messageVideo`.
+    /// Project `TDLib`'s `messageVideo`.
     #[must_use]
     pub fn from_tdlib(m: &TdMessageVideo) -> Self {
         Self {
@@ -1041,7 +1045,7 @@ pub struct Document {
 }
 
 impl Document {
-    /// Project TDLib's `messageDocument`.
+    /// Project `TDLib`'s `messageDocument`.
     #[must_use]
     pub fn from_tdlib(m: &TdMessageDocument) -> Self {
         Self {
@@ -1073,7 +1077,7 @@ pub struct Audio {
 }
 
 impl Audio {
-    /// Project TDLib's `messageAudio`.
+    /// Project `TDLib`'s `messageAudio`.
     #[must_use]
     pub fn from_tdlib(m: &TdMessageAudio) -> Self {
         Self {
@@ -1102,7 +1106,7 @@ pub struct Voice {
 }
 
 impl Voice {
-    /// Project TDLib's `messageVoiceNote`.
+    /// Project `TDLib`'s `messageVoiceNote`.
     #[must_use]
     pub fn from_tdlib(m: &TdMessageVoiceNote) -> Self {
         Self {
@@ -1115,7 +1119,7 @@ impl Voice {
 }
 
 /// A sticker message: its emoji, dimensions, and the file. Stickers carry no
-/// caption in TDLib, so there is none here.
+/// caption in `TDLib`, so there is none here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Sticker {
     /// The sticker file.
@@ -1129,13 +1133,13 @@ pub struct Sticker {
     /// Whether the sticker is a static WEBP image (#208) — `false` for the
     /// animated TGS (Lottie vector) and WEBM (video) formats, neither of
     /// which the `image` crate can raster-decode. Kept as a plain bool rather
-    /// than exposing TDLib's own `StickerFormat` enum, consistent with this
+    /// than exposing `TDLib`'s own `StickerFormat` enum, consistent with this
     /// module's insulation from `tdlib_rs` shapes.
     pub is_static: bool,
 }
 
 impl Sticker {
-    /// Project TDLib's `messageSticker`.
+    /// Project `TDLib`'s `messageSticker`.
     #[must_use]
     pub fn from_tdlib(m: &TdMessageSticker) -> Self {
         Self {
@@ -1166,14 +1170,14 @@ pub struct Animation {
     /// MIME type, as given by the sender (e.g. `video/mp4`; may be empty).
     pub mime_type: String,
     /// The animation's minithumbnail, decoded to raw JPEG bytes (#208): a
-    /// small inline preview TDLib delivers with the animation itself, needing
+    /// small inline preview `TDLib` delivers with the animation itself, needing
     /// no `downloadFile` round trip — used as the animation's static still.
-    /// `None` when TDLib attached none.
+    /// `None` when `TDLib` attached none.
     pub minithumbnail: Option<Vec<u8>>,
 }
 
 impl Animation {
-    /// Project TDLib's `messageAnimation`.
+    /// Project `TDLib`'s `messageAnimation`.
     #[must_use]
     pub fn from_tdlib(m: &TdMessageAnimation) -> Self {
         Self {
@@ -1189,10 +1193,10 @@ impl Animation {
     }
 }
 
-/// A geographic point — tuigram's projection of TDLib's `Location`. Reused by
+/// A geographic point — tuigram's projection of `TDLib`'s `Location`. Reused by
 /// both a [`MessageContent::Location`] message and a [`Venue`].
 ///
-/// This is the static point only; TDLib's live-location fields (update period,
+/// This is the static point only; `TDLib`'s live-location fields (update period,
 /// heading, proximity radius) live on the message wrapper and are dropped — a
 /// live location and a static one project alike here.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1206,7 +1210,7 @@ pub struct Location {
 }
 
 impl Location {
-    /// Project TDLib's `location`.
+    /// Project `TDLib`'s `location`.
     #[must_use]
     pub fn from_tdlib(l: &TdLocation) -> Self {
         Self {
@@ -1217,7 +1221,7 @@ impl Location {
     }
 }
 
-/// A venue — a named place at a [`Location`] — projecting TDLib's `Venue`. The
+/// A venue — a named place at a [`Location`] — projecting `TDLib`'s `Venue`. The
 /// provider-database fields (`provider`, `id`, `type`) are dropped; a client
 /// shows the title, address, and point.
 #[derive(Clone, Debug, PartialEq)]
@@ -1231,7 +1235,7 @@ pub struct Venue {
 }
 
 impl Venue {
-    /// Project TDLib's `venue`.
+    /// Project `TDLib`'s `venue`.
     #[must_use]
     pub fn from_tdlib(v: &TdVenue) -> Self {
         Self {
@@ -1242,7 +1246,7 @@ impl Venue {
     }
 }
 
-/// A shared contact card — tuigram's projection of TDLib's `Contact`. The vCard
+/// A shared contact card — tuigram's projection of `TDLib`'s `Contact`. The vCard
 /// blob is dropped; the model keeps the name, phone, and the Telegram user id.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contact {
@@ -1257,7 +1261,7 @@ pub struct Contact {
 }
 
 impl Contact {
-    /// Project TDLib's `contact`.
+    /// Project `TDLib`'s `contact`.
     #[must_use]
     pub fn from_tdlib(c: &TdContact) -> Self {
         Self {
@@ -1269,7 +1273,7 @@ impl Contact {
     }
 }
 
-/// One answer option in a [`Poll`] — tuigram's projection of TDLib's
+/// One answer option in a [`Poll`] — tuigram's projection of `TDLib`'s
 /// `pollOption`. Vote counts are meaningful only once the poll is voted in or
 /// closed; the transient "being chosen by a pending request" flag is dropped.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1285,7 +1289,7 @@ pub struct PollOption {
 }
 
 impl PollOption {
-    /// Project TDLib's `pollOption`.
+    /// Project `TDLib`'s `pollOption`.
     #[must_use]
     pub fn from_tdlib(o: &TdPollOption) -> Self {
         Self {
@@ -1297,7 +1301,7 @@ impl PollOption {
     }
 }
 
-/// What kind of poll a [`Poll`] is — tuigram's projection of TDLib's `PollType`.
+/// What kind of poll a [`Poll`] is — tuigram's projection of `TDLib`'s `PollType`.
 /// Total over the enum, no catch-all: a new poll type fails to compile here
 /// until it is classified.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1317,7 +1321,7 @@ pub enum PollKind {
 }
 
 impl PollKind {
-    /// Project TDLib's `PollType`.
+    /// Project `TDLib`'s `PollType`.
     #[must_use]
     pub fn from_tdlib(kind: &TdPollType) -> Self {
         match kind {
@@ -1332,12 +1336,12 @@ impl PollKind {
     }
 }
 
-/// A poll or quiz — tuigram's projection of TDLib's `Poll`.
+/// A poll or quiz — tuigram's projection of `TDLib`'s `Poll`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Poll {
     /// The poll question.
     pub question: FormattedText,
-    /// The answer options, in the order TDLib lists them.
+    /// The answer options, in the order `TDLib` lists them.
     pub options: Vec<PollOption>,
     /// Total number of voters across all options.
     pub total_voter_count: i32,
@@ -1350,7 +1354,7 @@ pub struct Poll {
 }
 
 impl Poll {
-    /// Project TDLib's `poll`.
+    /// Project `TDLib`'s `poll`.
     #[must_use]
     pub fn from_tdlib(p: &TdPoll) -> Self {
         Self {
@@ -1368,7 +1372,7 @@ impl Poll {
 /// types ([`Photo`], [`Video`], [`Document`], [`Audio`], [`Voice`], [`Sticker`],
 /// [`Animation`]), and the structured types ([`Location`], [`Venue`],
 /// [`Contact`], [`Poll`]); everything else is [`MessageContent::Unsupported`]
-/// carrying TDLib's content type name.
+/// carrying `TDLib`'s content type name.
 #[derive(Clone, Debug, PartialEq)]
 pub enum MessageContent {
     /// A text message, with its formatting entities.
@@ -1395,13 +1399,13 @@ pub enum MessageContent {
     Contact(Contact),
     /// A poll or quiz.
     Poll(Poll),
-    /// A content type tuigram does not model yet. Carries TDLib's type name
+    /// A content type tuigram does not model yet. Carries `TDLib`'s type name
     /// (e.g. `"messageVideoNote"`) so callers can report it precisely.
     Unsupported(&'static str),
 }
 
 impl MessageContent {
-    /// Project TDLib's `MessageContent`. Total over the enum: a new TDLib
+    /// Project `TDLib`'s `MessageContent`. Total over the enum: a new `TDLib`
     /// content variant will fail to compile here until it is classified.
     #[must_use]
     pub fn from_tdlib(content: &TdMessageContent) -> Self {
@@ -1635,8 +1639,8 @@ impl MessageContent {
 /// to the read-side media [`MessageContent`] variants ([`Photo`], [`Video`], …).
 ///
 /// Each variant carries the **local path** to upload and a caption (an empty
-/// [`FormattedText`] when there is none). The remaining TDLib metadata a
-/// `inputMessage*` accepts — dimensions, duration, thumbnails — is left for TDLib
+/// [`FormattedText`] when there is none). The remaining `TDLib` metadata a
+/// `inputMessage*` accepts — dimensions, duration, thumbnails — is left for `TDLib`
 /// to detect from the file itself: a headless client sends what it has on disk, so
 /// it does not pre-measure media. [`to_tdlib`](Self::to_tdlib) projects each
 /// variant into the matching `inputMessage*` content with that metadata defaulted.
@@ -1690,9 +1694,9 @@ pub enum OutgoingMedia {
 }
 
 impl OutgoingMedia {
-    /// Project into the matching TDLib `inputMessage*` content, wrapping the local
+    /// Project into the matching `TDLib` `inputMessage*` content, wrapping the local
     /// path as an [`InputFile::Local`](TdInputFile::Local) and carrying the caption
-    /// (omitted when empty). All other metadata is defaulted so TDLib measures the
+    /// (omitted when empty). All other metadata is defaulted so `TDLib` measures the
     /// file on upload; this never blocks on probing the media locally.
     #[must_use]
     pub fn to_tdlib(&self) -> TdInputMessageContent {
@@ -1771,22 +1775,22 @@ impl OutgoingMedia {
     }
 }
 
-/// Wrap a local path as a TDLib [`InputFile::Local`](TdInputFile::Local).
+/// Wrap a local path as a `TDLib` [`InputFile::Local`](TdInputFile::Local).
 fn local_file(path: &str) -> TdInputFile {
     TdInputFile::Local(InputFileLocal {
         path: path.to_owned(),
     })
 }
 
-/// Project a caption, omitting it when empty: TDLib reads a `None` caption as no
+/// Project a caption, omitting it when empty: `TDLib` reads a `None` caption as no
 /// caption, so an empty [`FormattedText`] must not be sent as an empty body.
 fn optional_caption(caption: &FormattedText) -> Option<TdFormattedText> {
     (!caption.text.is_empty()).then(|| caption.to_tdlib())
 }
 
-/// A reaction's identity — tuigram's projection of TDLib's `ReactionType`.
+/// A reaction's identity — tuigram's projection of `TDLib`'s `ReactionType`.
 ///
-/// Total over the TDLib enum: a standard [`Emoji`](Self::Emoji), a
+/// Total over the `TDLib` enum: a standard [`Emoji`](Self::Emoji), a
 /// [`CustomEmoji`](Self::CustomEmoji) by its sticker id, or the channel
 /// [`Paid`](Self::Paid) star reaction. Only the emoji case is sent over the
 /// request seam ([`add_message_reaction`](crate::ReactionRequests::add_message_reaction));
@@ -1802,7 +1806,7 @@ pub enum ReactionKind {
 }
 
 impl ReactionKind {
-    /// Project TDLib's `ReactionType`.
+    /// Project `TDLib`'s `ReactionType`.
     #[must_use]
     pub fn from_tdlib(kind: &TdReactionType) -> Self {
         match kind {
@@ -1812,7 +1816,7 @@ impl ReactionKind {
         }
     }
 
-    /// Lower back to TDLib's `ReactionType`, for adding or removing a reaction
+    /// Lower back to `TDLib`'s `ReactionType`, for adding or removing a reaction
     /// over the request seam — the inverse of [`from_tdlib`](Self::from_tdlib).
     #[must_use]
     pub fn to_tdlib(&self) -> TdReactionType {
@@ -1828,7 +1832,7 @@ impl ReactionKind {
     }
 }
 
-/// One reaction bucket on a message — tuigram's projection of TDLib's
+/// One reaction bucket on a message — tuigram's projection of `TDLib`'s
 /// `MessageReaction`: which reaction it is, how many added it, and whether
 /// tuigram's own account is one of them.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1842,7 +1846,7 @@ pub struct Reaction {
 }
 
 impl Reaction {
-    /// Project TDLib's `MessageReaction`. The recent-sender list and paid-reactor
+    /// Project `TDLib`'s `MessageReaction`. The recent-sender list and paid-reactor
     /// details are dropped — a headless client needs the kind, the count, and
     /// whether it is our own choice, not who else reacted.
     #[must_use]
@@ -1856,7 +1860,7 @@ impl Reaction {
 }
 
 /// Project a message's reactions out of its optional interaction info: the
-/// buckets in `interaction_info.reactions`, in TDLib's order, or empty when
+/// buckets in `interaction_info.reactions`, in `TDLib`'s order, or empty when
 /// either the interaction info or its reaction list is absent. Shared by
 /// [`Message::from_tdlib`] and the `updateMessageInteractionInfo` fold in
 /// [`MessageStore`](crate::messages::MessageStore).
@@ -1866,9 +1870,9 @@ pub(crate) fn reactions_from(info: Option<&TdMessageInteractionInfo>) -> Vec<Rea
         .unwrap_or_default()
 }
 
-/// What a message replies to — tuigram's projection of TDLib's
+/// What a message replies to — tuigram's projection of `TDLib`'s
 /// `MessageReplyTo` (#210). A construction-time field like
-/// [`Message::content`]/[`Message::sender`]: TDLib has no live "reply
+/// [`Message::content`]/[`Message::sender`]: `TDLib` has no live "reply
 /// changed" update, so unlike [`Reaction`] this needs no store-reducer fold.
 ///
 /// Resolving *who* was replied to and *what they said* is deliberately not
@@ -1890,13 +1894,13 @@ pub enum ReplyTo {
         quote: Option<String>,
     },
     /// A reply to a story — out of scope to resolve or render; carried only
-    /// so the projection stays total over TDLib's enum, matching
+    /// so the projection stays total over `TDLib`'s enum, matching
     /// [`MessageContent::Unsupported`]'s convention.
     Unsupported(&'static str),
 }
 
 impl ReplyTo {
-    /// Project TDLib's `MessageReplyTo`.
+    /// Project `TDLib`'s `MessageReplyTo`.
     #[must_use]
     pub fn from_tdlib(reply: &TdMessageReplyTo) -> Self {
         match reply {
@@ -1913,7 +1917,7 @@ impl ReplyTo {
     }
 }
 
-/// A single message — tuigram's projection of TDLib's `Message`.
+/// A single message — tuigram's projection of `TDLib`'s `Message`.
 ///
 /// Not `Eq`: a [`MessageContent::Location`] carries `f64` coordinates, so the
 /// content — and everything that embeds it — is only `PartialEq`.
@@ -1935,7 +1939,7 @@ pub struct Message {
     pub content: MessageContent,
     /// Delivery state for outgoing messages.
     pub send_state: SendState,
-    /// Reactions added to the message, one bucket per reaction, in TDLib's
+    /// Reactions added to the message, one bucket per reaction, in `TDLib`'s
     /// order. Empty when the message has no reactions.
     pub reactions: Vec<Reaction>,
     /// What this message replies to, if it is a reply (#210).
@@ -1943,7 +1947,7 @@ pub struct Message {
 }
 
 impl Message {
-    /// Project TDLib's `Message`.
+    /// Project `TDLib`'s `Message`.
     #[must_use]
     pub fn from_tdlib(message: &TdMessage) -> Self {
         Self {
@@ -1973,13 +1977,13 @@ impl Message {
     }
 }
 
-/// A chat's unsent compose draft — tuigram's projection of TDLib's
+/// A chat's unsent compose draft — tuigram's projection of `TDLib`'s
 /// `DraftMessage`. Telegram syncs this half-typed message across the account's
 /// devices, so it is **chat state, not history**: it lives on the [`Chat`]
 /// snapshot and never enters the message store.
 ///
 /// Phase 3 models a **text** draft — the realistic case for a keyboard-driven
-/// client. TDLib also allows voice/video-note drafts, which carry no text and
+/// client. `TDLib` also allows voice/video-note drafts, which carry no text and
 /// project with an empty [`text`](Self::text); modeling those is a follow-up,
 /// the same scope line as [`MessageContent`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1993,7 +1997,7 @@ pub struct Draft {
 }
 
 impl Draft {
-    /// Project TDLib's `DraftMessage`. A non-text draft (voice/video note, which
+    /// Project `TDLib`'s `DraftMessage`. A non-text draft (voice/video note, which
     /// Phase 3 does not model) keeps an empty `text`; a reply target other than
     /// an in-chat message (an external message or a story) is dropped, as those
     /// reply kinds are out of scope.
@@ -2014,7 +2018,7 @@ impl Draft {
         }
     }
 
-    /// Lower back to TDLib's `DraftMessage`, for pushing a draft over the seam.
+    /// Lower back to `TDLib`'s `DraftMessage`, for pushing a draft over the seam.
     /// The inverse of [`from_tdlib`](Self::from_tdlib): the text becomes an
     /// `inputMessageText` (never clearing the draft itself — clearing is a
     /// `None` draft at the request, not a flag here), and a reply target becomes
@@ -2041,7 +2045,7 @@ impl Draft {
     }
 }
 
-/// A chat — tuigram's projection of TDLib's `Chat`, carrying what the chat list
+/// A chat — tuigram's projection of `TDLib`'s `Chat`, carrying what the chat list
 /// and a conversation header need. Not `Eq`: its [`last_message`](Self::last_message)
 /// may carry `f64` location coordinates (see [`Message`]).
 #[derive(Clone, Debug, PartialEq)]
@@ -2067,13 +2071,13 @@ pub struct Chat {
     /// The unsent compose draft synced for this chat, if any.
     pub draft: Option<Draft>,
     /// Ids of the chat's pinned messages, ascending. Folded from
-    /// `updateMessageIsPinned` (#51); TDLib's `Chat` does not carry them inline,
+    /// `updateMessageIsPinned` (#51); `TDLib`'s `Chat` does not carry them inline,
     /// so this starts empty on projection and the pin/unpin updates maintain it.
     pub pinned_message_ids: Vec<i64>,
 }
 
 impl Chat {
-    /// Project TDLib's `Chat`.
+    /// Project `TDLib`'s `Chat`.
     #[must_use]
     pub fn from_tdlib(chat: &TdChat) -> Self {
         Self {
@@ -2130,7 +2134,7 @@ mod tests {
         MessageSendingStateFailed, TextEntity as TdTextEntityT, TextEntityTypeTextUrl,
     };
 
-    /// A TDLib `Message` with every field zeroed but the ones a test cares
+    /// A `TDLib` `Message` with every field zeroed but the ones a test cares
     /// about. Only `sender_id` and `content` are non-defaultable, so they (and a
     /// few useful fields) are parameters; the rest are inert.
     fn td_message(
@@ -2183,7 +2187,7 @@ mod tests {
         }
     }
 
-    /// A TDLib `Chat` with every field zeroed but the ones a test cares about.
+    /// A `TDLib` `Chat` with every field zeroed but the ones a test cares about.
     fn td_chat(
         id: i64,
         title: &str,
@@ -2223,7 +2227,9 @@ mod tests {
             unread_mention_count: 0,
             unread_reaction_count: 0,
             notification_settings: tdlib_rs::types::ChatNotificationSettings::default(),
-            available_reactions: ChatAvailableReactions::All(Default::default()),
+            available_reactions: ChatAvailableReactions::All(
+                tdlib_rs::types::ChatAvailableReactionsAll::default(),
+            ),
             message_auto_delete_time: 0,
             emoji_status: None,
             background: None,
@@ -2308,7 +2314,7 @@ mod tests {
         );
     }
 
-    /// A TDLib `File` is a deep record; tests only care about its id (what a
+    /// A `TDLib` `File` is a deep record; tests only care about its id (what a
     /// [`FileRef`] keeps), so build one with the rest zeroed.
     fn td_file(id: i32) -> TdFile {
         TdFile {
@@ -2782,7 +2788,7 @@ mod tests {
         );
     }
 
-    /// A TDLib `pollOption` with the fields a test cares about.
+    /// A `TDLib` `pollOption` with the fields a test cares about.
     fn td_poll_option(text: &str, voter_count: i32, percentage: i32, chosen: bool) -> TdPollOption {
         TdPollOption {
             text: TdFormattedTextT {
@@ -3149,7 +3155,7 @@ mod tests {
         assert_eq!(draft.reply_to_message_id, None);
     }
 
-    /// A TDLib `User` with every field zeroed but the ones a test cares about.
+    /// A `TDLib` `User` with every field zeroed but the ones a test cares about.
     #[allow(clippy::too_many_arguments)]
     fn td_user(
         id: i64,
@@ -3683,7 +3689,7 @@ mod tests {
     }
 
     /// A reply to a story is out of scope to resolve/render, but the
-    /// projection stays total over TDLib's enum rather than silently
+    /// projection stays total over `TDLib`'s enum rather than silently
     /// dropping it.
     #[test]
     fn message_projects_a_story_reply_as_unsupported() {

@@ -1,12 +1,12 @@
-//! Secure storage for the high-value asset: the TDLib session/database.
+//! Secure storage for the high-value asset: the `TDLib` session/database.
 //!
-//! The `api_id`/`api_hash` ([`crate::credentials`]) are low-value; the TDLib
+//! The `api_id`/`api_hash` ([`crate::credentials`]) are low-value; the `TDLib`
 //! database is *live account access*. Per
 //! `docs/research/app-registration-security.md` we keep it under the user's data
 //! directory with owner-only permissions and encrypt it at rest:
 //!
 //! * data dir `$XDG_DATA_HOME/tuigram` (else `~/.local/share/tuigram`), `700`;
-//! * TDLib's optional **database encryption key** enabled — 32 bytes of CSPRNG
+//! * `TDLib`'s optional **database encryption key** enabled — 32 bytes of CSPRNG
 //!   entropy, hex-encoded;
 //! * the key stored in the OS keyring (macOS Keychain / Windows Credential
 //!   Manager / Linux Secret Service), **falling back to a `600` key file** in the
@@ -47,13 +47,13 @@ const KEYRING_ENTRY: &str = "database-encryption-key";
 /// Name of the fallback key file inside the data dir.
 const KEY_FILE_NAME: &str = "db_encryption_key";
 
-/// The TDLib database encryption key: 32 bytes of CSPRNG entropy as a 64-char
+/// The `TDLib` database encryption key: 32 bytes of CSPRNG entropy as a 64-char
 /// lowercase hex string.
 ///
 /// Hex (not raw bytes) so it round-trips cleanly through the keyring's string API
-/// and a text key file, and maps onto the `String` TDLib expects. Treated as a
+/// and a text key file, and maps onto the `String` `TDLib` expects. Treated as a
 /// secret throughout: `Debug` is redacted and the value is exposed only via
-/// [`EncryptionKey::expose`], at the point it is moved into the TDLib request.
+/// [`EncryptionKey::expose`], at the point it is moved into the `TDLib` request.
 #[derive(Clone, PartialEq, Eq)]
 pub struct EncryptionKey(String);
 
@@ -83,9 +83,9 @@ impl EncryptionKey {
         Ok(Self(text.to_owned()))
     }
 
-    /// The key as the hex string TDLib's `database_encryption_key` expects.
+    /// The key as the hex string `TDLib`'s `database_encryption_key` expects.
     ///
-    /// Call this only when handing the key to TDLib — never log the result.
+    /// Call this only when handing the key to `TDLib` — never log the result.
     #[must_use]
     pub fn expose(&self) -> &str {
         &self.0
@@ -99,7 +99,7 @@ impl std::fmt::Debug for EncryptionKey {
     }
 }
 
-/// Resolved, owner-only locations and key for a TDLib client's persistent state.
+/// Resolved, owner-only locations and key for a `TDLib` client's persistent state.
 ///
 /// Build with [`SessionStorage::open`] for real use; `SessionStorage::open_at`
 /// takes an explicit data dir and keyring seam for tests.
@@ -135,7 +135,7 @@ impl SessionStorage {
         Ok(Self { data_dir, key })
     }
 
-    /// Directory TDLib uses for its persistent database.
+    /// Directory `TDLib` uses for its persistent database.
     #[must_use]
     pub fn database_directory(&self) -> String {
         self.data_dir
@@ -144,13 +144,13 @@ impl SessionStorage {
             .into_owned()
     }
 
-    /// Directory TDLib uses for downloaded files.
+    /// Directory `TDLib` uses for downloaded files.
     #[must_use]
     pub fn files_directory(&self) -> String {
         self.data_dir.join("files").to_string_lossy().into_owned()
     }
 
-    /// The database encryption key. Hand straight to TDLib; never log it.
+    /// The database encryption key. Hand straight to `TDLib`; never log it.
     #[must_use]
     pub fn encryption_key(&self) -> &EncryptionKey {
         &self.key
@@ -260,8 +260,8 @@ impl KeyStore for KeyringStore {
 /// present but failing is propagated.
 fn map_keyring_err(err: keyring::Error) -> KeyStoreError {
     match err {
-        keyring::Error::NoEntry => KeyStoreError::Unavailable,
-        keyring::Error::NoStorageAccess(_)
+        keyring::Error::NoEntry
+        | keyring::Error::NoStorageAccess(_)
         | keyring::Error::PlatformFailure(_)
         | keyring::Error::NotSupportedByStore(_) => KeyStoreError::Unavailable,
         other => KeyStoreError::Backend(other.to_string()),
