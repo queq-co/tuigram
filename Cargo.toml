@@ -127,3 +127,16 @@ cast_precision_loss = "allow"
 # (where the invariant doesn't actually hold — TDLib response parsing,
 # config/session file I/O, user input) proper `Result` propagation instead.
 unwrap_used = "warn"
+
+# #184: tuned release profile for shipped binaries. `panic = "abort"` was
+# evaluated and deliberately left unset — `Bridge`'s and `Client`'s `Drop`
+# impls (bridge.rs, client.rs) join the TDLib receive thread and stop the
+# router task on unwind; under `abort` those never run, and a mid-session
+# panic can leave TDLib's SQLite database mid-write (see the shutdown note in
+# examples/repl.rs). The terminal-restore panic hook (#178) isn't a reason to
+# switch, either — it runs before the abort/unwind decision, so it already
+# fires under `abort` too.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
