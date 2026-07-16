@@ -204,3 +204,22 @@ jobs:
       - name: cargo semver-checks
         if: steps.baseline.outputs.published == 'true'
         run: cargo semver-checks check-release -p tuigram-core
+
+  # Dependency hygiene gate (#176): advisories/licenses/bans/sources via
+  # cargo-deny, backed by the committed deny.toml. `-A unmaintained -A notice`
+  # downgrades those two categories to non-fatal (deny.toml's header comment
+  # explains why — this cargo-deny version has no per-category config keys for
+  # it); vulnerability/yanked/unsound/licenses/bans/sources stay at cargo-deny's
+  # default deny level. The weekly-scheduled sibling (deny-weekly.yml) runs the
+  # same check on a cron so new RustSec advisories are caught between pushes.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-deny
+      - name: cargo deny check
+        run: cargo deny check -A unmaintained -A notice
