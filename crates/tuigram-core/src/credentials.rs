@@ -284,7 +284,10 @@ fn set_dir_private(dir: &Path) -> io::Result<()> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
+// Must return `io::Result<()>` to match the `unix` sibling above: callers are
+// platform-agnostic and use `?` regardless of which cfg arm compiles.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_dir_private(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
