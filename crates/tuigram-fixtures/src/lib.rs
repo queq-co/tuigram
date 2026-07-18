@@ -18,7 +18,10 @@ use tuigram_core::types::{
     Message as TdMessage, MessageSenderUser, MessageText, UpdateChatPosition, UpdateNewChat,
     UpdateNewMessage, VideoChat,
 };
-use tuigram_core::{ChatStore, FormattedText, Message, MessageContent, SendState, Sender};
+use tuigram_core::{
+    ChatStore, File, FileRef, FormattedText, Message, MessageContent, Photo, SendState, Sender,
+    Sticker, Video,
+};
 
 /// A `TDLib` `Chat` with every field zeroed but id/title/type — mirrors the
 /// shape of `tuigram_core::chats`'s own private test helper of the same name.
@@ -216,6 +219,90 @@ pub fn fake_messages(n: usize, chat_id: i64) -> Vec<Message> {
                 send_state: SendState::Sent,
                 reactions: vec![],
                 reply_to: None,
+            }
+        })
+        .collect()
+}
+
+/// `n` media [`Message`] values for `chat_id`, oldest first, cycling through
+/// `Photo`/`Video`/`Sticker` content — each with a distinct file id starting
+/// at `first_file_id` — so a projection bench/test exercises tall,
+/// media-row-bearing messages with real file associations (#276), which
+/// [`fake_messages`]'s plain-text content never does. Pair with
+/// [`download_progress_burst`] to simulate one of those files mid-transfer.
+#[must_use]
+pub fn fake_media_messages(n: usize, chat_id: i64, first_file_id: i32) -> Vec<Message> {
+    (0..n)
+        .map(|i| {
+            let file = FileRef::new(first_file_id + i as i32);
+            let content = match i % 3 {
+                0 => MessageContent::Photo(Photo {
+                    caption: FormattedText::default(),
+                    file,
+                    width: 1280,
+                    height: 720,
+                }),
+                1 => MessageContent::Video(Video {
+                    caption: FormattedText::default(),
+                    file,
+                    width: 640,
+                    height: 480,
+                    duration: 12,
+                    file_name: format!("clip{i}.mp4"),
+                    mime_type: "video/mp4".to_owned(),
+                    minithumbnail: None,
+                }),
+                _ => MessageContent::Sticker(Sticker {
+                    file,
+                    width: 512,
+                    height: 512,
+                    emoji: "🎉".to_owned(),
+                    is_static: true,
+                }),
+            };
+            Message {
+                id: i as i64 + 1,
+                chat_id,
+                sender: Sender::User((i % 7) as i64 + 1),
+                date: 1_700_000_000 + i as i32,
+                edit_date: 0,
+                is_outgoing: false,
+                content,
+                send_state: SendState::Sent,
+                reactions: vec![],
+                reply_to: None,
+            }
+        })
+        .collect()
+}
+
+/// A sequence of [`File`] snapshots simulating one file's download
+/// progressing from `0` bytes to `total` over `ticks` steps, the last one
+/// marked complete (`is_downloading_completed`, `local_path` set) — the shape
+/// [`crate`] callers feed into `ConversationView::set_downloads` on every
+/// `updateFile` in a real session (#276). Feed each element in turn to
+/// simulate the burst.
+#[must_use]
+pub fn download_progress_burst(file_id: i32, ticks: usize, total: i64) -> Vec<File> {
+    (0..ticks)
+        .map(|t| {
+            let downloaded = total * (t as i64 + 1) / ticks as i64;
+            let completed = t + 1 == ticks;
+            File {
+                id: file_id,
+                size: total,
+                expected_size: total,
+                local_path: if completed {
+                    format!("/tmp/f{file_id}")
+                } else {
+                    String::new()
+                },
+                downloaded_size: downloaded,
+                is_downloading_active: !completed,
+                is_downloading_completed: completed,
+                uploaded_size: 0,
+                is_uploading_active: false,
+                is_uploading_completed: false,
             }
         })
         .collect()

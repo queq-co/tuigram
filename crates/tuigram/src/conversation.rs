@@ -320,14 +320,23 @@ impl ConversationView {
                 (self.offset, self.row_skip) = self.newest_anchor();
                 self.new_messages_below = false;
             } else {
-                self.offset = anchor
-                    .and_then(|id| self.messages.iter().position(|m| m.id == id))
+                let anchor_found =
+                    anchor.and_then(|id| self.messages.iter().position(|m| m.id == id));
+                self.offset = anchor_found
                     .unwrap_or(self.offset)
                     .min(self.messages.len().saturating_sub(1));
-                // The target message's own shape may have changed (a reaction
-                // added, media finishing a download); land on its header rather
-                // than trying to preserve an exact row position across that.
-                self.row_skip = 0;
+                // The anchor itself vanishing (deleted) is the one case landing
+                // on the header is right — the fallback offset now points at a
+                // different message entirely, so there's no "in-message depth"
+                // left to preserve. Otherwise (#276) reclamp against the anchor's
+                // possibly-changed height rather than unconditionally zeroing:
+                // a same-chat refresh fires on every unrelated `updateFile` tick
+                // too (#120), and zeroing here on every one of those snapped a
+                // mid-message scroll back to the header on every tick.
+                if anchor_found.is_none() {
+                    self.row_skip = 0;
+                }
+                self.clamp_row_skip();
                 // A genuinely new message landed at the tail (not just an edit
                 // or deletion elsewhere) while the reader was scrolled away —
                 // show the down-arrow until they scroll or jump back down.
@@ -565,6 +574,13 @@ impl ConversationView {
     /// not been folded yet clears to empty until its files arrive.
     pub fn set_downloads(&mut self, files: Vec<File>) {
         self.downloads = files.into_iter().map(|file| (file.id, file)).collect();
+        // `project_conversation` (lib.rs) calls this *after* `project()` (#276):
+        // a download-progress tick that shrinks the anchor's height only becomes
+        // visible here, not in `project()`'s own reclamp, which still saw the old
+        // map. `clamp_row_skip` only ever reduces `row_skip`, never raises it, so
+        // this is a no-op on the far more common case of an unrelated or growing
+        // download.
+        self.clamp_row_skip();
     }
 
     /// Scroll one row toward the newest (#222): advances within the current
@@ -778,6 +794,22 @@ impl ConversationView {
             + 1
     }
 
+    /// Clamp `row_skip` to `messages[offset]`'s current
+    /// [`message_height`](Self::message_height), without moving `offset` or
+    /// resetting it to `0` (#276). Shared by [`project`](Self::project)'s
+    /// same-chat/not-following branch and [`set_downloads`](Self::set_downloads):
+    /// both can leave the anchor message's rendered height smaller than it was
+    /// (a download placeholder collapsing, a reaction line disappearing), and
+    /// this pulls `row_skip` back in bounds instead of leaving it pointing past
+    /// the message's new last row — or, in the common case where the height
+    /// didn't shrink, leaves it untouched. A no-op on an empty history.
+    fn clamp_row_skip(&mut self) {
+        if let Some(message) = self.messages.get(self.offset) {
+            let max = self.message_height(message).saturating_sub(1);
+            self.row_skip = self.row_skip.min(max);
+        }
+    }
+
     /// The rows [`crate::ui::quote_lines`] renders above a reply's body (#210,
     /// word-wrapped since #214): `0` for a plain message, otherwise the wrapped
     /// row count of the same greentext preview text the renderer builds —
@@ -819,6 +851,23 @@ impl ConversationView {
         } else {
             crate::wrap::row_count(&text, self.width)
         }
+    }
+
+    /// Whether `file_id` is one this view's currently loaded messages
+    /// reference (#276) — the relevance filter the loop's `AppEvent::File`
+    /// handling uses to skip a full reproject when the touched file can't
+    /// affect anything currently rendered in the open chat. Checked against
+    /// the messages' own embedded file ids, not [`downloads`](Self::downloads):
+    /// a file id is known the instant its message lands, before any
+    /// `updateFile` has folded it into `downloads` — gating on `downloads`
+    /// instead would drop a fresh download's very first tick and, since that
+    /// dropped tick is the only thing that would have added the key, never
+    /// recover.
+    #[must_use]
+    pub(crate) fn references_file(&self, file_id: i32) -> bool {
+        self.messages
+            .iter()
+            .any(|m| m.content.file().is_some_and(|f| f.id == file_id))
     }
 
     /// Whether a message's content draws a download-progress line — mirroring
@@ -1129,6 +1178,16 @@ mod tests {
     }
 
     #[test]
+    fn references_file_checks_the_loaded_messages_not_downloads() {
+        let view = ConversationView::from_messages(vec![photo(1, 42)], HashSet::new());
+        assert!(view.references_file(42), "the photo's own file id");
+        assert!(
+            !view.references_file(99),
+            "no loaded message references this id"
+        );
+    }
+
+    #[test]
     fn scroll_down_steps_one_row_rolling_onto_the_next_message_once_exhausted() {
         // #222: scroll_down is now a row step, not a message step.
         // `history`'s plain-text messages are 3 rows each (header, body, blank
@@ -1235,6 +1294,46 @@ mod tests {
             view.offset(),
             1,
             "a full 6-row viewport back from the anchor at offset 3"
+        );
+    }
+
+    /// #276: a same-chat reproject that doesn't change the anchor message's
+    /// shape must not discard how far the reader had scrolled into it. Before
+    /// the fix, `project()`'s not-following branch unconditionally zeroed
+    /// `row_skip` on *every* same-chat refresh — including one triggered by an
+    /// `updateFile` tick for a file the view never even shows — which is
+    /// exactly what made scrolling in a busy media group feel like it kept
+    /// snapping back.
+    #[test]
+    fn same_chat_reproject_preserves_row_skip_when_the_anchor_is_unchanged() {
+        let messages = tuigram_fixtures::fake_media_messages(20, 10, 100);
+        let mut view = ConversationView::default();
+        // Fresh open: bottom-anchored at the newest message.
+        view.project(
+            10,
+            messages.clone(),
+            HashSet::new(),
+            HashMap::new(),
+            0,
+            0,
+            true,
+        );
+        assert!(view.is_at_newest());
+        // Scroll away from the newest so the not-following branch is in play.
+        view.scroll_up();
+        let before = (view.offset(), view.row_skip());
+        assert!(
+            before.1 > 0,
+            "test setup: expected to land mid-message after one scroll_up"
+        );
+
+        // Same chat, identical messages — simulates the reproject an unrelated
+        // `updateFile` tick triggers: nothing about the anchor's shape changed.
+        view.project(10, messages, HashSet::new(), HashMap::new(), 0, 0, false);
+        assert_eq!(
+            (view.offset(), view.row_skip()),
+            before,
+            "an unrelated reproject must not move the cursor or reset row_skip"
         );
     }
 
@@ -2219,6 +2318,45 @@ mod tests {
         let after = view.message_height(&message);
 
         assert_eq!(after, before + MEDIA_ROWS);
+    }
+
+    /// #276: `set_downloads` runs *after* `project()` in the real reproject
+    /// call order (`project_conversation`, lib.rs), so a file update that
+    /// shrinks the anchor's height (media box collapsing once a file is no
+    /// longer present) only becomes visible here — `row_skip` must clamp back
+    /// in bounds rather than being left pointing past the message's new last
+    /// row.
+    #[test]
+    fn set_downloads_clamps_row_skip_when_the_anchor_height_shrinks() {
+        let mut view =
+            ConversationView::from_messages(vec![photo(1, 42), text(2, "after")], HashSet::new());
+        view.set_graphics_capable(true);
+        view.set_downloads(vec![present_file(42)]);
+        let tall_height = view.message_height(&view.messages()[0].clone());
+        assert!(
+            tall_height > 2,
+            "test setup: expected the media box to add rows"
+        );
+
+        // Scroll to the photo's last row while it's tall.
+        for _ in 1..tall_height {
+            view.scroll_down();
+        }
+        assert_eq!(view.offset(), 0, "still within the photo's own rows");
+        assert_eq!(view.row_skip(), tall_height - 1);
+
+        // The file is evicted — media_rows/has_download_line both drop for it.
+        view.set_downloads(vec![]);
+        let short_height = view.message_height(&view.messages()[0].clone());
+        assert!(
+            short_height < tall_height,
+            "test setup: expected the height to shrink"
+        );
+        assert_eq!(
+            view.row_skip(),
+            short_height - 1,
+            "clamped to the new last row, not left pointing past it"
+        );
     }
 
     /// A [`User`] with the given name and usernames; every other field inert. `kind`

@@ -1450,7 +1450,7 @@ impl App {
             | AppEvent::Chats
             | AppEvent::ChatReadOutbox
             | AppEvent::Messages
-            | AppEvent::File
+            | AppEvent::File(_)
             | AppEvent::Secret
             | AppEvent::Lagged => Action::Render,
         }
@@ -2605,7 +2605,7 @@ mod tests {
             AppEvent::Auth,
             AppEvent::Chats,
             AppEvent::Messages,
-            AppEvent::File,
+            AppEvent::File(0),
             AppEvent::Lagged,
         ] {
             assert_eq!(app.on_app_event(event), Action::Render);
