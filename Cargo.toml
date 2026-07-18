@@ -30,7 +30,16 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 # separate event queues + separate raw-mode tracking (lost events, terminal not
 # restored on exit). The `event-stream` feature turns terminal input into an
 # async Stream feeding the central tokio::select! loop. See research/ratatui.md.
-ratatui = { version = "0.30" }
+# Trimmed off ratatui's defaults (#180): `all-widgets` (pulls in the calendar
+# widget, unused), `macros` (the `ratatui_macros` crate, unused), and
+# `underline-color` (colored-underline terminal support — we only use the
+# plain `Modifier::UNDERLINED` ANSI attribute, in richtext.rs). `layout-cache`
+# is kept: it's ratatui-core's internal `Layout::split` memoization, a pure
+# perf win with no extra surface.
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 # Local-time rendering for message timestamps (#194) — chrono is already pulled
 # in transitively via serde_with (a tdlib-rs dependency), so this adds no new
