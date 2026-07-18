@@ -47,11 +47,17 @@ Sidestep it entirely by building the profiling binary statically linked
 standalone:
 
 ```sh
-cargo build --release -p tuigram-client --bin tuigram --features tuigram-client/static
+CARGO_PROFILE_RELEASE_DEBUG=true cargo build --release -p tuigram-client --bin tuigram --features tuigram-client/static
 ```
 
 Do this once before a `samply`/`flamegraph` session; `cargo run`-based tools
-(dhat, tokio-console below) don't need it.
+(dhat, tokio-console below) don't need it for symbols (`cargo run` builds
+in the same invocation), but the `--release` profile still strips them by
+default (`strip = "symbols"`, #184) — see the `CARGO_PROFILE_RELEASE_DEBUG=true`
+prefix on the dhat command below. Skipping either override is why an earlier
+real-account capture came back with every frame unresolved (`0x...` addresses,
+no function names) — informative for the aggregate numbers (heap high-water
+mark, task counts) but useless for per-function attribution.
 
 ## 1. samply (CPU)
 
@@ -67,7 +73,7 @@ button to keep a `.json.gz` per scenario before the next run.
 ## 2. dhat (heap)
 
 ```sh
-cargo run -p tuigram-client --release --features profile-dhat
+CARGO_PROFILE_RELEASE_DEBUG=true cargo run -p tuigram-client --release --features profile-dhat
 ```
 
 Run the scenario, quit normally (`q`) — the profiler guard in `main.rs` is
