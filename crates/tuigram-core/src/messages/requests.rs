@@ -1,76 +1,15 @@
-//! Per-chat message history — paged backward from `TDLib` and kept current by
-//! live updates, folded into one ordered, deduplicated view.
-//!
-//! A chat's messages reach tuigram two ways: **history** is *pulled* a page at a
-//! time with `getChatHistory` (it returns the messages directly), while **live**
-//! messages are *pushed* as `updateNewMessage`. Both land in the same
-//! [`MessageStore`], keyed per chat by message id, so the two streams converge on
-//! a single chronological view with no duplicates — a message seen live and then
-//! re-fetched in a history page is the same entry, not two.
-//!
-//! Ordering is by message id, which `TDLib` assigns monotonically within a chat, so
-//! id-ascending is chronological (oldest first). A `BTreeMap` per chat gives that
-//! ordering and the dedupe for free: re-inserting an id replaces in place.
-//!
-//! This module owns the message slice of the request surface — the same
-//! per-domain segregation as [`ChatRequests`](crate::chats::ChatRequests) and
-//! [`AuthRequests`](crate::auth::AuthRequests), but segmented one level further:
-//! the seam is split into per-capability traits ([`HistoryRequests`],
-//! [`SendRequests`], [`EditRequests`], …) so a consumer binds only what it uses
-//! and a test double implements only what it exercises. [`MessageRequests`]
-//! bundles them all for a caller that wants the whole surface. [`load_history`]
-//! drives the backward paging; folding each page stays the caller's choice (so
-//! production can fold under its lock per page, never across an await).
-//!
-//! Sending (#19) lives here too: [`SendRequests::send_text`] posts a text
-//! message (optionally a reply) and `TDLib` creates it optimistically with a
-//! temporary id in [`SendState::Pending`]; the reducer then folds the lifecycle —
-//! `updateMessageSendSucceeded` swaps the temp id for the server's real one,
-//! `updateMessageSendFailed` flips the same entry to [`SendState::Failed`] — so a
-//! sent message appears at once and reconciles in place, never blocking on
-//! delivery.
-//!
-//! Editing and deleting (#20) round out the write side:
-//! [`EditRequests::edit_text`] replaces a message's text and
-//! [`DeleteRequests::delete`] removes messages (for self or, with `revoke`, for
-//! everyone). The reducer reconciles both: `updateMessageContent` swaps a known
-//! message's content in place, and a permanent `updateDeleteMessages` drops the
-//! messages — a cache-eviction delete is ignored so our copy survives.
-//!
-//! Read state (#21): [`ReadRequests::view_messages`] marks a chat's messages
-//! read. It is advisory — the call acknowledges the messages to the server and
-//! never blocks the read path; the resulting unread-count change arrives as
-//! `updateChatReadInbox`, which the [chat store](crate::chats::ChatStore) folds.
-//!
-//! Search (#37): [`SearchRequests::search_chat_messages`] looks within one chat
-//! and [`SearchRequests::search_messages`] across the whole account. Both return
-//! normalized hits with a paging cursor as a [`SearchPage`], and the caller
-//! collects them into a [`SearchResults`] — a transient, id-deduplicated view
-//! that never folds into [`MessageStore`], so a search leaves loaded history
-//! untouched. [`search_chat`] and [`search_global`] drive either search to
-//! exhaustion into that view, the search counterpart to [`load_history`].
-//!
-//! Reactions and pins (#51): [`ReactionRequests::add_message_reaction`] /
-//! [`ReactionRequests::remove_message_reaction`] react to a message, and
-//! [`PinRequests::pin_chat_message`] / [`PinRequests::unpin_chat_message`]
-//! pin it. Both are advisory, like the read path: a reaction's new counts arrive
-//! as `updateMessageInteractionInfo`, which this store folds onto the message
-//! (replacing its reaction buckets in place); a pin's `updateMessageIsPinned`
-//! is chat state, folded by the [chat store](crate::chats::ChatStore) onto
-//! [`Chat::pinned_message_ids`](crate::model::Chat::pinned_message_ids), not here.
-//!
-//! Scope: history paging, live `updateNewMessage`, sending text + reply with its
-//! lifecycle (#19), editing and deleting with their updates (#20), marking
-//! messages read (#21), forwarding (#36), in-chat and global search (#37),
-//! reactions and pins (#51), and the snapshot.
-
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
+//! The message request seam — traits per capability (history, send, edit,
+//! format, delete, read, forward, search, reaction, pin), `Bridge`'s live
+//! implementation of each, and the paging drivers ([`load_history`],
+//! [`search_chat`], [`search_global`]) built on them. The client-side store
+//! ([`MessageStore`](super::store::MessageStore),
+//! [`SearchPage`](super::store::SearchPage),
+//! [`SearchResults`](super::store::SearchResults)) lives in [`super::store`];
+//! see [`super`] for how the two sides fit together.
 
 use tdlib_rs::enums::{
     FoundChatMessages, FoundMessages, InputMessageContent, InputMessageReplyTo, MessageSource,
-    Messages, ReactionType, TextParseMode, Update,
+    Messages, ReactionType, TextParseMode,
 };
 use tdlib_rs::types::{
     Error as TdError, InputMessageReplyToMessage, InputMessageText, ReactionTypeEmoji,
@@ -78,9 +17,9 @@ use tdlib_rs::types::{
 };
 
 use crate::bridge::Bridge;
-use crate::model::{
-    FormattedText, Message, MessageContent, OutgoingMedia, Reaction, SendState, Sender,
-};
+use crate::model::{FormattedText, Message, OutgoingMedia, Sender};
+
+use super::store::{SearchPage, SearchResults};
 
 // The message request seam — tuigram's message slice of the
 // `tdlib_rs::functions` surface, segregated from the auth and chat requests.
@@ -120,7 +59,7 @@ pub trait HistoryRequests {
 pub trait SendRequests {
     /// Send `text` to a chat, optionally replying to `reply_to` (a message id in
     /// the same chat; `None` for a plain message). Returns the message `TDLib`
-    /// creates **optimistically** — a temporary id, [`SendState::Pending`] —
+    /// creates **optimistically** — a temporary id, [`SendState::Pending`](crate::model::SendState::Pending) —
     /// which the lifecycle updates later reconcile in the store. Returns as soon
     /// as `TDLib` accepts the request; it never waits for delivery.
     async fn send_text(
@@ -136,11 +75,11 @@ pub trait SendRequests {
     /// optional caption; `TDLib` uploads the file and measures its metadata.
     ///
     /// Returns the message `TDLib` creates **optimistically** — a temporary id,
-    /// [`SendState::Pending`] — exactly like [`send_text`](Self::send_text). The
+    /// [`SendState::Pending`](crate::model::SendState::Pending) — exactly like [`send_text`](Self::send_text). The
     /// upload then streams as `updateFile` (folded by the
     /// [`FileStore`](crate::files::FileStore)) and the send settles via
     /// `updateMessageSendSucceeded`/`updateMessageSendFailed` (folded by the
-    /// [`MessageStore`]), so a caller observes progress and reconciliation through
+    /// [`MessageStore`](super::store::MessageStore)), so a caller observes progress and reconciliation through
     /// the router rather than awaiting this. It never waits for the upload.
     async fn send_media(
         &self,
@@ -234,7 +173,7 @@ pub trait ForwardRequests {
     /// any caption when copying (only meaningful with `send_copy`).
     ///
     /// Returns the messages `TDLib` creates **optimistically** in the target chat —
-    /// temporary ids, [`SendState::Pending`] — exactly like
+    /// temporary ids, [`SendState::Pending`](crate::model::SendState::Pending) — exactly like
     /// [`send_text`](SendRequests::send_text). `TDLib` also streams each as
     /// `updateNewMessage`, so the store gains them through the router on the same
     /// lifecycle path as a normal send; these returned copies are for the caller's
@@ -259,7 +198,7 @@ pub trait SearchRequests {
     /// The returned [`SearchPage`] carries the normalized hits, an approximate
     /// total, and the cursor for the next page ([`SearchPage::next`] is `None` at
     /// the end). Results are a **transient view** — the caller folds them into a
-    /// [`SearchResults`], never the live [`MessageStore`], so a search leaves the
+    /// [`SearchResults`], never the live [`MessageStore`](super::store::MessageStore), so a search leaves the
     /// loaded history untouched.
     ///
     /// Media-type filtering (`TDLib`'s `SearchMessagesFilter`) is out of scope here
@@ -297,7 +236,7 @@ pub trait ReactionRequests {
     /// (e.g. `"👍"`), `TDLib`'s `addMessageReaction`. **Advisory**, like
     /// [`view_messages`](ReadRequests::view_messages): it acknowledges the reaction to the
     /// server and never blocks; the resulting reaction counts arrive as
-    /// `updateMessageInteractionInfo`, which the [`MessageStore`] folds onto the
+    /// `updateMessageInteractionInfo`, which the [`MessageStore`](super::store::MessageStore) folds onto the
     /// message. Only emoji reactions are sent here — custom-emoji and paid
     /// reactions ([`ReactionKind`](crate::model::ReactionKind)) are read-only in
     /// this model.
@@ -853,85 +792,6 @@ impl PinRequests for Bridge {
     }
 }
 
-/// A page of message-search hits plus the cursor for the next page.
-///
-/// Generic over the cursor `C` because `TDLib` pages the two searches differently:
-/// an in-chat search resumes from a message id (`C = i64`), a global search from
-/// an opaque string offset (`C = String`). [`next`](Self::next) is `None` at the
-/// end of results — the loop stop condition either way.
-///
-/// A search page is a **transient view**: its messages are normalized
-/// [`Message`]s but they are never folded into the [`MessageStore`]; collect them
-/// into a [`SearchResults`] instead, so a search never disturbs loaded history.
-// Not `Eq`: a hit's [`Message`] may carry `f64` location coordinates.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SearchPage<C> {
-    /// The normalized hits on this page, in the order `TDLib` ranked them.
-    pub messages: Vec<Message>,
-    /// Approximate total number of matches; `-1` when `TDLib` does not know.
-    pub total_count: i32,
-    /// Cursor for the next page, or `None` when results are exhausted.
-    pub next: Option<C>,
-}
-
-/// A transient, deduplicated accumulation of search hits across pages.
-///
-/// Search results are a view onto messages that mostly already live (or could
-/// live) in the [`MessageStore`]; this keeps them **separate** so a search never
-/// mutates loaded history. Hits are deduplicated by `(chat_id, message_id)` — so
-/// overlapping pages, or a hit that also appears in the history already on
-/// screen, collapse onto one entry — while preserving `TDLib`'s result ordering.
-#[derive(Debug, Default)]
-pub struct SearchResults {
-    messages: Vec<Message>,
-    seen: HashSet<(i64, i64)>,
-}
-
-impl SearchResults {
-    /// An empty result set.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Append a page of hits, dropping any whose `(chat_id, message_id)` was
-    /// already collected. Order is preserved (the first occurrence wins), so
-    /// re-appending an overlapping page — or [`extend`](Self::extend)ing with a
-    /// hit already on screen — is idempotent.
-    pub fn extend(&mut self, page: impl IntoIterator<Item = Message>) {
-        for message in page {
-            if self.seen.insert((message.chat_id, message.id)) {
-                self.messages.push(message);
-            }
-        }
-    }
-
-    /// The collected hits, in result order.
-    #[must_use]
-    pub fn messages(&self) -> &[Message] {
-        &self.messages
-    }
-
-    /// Whether a given message has already been collected — the dedupe a caller
-    /// uses to avoid showing a hit twice when it also sits in loaded history.
-    #[must_use]
-    pub fn contains(&self, chat_id: i64, message_id: i64) -> bool {
-        self.seen.contains(&(chat_id, message_id))
-    }
-
-    /// Number of distinct hits collected.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-
-    /// Whether no hits have been collected.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-}
-
 /// Anchor passed to [`HistoryRequests::get_chat_history`] to start from a chat's
 /// most recent message. `TDLib` reads message id `0` as "the newest".
 pub const NEWEST: i64 = 0;
@@ -943,7 +803,7 @@ pub const NEWEST: i64 = 0;
 /// request asks for the messages before it; paging stops when `TDLib` returns an
 /// empty page. Folding is left to the caller — production folds into the shared
 /// store under its lock per page (never held across the awaits here), while a
-/// test folds into a local [`MessageStore`]. Any request error is propagated.
+/// test folds into a local [`MessageStore`](super::store::MessageStore). Any request error is propagated.
 ///
 /// # Errors
 ///
@@ -983,7 +843,7 @@ where
 /// [`SearchResults`].
 ///
 /// Mirrors [`load_history`]'s paging, but for search and with one deliberate
-/// difference: the hits are **never** folded into a [`MessageStore`]. Each call
+/// difference: the hits are **never** folded into a [`MessageStore`](super::store::MessageStore). Each call
 /// resumes from the previous page's [`SearchPage::next`] cursor (the first from
 /// [`NEWEST`]) and stops when the cursor comes back `None`; the hits accumulate —
 /// deduplicated by `(chat_id, message_id)` — in the returned [`SearchResults`], so
@@ -1025,7 +885,7 @@ where
 /// string offset `TDLib` returns (the first page from the empty string) and stops
 /// when [`SearchPage::next`] comes back `None`. Hits across different chats stay
 /// distinct — the dedupe keys on `(chat_id, message_id)` — and, as with the
-/// in-chat search, never fold into the live [`MessageStore`]. Errors propagate.
+/// in-chat search, never fold into the live [`MessageStore`](super::store::MessageStore). Errors propagate.
 ///
 /// # Errors
 ///
@@ -1047,181 +907,6 @@ where
         match next {
             Some(cursor) => offset = cursor,
             None => return Ok(results),
-        }
-    }
-}
-
-/// Every known message, grouped by chat and ordered chronologically within each.
-#[derive(Debug, Default)]
-pub struct MessageStore {
-    by_chat: HashMap<i64, BTreeMap<i64, Message>>,
-}
-
-impl MessageStore {
-    /// An empty store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Fold one message-route update into the store.
-    ///
-    /// - `updateNewMessage` — a live (or optimistically sent) message; inserted.
-    /// - `updateMessageSendSucceeded` — the send was accepted; the temporary
-    ///   entry is dropped and the server's message (real id) inserted in its
-    ///   place, so the message keeps its spot but gains its final id.
-    /// - `updateMessageSendFailed` — the send was rejected; the same entry (it
-    ///   keeps its temporary id) flips to [`SendState::Failed`] with the cause.
-    /// - `updateMessageContent` — an edit; the known message's content is swapped
-    ///   in place (unknown message: ignored).
-    /// - `updateMessageInteractionInfo` — a reaction change (#51); the known
-    ///   message's reactions are replaced in place with the update's buckets, or
-    ///   cleared when it carries none (unknown message: ignored).
-    /// - `updateDeleteMessages` — a deletion; when permanent, the messages are
-    ///   removed. A cache-eviction delete (`is_permanent` false) is ignored.
-    ///
-    /// Every arm is idempotent: re-applying converges (a reconcile whose temp
-    /// entry is already gone just re-inserts the real message; a failure re-marks
-    /// in place; a re-edit re-sets the same content; a re-delete of an absent id
-    /// is a no-op).
-    pub fn reduce(&mut self, update: &Update) {
-        match update {
-            Update::NewMessage(u) => self.insert(Message::from_tdlib(&u.message)),
-            Update::MessageSendSucceeded(u) => {
-                let message = Message::from_tdlib(&u.message);
-                // The temp message lived in the same chat under the old id.
-                self.remove(message.chat_id, u.old_message_id);
-                self.insert(message);
-            }
-            Update::MessageSendFailed(u) => {
-                // The failed message keeps its temporary id; flip it in place and
-                // carry TDLib's error so callers can surface and retry it.
-                let mut message = Message::from_tdlib(&u.message);
-                message.send_state = SendState::Failed {
-                    code: u.error.code,
-                    message: u.error.message.clone(),
-                };
-                self.insert(message);
-            }
-            Update::MessageContent(u) => {
-                // An edit: swap the known message's content in place.
-                self.edit_content(
-                    u.chat_id,
-                    u.message_id,
-                    MessageContent::from_tdlib(&u.new_content),
-                );
-            }
-            Update::MessageInteractionInfo(u) => {
-                // A reaction change: replace the known message's reactions with
-                // this update's buckets (empty when the info or its reactions are
-                // absent — i.e. the last reaction was removed).
-                self.set_reactions(
-                    u.chat_id,
-                    u.message_id,
-                    crate::model::reactions_from(u.interaction_info.as_ref()),
-                );
-            }
-            // A real deletion removes the messages; a cache-eviction delete
-            // (`is_permanent` false — TDLib unloading its own cache) leaves our
-            // copy intact, so only the permanent case folds here.
-            Update::DeleteMessages(u) if u.is_permanent => {
-                for &message_id in &u.message_ids {
-                    self.remove(u.chat_id, message_id);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Merge a history page (or any batch of messages) into the store. Each
-    /// message is filed under its own chat and id, so re-merging an overlapping
-    /// page is idempotent — duplicates collapse onto the same entry.
-    ///
-    /// A re-fetched page **replaces** an already-known message rather than
-    /// skipping it: `getChatHistory` is server-authoritative, and is the one
-    /// documented recovery path (#207) for a message whose reactions or content
-    /// changed while its chat was closed and so never arrived as a live update —
-    /// opening the chat and re-paging its history is what catches those up mid
-    /// session, exactly as a restart does. A live fold ([`reduce`](Self::reduce))
-    /// racing a page fetch for the same id is a narrower, separate concern than
-    /// disabling that recovery path is worth trading away here.
-    pub fn merge(&mut self, messages: impl IntoIterator<Item = Message>) {
-        for message in messages {
-            self.insert(message);
-        }
-    }
-
-    /// A chat's messages, oldest first. Empty if the chat is unknown.
-    #[must_use]
-    pub fn history(&self, chat_id: i64) -> Vec<&Message> {
-        self.by_chat
-            .get(&chat_id)
-            .map(|m| m.values().collect())
-            .unwrap_or_default()
-    }
-
-    /// Look up a single message within a chat.
-    #[must_use]
-    pub fn get(&self, chat_id: i64, message_id: i64) -> Option<&Message> {
-        self.by_chat.get(&chat_id)?.get(&message_id)
-    }
-
-    /// Number of messages known for a chat.
-    #[must_use]
-    pub fn count(&self, chat_id: i64) -> usize {
-        self.by_chat.get(&chat_id).map_or(0, BTreeMap::len)
-    }
-
-    /// Whether no messages are known for any chat.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_chat.values().all(BTreeMap::is_empty)
-    }
-
-    /// File a message under its chat and id, replacing any existing entry with
-    /// the same id (the dedupe across the live and history streams).
-    fn insert(&mut self, message: Message) {
-        self.by_chat
-            .entry(message.chat_id)
-            .or_default()
-            .insert(message.id, message);
-    }
-
-    /// Drop a message from a chat by id. A no-op if the chat or id is unknown, so
-    /// reconciling an already-reconciled send — or replaying a delete — is
-    /// idempotent.
-    fn remove(&mut self, chat_id: i64, message_id: i64) {
-        if let Some(chat) = self.by_chat.get_mut(&chat_id) {
-            chat.remove(&message_id);
-        }
-    }
-
-    /// Replace a known message's content in place (the `updateMessageContent`
-    /// fold). A no-op if the message is unknown: `TDLib` only edits the content of
-    /// a message it already delivered, and a content-only update carries no
-    /// sender/date, so we never synthesize a partial entry from one.
-    fn edit_content(&mut self, chat_id: i64, message_id: i64, content: MessageContent) {
-        if let Some(message) = self
-            .by_chat
-            .get_mut(&chat_id)
-            .and_then(|chat| chat.get_mut(&message_id))
-        {
-            message.content = content;
-        }
-    }
-
-    /// Replace a known message's reactions in place (the
-    /// `updateMessageInteractionInfo` fold). A no-op if the message is unknown —
-    /// the update carries no sender/date/content, so we never synthesize a partial
-    /// entry from one, the same rule as [`edit_content`](Self::edit_content).
-    /// Idempotent: re-applying sets the same buckets; the empty list clears them.
-    fn set_reactions(&mut self, chat_id: i64, message_id: i64, reactions: Vec<Reaction>) {
-        if let Some(message) = self
-            .by_chat
-            .get_mut(&chat_id)
-            .and_then(|chat| chat.get_mut(&message_id))
-        {
-            message.reactions = reactions;
         }
     }
 }
@@ -1329,12 +1014,14 @@ mod markdown_v2_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
+    use super::super::store::MessageStore;
     use super::*;
     use crate::model::OutgoingMedia;
-    use crate::model::{MessageContent, Sender};
+    use crate::model::{MessageContent, Reaction, SendState, Sender};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use tdlib_rs::enums::MessageSendingState;
+    use tdlib_rs::enums::Update;
     use tdlib_rs::types::{
         FormattedText as TdFormattedText, MessagePhoto as TdMessagePhoto, MessageSenderUser,
         MessageSendingStatePending, MessageText, UpdateMessageContent, UpdateMessageSendFailed,
@@ -2752,7 +2439,7 @@ mod tests {
     }
 
     /// Secret chat text messaging (#54). A secret chat is reached by an ordinary
-    /// chat id, so text sent and received in one rides the same [`MessageStore`]
+    /// chat id, so text sent and received in one rides the same [`MessageStore`](super::store::MessageStore)
     /// and send lifecycle as any chat — there is no secret-chat-specific routing.
     /// These exercise that path on a secret chat's chat id; the only rule the
     /// lifecycle adds is that a send waits for the chat to be ready.
@@ -2840,7 +2527,7 @@ mod tests {
     /// the secret chat's ordinary chat id just as text does:
     /// [`send_media`](SendRequests::send_media) posts a file-backed message
     /// optimistically and the lifecycle reconciles it through the same
-    /// [`MessageStore`], the file-backed content surviving the temp→real swap. The
+    /// [`MessageStore`](super::store::MessageStore), the file-backed content surviving the temp→real swap. The
     /// readiness gate is shared with text — there is no media-specific rule — so
     /// these reuse [`SecretChat::is_ready`] rather than restating one.
     mod secret_chat_media {
