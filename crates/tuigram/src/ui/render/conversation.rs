@@ -1631,6 +1631,112 @@ mod tests {
         );
     }
 
+    /// Reported: scrolling up through a media message into one from a sender
+    /// with a long username left a fragment of that name "stuck", duplicating
+    /// into a column of garbage as scrolling up continued, recovering when
+    /// scrolling back down. This drives one `Terminal` across many draws
+    /// (unlike `render`/`render_output`, which each start a fresh one) so it
+    /// actually exercises ratatui's own cross-frame buffer diffing — the same
+    /// as the real run loop's persistent `Terminal`. If a stale-cell bug lived
+    /// in this codebase's own render/scroll path (rather than a real
+    /// terminal's graphics-protocol pixel ghosting, which `TestBackend` never
+    /// executes at all), this is where it would show up: the long name's text
+    /// appearing in more than one row at once.
+    #[test]
+    fn scrolling_past_media_never_leaves_a_long_username_in_two_rows_at_once() {
+        let long_user = Sender::User(99);
+        let long_name = "Alexandrapetrovnakuznetsovaverylongusername";
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let named = Message {
+            id: 2,
+            chat_id: 1,
+            sender: long_user.clone(),
+            date: 0,
+            edit_date: 0,
+            is_outgoing: false,
+            content: MessageContent::Text(FormattedText {
+                text: "hi".to_owned(),
+                entities: Vec::new(),
+            }),
+            send_state: SendState::Sent,
+            reactions: Vec::new(),
+            reply_to: None,
+        };
+        let mut messages = vec![photo, named];
+        messages.extend((3..15).map(|i| text_message(i, &format!("filler {i}"))));
+
+        let mut senders = HashMap::new();
+        senders.insert(
+            long_user,
+            SenderLabel {
+                label: long_name.to_owned(),
+                color: None,
+            },
+        );
+        let mut view = ConversationView::default();
+        view.project(1, messages, HashSet::new(), senders, 0, 0, true);
+
+        let mut app = App::with_conversation(view);
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        app.project_downloads(vec![present_file(7)]);
+        let picker = graphics_picker();
+        let build_protocol = |picker: &ratatui_image::picker::Picker| {
+            picker
+                .new_protocol(
+                    image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4)),
+                    ratatui::layout::Size::new(4, 4),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .expect("halfblocks protocol always encodes")
+        };
+        app.cache_media(1, build_protocol(&picker));
+        // Cache an avatar for every sender (including the long-username one),
+        // so scrolling actually shifts different avatar images through the
+        // same gutter rows across frames — the specific mechanism a stale-cell
+        // bug would show up in, per the #229 ghosting precedent (avatars sit
+        // in the gutter, on the header row, as a second-pass `Image` overlay).
+        for user_id in [1, 99].into_iter().chain(3..15) {
+            app.cache_avatar(user_id, build_protocol(&picker));
+        }
+
+        // A short, distinctive slice of the long name — enough to identify a
+        // fragment without depending on where a wrap/truncation would cut it.
+        let needle = &long_name[..15];
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 15)).unwrap();
+        terminal
+            .draw(|frame| drop(crate::ui::ui(frame, &app)))
+            .unwrap();
+
+        // Scroll up several times, redrawing on the *same* terminal each step —
+        // exactly where a leftover-cell bug (if this codebase has one) would
+        // show the fragment surviving into a row it no longer belongs to.
+        for step in 0..12 {
+            app.dispatch(Action::ScrollUp);
+            terminal
+                .draw(|frame| drop(crate::ui::ui(frame, &app)))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows_with_fragment: Vec<u16> = (0..buffer.area.height)
+                .filter(|&y| row_text(buffer, y).contains(needle))
+                .collect();
+            assert!(
+                rows_with_fragment.len() <= 1,
+                "step {step}: the long username fragment appeared in more than \
+                 one row at once: {rows_with_fragment:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_pinned_message_shows_the_pin_marker() {
         let view =
