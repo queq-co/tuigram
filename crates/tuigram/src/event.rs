@@ -42,8 +42,12 @@ pub enum AppEvent {
     ChatReadOutbox,
     /// A message update folded by core: a chat's history may have changed.
     Messages,
-    /// `updateFile`: a download or upload made progress.
-    File,
+    /// `updateFile`: a download or upload made progress, carrying the touched
+    /// file's `TDLib` id (#276). `updateFile` fires for every in-flight
+    /// transfer on the *whole account*, not just the open chat — the id lets
+    /// the loop skip a reproject the open conversation can't possibly be
+    /// affected by, instead of repainting on every unrelated tick.
+    File(i32),
     /// `updateSecretChat`: a secret chat's lifecycle/key state advanced (#121) —
     /// pending → ready → closed — so the secret-state projection re-reads it.
     Secret,
@@ -128,7 +132,7 @@ fn classify_update(update: &Update) -> Option<AppEvent> {
         // re-resolves senders from the (now updated) user store. `updateUserStatus`
         // stays dropped below: presence churn must not wake the loop constantly.
         | Update::User(_) => Some(AppEvent::Messages),
-        Update::File(_) => Some(AppEvent::File),
+        Update::File(u) => Some(AppEvent::File(u.file.id)),
         // The E2E chat lifecycle: a state advance (pending/ready/closed) folds into
         // the secret-chat store, which the secret-state projection reads back (#121).
         Update::SecretChat(_) => Some(AppEvent::Secret),
@@ -251,7 +255,7 @@ mod tests {
                     ..Default::default()
                 },
             })),
-            Some(AppEvent::File)
+            Some(AppEvent::File(7))
         );
         assert_eq!(
             signal(Update::AuthorizationState(UpdateAuthorizationState {

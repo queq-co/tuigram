@@ -481,8 +481,13 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
                             project_conversation(&mut app, client, history.open, false);
                         }
                         // A file transfer advanced (#120): re-project so the open
-                        // chat's download-progress lines reflect the newest `updateFile`.
-                        AppEvent::File => project_conversation(&mut app, client, history.open, false),
+                        // chat's download-progress lines reflect the newest `updateFile` —
+                        // but only when it could actually affect it (#276): `updateFile`
+                        // fires for every in-flight transfer on the whole account, and
+                        // most emissions in a busy media chat are for files elsewhere.
+                        AppEvent::File(file_id) => {
+                            drive_file_update(&mut app, client, history.open, file_id);
+                        }
                         // A secret chat's lifecycle advanced (#121): re-project the
                         // secret-state map so the row reflects pending → ready → closed.
                         AppEvent::Secret => reproject_secret_states(&mut app, client),
@@ -1740,6 +1745,26 @@ fn drive_storage_sweep(client: &Arc<Client>, settings: &StorageSettings) {
     }
 }
 
+/// Re-project the open chat from an `updateFile` tick, but only when the
+/// touched file could actually affect what it shows (#276). `updateFile` fires
+/// for every in-flight transfer on the whole account, not just the open chat —
+/// most emissions in a busy media chat are for files elsewhere entirely — so
+/// this drops the ones [`should_reproject_for_file`] says the open pane can't
+/// be affected by, before paying for a full history re-read, sender
+/// resolution, and reprojection.
+fn drive_file_update(app: &mut App, client: &Arc<Client>, open: Option<i64>, file_id: i32) {
+    if should_reproject_for_file(app, open, file_id) {
+        project_conversation(app, client, open, false);
+    }
+}
+
+/// The pure gate [`drive_file_update`] applies — split out so it is testable
+/// without an `Arc<Client>` (#276): no chat open, or the open chat's loaded
+/// messages don't reference `file_id`, and the tick is a no-op.
+fn should_reproject_for_file(app: &App, open: Option<i64>, file_id: i32) -> bool {
+    open.is_some() && app.conversation().references_file(file_id)
+}
+
 /// Read the open chat's folded history and pinned ids back from the `Client` and
 /// project them onto the conversation pane (#114). The projection needs the client,
 /// so it lives here rather than in the pure `App`, which only receives the owned
@@ -1940,6 +1965,28 @@ mod tests {
         assert!(groups.private.is_empty());
         assert!(groups.groups.is_empty());
         assert!(groups.channels.is_empty());
+    }
+
+    // --- file-reproject relevance gate (#276) ---
+
+    #[test]
+    fn should_reproject_for_file_ignores_ids_the_open_chat_does_not_reference() {
+        let mut app = App::new();
+        let messages = tuigram_fixtures::fake_media_messages(5, 1, 100); // file ids 100..104
+        app.project_conversation(1, messages, HashSet::new(), HashMap::new(), 0, 0, true);
+
+        assert!(
+            !should_reproject_for_file(&app, Some(1), 999),
+            "no loaded message references this id"
+        );
+        assert!(
+            should_reproject_for_file(&app, Some(1), 100),
+            "referenced by a loaded message"
+        );
+        assert!(
+            !should_reproject_for_file(&app, None, 100),
+            "no chat is open"
+        );
     }
 
     // --- ghosting-fix clear decision (#229) ---

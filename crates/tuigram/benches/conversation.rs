@@ -76,5 +76,53 @@ fn project_refresh_bench(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, project_fresh_open_bench, project_refresh_bench);
+/// Baseline for #276: a busy-media-chat "`updateFile` flood" — repeated
+/// same-chat refreshes against tall media messages, mirroring what
+/// `project_conversation` (lib.rs) does on every `AppEvent::File` before the
+/// relevance filter has a chance to skip it. This measures
+/// `ConversationView::project`'s own cost under that burst, not the filter's
+/// savings — those live a layer up, in `lib.rs`'s `should_reproject_for_file`,
+/// which this bench file (deliberately) never touches.
+fn project_file_flood_bench(c: &mut Criterion) {
+    let messages = tuigram_fixtures::fake_media_messages(500, CHAT_ID, 1);
+    c.bench_function("conversation_project_500_media_messages_file_flood", |b| {
+        b.iter_batched(
+            || {
+                let mut view = ConversationView::default();
+                view.project(
+                    CHAT_ID,
+                    messages.clone(),
+                    HashSet::new(),
+                    HashMap::new(),
+                    0,
+                    0,
+                    true,
+                );
+                view
+            },
+            |mut view| {
+                for _ in 0..200 {
+                    view.project(
+                        black_box(CHAT_ID),
+                        messages.clone(),
+                        HashSet::new(),
+                        HashMap::new(),
+                        0,
+                        0,
+                        false,
+                    );
+                }
+                black_box(&view);
+            },
+            BatchSize::LargeInput,
+        );
+    });
+}
+
+criterion_group!(
+    benches,
+    project_fresh_open_bench,
+    project_refresh_bench,
+    project_file_flood_bench
+);
 criterion_main!(benches);
