@@ -204,6 +204,12 @@ const TYPING_RESEND: Duration = Duration::from_secs(4);
 #[tokio::main]
 #[must_use]
 pub async fn run_app() -> ExitCode {
+    // tokio-console (#185, `profile-console` feature): registers the runtime
+    // with the console-subscriber aggregator before anything else spawns, so
+    // task instrumentation covers the whole run, not just the TUI loop.
+    #[cfg(feature = "profile-console")]
+    console_subscriber::init();
+
     // argv check (#166): before any terminal-mode or TDLib work, so
     // `--version`/`--help`/an unknown argument exit cleanly with no TTY and no
     // `~/.config/tuigram/` access — required for packaging smoke tests and the

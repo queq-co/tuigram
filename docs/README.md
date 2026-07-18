@@ -34,6 +34,8 @@ Project documentation index. Milestones and sub-step tracking live on GitHub
   global size backstop) and terminal-UI toggles (mouse, graphics). Optional; copy
   it into place to opt in.
 - [branch-model.md](branch-model.md) — how we use `develop` → PR → `main`.
+- [profiling.md](profiling.md) — the real-session profiling exercise (#185):
+  flamegraph, dhat, and tokio-console, step by step, against a live account.
 - Research (Phase 1):
   - [research/ratatui.md](research/ratatui.md) — how Ratatui works and how we'll use it.
   - [research/tdlib.md](research/tdlib.md) — TDLib integration (prebuilt `tdjson` + binding crate).
