@@ -260,4 +260,54 @@ mod tests {
         // to_tdlib then back is the identity — the projections mirror each other.
         assert_eq!(FormattedText::from_tdlib(&ft.to_tdlib()), ft);
     }
+
+    /// Every [`EntityKind`] variant round-trips through `TDLib`'s
+    /// `TextEntityType` (#181): the test above only exercised three of twenty
+    /// variants, leaving every bare/auto-detected kind (`Mention`, `Hashtag`, …)
+    /// and two of the three payload-bearing kinds (`MentionName`, `CustomEmoji`,
+    /// `MediaTimestamp`) untouched in both `from_tdlib` and `to_tdlib`'s match
+    /// arms — `EntityKind::from_tdlib` is total over `TdTextEntityType` (a new
+    /// `TDLib` variant fails to compile until handled here), so this asserts each
+    /// arm actually maps to itself, not just that the match compiles.
+    #[test]
+    fn every_entity_kind_round_trips_through_tdlib() {
+        let kinds = [
+            EntityKind::Mention,
+            EntityKind::Hashtag,
+            EntityKind::Cashtag,
+            EntityKind::BotCommand,
+            EntityKind::Url,
+            EntityKind::EmailAddress,
+            EntityKind::PhoneNumber,
+            EntityKind::BankCardNumber,
+            EntityKind::Bold,
+            EntityKind::Italic,
+            EntityKind::Underline,
+            EntityKind::Strikethrough,
+            EntityKind::Spoiler,
+            EntityKind::Code,
+            EntityKind::Pre,
+            EntityKind::PreCode {
+                language: "rust".to_owned(),
+            },
+            EntityKind::BlockQuote,
+            EntityKind::ExpandableBlockQuote,
+            EntityKind::TextUrl {
+                url: "https://t.me".to_owned(),
+            },
+            EntityKind::MentionName { user_id: 42 },
+            EntityKind::CustomEmoji {
+                custom_emoji_id: 99,
+            },
+            EntityKind::MediaTimestamp { media_timestamp: 7 },
+        ];
+
+        for kind in kinds {
+            assert_eq!(
+                EntityKind::from_tdlib(&kind.to_tdlib()),
+                kind,
+                "{kind:?} did not round-trip"
+            );
+        }
+    }
 }

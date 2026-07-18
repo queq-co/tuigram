@@ -212,6 +212,45 @@ jobs:
         if: steps.baseline.outputs.published == 'true'
         run: cargo semver-checks check-release -p tuigram-core
 
+  # Coverage map (#181): cargo-llvm-cov over the workspace, uploaded as an
+  # artifact (HTML report for browsing + lcov.info for tooling). Informational
+  # only — no percentage gate. A floor would reward padding easy tests to hit a
+  # number over fixing the load-bearing gaps the issue actually cared about;
+  # the gap list, read from the artifact, is the deliverable, not the percentage.
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Install llvm-tools-preview
+        run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      # Same reason as the build job's identically-named step: the Linux
+      # prebuilt tdjson links libc++ (not libstdc++), which isn't preinstalled
+      # on ubuntu runners. Without this, `tests/cli.rs`'s spawned binary can't
+      # resolve libc++ at runtime and glibc's loader exits 127.
+      - name: Install Linux native deps (libc++)
+        run: sudo apt-get update && sudo apt-get install -y libc++1 libc++abi1
+      # See the semver-checks job above for why this pins the versioned
+      # release tag rather than hashing the `@cargo-llvm-cov` convenience tag.
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-llvm-cov
+      - name: cargo llvm-cov
+        run: |
+          cargo llvm-cov --workspace --html --output-dir target/llvm-cov-html
+          cargo llvm-cov report --lcov --output-path target/lcov.info
+          cargo llvm-cov report --summary-only
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-report
+          path: |
+            target/llvm-cov-html
+            target/lcov.info
+          retention-days: 30
+
   # Dependency hygiene gate (#176): advisories/licenses/bans/sources via
   # cargo-deny, backed by the committed deny.toml. `-A unmaintained -A notice`
   # downgrades those two categories to non-fatal (deny.toml's header comment

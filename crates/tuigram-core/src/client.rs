@@ -554,4 +554,201 @@ mod tests {
         let ids: Vec<i64> = state.messages().history(10).iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
     }
+
+    /// Every domain's `reduce_*` arm folds into its own store and is readable back
+    /// through the matching accessor — the four domains (#181) whose only
+    /// exercise elsewhere was transitive through their own module's tests, never
+    /// through `AccountState` itself.
+    #[test]
+    fn every_domain_update_folds_into_its_own_store() {
+        use tdlib_rs::enums::{ChatAction as TdChatAction, MessageSender};
+        use tdlib_rs::types::{
+            File as TdFile, LocalFile, RemoteFile, UpdateChatAction, UpdateFile, UpdateSecretChat,
+            UpdateUser, User as TdUser,
+        };
+
+        let mut state = AccountState::default();
+
+        state.reduce_user(&Update::User(UpdateUser {
+            user: TdUser {
+                id: 7,
+                first_name: "Ada".to_owned(),
+                last_name: "Lovelace".to_owned(),
+                usernames: None,
+                phone_number: String::new(),
+                status: tdlib_rs::enums::UserStatus::Empty,
+                profile_photo: None,
+                accent_color_id: 0,
+                background_custom_emoji_id: 0,
+                upgraded_gift_colors: None,
+                profile_accent_color_id: 0,
+                profile_background_custom_emoji_id: 0,
+                emoji_status: None,
+                is_contact: false,
+                is_mutual_contact: false,
+                is_close_friend: false,
+                verification_status: None,
+                is_premium: false,
+                is_support: false,
+                restriction_info: None,
+                active_story_state: None,
+                restricts_new_chats: false,
+                paid_message_star_count: 0,
+                have_access: true,
+                r#type: tdlib_rs::enums::UserType::Regular,
+                language_code: String::new(),
+                added_to_attachment_menu: false,
+            },
+        }));
+        assert!(state.users().get(7).is_some());
+
+        state.reduce_file(&Update::File(UpdateFile {
+            file: TdFile {
+                id: 3,
+                size: 1000,
+                expected_size: 1000,
+                local: LocalFile {
+                    path: String::new(),
+                    can_be_downloaded: true,
+                    can_be_deleted: true,
+                    is_downloading_active: false,
+                    is_downloading_completed: false,
+                    download_offset: 0,
+                    downloaded_prefix_size: 0,
+                    downloaded_size: 0,
+                },
+                remote: RemoteFile::default(),
+            },
+        }));
+        assert!(state.files().get(3).is_some());
+
+        state.reduce_action(&Update::ChatAction(UpdateChatAction {
+            chat_id: 42,
+            topic_id: None,
+            sender_id: MessageSender::User(tdlib_rs::types::MessageSenderUser { user_id: 7 }),
+            action: TdChatAction::Typing,
+        }));
+        assert!(state.actions().action(42, &Sender::User(7)).is_some());
+
+        state.reduce_secret_chat(&Update::SecretChat(UpdateSecretChat {
+            secret_chat: tdlib_rs::types::SecretChat {
+                id: 1,
+                user_id: 7,
+                state: tdlib_rs::enums::SecretChatState::Pending,
+                is_outbound: true,
+                key_hash: String::new(),
+                layer: 144,
+            },
+        }));
+        assert!(state.secret_chats().get(1).is_some());
+
+        // Every domain accessor stays readable even before its store has seen
+        // anything (the composition root's default wiring, exercised by the
+        // untouched `chats()` accessor here).
+        assert!(state.chats().is_empty());
+    }
+
+    /// The production sink (`SharedState`) delegates each domain's update to
+    /// `AccountState` under the lock — the router-driven test above only
+    /// exercises the chat/connection arms of `impl UpdateSink for SharedState`
+    /// (via a `ChatReadInbox` and a lag); this covers the remaining four arms
+    /// (user/file/action/secret-chat) the same way production reaches them: through
+    /// the trait, not `AccountState` directly.
+    #[test]
+    fn shared_state_sink_delegates_every_domain_to_account_state() {
+        use tdlib_rs::enums::{ChatAction as TdChatAction, MessageSender};
+        use tdlib_rs::types::{
+            File as TdFile, LocalFile, MessageSenderUser, RemoteFile, UpdateChatAction, UpdateFile,
+            UpdateSecretChat, UpdateUser, User as TdUser,
+        };
+
+        let mut state: SharedState = Arc::new(Mutex::new(AccountState::default()));
+
+        UpdateSink::reduce_user(
+            &mut state,
+            &Update::User(UpdateUser {
+                user: TdUser {
+                    id: 7,
+                    first_name: "Ada".to_owned(),
+                    last_name: "Lovelace".to_owned(),
+                    usernames: None,
+                    phone_number: String::new(),
+                    status: tdlib_rs::enums::UserStatus::Empty,
+                    profile_photo: None,
+                    accent_color_id: 0,
+                    background_custom_emoji_id: 0,
+                    upgraded_gift_colors: None,
+                    profile_accent_color_id: 0,
+                    profile_background_custom_emoji_id: 0,
+                    emoji_status: None,
+                    is_contact: false,
+                    is_mutual_contact: false,
+                    is_close_friend: false,
+                    verification_status: None,
+                    is_premium: false,
+                    is_support: false,
+                    restriction_info: None,
+                    active_story_state: None,
+                    restricts_new_chats: false,
+                    paid_message_star_count: 0,
+                    have_access: true,
+                    r#type: tdlib_rs::enums::UserType::Regular,
+                    language_code: String::new(),
+                    added_to_attachment_menu: false,
+                },
+            }),
+        );
+
+        UpdateSink::reduce_file(
+            &mut state,
+            &Update::File(UpdateFile {
+                file: TdFile {
+                    id: 3,
+                    size: 1000,
+                    expected_size: 1000,
+                    local: LocalFile {
+                        path: String::new(),
+                        can_be_downloaded: true,
+                        can_be_deleted: true,
+                        is_downloading_active: false,
+                        is_downloading_completed: false,
+                        download_offset: 0,
+                        downloaded_prefix_size: 0,
+                        downloaded_size: 0,
+                    },
+                    remote: RemoteFile::default(),
+                },
+            }),
+        );
+
+        UpdateSink::reduce_action(
+            &mut state,
+            &Update::ChatAction(UpdateChatAction {
+                chat_id: 1,
+                topic_id: None,
+                sender_id: MessageSender::User(MessageSenderUser { user_id: 9 }),
+                action: TdChatAction::Typing,
+            }),
+        );
+
+        UpdateSink::reduce_secret_chat(
+            &mut state,
+            &Update::SecretChat(UpdateSecretChat {
+                secret_chat: tdlib_rs::types::SecretChat {
+                    id: 1,
+                    user_id: 7,
+                    state: tdlib_rs::enums::SecretChatState::Pending,
+                    is_outbound: true,
+                    key_hash: String::new(),
+                    layer: 144,
+                },
+            }),
+        );
+
+        let guard = state.lock().expect("mutex usable after the sink calls");
+        assert!(guard.users().get(7).is_some());
+        assert!(guard.files().get(3).is_some());
+        assert!(guard.actions().action(1, &Sender::User(9)).is_some());
+        assert!(guard.secret_chats().get(1).is_some());
+    }
 }
