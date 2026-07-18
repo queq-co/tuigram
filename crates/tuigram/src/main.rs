@@ -7,6 +7,18 @@
 
 use std::process::ExitCode;
 
+// dhat needs to own the global allocator to see every allocation (#185,
+// `profile-dhat` feature) — a normal build keeps the system allocator.
+#[cfg(feature = "profile-dhat")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() -> ExitCode {
+    // Heap profiling (#185, `profile-dhat` feature): the guard must outlive the
+    // whole run, so it's held here in `main` rather than inside `run_app` —
+    // dropping it (on return) is what flushes `dhat-heap.json`.
+    #[cfg(feature = "profile-dhat")]
+    let _profiler = dhat::Profiler::new_heap();
+
     tuigram_client::run_app()
 }
