@@ -367,6 +367,15 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // either can be detected before the next `draw` — see `should_clear_for_graphics`.
     let mut last_open_chat: Option<i64> = None;
     let mut last_overlay = app.overlay();
+    // The conversation's scroll position as of the last drawn frame, and whether
+    // that frame drew any avatar/inline-media image at all (#278) — the same
+    // "detect a change before the next draw" pattern as `last_open_chat`/
+    // `last_overlay` above, extended to ordinary scrolling. `last_had_images`
+    // necessarily updates *after* `draw()` (it comes from that frame's render
+    // output), unlike the other three, which are derived from state already
+    // available before drawing.
+    let mut last_scroll_position: (usize, usize) = (0, 0);
+    let mut last_had_images = false;
 
     while !app.should_quit() {
         if app.is_dirty() {
@@ -388,6 +397,19 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // is a best-effort mitigation pending real-terminal confirmation,
             // not a verified fix.
             //
+            // Extended (#278) to a real Kitty report: an avatar/inline-media
+            // image left stale during *ordinary scrolling* within an already-open
+            // chat, on Ghostty. `TestBackend` proved this codebase's own
+            // render/scroll buffer-diffing is correct even across many scroll
+            // steps (see the regression test next to `render_conversation`), so
+            // the remaining suspect is Kitty placement *repositioning*: every
+            // visible avatar/media's row shifts on any `(offset, row_skip)`
+            // change, and some terminals don't fully repaint an existing
+            // placement's old position when it's merely moved rather than
+            // deleted and recreated. Gated on `last_had_images` (was there
+            // anything on screen last frame worth protecting) so a scroll
+            // through a chat with zero avatars/media never pays for this.
+            //
             // Forced via `resize()` to the current size, not `Terminal::clear()`
             // (#234 hotfix): `clear()` snapshots the cursor position first via a
             // blocking DSR query (`ESC[6n`, crossterm's `cursor::position()`),
@@ -400,17 +422,23 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // whole app via `?`. `resize()` to an unchanged size performs the
             // exact same clear + back-buffer-reset ratatui's own resize path
             // does internally (see `clear_viewport`) but never touches cursor
-            // position, so it can't race the event reader.
+            // position, so it can't race the event reader — true regardless of
+            // how often it now fires, since it never touches cursor position at
+            // all.
+            let scroll_position = (app.conversation().offset(), app.conversation().row_skip());
             if should_clear_for_graphics(
                 app.graphics_active(),
                 history.open != last_open_chat,
                 app.overlay() != last_overlay,
+                scroll_position != last_scroll_position,
+                last_had_images,
             ) {
                 let area = guard.terminal_mut().size()?.into();
                 guard.terminal_mut().resize(area)?;
             }
             last_open_chat = history.open;
             last_overlay = app.overlay();
+            last_scroll_position = scroll_position;
 
             // The draw reports the history pane's inner height; record it on the view
             // so an open/`G`/tail-follow can bottom-anchor against the real number of
@@ -435,6 +463,10 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // Record the open overlay's row map this frame drew, so a mouse click
             // on an actual overlay row can select-and-confirm it directly (#217).
             app.set_overlay_rows(render_out.overlay_rows);
+            // Unlike last_open_chat/last_overlay/last_scroll_position above, this
+            // can only be known *after* the draw (#278) — it's this frame's own
+            // render output, not state available beforehand.
+            last_had_images = render_out.history_has_visible_images;
         }
 
         tokio::select! {
@@ -1157,17 +1189,28 @@ fn drive_secret(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<
 }
 
 /// Whether the loop should force a full terminal repaint before the next
-/// `draw` (#229): only when graphics are actually in play (a graphics-capable
-/// terminal *and* the user's setting on, [`App::graphics_active`]) and the
-/// open chat or overlay just changed. Pure and independent of the tokio loop
-/// so the decision itself is unit-testable without a real terminal — see
-/// `run`'s call site for the full (and still not fully confirmed) rationale.
+/// `draw` (#229, extended #278): only when graphics are actually in play (a
+/// graphics-capable terminal *and* the user's setting on,
+/// [`App::graphics_active`]), and either the open chat or overlay just
+/// changed, or the conversation scrolled while it had at least one avatar or
+/// inline-media image on screen last frame (`had_visible_images`) — the
+/// scroll case is gated on that because a scroll through an image-free chat
+/// has nothing an extra clear could protect. Pure and independent of the
+/// tokio loop so the decision itself is unit-testable without a real
+/// terminal — see `run`'s call site for the full (and still not fully
+/// confirmed) rationale.
+// Five orthogonal, independently-meaningful conditions (see the `#[test]`
+// block below, which enumerates their combinations) — a struct would only
+// add ceremony around what's a pure decision table.
+#[allow(clippy::fn_params_excessive_bools)]
 fn should_clear_for_graphics(
     graphics_active: bool,
     chat_changed: bool,
     overlay_changed: bool,
+    scroll_changed: bool,
+    had_visible_images: bool,
 ) -> bool {
-    graphics_active && (chat_changed || overlay_changed)
+    graphics_active && (chat_changed || overlay_changed || (scroll_changed && had_visible_images))
 }
 
 /// Apply a confirmed retention edit from the in-app editor (#146). The editor
@@ -2000,30 +2043,56 @@ mod tests {
     #[test]
     fn never_clears_when_graphics_are_not_active() {
         // No images were ever drawn, so there is nothing to ghost — regardless of
-        // whether the chat or overlay changed.
-        assert!(!should_clear_for_graphics(false, false, false));
-        assert!(!should_clear_for_graphics(false, true, false));
-        assert!(!should_clear_for_graphics(false, false, true));
-        assert!(!should_clear_for_graphics(false, true, true));
+        // whether the chat, overlay, or scroll position changed.
+        assert!(!should_clear_for_graphics(
+            false, false, false, false, false
+        ));
+        assert!(!should_clear_for_graphics(false, true, false, false, false));
+        assert!(!should_clear_for_graphics(false, false, true, false, false));
+        assert!(!should_clear_for_graphics(false, true, true, false, false));
+        assert!(!should_clear_for_graphics(false, false, false, true, true));
     }
 
     #[test]
     fn never_clears_when_graphics_are_active_but_nothing_changed() {
         // No structural transition happened, so nothing could have been left
         // behind since the last frame.
-        assert!(!should_clear_for_graphics(true, false, false));
+        assert!(!should_clear_for_graphics(true, false, false, false, false));
     }
 
     #[test]
     fn clears_when_graphics_are_active_and_the_chat_or_overlay_changed() {
-        assert!(should_clear_for_graphics(true, true, false), "chat changed");
         assert!(
-            should_clear_for_graphics(true, false, true),
+            should_clear_for_graphics(true, true, false, false, false),
+            "chat changed"
+        );
+        assert!(
+            should_clear_for_graphics(true, false, true, false, false),
             "overlay changed"
         );
         assert!(
-            should_clear_for_graphics(true, true, true),
+            should_clear_for_graphics(true, true, true, false, false),
             "both changed at once"
+        );
+    }
+
+    /// #278: a scroll step alone (no chat/overlay transition) only clears when
+    /// there was at least one avatar/inline-media image on screen last frame —
+    /// a scroll through an image-free chat has nothing an extra clear could
+    /// protect, so it must stay a no-op.
+    #[test]
+    fn clears_on_a_scroll_step_only_when_images_were_visible() {
+        assert!(
+            should_clear_for_graphics(true, false, false, true, true),
+            "scrolled with an image on screen"
+        );
+        assert!(
+            !should_clear_for_graphics(true, false, false, true, false),
+            "scrolled but nothing was on screen to ghost"
+        );
+        assert!(
+            !should_clear_for_graphics(true, false, false, false, true),
+            "images were visible but the scroll position didn't change"
         );
     }
 }

@@ -224,6 +224,11 @@ pub struct RenderOutput {
     pub chat_rows: ChatRows,
     /// Row-range → message id map this frame drew.
     pub history_rows: HistoryRows,
+    /// Whether this frame drew at least one avatar or inline-media image in the
+    /// history pane (#278) — the Kitty-scroll-ghosting mitigation's signal for
+    /// whether a scroll step actually had anything on screen worth protecting
+    /// with an extra clear; see `should_clear_for_graphics` in `lib.rs`.
+    pub history_has_visible_images: bool,
     /// Row/column → list-index map for the open overlay, if any (empty when none
     /// is open, or the open one has no selectable list).
     pub overlay_rows: OverlayRows,
@@ -239,7 +244,7 @@ pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
     );
 
     let chat_rows = render_chat_list(frame, panes.list, app);
-    let history_rows = render_conversation(frame, panes.history, app);
+    let (history_rows, history_has_visible_images) = render_conversation(frame, panes.history, app);
     render_composer(frame, panes.composer, app);
     render_status_bar(frame, panes.status, app);
 
@@ -306,6 +311,7 @@ pub fn ui(frame: &mut Frame, app: &App) -> RenderOutput {
         panes,
         chat_rows,
         history_rows,
+        history_has_visible_images,
         overlay_rows,
     }
 }

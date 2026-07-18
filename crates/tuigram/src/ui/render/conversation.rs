@@ -56,11 +56,11 @@ pub(crate) fn convo_body_width(area: Rect, gutter_cols: usize) -> usize {
 /// reaction line — windowed forward from the scroll offset so a long history never
 /// builds the whole buffer, with a scrollbar tracking the offset. With no chat open
 /// the view is empty, so the pane falls through to the empty-state placeholder (#188).
-pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows {
+pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> (HistoryRows, bool) {
     let view = app.conversation();
     if view.is_empty() {
         render_conversation_placeholder(frame, area, app);
-        return HistoryRows::default();
+        return (HistoryRows::default(), false);
     }
 
     // Window forward from the offset: format messages until the visible rows are
@@ -156,6 +156,13 @@ pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> H
     }
     lines.truncate(inner_rows);
 
+    // Recorded before the second-pass loops below consume `avatars`/`media` by
+    // value (#278): whether this frame drew at least one avatar or inline-media
+    // image at all — the loop's Kitty-scroll-ghosting mitigation only needs to
+    // force an extra clear on a scroll step when there was something on screen
+    // that could actually be left stale by one.
+    let has_visible_images = !avatars.is_empty() || !media.is_empty();
+
     // The conversation header doubles as the chat-action indicator (#87): the pane
     // title names the transient "typing…" activity when someone is acting.
     let title = match view.chat_action() {
@@ -247,17 +254,20 @@ pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> H
     // `area.y + 1 + row` above), clipped to what `truncate` above actually kept
     // so a message half-cut off at the pane's bottom edge never claims rows past
     // the border.
-    HistoryRows(
-        message_rows
-            .into_iter()
-            .map(|(start, end, id)| {
-                (
-                    area.y + 1 + start as u16,
-                    area.y + 1 + end.min(inner_rows) as u16,
-                    id,
-                )
-            })
-            .collect(),
+    (
+        HistoryRows(
+            message_rows
+                .into_iter()
+                .map(|(start, end, id)| {
+                    (
+                        area.y + 1 + start as u16,
+                        area.y + 1 + end.min(inner_rows) as u16,
+                        id,
+                    )
+                })
+                .collect(),
+        ),
+        has_visible_images,
     )
 }
 
@@ -1735,6 +1745,70 @@ mod tests {
                  one row at once: {rows_with_fragment:?}"
             );
         }
+    }
+
+    /// #278: `RenderOutput::history_has_visible_images` is the signal the
+    /// scroll-ghosting mitigation gates on — it must stay `false` when nothing
+    /// on screen could be left stale (plain text, or graphics off) and flip
+    /// `true` the moment either an avatar or inline media is actually drawn.
+    #[test]
+    fn history_has_visible_images_reflects_avatars_and_media() {
+        let plain = app_with_history(vec![text_message(1, "hi")]);
+        assert!(
+            !render_output(&plain, 80, 24).history_has_visible_images,
+            "plain text, no graphics support at all"
+        );
+
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut with_media = app_with_history(vec![photo]);
+        with_media.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        with_media.project_downloads(vec![present_file(7)]);
+        assert!(
+            !render_output(&with_media, 80, 24).history_has_visible_images,
+            "the media box is reserved but no protocol is cached yet"
+        );
+        let picker = graphics_picker();
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4));
+        let protocol = picker
+            .new_protocol(
+                image,
+                ratatui::layout::Size::new(4, 4),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("halfblocks protocol always encodes");
+        with_media.cache_media(1, protocol);
+        assert!(
+            render_output(&with_media, 80, 24).history_has_visible_images,
+            "a decoded, visible media protocol is now on screen"
+        );
+
+        let mut with_avatar = app_with_history(vec![text_message(2, "hi")]);
+        with_avatar.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        assert!(
+            !render_output(&with_avatar, 80, 24).history_has_visible_images,
+            "the gutter is reserved but no avatar protocol is cached yet"
+        );
+        let picker = graphics_picker();
+        let protocol = picker
+            .new_protocol(
+                image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4)),
+                ratatui::layout::Size::new(4, 4),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("halfblocks protocol always encodes");
+        with_avatar.cache_avatar(2, protocol);
+        assert!(
+            render_output(&with_avatar, 80, 24).history_has_visible_images,
+            "a cached avatar alone also counts"
+        );
     }
 
     #[test]
