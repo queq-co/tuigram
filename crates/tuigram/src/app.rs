@@ -3,6 +3,20 @@
 //! translates its source into an [`Action`], [`App::dispatch`] applies it and
 //! marks the frame dirty, and the loop repaints from the new state. Nothing here
 //! touches the terminal or awaits — it stays a pure, unit-testable reducer.
+//!
+//! Cohesion review (#182d): this file stays one module, by design rather than
+//! neglect. `Action` is one flat enum because it is the single vocabulary every
+//! input source (terminal, mouse, `TDLib` updates) is translated into, and
+//! splitting it would just scatter that vocabulary. `App`'s ~80-odd accessor,
+//! projection, and `take_*` methods are the state the rest of the crate reads
+//! and drains — they are coupled to the one struct's fields, not an independent
+//! seam. [`App::dispatch`] itself is one large `match` over every `Action`
+//! variant; unlike `tuigram-core`'s `messages.rs` (#182c, request traits vs. a
+//! store) or `ui.rs` (#182b, one render function per pane), there is no
+//! existing per-arm boundary to move code across — the match arms share `self`
+//! and each other's helpers directly. Breaking `dispatch` up would mean
+//! redesigning it around a command-pattern dispatch table, which is a design
+//! change, not a mechanical move, so it is out of scope for a cohesion pass.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
