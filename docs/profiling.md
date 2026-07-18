@@ -7,21 +7,18 @@ scenarios from #185 (cold start on a large account, scrolling a busy group,
 a sustained update storm).
 
 Run these **one tool at a time** — stacking dhat/console instrumentation on
-top of each other skews both readings, and a flamegraph samples the process
-from outside so it wants an unencumbered binary.
+top of each other skews both readings, and samply samples the process from
+outside so it wants an unencumbered binary.
 
 ## 0. One-time setup
 
 ```sh
-# Flamegraph: samples the running process from outside — no code change, no
-# feature flag, just the tool.
-cargo install flamegraph
-
-# macOS only: flamegraph shells out to `dtrace`, which needs one-time sudo
-# grants. Linux uses `perf` instead — install via your package manager
-# (e.g. `sudo apt install linux-tools-common linux-tools-generic`) and see
-# https://github.com/flamegraph-rs/flamegraph#perf for the paranoid/kptr sysctls.
-sudo dtrace -l >/dev/null   # macOS: triggers the permission prompt once
+# samply: samples the running process from outside — no code change, no
+# feature flag, just the tool. Preferred over cargo-flamegraph on macOS: it
+# doesn't go through Instruments/xctrace (see the gotcha below and the
+# Troubleshooting section), and it opens an interactive view (zoom, search
+# by symbol) instead of one static SVG.
+cargo install samply
 
 # tokio-console: the CLI that connects to the running binary's diagnostic port.
 cargo install tokio-console
@@ -30,22 +27,42 @@ cargo install tokio-console
 dhat needs no separate install — it's a regular (optional) dependency,
 already wired into `tuigram-client` behind the `profile-dhat` feature.
 
-## 1. Flamegraph (CPU)
+### Gotcha: build with `--features tuigram-client/static` for anything that runs the binary directly
 
-Release-profile symbols are stripped (`strip = "symbols"`, #184), which would
-leave a flamegraph full of `??`. Override just the debug-info bit for this run
-— `CARGO_PROFILE_RELEASE_DEBUG=true` keeps everything else in `[profile.release]`
-(lto, codegen-units) intact so the perf characteristics still match a real
-release build:
+`samply` (and `cargo-flamegraph`, if you use that instead — see
+Troubleshooting) exec the compiled `tuigram` binary directly, not through
+`cargo run`. A plain `cargo build --release` links against tdjson as a
+dylib whose install name is `@rpath/libtdjson.<ver>.dylib`, resolved via an
+rpath that only `cargo run`/`cargo test` supply (they set `DYLD_LIBRARY_PATH`
+for you); the standalone binary itself carries no working rpath and fails
+immediately with:
+
+```
+dyld[...]: Library not loaded: @rpath/libtdjson.1.8.61.dylib
+Reason: no LC_RPATH's found
+```
+
+Sidestep it entirely by building the profiling binary statically linked
+(same feature the release CI job uses, #167) — no dylib, no rpath, runs
+standalone:
 
 ```sh
-CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph -p tuigram-client --bin tuigram -- 
+cargo build --release -p tuigram-client --bin tuigram --features tuigram-client/static
+```
+
+Do this once before a `samply`/`flamegraph` session; `cargo run`-based tools
+(dhat, tokio-console below) don't need it.
+
+## 1. samply (CPU)
+
+```sh
+samply record ./target/release/tuigram
 ```
 
 Use the TUI normally for the scenario you're capturing (see §4), then quit
-(`q`) — flamegraph stops sampling when the process exits and writes
-`flamegraph.svg` in the current directory. Rename it per scenario before the
-next run, e.g. `mv flamegraph.svg flamegraph-cold-start.svg`.
+(`q`) — samply opens the recorded profile in the Firefox Profiler UI
+(locally, in your browser) as soon as the process exits. Use its "Save"
+button to keep a `.json.gz` per scenario before the next run.
 
 ## 2. dhat (heap)
 
@@ -57,7 +74,7 @@ Run the scenario, quit normally (`q`) — the profiler guard in `main.rs` is
 dropped on return, which flushes `dhat-heap.json` to the working directory.
 Open it at <https://nnethercote.github.io/dh_view/dh_view.html> (drag the file
 in, nothing is uploaded — it's a client-side page). Rename the json per
-scenario before the next run, same as the flamegraph.
+scenario before the next run, same as the samply profile.
 
 ## 3. tokio-console (tasks)
 
@@ -98,13 +115,52 @@ recorded as the baseline budget.
 While in each scenario, keep an eye on the prime suspect named in #185: the
 per-repaint rebuild of owned `Line<'static>` allocations in the render path
 (`tuigram/src/ui/render/conversation.rs`) — dhat's allocation-site view and
-the flamegraph's self-time for that path are the two views that would
-confirm or clear it.
+samply's self-time for that function are the two views that would confirm or
+clear it.
 
 ## 5. Reporting
 
 File each finding as its own issue (per #185's deliverables), and paste the
-startup-time/idle-RSS numbers plus links/attachments to the flamegraphs and
-dhat json (or screenshots of the tokio-console tables) into #185's closing
+startup-time/idle-RSS numbers plus links/attachments to the samply profiles
+and dhat json (or screenshots of the tokio-console tables) into #185's closing
 comment as the baseline. If the render-path allocation suspicion is confirmed
 or cleared, say so explicitly — that's the evidence #186 is gated on.
+
+## Troubleshooting
+
+**`cargo-flamegraph` instead of samply:** if you'd rather use
+`cargo-flamegraph` (one static SVG instead of samply's interactive view), the
+same static-build gotcha above applies, plus on macOS it shells out to
+`xctrace` (Instruments' CLI), not `dtrace` — which only exists inside a full
+Xcode.app, not the standalone Command Line Tools:
+
+```
+xcode-select: error: tool 'xctrace' requires Xcode, but active developer
+directory '/Library/Developer/CommandLineTools' is a command line tools instance
+```
+
+Fix by pointing `xcode-select` at a full (or beta) Xcode install for the
+session, then **switching back afterwards** — leaving it pointed at a beta
+Xcode affects every other `cargo build`'s clang/linker on the machine, not
+just this one:
+
+```sh
+# 1. Find your installed Xcode(s):
+ls /Applications | grep -i xcode
+
+# 2. Point at it (adjust the app name to what step 1 found):
+sudo xcode-select -s /Applications/Xcode-beta.app/Contents/Developer
+
+# 3. Accept its license once:
+sudo xcodebuild -license accept
+
+# 4. Verify:
+xcrun xctrace version
+
+# 5. Run cargo-flamegraph, then switch back to Command Line Tools:
+CARGO_PROFILE_RELEASE_DEBUG=true cargo flamegraph -p tuigram-client --bin tuigram --features tuigram-client/static --
+sudo xcode-select -s /Library/Developer/CommandLineTools
+```
+
+`samply` needs none of this — it's the reason it's the default recommendation
+above.
