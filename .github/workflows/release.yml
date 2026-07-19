@@ -505,15 +505,22 @@ jobs:
       # name (its naming isn't part of the action's documented contract).
       # `--auto` waits on homebrew-tuigram's own required `test` check
       # (.github/workflows/tests.yml there) rather than merging blind.
-      - name: Auto-merge the tap PR
+      - name: Enable auto-merge for the tap PR
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          pr=$(gh pr list --repo queq-co/homebrew-tuigram --state open \
-            --json number,createdAt --jq 'sort_by(.createdAt) | last | .number')
-          if [ -z "$pr" ] || [ "$pr" = "null" ]; then
-            echo "No open PR found on homebrew-tuigram to auto-merge" >&2
-            exit 1
-          fi
-          gh pr merge "$pr" --repo queq-co/homebrew-tuigram --auto --squash
+          pr_id=$(gh pr list --repo queq-co/homebrew-tuigram --state open \
+            --json id,createdAt --jq 'sort_by(.createdAt) | last | .id')
+
+          gh api graphql \
+            -f query='
+              mutation($id: ID!) {
+                enablePullRequestAutoMerge(input: {
+                  pullRequestId: $id,
+                  mergeMethod: SQUASH
+                }) {
+                  pullRequest { number }
+                }
+              }' \
+            -F id="$pr_id"
