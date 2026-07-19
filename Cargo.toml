@@ -7,7 +7,7 @@ members = ["crates/tuigram-core", "crates/tuigram", "crates/tuigram-fixtures"]
 # SemVer (leading zeros are rejected). MINOR is the release month, MICRO the
 # patch within it; both crates inherit this via `version.workspace = true`, and
 # it flows to TDLib as `application_version` through `tuigram_core::version()`.
-version = "2026.7.2"
+version = "2026.7.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/queq-co/tuigram"
