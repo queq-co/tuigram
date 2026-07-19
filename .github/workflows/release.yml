@@ -495,6 +495,16 @@ jobs:
         with:
           formula-name: tuigram
           homebrew-tap: queq-co/homebrew-tuigram
+          # The action defaults to forking homebrew-tap and pushing there
+          # (a personal-access-token workflow) — a GitHub App installation
+          # token has no personal account to fork into, so that POST
+          # /repos/.../forks 403s ("Resource not accessible by integration"),
+          # confirmed on the v2026.7.3 release run. `push-to` pointed at the
+          # tap repo itself (not an actual fork) tells the action the
+          # COMMITTER_TOKEN can already write there directly — it still opens
+          # a same-repo branch + PR (so the auto-merge step below has
+          # something to act on), it just never attempts the fork.
+          push-to: queq-co/homebrew-tuigram
           download-url: https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/tuigram-${{ needs.preflight.outputs.version }}-macos-arm64.tar.gz
           download-sha256: ${{ steps.sha.outputs.sha256 }}
         env:
