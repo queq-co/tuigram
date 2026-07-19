@@ -3,7 +3,7 @@
 //! block, and plain user sanity all need `tuigram --version` to print and exit
 //! — today `main` ignores argv entirely and starts the TUI regardless. This is
 //! a hand-rolled check, not a general parser (clap would be overkill for two
-//! flags): [`parse`] must run and return before any terminal-mode or TDLib work
+//! flags): [`parse`] must run and return before any terminal-mode or `TDLib` work
 //! so these paths exit cleanly with no TTY and no `~/.config/tuigram/` access.
 
 use std::process::ExitCode;
@@ -74,7 +74,7 @@ mod tests {
     use super::*;
 
     fn args(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+        items.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]

@@ -1,9 +1,9 @@
-//! Render a [`FormattedText`]'s entities (#211): TDLib carries a formatting
+//! Render a [`FormattedText`]'s entities (#211): `TDLib` carries a formatting
 //! entity list end to end (bold, italic, code, spoiler, …) but until now the
 //! conversation pane dropped it and rendered plain text. This module maps
 //! entity ranges onto ratatui [`Span`]s.
 //!
-//! TDLib reports entity `offset`/`length` in **UTF-16 code units**, not bytes
+//! `TDLib` reports entity `offset`/`length` in **UTF-16 code units**, not bytes
 //! or chars, so [`utf16_offset_to_byte`] converts before slicing the `&str`.
 //! Entities can nest or overlap (e.g. a link inside bold text), so
 //! [`styled_spans`] composes them by boundary rather than walking one entity
@@ -23,9 +23,9 @@ use tuigram_core::model::{EntityKind, TextEntity};
 /// (so the concealed run keeps the original text's display width).
 const SPOILER_GLYPH: char = '▒';
 
-/// Convert a TDLib UTF-16 code-unit offset into `s` to a byte offset, for
+/// Convert a `TDLib` UTF-16 code-unit offset into `s` to a byte offset, for
 /// slicing. Clamps to `s.len()` if `utf16_offset` runs past the string's
-/// UTF-16 length (a defensively-tolerant read of a value TDLib guarantees is
+/// UTF-16 length (a defensively-tolerant read of a value `TDLib` guarantees is
 /// in range, but which a mid-string clip must not panic on).
 fn utf16_offset_to_byte(s: &str, utf16_offset: usize) -> usize {
     let mut utf16_count = 0usize;
@@ -135,6 +135,7 @@ pub fn styled_spans(text: &str, entities: &[TextEntity], selected: bool) -> Vec<
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use tuigram_core::model::TextEntity;

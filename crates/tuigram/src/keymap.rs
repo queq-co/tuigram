@@ -30,7 +30,7 @@ pub enum Focus {
 }
 
 impl Focus {
-    /// The next pane in the cycle (ChatList → History → Composer → ChatList).
+    /// The next pane in the cycle (`ChatList` → History → Composer → `ChatList`).
     #[must_use]
     pub fn next(self) -> Self {
         match self {
@@ -589,7 +589,7 @@ fn resolve_help(key: &KeyEvent) -> Action {
         return Action::Quit;
     }
     match key.code {
-        KeyCode::Char('?') | KeyCode::Char('q') | KeyCode::Esc => Action::ToggleHelp,
+        KeyCode::Char('?' | 'q') | KeyCode::Esc => Action::ToggleHelp,
         KeyCode::Char('j') | KeyCode::Down => Action::HelpScrollDown,
         KeyCode::Char('k') | KeyCode::Up => Action::HelpScrollUp,
         _ => Action::Noop,
@@ -870,6 +870,7 @@ pub fn help_line_count() -> usize {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
 

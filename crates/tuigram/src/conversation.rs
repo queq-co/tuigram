@@ -1,6 +1,6 @@
 //! The conversation view-model: the projection the history pane renders from.
 //!
-//! The core [`MessageStore`](tuigram_core::messages::MessageStore) folds TDLib's
+//! The core [`MessageStore`](tuigram_core::messages::MessageStore) folds `TDLib`'s
 //! per-chat history; this is the TUI side of it — a display snapshot of the open
 //! chat's [`Message`]s plus the cursor state the store has no opinion on: the set
 //! of pinned message ids (carried by the chat, see
@@ -169,7 +169,7 @@ pub struct ConversationView {
     /// first frame measures it; the anchor then falls back to the newest message
     /// alone and the next render re-anchors against the real height.
     viewport: usize,
-    /// Download state of media files referenced by the messages, keyed by TDLib
+    /// Download state of media files referenced by the messages, keyed by `TDLib`
     /// file id, for the download-progress indicator (#85). Phase 6 projects this
     /// from the core [`FileStore`](tuigram_core::files::FileStore); empty until then.
     downloads: HashMap<i32, File>,
@@ -200,6 +200,11 @@ pub struct ConversationView {
     /// mark-read can never erase the rule the instant it appears — but a genuine
     /// re-open (see `fresh_open` on [`project`](Self::project)) resets it to
     /// pending so reopening a now-fully-read chat correctly shows no rule.
+    // The nested Option *is* the 3-state enum clippy's `option_option` suggests —
+    // spelled with `Option<Option<_>>` because `.flatten()` in
+    // `unread_separator_before` reads more plainly than a bespoke tri-state type
+    // would for this single field.
+    #[allow(clippy::option_option)]
     unread_separator: Option<Option<i64>>,
     /// Whether graphics are capable *and* enabled (#208, live since #209), set
     /// via [`set_graphics_capable`](Self::set_graphics_capable) from `App`'s
@@ -218,6 +223,14 @@ pub struct ConversationView {
     /// as it did before #214. Carried across a chat switch the same way
     /// `viewport`/`graphics_capable` are, for the same reason.
     width: usize,
+    /// Whether a message has arrived at the tail while the reader was
+    /// scrolled away from the newest one — the official app's "new messages"
+    /// down-arrow. Set in [`project`](Self::project) when a same-chat refresh
+    /// appends a new newest message and the view was not following the tail;
+    /// cleared the moment the view reaches [`newest_anchor`](Self::newest_anchor)
+    /// again (scrolling down, paging down, or jumping to newest), so it never
+    /// lingers once the reader has actually caught up.
+    new_messages_below: bool,
 }
 
 impl ConversationView {
@@ -246,6 +259,7 @@ impl ConversationView {
             unread_separator: None,
             graphics_capable: false,
             width: 0,
+            new_messages_below: false,
         }
     }
 
@@ -298,20 +312,37 @@ impl ConversationView {
             // the selected message under the cursor by id.
             let following = self.is_at_newest();
             let anchor = self.selected_message().map(|m| m.id);
+            let old_newest = self.messages.last().map(|m| m.id);
             self.messages = messages;
             self.pinned = pinned;
             self.senders = senders;
             if following {
                 (self.offset, self.row_skip) = self.newest_anchor();
+                self.new_messages_below = false;
             } else {
-                self.offset = anchor
-                    .and_then(|id| self.messages.iter().position(|m| m.id == id))
+                let anchor_found =
+                    anchor.and_then(|id| self.messages.iter().position(|m| m.id == id));
+                self.offset = anchor_found
                     .unwrap_or(self.offset)
                     .min(self.messages.len().saturating_sub(1));
-                // The target message's own shape may have changed (a reaction
-                // added, media finishing a download); land on its header rather
-                // than trying to preserve an exact row position across that.
-                self.row_skip = 0;
+                // The anchor itself vanishing (deleted) is the one case landing
+                // on the header is right — the fallback offset now points at a
+                // different message entirely, so there's no "in-message depth"
+                // left to preserve. Otherwise (#276) reclamp against the anchor's
+                // possibly-changed height rather than unconditionally zeroing:
+                // a same-chat refresh fires on every unrelated `updateFile` tick
+                // too (#120), and zeroing here on every one of those snapped a
+                // mid-message scroll back to the header on every tick.
+                if anchor_found.is_none() {
+                    self.row_skip = 0;
+                }
+                self.clamp_row_skip();
+                // A genuinely new message landed at the tail (not just an edit
+                // or deletion elsewhere) while the reader was scrolled away —
+                // show the down-arrow until they scroll or jump back down.
+                if self.messages.last().map(|m| m.id) != old_newest {
+                    self.new_messages_below = true;
+                }
             }
         } else {
             // A different chat opened: a fresh view, dropping the previous chat's
@@ -510,7 +541,7 @@ impl ConversationView {
         }
     }
 
-    /// The download state of the file with TDLib id `file_id`, if known — the
+    /// The download state of the file with `TDLib` id `file_id`, if known — the
     /// source of the media download-progress indicator.
     #[must_use]
     pub fn download(&self, file_id: i32) -> Option<&File> {
@@ -543,12 +574,19 @@ impl ConversationView {
     /// not been folded yet clears to empty until its files arrive.
     pub fn set_downloads(&mut self, files: Vec<File>) {
         self.downloads = files.into_iter().map(|file| (file.id, file)).collect();
+        // `project_conversation` (lib.rs) calls this *after* `project()` (#276):
+        // a download-progress tick that shrinks the anchor's height only becomes
+        // visible here, not in `project()`'s own reclamp, which still saw the old
+        // map. `clamp_row_skip` only ever reduces `row_skip`, never raises it, so
+        // this is a no-op on the far more common case of an unrelated or growing
+        // download.
+        self.clamp_row_skip();
     }
 
     /// Scroll one row toward the newest (#222): advances within the current
     /// message's own rows, rolling onto the next message once they are
     /// exhausted. Clamps at the bottom-anchored position
-    /// ([`newest_anchor`](Self::newest_anchor)) rather than allowing an
+    /// (`newest_anchor`) rather than allowing an
     /// overscroll past it — a real pager's "you're at the end." A no-op on an
     /// empty history.
     pub fn scroll_down(&mut self) {
@@ -567,6 +605,9 @@ impl ConversationView {
         } else if self.offset + 1 < self.messages.len() {
             self.offset += 1;
             self.row_skip = 0;
+        }
+        if self.is_at_newest() {
+            self.new_messages_below = false;
         }
     }
 
@@ -624,6 +665,7 @@ impl ConversationView {
     /// the "message at offset" cursor); repeated `k` then walks upward from there.
     pub fn jump_to_newest(&mut self) {
         (self.offset, self.row_skip) = self.newest_anchor();
+        self.new_messages_below = false;
     }
 
     /// Whether the view is pinned to the newest message — sitting exactly at the
@@ -633,6 +675,14 @@ impl ConversationView {
     #[must_use]
     pub fn is_at_newest(&self) -> bool {
         (self.offset, self.row_skip) == self.newest_anchor()
+    }
+
+    /// Whether a message has arrived below the fold while the reader was
+    /// scrolled away from the newest message — drives the "new messages"
+    /// down-arrow drawn in the history pane's bottom-right corner.
+    #[must_use]
+    pub fn has_new_messages_below(&self) -> bool {
+        self.new_messages_below
     }
 
     /// Record the history pane's inner height (rows) measured by the last render
@@ -656,7 +706,7 @@ impl ConversationView {
     /// Set whether graphics are capable *and* enabled (#201/#208, live since
     /// #209 — `App` combines the terminal's detected capability with the user's
     /// `graphics` setting before calling this), so
-    /// [`message_height`](Self::message_height) knows whether to reserve rows
+    /// `message_height` knows whether to reserve rows
     /// for inline media. Toggling this while pinned to the newest message
     /// re-anchors the same way [`set_viewport_height`](Self::set_viewport_height)
     /// does, since every message's height changes at once. Returns whether the
@@ -676,7 +726,7 @@ impl ConversationView {
     }
 
     /// Record the history pane's measured body width (#214) — the column
-    /// budget [`content_rows`] wraps message bodies against. Re-anchors while
+    /// budget `content_rows` wraps message bodies against. Re-anchors while
     /// pinned to the newest message the same way
     /// [`set_viewport_height`](Self::set_viewport_height) does, since a width
     /// change (a resize) changes every wrapped message's height at once.
@@ -744,6 +794,22 @@ impl ConversationView {
             + 1
     }
 
+    /// Clamp `row_skip` to `messages[offset]`'s current
+    /// [`message_height`](Self::message_height), without moving `offset` or
+    /// resetting it to `0` (#276). Shared by [`project`](Self::project)'s
+    /// same-chat/not-following branch and [`set_downloads`](Self::set_downloads):
+    /// both can leave the anchor message's rendered height smaller than it was
+    /// (a download placeholder collapsing, a reaction line disappearing), and
+    /// this pulls `row_skip` back in bounds instead of leaving it pointing past
+    /// the message's new last row — or, in the common case where the height
+    /// didn't shrink, leaves it untouched. A no-op on an empty history.
+    fn clamp_row_skip(&mut self) {
+        if let Some(message) = self.messages.get(self.offset) {
+            let max = self.message_height(message).saturating_sub(1);
+            self.row_skip = self.row_skip.min(max);
+        }
+    }
+
     /// The rows [`crate::ui::quote_lines`] renders above a reply's body (#210,
     /// word-wrapped since #214): `0` for a plain message, otherwise the wrapped
     /// row count of the same greentext preview text the renderer builds —
@@ -768,14 +834,16 @@ impl ConversationView {
                 .messages
                 .iter()
                 .find(|m| m.id == *message_id)
-                .map(|quoted| {
-                    let sender = self.sender_label(quoted).label;
-                    format!(
-                        ">{sender}: {}",
-                        truncate(&content_snippet(&quoted.content), 60)
-                    )
-                })
-                .unwrap_or_else(|| ">reply".to_owned()),
+                .map_or_else(
+                    || ">reply".to_owned(),
+                    |quoted| {
+                        let sender = self.sender_label(quoted).label;
+                        format!(
+                            ">{sender}: {}",
+                            truncate(&content_snippet(&quoted.content), 60)
+                        )
+                    },
+                ),
             ReplyTo::Message { .. } | ReplyTo::Unsupported(_) => ">reply".to_owned(),
         };
         if self.width == 0 {
@@ -783,6 +851,23 @@ impl ConversationView {
         } else {
             crate::wrap::row_count(&text, self.width)
         }
+    }
+
+    /// Whether `file_id` is one this view's currently loaded messages
+    /// reference (#276) — the relevance filter the loop's `AppEvent::File`
+    /// handling uses to skip a full reproject when the touched file can't
+    /// affect anything currently rendered in the open chat. Checked against
+    /// the messages' own embedded file ids, not [`downloads`](Self::downloads):
+    /// a file id is known the instant its message lands, before any
+    /// `updateFile` has folded it into `downloads` — gating on `downloads`
+    /// instead would drop a fresh download's very first tick and, since that
+    /// dropped tick is the only thing that would have added the key, never
+    /// recover.
+    #[must_use]
+    pub(crate) fn references_file(&self, file_id: i32) -> bool {
+        self.messages
+            .iter()
+            .any(|m| m.content.file().is_some_and(|f| f.id == file_id))
     }
 
     /// Whether a message's content draws a download-progress line — mirroring
@@ -838,7 +923,7 @@ pub(crate) const MEDIA_COLS: usize = 48;
 ///   existing download driver already fetches is present.
 /// - `Video` and `Animation` are ready as soon as they carry a minithumbnail —
 ///   embedded with the message, no download needed.
-/// - Everything else (animated stickers included — TDLib gives those no
+/// - Everything else (animated stickers included — `TDLib` gives those no
 ///   minithumbnail, and rendering their `thumbnail` would need a new
 ///   download-trigger path out of scope for #208) is never ready.
 pub(crate) fn media_ready(content: &MessageContent, downloads: &HashMap<i32, File>) -> bool {
@@ -946,7 +1031,7 @@ fn truncate(s: &str, max: usize) -> String {
 /// (#194). `color` is `None` for senders that get no accent tint — "You", a
 /// chat (channel/anonymous-admin post), or an unresolved fallback id.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SenderLabel {
+pub struct SenderLabel {
     pub(crate) label: String,
     pub(crate) color: Option<Color>,
 }
@@ -1093,6 +1178,16 @@ mod tests {
     }
 
     #[test]
+    fn references_file_checks_the_loaded_messages_not_downloads() {
+        let view = ConversationView::from_messages(vec![photo(1, 42)], HashSet::new());
+        assert!(view.references_file(42), "the photo's own file id");
+        assert!(
+            !view.references_file(99),
+            "no loaded message references this id"
+        );
+    }
+
+    #[test]
     fn scroll_down_steps_one_row_rolling_onto_the_next_message_once_exhausted() {
         // #222: scroll_down is now a row step, not a message step.
         // `history`'s plain-text messages are 3 rows each (header, body, blank
@@ -1199,6 +1294,46 @@ mod tests {
             view.offset(),
             1,
             "a full 6-row viewport back from the anchor at offset 3"
+        );
+    }
+
+    /// #276: a same-chat reproject that doesn't change the anchor message's
+    /// shape must not discard how far the reader had scrolled into it. Before
+    /// the fix, `project()`'s not-following branch unconditionally zeroed
+    /// `row_skip` on *every* same-chat refresh — including one triggered by an
+    /// `updateFile` tick for a file the view never even shows — which is
+    /// exactly what made scrolling in a busy media group feel like it kept
+    /// snapping back.
+    #[test]
+    fn same_chat_reproject_preserves_row_skip_when_the_anchor_is_unchanged() {
+        let messages = tuigram_fixtures::fake_media_messages(20, 10, 100);
+        let mut view = ConversationView::default();
+        // Fresh open: bottom-anchored at the newest message.
+        view.project(
+            10,
+            messages.clone(),
+            HashSet::new(),
+            HashMap::new(),
+            0,
+            0,
+            true,
+        );
+        assert!(view.is_at_newest());
+        // Scroll away from the newest so the not-following branch is in play.
+        view.scroll_up();
+        let before = (view.offset(), view.row_skip());
+        assert!(
+            before.1 > 0,
+            "test setup: expected to land mid-message after one scroll_up"
+        );
+
+        // Same chat, identical messages — simulates the reproject an unrelated
+        // `updateFile` tick triggers: nothing about the anchor's shape changed.
+        view.project(10, messages, HashSet::new(), HashMap::new(), 0, 0, false);
+        assert_eq!(
+            (view.offset(), view.row_skip()),
+            before,
+            "an unrelated reproject must not move the cursor or reset row_skip"
         );
     }
 
@@ -1609,6 +1744,146 @@ mod tests {
             3,
             "index shifted by the two prepended messages"
         );
+    }
+
+    #[test]
+    fn a_new_message_while_scrolled_up_shows_the_new_messages_indicator() {
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.scroll_up(); // off the newest anchor
+        assert!(!view.has_new_messages_below());
+
+        // A new message (5) arrives at the tail while scrolled away from it.
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(view.has_new_messages_below());
+    }
+
+    #[test]
+    fn following_the_tail_never_shows_the_new_messages_indicator() {
+        // Pinned to the newest message: new arrivals auto-follow, so there is
+        // nothing hidden below the fold to signal.
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        assert!(view.is_at_newest());
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(view.is_at_newest());
+        assert!(!view.has_new_messages_below());
+    }
+
+    #[test]
+    fn a_refresh_with_no_new_tail_message_does_not_show_the_indicator() {
+        // Scrolled away from the tail, but the refresh only edited an existing
+        // message (same newest id) — nothing new arrived, so no indicator.
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.scroll_up();
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m (edited)")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(!view.has_new_messages_below());
+    }
+
+    #[test]
+    fn the_new_messages_indicator_clears_on_jump_to_newest() {
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.scroll_up();
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(view.has_new_messages_below());
+        view.jump_to_newest();
+        assert!(!view.has_new_messages_below());
+    }
+
+    #[test]
+    fn the_new_messages_indicator_clears_on_scrolling_back_to_the_anchor() {
+        let mut view = view_fitting(2);
+        view.project(
+            10,
+            (1..=4).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            true,
+        );
+        view.scroll_up();
+        view.project(
+            10,
+            (1..=5).map(|i| text(i, "m")).collect(),
+            HashSet::new(),
+            HashMap::new(),
+            i64::MAX,
+            0,
+            false,
+        );
+        assert!(view.has_new_messages_below());
+        for _ in 0..100 {
+            view.scroll_down();
+        }
+        assert!(view.is_at_newest());
+        assert!(!view.has_new_messages_below());
     }
 
     #[test]
@@ -2043,6 +2318,45 @@ mod tests {
         let after = view.message_height(&message);
 
         assert_eq!(after, before + MEDIA_ROWS);
+    }
+
+    /// #276: `set_downloads` runs *after* `project()` in the real reproject
+    /// call order (`project_conversation`, lib.rs), so a file update that
+    /// shrinks the anchor's height (media box collapsing once a file is no
+    /// longer present) only becomes visible here — `row_skip` must clamp back
+    /// in bounds rather than being left pointing past the message's new last
+    /// row.
+    #[test]
+    fn set_downloads_clamps_row_skip_when_the_anchor_height_shrinks() {
+        let mut view =
+            ConversationView::from_messages(vec![photo(1, 42), text(2, "after")], HashSet::new());
+        view.set_graphics_capable(true);
+        view.set_downloads(vec![present_file(42)]);
+        let tall_height = view.message_height(&view.messages()[0].clone());
+        assert!(
+            tall_height > 2,
+            "test setup: expected the media box to add rows"
+        );
+
+        // Scroll to the photo's last row while it's tall.
+        for _ in 1..tall_height {
+            view.scroll_down();
+        }
+        assert_eq!(view.offset(), 0, "still within the photo's own rows");
+        assert_eq!(view.row_skip(), tall_height - 1);
+
+        // The file is evicted — media_rows/has_download_line both drop for it.
+        view.set_downloads(vec![]);
+        let short_height = view.message_height(&view.messages()[0].clone());
+        assert!(
+            short_height < tall_height,
+            "test setup: expected the height to shrink"
+        );
+        assert_eq!(
+            view.row_skip(),
+            short_height - 1,
+            "clamped to the new last row, not left pointing past it"
+        );
     }
 
     /// A [`User`] with the given name and usernames; every other field inert. `kind`

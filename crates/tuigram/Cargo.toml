@@ -52,6 +52,18 @@ pkg-fmt = "zip"
 name = "tuigram"
 path = "src/main.rs"
 
+[[bench]]
+name = "chat_list"
+harness = false
+
+[[bench]]
+name = "conversation"
+harness = false
+
+[[bench]]
+name = "wrap"
+harness = false
+
 [features]
 # Manual, interactive headless harness (#9, #22; examples/repl.rs). Off by default
 # so it is excluded from default CI — it needs a real account and a TTY. It logs
@@ -70,6 +82,23 @@ login-harness = ["dep:rustyline"]
 # runtime deps — see docs/research/tdlib.md.
 static = ["tuigram-core/static"]
 
+# Real-session profiling exercise (#185). Both are dev-only instrumentation,
+# off by default (zero overhead, zero extra deps in a normal build) and meant
+# to be run one at a time against a real account — see
+# docs/research/profiling.md for the exact commands and what each scenario
+# should capture. Flamegraphs need no feature flag: `cargo flamegraph` samples
+# the process from outside, it doesn't need instrumentation compiled in.
+#
+# Heap profiling via dhat-rs: writes `dhat-heap.json` on exit, viewable at
+# https://nnethercote.github.io/dh_view/dh_view.html.
+profile-dhat = ["dep:dhat"]
+# Live async-task inspection via tokio-console: exposes the tokio runtime to
+# the `tokio-console` CLI over a local gRPC socket. Requires building with
+# `RUSTFLAGS="--cfg tokio_unstable"` (console-subscriber's instrumentation
+# hooks are behind that cfg in tokio itself; not something a Cargo feature can
+# set on its own, hence the separate rustflags in the run command).
+profile-console = ["dep:console-subscriber", "tokio/tracing"]
+
 [[example]]
 name = "repl"
 required-features = ["login-harness"]
@@ -79,7 +108,7 @@ required-features = ["login-harness"]
 # `version.workspace = true` (that only equalizes the two crates' own package
 # versions) — bump this by hand alongside every workspace version bump, or
 # tuigram-client's crates.io publish will fail to resolve. See docs/releasing.md.
-tuigram-core = { version = "=2026.7.2", path = "../tuigram-core" }
+tuigram-core = { version = "=2026.7.3", path = "../tuigram-core" }
 # Async runtime for the central tokio::select! event loop (Phase 5). The TUI is
 # I/O-bound on terminal events + core updates, not CPU-bound, but the multi-thread
 # runtime lets blocking core work run off the render thread. `time` drives the
@@ -113,3 +142,13 @@ imageproc = { workspace = true }
 ab_glyph = { workspace = true }
 # Display-column measurement for word-wrapping (#214, #215).
 unicode-width = { workspace = true }
+# Heap profiler for the real-session profiling exercise (#185), behind the
+# profile-dhat feature only — never in a default build.
+dhat = { version = "0.3.3", optional = true }
+# tokio-console server for the same exercise (#185), behind profile-console.
+console-subscriber = { version = "0.5.0", optional = true }
+
+[dev-dependencies]
+# Benchmark harness (#183) and its shared synthetic-data generators.
+criterion = { workspace = true }
+tuigram-fixtures = { path = "../tuigram-fixtures" }

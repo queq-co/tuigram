@@ -1,4 +1,4 @@
-//! Pre-TUI bootstrap (Phase 6 #109, #111): stand up an *initialized* TDLib
+//! Pre-TUI bootstrap (Phase 6 #109, #111): stand up an *initialized* `TDLib`
 //! [`Bridge`] on the plain terminal, before the login screens take over inside
 //! the TUI.
 //!
@@ -13,10 +13,10 @@
 //! `setTdlibParameters` is the first request of every run and the one that
 //! surfaces a bad `api_id` as `API_ID_PUBLISHED_FLOOD`; keeping it here means
 //! that failure prints its actionable, multi-line guidance on the normal screen
-//! rather than as a single line inside a raw-mode TUI. Once it returns, TDLib
+//! rather than as a single line inside a raw-mode TUI. Once it returns, `TDLib`
 //! advances to the first login state and the TUI drives the rest.
 //!
-//! Secrets are handled exactly as the library is: TDLib's own logging is silenced
+//! Secrets are handled exactly as the library is: `TDLib`'s own logging is silenced
 //! by [`Login::set_parameters`] before the first credential-bearing request
 //! (including the `api_id`/`api_hash` in the parameters themselves). Credentials
 //! and the session live only where `tuigram-core` puts them (the `600` config and
@@ -35,7 +35,7 @@ use tuigram_core::{
 /// Any bootstrap failure, surfaced to the user before the TUI starts.
 type BootResult<T> = Result<T, Box<dyn Error>>;
 
-/// Resolve credentials, open storage, and initialize TDLib — returning the
+/// Resolve credentials, open storage, and initialize `TDLib` — returning the
 /// initialized (but not-yet-logged-in) [`Bridge`] `main` holds across the login
 /// screens and the run loop.
 ///
@@ -64,11 +64,11 @@ pub async fn bootstrap() -> BootResult<Bridge> {
 
 /// Send `setTdlibParameters` so the client is initialized before the TUI takes
 /// over login. A fresh process always begins at `WaitTdlibParameters`; a
-/// persisted session still needs the parameters set before TDLib will report
+/// persisted session still needs the parameters set before `TDLib` will report
 /// `Ready`. Either way one request advances the state machine to the first login
 /// state the TUI then drives.
 ///
-/// `set_parameters` first drops TDLib's log verbosity — ahead of any credential,
+/// `set_parameters` first drops `TDLib`'s log verbosity — ahead of any credential,
 /// including the `api_id`/`api_hash` it carries. A bad `api_id` surfaces here (or
 /// on the first network request) as `API_ID_PUBLISHED_FLOOD`; it becomes the
 /// actionable guidance on the plain terminal rather than a line inside the TUI.
@@ -84,7 +84,7 @@ async fn initialize(bridge: &Bridge, params: ClientParameters) -> BootResult<()>
     Ok(())
 }
 
-/// Cleanly close the TDLib instance before the process exits, so its database is
+/// Cleanly close the `TDLib` instance before the process exits, so its database is
 /// flushed and properly closed rather than left mid-write. Without this, the next
 /// run fails to open a half-written database ("database disk image is malformed").
 ///
@@ -100,7 +100,7 @@ pub async fn shutdown(bridge: &Bridge) {
 }
 
 /// Build the `setTdlibParameters` bundle from the resolved credentials and the
-/// secure session storage. The api_hash and database encryption key move
+/// secure session storage. The `api_hash` and database encryption key move
 /// straight into the request and are never logged.
 fn build_parameters(creds: &ApiCredentials, session: &SessionStorage) -> ClientParameters {
     ClientParameters {
@@ -187,16 +187,18 @@ fn system_language_code() -> String {
         .ok()
         .and_then(|l| l.split(['_', '.', '@']).next().map(str::to_owned))
         .filter(|c| c.len() == 2 && c.bytes().all(|b| b.is_ascii_alphabetic()))
-        .map(|c| c.to_ascii_lowercase())
-        .unwrap_or_else(|| "en".to_owned())
+        .map_or_else(|| "en".to_owned(), |c| c.to_ascii_lowercase())
 }
 
-/// Convert a TDLib error into a boxed error without leaking any input.
+/// Convert a `TDLib` error into a boxed error without leaking any input.
+// Must accept by value: used as a bare fn pointer where `map_err`/`flood_or`
+// expect `FnOnce(TdError) -> _`.
+#[allow(clippy::needless_pass_by_value)]
 fn td(e: TdError) -> Box<dyn Error> {
     format!("Telegram error {}: {}", e.code, e.message).into()
 }
 
-/// First-run disclosure. Satisfies Telegram ToS 2.2 (state that the app uses the
+/// First-run disclosure. Satisfies Telegram `ToS` 2.2 (state that the app uses the
 /// Telegram API / is part of the ecosystem) and 2.4 (no "Telegram" in the name,
 /// no official logo).
 fn print_intro() {

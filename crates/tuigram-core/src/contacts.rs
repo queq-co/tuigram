@@ -3,7 +3,7 @@
 //! The REPL's `secret-new <user_id>` targets an arbitrary user by a free-typed
 //! id; the TUI has no such free-text entry, so starting a secret chat with
 //! someone outside the open chat list needs a search-by-name picker instead.
-//! TDLib's `searchContacts` answers with matching ids only (no name; the
+//! `TDLib`'s `searchContacts` answers with matching ids only (no name; the
 //! existing [`UserStore`](crate::users::UserStore) already resolves those, via
 //! [`UserRequests::get_user`](crate::users::UserRequests::get_user) as a
 //! backfill for anyone the update stream has not announced) — so this seam
@@ -29,9 +29,9 @@ use crate::bridge::Bridge;
 #[allow(async_fn_in_trait)]
 pub trait ContactRequests {
     /// Search this account's contacts for `query` (name or username substring),
-    /// returning up to `limit` matching user ids in TDLib's ranked order.
+    /// returning up to `limit` matching user ids in `TDLib`'s ranked order.
     ///
-    /// TDLib returns ids only; the caller resolves each to a display name
+    /// `TDLib` returns ids only; the caller resolves each to a display name
     /// through [`UserStore`](crate::users::UserStore) /
     /// [`UserRequests::get_user`](crate::users::UserRequests::get_user), the
     /// same backfill every other id-only result (senders, private-chat peers)
@@ -48,6 +48,7 @@ impl ContactRequests for Bridge {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use std::cell::RefCell;

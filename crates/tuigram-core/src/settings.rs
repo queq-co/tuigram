@@ -13,10 +13,10 @@
 //!
 //! ## Retention ([`StorageSettings`])
 //!
-//! Downloaded media accumulates in TDLib's cache with no bound; these settings cap
+//! Downloaded media accumulates in `TDLib`'s cache with no bound; these settings cap
 //! that by expiring files not accessed within a per-kind time-to-live, mirroring the
 //! official apps' separate **private chats / groups / channels** "Keep Media"
-//! controls. The driver applies them through TDLib `optimizeStorage`, whose `ttl` is
+//! controls. The driver applies them through `TDLib` `optimizeStorage`, whose `ttl` is
 //! measured since a file was last *accessed* — so viewing a file resets its clock.
 //!
 //! Configured by hand in `~/.config/tuigram/settings.toml`; every key is optional and
@@ -45,7 +45,7 @@
 //! the user browses. To bound the cache regardless of which chats are loaded,
 //! [`max_cache`](StorageSettings::max_cache) runs one **unscoped** `optimizeStorage`
 //! with a byte cap (and no TTL) over every chat — a safety net that catches media from
-//! chats never opened this session (#138). TDLib evicts least-recently-used files
+//! chats never opened this session (#138). `TDLib` evicts least-recently-used files
 //! first, so a generous ceiling rarely touches actively-used media while still
 //! bounding the total. Both default off, so retention stays strictly opt-in.
 
@@ -373,6 +373,11 @@ impl StorageSettings {
     /// on-disk file matches what the running session applies. The error (no config dir,
     /// an unwritable location) is returned rather than logged, so the caller can toast
     /// it while still applying the edit in memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config directory can't be resolved or the file
+    /// can't be written.
     pub fn save(&self) -> io::Result<()> {
         let path = settings_path().ok_or_else(|| {
             io::Error::new(
@@ -524,6 +529,11 @@ impl InterfaceSettings {
     /// re-reads the current `[storage]` table from disk and re-emits it
     /// unchanged, so persisting an interface edit never clobbers a retention
     /// policy the user (or `StorageSettings::save`) already wrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the config directory can't be resolved or the file
+    /// can't be written.
     pub fn save(&self) -> io::Result<()> {
         let path = settings_path().ok_or_else(|| {
             io::Error::new(
@@ -567,6 +577,7 @@ fn settings_path() -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
 

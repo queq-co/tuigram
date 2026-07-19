@@ -52,7 +52,7 @@ use crate::users::UserStore;
 
 /// How many chats [`Client::resync`] re-requests for the Main list when
 /// recovering from a dropped-update gap. Matches the harness's startup page size;
-/// TDLib re-emits the current chats as updates the router folds.
+/// `TDLib` re-emits the current chats as updates the router folds.
 const RESYNC_CHATS_PAGE: i32 = 100;
 
 /// The account content the router folds updates into: the chat list (#17) and
@@ -314,6 +314,11 @@ impl Client {
     /// The router folds updates into the same state on its own task; this is the
     /// facade's read side. The domain snapshot accessors (the chat list in #17,
     /// a chat's messages in #18) are thin wrappers over this.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account state mutex is poisoned (a prior holder panicked
+    /// while holding the lock).
     pub fn read<R>(&self, reader: impl FnOnce(&AccountState) -> R) -> R {
         reader(&self.state.lock().expect("account state mutex poisoned"))
     }
@@ -328,6 +333,11 @@ impl Client {
     /// paging a chat's history hands each page here to merge it into the store the
     /// facade reads back. This is the "production fold" `load_history` leaves to
     /// its caller; merging is deduped, so an overlapping re-page is idempotent.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account state mutex is poisoned (a prior holder panicked
+    /// while holding the lock).
     pub fn merge_history(&self, page: Vec<Message>) {
         self.state
             .lock()
@@ -339,7 +349,7 @@ impl Client {
     ///
     /// When the router reports a broadcast overflow the folded snapshot may be
     /// missing updates, surfaced as [`needs_resync`](AccountState::needs_resync). This
-    /// reloads the Main chat list over the bridge — TDLib re-emits the current
+    /// reloads the Main chat list over the bridge — `TDLib` re-emits the current
     /// chats as updates the router folds — then clears the flag. Re-paging the
     /// *open* chat's history is the caller's complementary job (the core does not
     /// track which chat the UI has open); this restores the always-present chat
@@ -347,6 +357,16 @@ impl Client {
     ///
     /// On a failed reload the flag is left set so the caller can retry; the error
     /// is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` fails a page load for a reason other than the
+    /// list being exhausted, leaving `needs_resync` set for a retry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the account state mutex is poisoned (a prior holder panicked
+    /// while holding the lock).
     pub async fn resync(&self) -> Result<(), TdError> {
         crate::chats::load_main_list(&self.bridge, RESYNC_CHATS_PAGE).await?;
         self.state
@@ -366,6 +386,10 @@ impl Client {
     /// untouched. `sender` optionally restricts hits to one sender. The paging
     /// itself lives in [`search_chat`](crate::messages::search_chat); the facade
     /// only binds it to this session's bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` fails a page of the search.
     pub async fn search_chat(
         &self,
         chat_id: i64,
@@ -383,6 +407,10 @@ impl Client {
     /// the same discipline: the hits are a transient view and never fold into the
     /// live [`MessageStore`]. Paging lives in
     /// [`search_global`](crate::messages::search_global).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` fails a page of the search.
     pub async fn search_messages(
         &self,
         query: String,
@@ -395,14 +423,18 @@ impl Client {
     ///
     /// `send_copy` forwards a fresh copy (no "forwarded from" attribution);
     /// `remove_caption` drops captions when copying. Unlike search, a forward is a
-    /// **write that reconciles through the router**: TDLib streams each forwarded
+    /// **write that reconciles through the router**: `TDLib` streams each forwarded
     /// message into the target chat as `updateNewMessage`, which the router folds
     /// into the [`MessageStore`] on the same optimistic-send lifecycle as
     /// [`SendRequests::send_text`](crate::messages::SendRequests::send_text). The
     /// returned [`Message`]s are the caller's
     /// reference copies of those optimistic entries (temporary ids,
     /// [`SendState::Pending`](crate::model::SendState::Pending)), not a second
-    /// insert. It returns as soon as TDLib accepts the request.
+    /// insert. It returns as soon as `TDLib` accepts the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` rejects the forward request.
     pub async fn forward_messages(
         &self,
         from_chat_id: i64,
@@ -443,7 +475,7 @@ mod tests {
     #[tokio::test]
     async fn shared_state_sink_drives_the_router() {
         let state: SharedState = Arc::new(Mutex::new(AccountState::default()));
-        let events = tokio_stream::iter([
+        let events = tokio_stream::iter(vec![
             RouterEvent::Update(Update::ChatReadInbox(UpdateChatReadInbox {
                 chat_id: 1,
                 last_read_inbox_message_id: 1,
@@ -452,7 +484,7 @@ mod tests {
             RouterEvent::Lagged(3),
         ]);
 
-        Router::new(Arc::clone(&state)).run(events).await;
+        Box::pin(Router::new(Arc::clone(&state)).run(events)).await;
 
         // Readable through the same lock the facade's `read` uses, and the lag was
         // recorded through the shared sink rather than swallowed.
@@ -521,5 +553,202 @@ mod tests {
 
         let ids: Vec<i64> = state.messages().history(10).iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    /// Every domain's `reduce_*` arm folds into its own store and is readable back
+    /// through the matching accessor — the four domains (#181) whose only
+    /// exercise elsewhere was transitive through their own module's tests, never
+    /// through `AccountState` itself.
+    #[test]
+    fn every_domain_update_folds_into_its_own_store() {
+        use tdlib_rs::enums::{ChatAction as TdChatAction, MessageSender};
+        use tdlib_rs::types::{
+            File as TdFile, LocalFile, RemoteFile, UpdateChatAction, UpdateFile, UpdateSecretChat,
+            UpdateUser, User as TdUser,
+        };
+
+        let mut state = AccountState::default();
+
+        state.reduce_user(&Update::User(UpdateUser {
+            user: TdUser {
+                id: 7,
+                first_name: "Ada".to_owned(),
+                last_name: "Lovelace".to_owned(),
+                usernames: None,
+                phone_number: String::new(),
+                status: tdlib_rs::enums::UserStatus::Empty,
+                profile_photo: None,
+                accent_color_id: 0,
+                background_custom_emoji_id: 0,
+                upgraded_gift_colors: None,
+                profile_accent_color_id: 0,
+                profile_background_custom_emoji_id: 0,
+                emoji_status: None,
+                is_contact: false,
+                is_mutual_contact: false,
+                is_close_friend: false,
+                verification_status: None,
+                is_premium: false,
+                is_support: false,
+                restriction_info: None,
+                active_story_state: None,
+                restricts_new_chats: false,
+                paid_message_star_count: 0,
+                have_access: true,
+                r#type: tdlib_rs::enums::UserType::Regular,
+                language_code: String::new(),
+                added_to_attachment_menu: false,
+            },
+        }));
+        assert!(state.users().get(7).is_some());
+
+        state.reduce_file(&Update::File(UpdateFile {
+            file: TdFile {
+                id: 3,
+                size: 1000,
+                expected_size: 1000,
+                local: LocalFile {
+                    path: String::new(),
+                    can_be_downloaded: true,
+                    can_be_deleted: true,
+                    is_downloading_active: false,
+                    is_downloading_completed: false,
+                    download_offset: 0,
+                    downloaded_prefix_size: 0,
+                    downloaded_size: 0,
+                },
+                remote: RemoteFile::default(),
+            },
+        }));
+        assert!(state.files().get(3).is_some());
+
+        state.reduce_action(&Update::ChatAction(UpdateChatAction {
+            chat_id: 42,
+            topic_id: None,
+            sender_id: MessageSender::User(tdlib_rs::types::MessageSenderUser { user_id: 7 }),
+            action: TdChatAction::Typing,
+        }));
+        assert!(state.actions().action(42, &Sender::User(7)).is_some());
+
+        state.reduce_secret_chat(&Update::SecretChat(UpdateSecretChat {
+            secret_chat: tdlib_rs::types::SecretChat {
+                id: 1,
+                user_id: 7,
+                state: tdlib_rs::enums::SecretChatState::Pending,
+                is_outbound: true,
+                key_hash: String::new(),
+                layer: 144,
+            },
+        }));
+        assert!(state.secret_chats().get(1).is_some());
+
+        // Every domain accessor stays readable even before its store has seen
+        // anything (the composition root's default wiring, exercised by the
+        // untouched `chats()` accessor here).
+        assert!(state.chats().is_empty());
+    }
+
+    /// The production sink (`SharedState`) delegates each domain's update to
+    /// `AccountState` under the lock — the router-driven test above only
+    /// exercises the chat/connection arms of `impl UpdateSink for SharedState`
+    /// (via a `ChatReadInbox` and a lag); this covers the remaining four arms
+    /// (user/file/action/secret-chat) the same way production reaches them: through
+    /// the trait, not `AccountState` directly.
+    #[test]
+    fn shared_state_sink_delegates_every_domain_to_account_state() {
+        use tdlib_rs::enums::{ChatAction as TdChatAction, MessageSender};
+        use tdlib_rs::types::{
+            File as TdFile, LocalFile, MessageSenderUser, RemoteFile, UpdateChatAction, UpdateFile,
+            UpdateSecretChat, UpdateUser, User as TdUser,
+        };
+
+        let mut state: SharedState = Arc::new(Mutex::new(AccountState::default()));
+
+        UpdateSink::reduce_user(
+            &mut state,
+            &Update::User(UpdateUser {
+                user: TdUser {
+                    id: 7,
+                    first_name: "Ada".to_owned(),
+                    last_name: "Lovelace".to_owned(),
+                    usernames: None,
+                    phone_number: String::new(),
+                    status: tdlib_rs::enums::UserStatus::Empty,
+                    profile_photo: None,
+                    accent_color_id: 0,
+                    background_custom_emoji_id: 0,
+                    upgraded_gift_colors: None,
+                    profile_accent_color_id: 0,
+                    profile_background_custom_emoji_id: 0,
+                    emoji_status: None,
+                    is_contact: false,
+                    is_mutual_contact: false,
+                    is_close_friend: false,
+                    verification_status: None,
+                    is_premium: false,
+                    is_support: false,
+                    restriction_info: None,
+                    active_story_state: None,
+                    restricts_new_chats: false,
+                    paid_message_star_count: 0,
+                    have_access: true,
+                    r#type: tdlib_rs::enums::UserType::Regular,
+                    language_code: String::new(),
+                    added_to_attachment_menu: false,
+                },
+            }),
+        );
+
+        UpdateSink::reduce_file(
+            &mut state,
+            &Update::File(UpdateFile {
+                file: TdFile {
+                    id: 3,
+                    size: 1000,
+                    expected_size: 1000,
+                    local: LocalFile {
+                        path: String::new(),
+                        can_be_downloaded: true,
+                        can_be_deleted: true,
+                        is_downloading_active: false,
+                        is_downloading_completed: false,
+                        download_offset: 0,
+                        downloaded_prefix_size: 0,
+                        downloaded_size: 0,
+                    },
+                    remote: RemoteFile::default(),
+                },
+            }),
+        );
+
+        UpdateSink::reduce_action(
+            &mut state,
+            &Update::ChatAction(UpdateChatAction {
+                chat_id: 1,
+                topic_id: None,
+                sender_id: MessageSender::User(MessageSenderUser { user_id: 9 }),
+                action: TdChatAction::Typing,
+            }),
+        );
+
+        UpdateSink::reduce_secret_chat(
+            &mut state,
+            &Update::SecretChat(UpdateSecretChat {
+                secret_chat: tdlib_rs::types::SecretChat {
+                    id: 1,
+                    user_id: 7,
+                    state: tdlib_rs::enums::SecretChatState::Pending,
+                    is_outbound: true,
+                    key_hash: String::new(),
+                    layer: 144,
+                },
+            }),
+        );
+
+        let guard = state.lock().expect("mutex usable after the sink calls");
+        assert!(guard.users().get(7).is_some());
+        assert!(guard.files().get(3).is_some());
+        assert!(guard.actions().action(1, &Sender::User(9)).is_some());
+        assert!(guard.secret_chats().get(1).is_some());
     }
 }

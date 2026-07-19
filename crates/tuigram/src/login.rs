@@ -1,8 +1,8 @@
-//! The login screens (#86): TDLib's auth state machine
+//! The login screens (#86): `TDLib`'s auth state machine
 //! ([`docs/login-flow.md`](../../../docs/login-flow.md)) rendered as one UI screen
 //! per waiting state, replacing the stdin harness for the eventual product.
 //!
-//! Core's [`AuthState`] is the authority — it is a *total* projection of TDLib's
+//! Core's [`AuthState`] is the authority — it is a *total* projection of `TDLib`'s
 //! authorization states — so the screen set here is closed and known: a screen for
 //! each state the driver acts on (phone number, login code, masked 2FA password, a
 //! scannable QR for `WaitOtherDeviceConfirmation`, email address, email code,
@@ -18,7 +18,7 @@
 //! entry never carries from one screen to the next.
 //!
 //! Phase 6 (#111) mounts these screens: [`run_login`] drives the TUI login loop
-//! over the real bridge — feeding TDLib's `updateAuthorizationState` into
+//! over the real bridge — feeding `TDLib`'s `updateAuthorizationState` into
 //! [`LoginView::set_state`], dispatching each [`LoginAnswer`] through the core
 //! [`Login`] / [`AuthRequests`](tuigram_core::AuthRequests) seam, and returning
 //! once login reaches a terminal state so `main` gates the three-pane UI behind
@@ -55,7 +55,7 @@ pub enum LoginAnswer {
     /// The phone number to authenticate with (international format).
     Phone(String),
     /// Use QR login instead of a phone number — the alternative answer at the phone
-    /// screen, which moves TDLib to `WaitOtherDeviceConfirmation`.
+    /// screen, which moves `TDLib` to `WaitOtherDeviceConfirmation`.
     RequestQr,
     /// The login code delivered to the account.
     Code(String),
@@ -99,8 +99,8 @@ pub enum RegField {
 }
 
 /// The new-user registration screen's state: the two name fields, which one is
-/// focused, and whether the terms of service have been accepted. TDLib needs a
-/// first name and an accepted ToS before [`LoginAnswer::Register`] can be sent.
+/// focused, and whether the terms of service have been accepted. `TDLib` needs a
+/// first name and an accepted `ToS` before [`LoginAnswer::Register`] can be sent.
 #[derive(Debug, Clone, Default)]
 pub struct RegisterForm {
     first: TextInput,
@@ -149,7 +149,7 @@ impl RegisterForm {
     }
 
     /// Whether the form can be submitted: the terms accepted and a first name given
-    /// (TDLib requires the first name; the last name is optional).
+    /// (`TDLib` requires the first name; the last name is optional).
     fn is_submittable(&self) -> bool {
         self.accepted && !self.first.text().trim().is_empty()
     }
@@ -157,7 +157,7 @@ impl RegisterForm {
 
 /// The login flow's view-model: the current [`AuthState`] and the field(s) the
 /// active screen edits. Built fresh at `WaitTdlibParameters`; the owning loop moves
-/// it through the states with [`set_state`](Self::set_state) as TDLib reports them.
+/// it through the states with [`set_state`](Self::set_state) as `TDLib` reports them.
 #[derive(Debug, Clone)]
 pub struct LoginView {
     state: AuthState,
@@ -166,8 +166,8 @@ pub struct LoginView {
     input: TextInput,
     /// The registration screen's multi-field form.
     register: RegisterForm,
-    /// A rejected-submit message to show under the field — a TDLib error *code*
-    /// (e.g. `PHONE_CODE_INVALID`), never the user's input. TDLib does not emit a
+    /// A rejected-submit message to show under the field — a `TDLib` error *code*
+    /// (e.g. `PHONE_CODE_INVALID`), never the user's input. `TDLib` does not emit a
     /// new state when it rejects an answer (it stays on the same waiting screen),
     /// so this is how a wrong code/password is surfaced before the retry. Cleared
     /// on every transition and at the start of each new submit.
@@ -212,7 +212,7 @@ impl LoginView {
     }
 
     /// Set or clear the rejected-submit message. The owning loop clears it
-    /// (`None`) before each submit and sets it (the TDLib error code) when a
+    /// (`None`) before each submit and sets it (the `TDLib` error code) when a
     /// submit is rejected; a transition clears it via [`set_state`](Self::set_state).
     pub fn set_error(&mut self, error: Option<String>) {
         self.error = error;
@@ -230,7 +230,7 @@ impl LoginView {
         &self.register
     }
 
-    /// Move to a new auth state on a TDLib `updateAuthorizationState`, clearing the
+    /// Move to a new auth state on a `TDLib` `updateAuthorizationState`, clearing the
     /// fields so a previous screen's entry (including any secret) never carries
     /// over to the next.
     pub fn set_state(&mut self, state: AuthState) {
@@ -394,7 +394,7 @@ pub enum LoginEnd {
     Ready,
     /// The user quit (Ctrl-C, or stdin closed) before logging in.
     Quit,
-    /// TDLib closed the session (logged out / shutting down) before it was ready.
+    /// `TDLib` closed the session (logged out / shutting down) before it was ready.
     Closed,
 }
 
@@ -456,9 +456,8 @@ pub async fn run_login(guard: &mut TerminalGuard, bridge: &Bridge) -> io::Result
                 },
                 // A resize must repaint against the new viewport.
                 Some(Ok(Event::Resize(_, _))) => dirty = true,
-                Some(Ok(_)) => {}
-                // Transient read error: ignore and re-enter the loop.
-                Some(Err(_)) => {}
+                // Some(Err(_)): a transient read error; ignore and re-enter the loop.
+                Some(Ok(_) | Err(_)) => {}
                 // stdin closed: quit rather than spin on a dead stream.
                 None => return Ok(LoginEnd::Quit),
             },
@@ -513,9 +512,9 @@ async fn submit_answer<C: AuthRequests>(
     }
 }
 
-/// The single-line message for a rejected submit: TDLib's error text (a stable
+/// The single-line message for a rejected submit: `TDLib`'s error text (a stable
 /// phrase like `PHONE_CODE_INVALID`), falling back to the numeric code when the
-/// text is blank. Never the user's input — TDLib names the rejection, not the
+/// text is blank. Never the user's input — `TDLib` names the rejection, not the
 /// value.
 fn error_line(e: &TdError) -> String {
     if e.message.is_empty() {
@@ -809,6 +808,7 @@ fn error_line_widget(text: &str) -> Line<'static> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use ratatui::Terminal;

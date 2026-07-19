@@ -1,6 +1,6 @@
-//! Chat-list state — the Main list, folded from TDLib's chat-update family.
+//! Chat-list state — the Main list, folded from `TDLib`'s chat-update family.
 //!
-//! TDLib never hands over "the chat list" as a value; it streams a sequence of
+//! `TDLib` never hands over "the chat list" as a value; it streams a sequence of
 //! updates (`updateNewChat`, `updateChatPosition`, `updateChatLastMessage`,
 //! `updateChatReadInbox`, `updateChatDraftMessage`, …) and expects the client to
 //! maintain the list itself. [`ChatStore`] is that maintained state: the single
@@ -9,7 +9,7 @@
 //! view. A chat's synced compose draft (#38) rides this same family — it is chat
 //! state, surfaced on the [`Chat`] snapshot, never in the message store.
 //!
-//! Folding is **idempotent** — TDLib repeats and reorders updates freely (on
+//! Folding is **idempotent** — `TDLib` repeats and reorders updates freely (on
 //! reconnect, on resync, or just because order changed), so re-applying any
 //! update converges to the same state rather than double-counting.
 //!
@@ -48,19 +48,19 @@ use crate::model::{Chat, ChatFolderInfo, ChatListKind, ChatPosition, Draft, Mess
 // is not a concern here.
 #[allow(async_fn_in_trait)]
 pub trait ChatRequests {
-    /// Ask TDLib to load up to `limit` more chats from `list` (Main, Archive, or
+    /// Ask `TDLib` to load up to `limit` more chats from `list` (Main, Archive, or
     /// a folder).
     ///
-    /// This does not return the chats: TDLib loads them into its own state and
+    /// This does not return the chats: `TDLib` loads them into its own state and
     /// emits `updateNewChat` / `updateChatPosition` for any the client did not
     /// already know, which [`ChatStore`] folds. Once the list is fully loaded,
-    /// TDLib answers with error [`CHATS_EXHAUSTED`] (404) — the normal end of
+    /// `TDLib` answers with error [`CHATS_EXHAUSTED`] (404) — the normal end of
     /// paging, which the paging drivers treat as success.
     async fn load_chats(&self, list: ChatListKind, limit: i32) -> Result<(), TdError>;
 
     /// Push a compose draft to a chat, or clear it with `None`.
     ///
-    /// TDLib persists the draft and syncs it across the account's devices, then
+    /// `TDLib` persists the draft and syncs it across the account's devices, then
     /// echoes `updateChatDraftMessage`, which [`ChatStore`] folds — so this only
     /// *writes*; the snapshot updates through the router, the same one-way shape
     /// as the read-state and send requests. Idempotent: setting the same draft,
@@ -95,9 +95,9 @@ impl ChatRequests for Bridge {
     }
 }
 
-/// Tell TDLib which chat, if any, tuigram currently has open (#207).
+/// Tell `TDLib` which chat, if any, tuigram currently has open (#207).
 ///
-/// TDLib documents several update families — including `updateMessageInteractionInfo`
+/// `TDLib` documents several update families — including `updateMessageInteractionInfo`
 /// (reactions) and `updateMessageContent` (edits) from *other* devices/users — as
 /// guaranteed only for a chat it considers open; a chat never marked open may
 /// simply never receive them, leaving the local copy stale until the next full
@@ -106,11 +106,11 @@ impl ChatRequests for Bridge {
 /// the usual router path, not through this trait.
 #[allow(async_fn_in_trait)]
 pub trait ChatLifecycleRequests {
-    /// Mark a chat open, TDLib's `openChat`. Call once per genuine open (a chat
+    /// Mark a chat open, `TDLib`'s `openChat`. Call once per genuine open (a chat
     /// switch), not on every re-projection of an already-open chat.
     async fn open_chat(&self, chat_id: i64) -> Result<(), TdError>;
 
-    /// Mark a chat no longer open, TDLib's `closeChat` — the counterpart to
+    /// Mark a chat no longer open, `TDLib`'s `closeChat` — the counterpart to
     /// [`open_chat`](Self::open_chat). Call when the chat stops being the one
     /// shown (switching away, or leaving the history pane), including when it is
     /// replaced by a different chat becoming open.
@@ -127,11 +127,11 @@ impl ChatLifecycleRequests for Bridge {
     }
 }
 
-/// The TDLib error code returned by `loadChats` once every chat in the list has
+/// The `TDLib` error code returned by `loadChats` once every chat in the list has
 /// been loaded. Not a failure — the natural terminal condition of paging.
 pub const CHATS_EXHAUSTED: i32 = 404;
 
-/// Page an entire chat list, asking for `page` chats at a time until TDLib
+/// Page an entire chat list, asking for `page` chats at a time until `TDLib`
 /// reports there are no more ([`CHATS_EXHAUSTED`]).
 ///
 /// Only the *requests* are driven here; the chats themselves arrive on the
@@ -153,11 +153,21 @@ async fn load_list<C: ChatRequests>(
 }
 
 /// Page the entire **Main** chat list to exhaustion. See `load_list`.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page load for a reason other than the
+/// list being exhausted.
 pub async fn load_main_list<C: ChatRequests>(client: &C, page: i32) -> Result<(), TdError> {
     load_list(client, ChatListKind::Main, page).await
 }
 
 /// Page the entire **Archive** chat list to exhaustion (#48). See `load_list`.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page load for a reason other than the
+/// list being exhausted.
 pub async fn load_archive_list<C: ChatRequests>(client: &C, page: i32) -> Result<(), TdError> {
     load_list(client, ChatListKind::Archive, page).await
 }
@@ -166,6 +176,11 @@ pub async fn load_archive_list<C: ChatRequests>(client: &C, page: i32) -> Result
 /// metadata arrives separately as `updateChatFolders` (see
 /// [`ChatStore::folders`]); this pages the chats positioned in it, which fold
 /// into [`ChatStore::folder_list`]. See `load_list`.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page load for a reason other than the
+/// list being exhausted.
 pub async fn load_folder_list<C: ChatRequests>(
     client: &C,
     folder_id: i32,
@@ -236,7 +251,7 @@ impl ChatStore {
         }
     }
 
-    /// One chat list, ordered the way TDLib intends it shown: by descending
+    /// One chat list, ordered the way `TDLib` intends it shown: by descending
     /// position order (pinned chats carry higher orders, so they float to the
     /// top), with chat id as a stable tiebreaker. Chats with no position in
     /// `list` are excluded. The per-list views ([`main_list`](Self::main_list),
@@ -280,7 +295,7 @@ impl ChatStore {
         self.ordered_by(&ChatListKind::Folder(folder_id))
     }
 
-    /// The user-defined chat folders, in the order TDLib lists them (#49). The
+    /// The user-defined chat folders, in the order `TDLib` lists them (#49). The
     /// folder *contents* read back via [`folder_list`](Self::folder_list); this
     /// is the set of folders themselves, from the last `updateChatFolders`.
     #[must_use]
@@ -317,7 +332,7 @@ impl ChatStore {
 
     /// Insert or replace a chat from `updateNewChat`.
     ///
-    /// TDLib sends `updateNewChat` once, before any position update, so it
+    /// `TDLib` sends `updateNewChat` once, before any position update, so it
     /// usually carries empty positions. If a repeat arrives after positions were
     /// learned (e.g. on resync), keeping the already-folded positions makes the
     /// re-application idempotent rather than wiping the chat off the list.
@@ -325,13 +340,13 @@ impl ChatStore {
         if chat.positions.is_empty()
             && let Some(existing) = self.chats.get(&chat.id)
         {
-            chat.positions = existing.positions.clone();
+            chat.positions.clone_from(&existing.positions);
         }
         self.chats.insert(chat.id, chat);
     }
 
     /// Apply a single-list position change from `updateChatPosition`. An order of
-    /// `0` removes the chat from that list. Unknown chats are ignored: TDLib
+    /// `0` removes the chat from that list. Unknown chats are ignored: `TDLib`
     /// always announces a chat before positioning it, so this is only a stale or
     /// out-of-order update, safe to drop.
     fn reposition(&mut self, chat_id: i64, position: ChatPosition) {
@@ -341,7 +356,7 @@ impl ChatStore {
     }
 
     /// Fold `updateChatLastMessage`: refresh the chat's last message and merge
-    /// any positions it carries (TDLib reorders a chat when its last message
+    /// any positions it carries (`TDLib` reorders a chat when its last message
     /// changes, delivering the new positions on the same update).
     fn relink_last_message(
         &mut self,
@@ -373,11 +388,11 @@ impl ChatStore {
 
     /// Fold `updateChatDraftMessage`: set or clear the chat's compose draft, and
     /// merge any positions it carries (setting a draft floats the chat up the
-    /// list, so TDLib delivers the new positions on the same update). A `None`
+    /// list, so `TDLib` delivers the new positions on the same update). A `None`
     /// draft clears it. Idempotent — re-applying sets the same draft. Drafts are
     /// chat state: they land here on the [`Chat`] snapshot and never in the
     /// message store, so a draft is never confused with a sent message. Unknown
-    /// chats are ignored (TDLib announces a chat before drafting into it).
+    /// chats are ignored (`TDLib` announces a chat before drafting into it).
     fn set_draft(&mut self, chat_id: i64, draft: Option<Draft>, positions: Vec<ChatPosition>) {
         if let Some(chat) = self.chats.get_mut(&chat_id) {
             chat.draft = draft;
@@ -387,7 +402,7 @@ impl ChatStore {
         }
     }
 
-    /// Fold `updateChatFolders`: TDLib delivers the **entire** new folder list on
+    /// Fold `updateChatFolders`: `TDLib` delivers the **entire** new folder list on
     /// every change, so this is a wholesale replace — adding, removing, renaming,
     /// or reordering a folder all arrive the same way. Idempotent: re-applying the
     /// same list converges. The chats inside each folder are unaffected; they ride
@@ -411,7 +426,7 @@ impl ChatStore {
     /// set when `is_pinned`, or remove it when not. The set is kept sorted and
     /// deduplicated, so the order is deterministic and re-applying either
     /// transition converges — pinning an already-pinned message, or unpinning one
-    /// not in the set, is a no-op. Unknown chats are ignored (TDLib announces a
+    /// not in the set, is a no-op. Unknown chats are ignored (`TDLib` announces a
     /// chat before pinning within it).
     fn set_message_pinned(&mut self, chat_id: i64, message_id: i64, is_pinned: bool) {
         if let Some(chat) = self.chats.get_mut(&chat_id) {
@@ -429,7 +444,7 @@ impl ChatStore {
 }
 
 /// Merge one position into a chat's position list: replace any existing position
-/// for the same list, dropping it entirely when the new order is `0` (TDLib's
+/// for the same list, dropping it entirely when the new order is `0` (`TDLib`'s
 /// "remove from this list"). Idempotent — re-applying the same position is a
 /// no-op.
 fn merge_position(positions: &mut Vec<ChatPosition>, position: ChatPosition) {
@@ -440,6 +455,7 @@ fn merge_position(positions: &mut Vec<ChatPosition>, position: ChatPosition) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use crate::model::FormattedText;
@@ -451,7 +467,7 @@ mod tests {
         UpdateNewChat,
     };
 
-    /// A TDLib `Chat` with every field zeroed but id/title and an empty position
+    /// A `TDLib` `Chat` with every field zeroed but id/title and an empty position
     /// list — positions arrive on their own updates, which is what we exercise.
     fn td_chat(id: i64, title: &str) -> tdlib_rs::types::Chat {
         tdlib_rs::types::Chat {
@@ -485,7 +501,9 @@ mod tests {
             unread_mention_count: 0,
             unread_reaction_count: 0,
             notification_settings: tdlib_rs::types::ChatNotificationSettings::default(),
-            available_reactions: tdlib_rs::enums::ChatAvailableReactions::All(Default::default()),
+            available_reactions: tdlib_rs::enums::ChatAvailableReactions::All(
+                tdlib_rs::types::ChatAvailableReactionsAll::default(),
+            ),
             message_auto_delete_time: 0,
             emoji_status: None,
             background: None,

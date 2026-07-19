@@ -1,6 +1,6 @@
-//! Login state machine mirroring TDLib's `updateAuthorizationState`.
+//! Login state machine mirroring `TDLib`'s `updateAuthorizationState`.
 //!
-//! TDLib *is* the authority on login: it emits an [`AuthorizationState`] and
+//! `TDLib` *is* the authority on login: it emits an [`AuthorizationState`] and
 //! waits for the matching request, looping until it reaches `Ready`. This module
 //! projects that stream onto a reduced [`AuthState`] the login UI is driven from
 //! ([`AuthState::from_tdlib`]), and a [`Login`] driver that answers each waiting
@@ -12,7 +12,7 @@
 //! only the requests it makes. [`Bridge`] implements it via its public id; the
 //! chats/messages modules own their own request traits the same way.
 //!
-//! Every TDLib authorization state is handled. The phone path — **phone number +
+//! Every `TDLib` authorization state is handled. The phone path — **phone number +
 //! login code + 2FA password** — plus **QR login** (`waitOtherDeviceConfirmation`:
 //! request a code, scan the link on an already-signed-in device), **new-user
 //! registration** (`waitRegistration`: accept the terms of service and submit a
@@ -22,12 +22,12 @@
 //! in-store purchase a headless client can't perform — so the flow reports it
 //! rather than hanging on a silent unknown.
 //!
-//! The projection is total by *exhaustive* match over TDLib's (closed)
+//! The projection is total by *exhaustive* match over `TDLib`'s (closed)
 //! [`AuthorizationState`] enum: there is no catch-all, so a state added by a future
-//! TDLib version is a compile error here, never a silent misclassification.
+//! `TDLib` version is a compile error here, never a silent misclassification.
 //!
 //! Secrets are never retained: the login code, the email code, and the 2FA
-//! password are taken by value and moved straight into their TDLib request (see
+//! password are taken by value and moved straight into their `TDLib` request (see
 //! the threat model).
 
 use crate::bridge::{Bridge, ClientParameters};
@@ -48,25 +48,25 @@ use tdlib_rs::types::Error as TdError;
 pub trait AuthRequests {
     /// Fetch the current authorization state.
     ///
-    /// The canonical proof that request/response correlation works: TDLib
+    /// The canonical proof that request/response correlation works: `TDLib`
     /// answers it immediately from local state with no network, so a successful
     /// round-trip means the receive loop is correctly notifying the observer.
     async fn authorization_state(&self) -> Result<AuthorizationState, TdError>;
 
-    /// Set TDLib's global log verbosity level (0 = fatal only … 3 = info,
+    /// Set `TDLib`'s global log verbosity level (0 = fatal only … 3 = info,
     /// the default … 5 = verbose).
     ///
-    /// Security-relevant: at the default level TDLib logs request and response
+    /// Security-relevant: at the default level `TDLib` logs request and response
     /// payloads to stderr, which during login would include phone numbers,
     /// codes, and the 2FA password. The flow lowers this before any
     /// credential-bearing request (see [`Login::set_parameters`]).
     async fn set_log_verbosity_level(&self, level: i32) -> Result<(), TdError>;
 
-    /// Redirect TDLib's native log stream to `path`, off stderr entirely.
+    /// Redirect `TDLib`'s native log stream to `path`, off stderr entirely.
     ///
-    /// Display-relevant, not just security-relevant: TDLib's log stream
+    /// Display-relevant, not just security-relevant: `TDLib`'s log stream
     /// defaults to stderr, which the TUI's raw-mode/alternate-screen terminal
-    /// inherits as its own fd 2. TDLib's C++ logger writes there directly and
+    /// inherits as its own fd 2. `TDLib`'s C++ logger writes there directly and
     /// unbuffered, with no coordination with ratatui's own screen buffer — so
     /// any line it logs (plausible even at [`SECURE_LOG_VERBOSITY`], and far
     /// likelier during a cold first launch's heavier initialization) bleeds
@@ -86,7 +86,7 @@ pub trait AuthRequests {
     /// Answer `WaitPhoneNumber` the other way — request QR-code authentication
     /// instead of a phone number.
     ///
-    /// TDLib responds by moving to `WaitOtherDeviceConfirmation`, carrying a
+    /// `TDLib` responds by moving to `WaitOtherDeviceConfirmation`, carrying a
     /// `tg://login` link to render as a QR code; scanning it on an already
     /// signed-in device completes the login (which may then still require the
     /// 2FA password). Carries no credential payload of its own.
@@ -97,7 +97,7 @@ pub trait AuthRequests {
 
     /// Answer `WaitPassword` — submit the 2FA password.
     ///
-    /// The password is moved straight into the TDLib request and never retained
+    /// The password is moved straight into the `TDLib` request and never retained
     /// (see the threat model).
     async fn check_authentication_password(&self, password: String) -> Result<(), TdError>;
 
@@ -105,31 +105,31 @@ pub trait AuthRequests {
     /// new user with a first and last name.
     ///
     /// Reached when the phone number isn't tied to an account yet. The names are
-    /// not credentials; `disable_notification` is left `false`, letting TDLib
+    /// not credentials; `disable_notification` is left `false`, letting `TDLib`
     /// notify contacts of the new account as it defaults to.
     async fn register_user(&self, first_name: String, last_name: String) -> Result<(), TdError>;
 
-    /// Answer `WaitEmailAddress` — submit the user's email address, which TDLib
+    /// Answer `WaitEmailAddress` — submit the user's email address, which `TDLib`
     /// then sends an authentication code to (moving to `WaitEmailCode`).
     async fn set_authentication_email_address(&self, email_address: String) -> Result<(), TdError>;
 
     /// Answer `WaitEmailCode` — submit the code delivered to the email address.
     ///
     /// Wraps the code in `EmailAddressAuthentication::Code`; the Apple/Google ID
-    /// token answers TDLib also accepts here are out of scope for a headless
+    /// token answers `TDLib` also accepts here are out of scope for a headless
     /// client. The code is moved straight into the request and never retained.
     async fn check_authentication_email_code(&self, code: String) -> Result<(), TdError>;
 
     /// Log out of the current account.
     ///
-    /// TDLib invalidates the session server-side and wipes its local database,
+    /// `TDLib` invalidates the session server-side and wipes its local database,
     /// then drives authorization back through `Closed` to `WaitPhoneNumber`, so a
     /// fresh login can follow. Carries no credential payload, and leaves the app's
     /// `api_id`/`api_hash` and the storage encryption key untouched — those are
     /// reused for the next login, not part of the account session.
     async fn log_out(&self) -> Result<(), TdError>;
 
-    /// Cleanly close the TDLib instance, flushing and properly closing the local
+    /// Cleanly close the `TDLib` instance, flushing and properly closing the local
     /// database before driving authorization to `Closed`.
     ///
     /// Unlike [`log_out`](Self::log_out) this preserves the session and all local
@@ -148,7 +148,7 @@ pub trait AuthRequests {
     // operations callers should reach for; the bare `log_out`/`close` are the
     // primitives they build on.
 
-    /// Wait until TDLib reaches [`AuthorizationState::Closed`] — the signal that a
+    /// Wait until `TDLib` reaches [`AuthorizationState::Closed`] — the signal that a
     /// preceding [`log_out`](Self::log_out) has finished destroying local data, or a
     /// [`close`](Self::close) has finished flushing the database. Bounded
     /// (~`WAIT_CLOSED_POLLS` × `WAIT_CLOSED_INTERVAL` ≈ 5s) so a stuck teardown
@@ -165,7 +165,7 @@ pub trait AuthRequests {
 
     /// Log out **and wait for the logout to complete** — the whole operation.
     ///
-    /// [`log_out`](Self::log_out) only *acknowledges* the request; TDLib then
+    /// [`log_out`](Self::log_out) only *acknowledges* the request; `TDLib` then
     /// asynchronously destroys all local data and drives authorization to `Closed`.
     /// A caller that quits or [`close`](Self::close)s before `Closed` strands a
     /// half-cleared session the next run can neither resume nor cleanly replace — so
@@ -284,18 +284,18 @@ impl AuthRequests for Bridge {
     }
 }
 
-/// TDLib log verbosity the login flow drops to before sending any request:
+/// `TDLib` log verbosity the login flow drops to before sending any request:
 /// errors only, so request/response payloads (phone number, code, 2FA password)
-/// are never written to TDLib's stderr log (see the threat model). `1` keeps
+/// are never written to `TDLib`'s stderr log (see the threat model). `1` keeps
 /// genuine errors visible while silencing the default info-level logging.
 pub const SECURE_LOG_VERBOSITY: i32 = 1;
 
-/// Cap on TDLib's log file before it truncates and starts over (TDLib's own
+/// Cap on `TDLib`'s log file before it truncates and starts over (`TDLib`'s own
 /// `logStreamFile` rotation, not tuigram's). Generous for a single-account
 /// debug trail without growing unbounded across a long-running session.
 const LOG_FILE_MAX_BYTES: i64 = 10 * 1024 * 1024;
 
-/// Where TDLib's log file lives for a given `database_directory` — a sibling
+/// Where `TDLib`'s log file lives for a given `database_directory` — a sibling
 /// of the database, so both land under the same session data dir without
 /// needing a separate path threaded in. Falls back to a relative path in the
 /// unexpected case `database_directory` has no parent (e.g. it was literally
@@ -303,13 +303,15 @@ const LOG_FILE_MAX_BYTES: i64 = 10 * 1024 * 1024;
 fn log_file_path(database_directory: &str) -> String {
     std::path::Path::new(database_directory)
         .parent()
-        .map(|dir| dir.join("tdlib.log"))
-        .unwrap_or_else(|| std::path::PathBuf::from("tdlib.log"))
+        .map_or_else(
+            || std::path::PathBuf::from("tdlib.log"),
+            |dir| dir.join("tdlib.log"),
+        )
         .to_string_lossy()
         .into_owned()
 }
 
-/// tuigram's view of the login flow — a reduced projection of TDLib's
+/// tuigram's view of the login flow — a reduced projection of `TDLib`'s
 /// [`AuthorizationState`] covering the states Phase 2 acts on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthState {
@@ -325,7 +327,7 @@ pub enum AuthState {
         /// The user's password hint (may be empty). Never the password itself.
         hint: String,
     },
-    /// QR login was requested; TDLib is waiting for the link to be scanned on an
+    /// QR login was requested; `TDLib` is waiting for the link to be scanned on an
     /// already signed-in device. Carries the `tg://login` link to render as a QR
     /// code. No input is taken here — the confirmation happens on the other
     /// device — so the flow advances on the next `updateAuthorizationState`.
@@ -334,16 +336,16 @@ pub enum AuthState {
         link: String,
     },
     /// New-user registration: the phone number isn't tied to an account yet, so
-    /// TDLib needs a first and last name to create one. Carries the
+    /// `TDLib` needs a first and last name to create one. Carries the
     /// terms-of-service text the user must accept before [`Login::register`]
     /// submits the name.
     WaitRegistration {
         /// Terms-of-service text the user must accept before registering.
         terms_of_service: String,
     },
-    /// Email-based login: TDLib needs the user's email address, answered with
+    /// Email-based login: `TDLib` needs the user's email address, answered with
     /// [`Login::submit_email_address`]. (Apple/Google ID sign-in — the other
-    /// answers TDLib would take here — is out of scope for a headless client.)
+    /// answers `TDLib` would take here — is out of scope for a headless client.)
     WaitEmailAddress,
     /// An email authentication code was sent; needs the code, answered with
     /// [`Login::submit_email_code`]. Carries the masked address pattern (e.g.
@@ -367,10 +369,10 @@ pub enum AuthState {
 }
 
 impl AuthState {
-    /// Project a TDLib [`AuthorizationState`] onto tuigram's [`AuthState`].
+    /// Project a `TDLib` [`AuthorizationState`] onto tuigram's [`AuthState`].
     ///
-    /// Total over TDLib's enum by *exhaustive* match — every state maps to a
-    /// handled variant, with no catch-all — so a state added by a future TDLib
+    /// Total over `TDLib`'s enum by *exhaustive* match — every state maps to a
+    /// handled variant, with no catch-all — so a state added by a future `TDLib`
     /// version is a compile error here rather than a silent misclassification.
     #[must_use]
     pub fn from_tdlib(state: &AuthorizationState) -> Self {
@@ -438,7 +440,7 @@ impl<'a, C: AuthRequests> Login<'a, C> {
         &self.state
     }
 
-    /// Advance the machine on a TDLib authorization-state update.
+    /// Advance the machine on a `TDLib` authorization-state update.
     pub fn on_update(&mut self, state: &AuthorizationState) {
         self.state = AuthState::from_tdlib(state);
     }
@@ -446,10 +448,15 @@ impl<'a, C: AuthRequests> Login<'a, C> {
     /// Answer [`AuthState::WaitTdlibParameters`].
     ///
     /// `setTdlibParameters` is the first request of every login, so this is
-    /// where we first silence TDLib's logging — redirecting its stream off
+    /// where we first silence `TDLib`'s logging — redirecting its stream off
     /// stderr ([`AuthRequests::set_log_stream`]) and lowering its verbosity
     /// ([`SECURE_LOG_VERBOSITY`]) — before any credential-bearing request,
     /// including the `api_id`/`api_hash` in `params` itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` rejects the log setup or the parameters
+    /// themselves (e.g. an invalid `database_directory`).
     pub async fn set_parameters(&self, params: ClientParameters) -> Result<(), TdError> {
         self.client
             .set_log_stream(log_file_path(&params.database_directory))
@@ -461,20 +468,32 @@ impl<'a, C: AuthRequests> Login<'a, C> {
     }
 
     /// Answer [`AuthState::WaitPhoneNumber`]. The number is sent in international
-    /// format; TDLib then delivers a code and transitions to `WaitCode`.
+    /// format; `TDLib` then delivers a code and transitions to `WaitCode`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` rejects the number (e.g. malformed or banned).
     pub async fn submit_phone_number(&self, phone_number: String) -> Result<(), TdError> {
         self.client.set_phone_number(phone_number).await
     }
 
     /// Answer [`AuthState::WaitPhoneNumber`] with QR login instead of a phone
-    /// number. TDLib transitions to
+    /// number. `TDLib` transitions to
     /// [`AuthState::WaitOtherDeviceConfirmation`], whose `link` is rendered as a
     /// QR code and scanned on an already signed-in device.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` rejects the request (e.g. wrong auth state).
     pub async fn request_qr_code(&self) -> Result<(), TdError> {
         self.client.request_qr_code_authentication().await
     }
 
     /// Answer [`AuthState::WaitCode`] with the code the user received.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the code is wrong or expired.
     pub async fn submit_code(&self, code: String) -> Result<(), TdError> {
         self.client.check_authentication_code(code).await
     }
@@ -482,18 +501,30 @@ impl<'a, C: AuthRequests> Login<'a, C> {
     /// Answer [`AuthState::WaitPassword`] with the 2FA password.
     ///
     /// The password is moved straight into the request and never stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the password is wrong.
     pub async fn submit_password(&self, password: String) -> Result<(), TdError> {
         self.client.check_authentication_password(password).await
     }
 
     /// Answer [`AuthState::WaitRegistration`] — accept the terms of service and
     /// register a new account with the given first and last name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` rejects the registration (e.g. wrong auth state).
     pub async fn register(&self, first_name: String, last_name: String) -> Result<(), TdError> {
         self.client.register_user(first_name, last_name).await
     }
 
-    /// Answer [`AuthState::WaitEmailAddress`] with the user's email address; TDLib
+    /// Answer [`AuthState::WaitEmailAddress`] with the user's email address; `TDLib`
     /// then sends a code and transitions to [`AuthState::WaitEmailCode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `TDLib` rejects the address (e.g. malformed).
     pub async fn submit_email_address(&self, email_address: String) -> Result<(), TdError> {
         self.client
             .set_authentication_email_address(email_address)
@@ -502,12 +533,17 @@ impl<'a, C: AuthRequests> Login<'a, C> {
 
     /// Answer [`AuthState::WaitEmailCode`] with the code delivered to the email
     /// address. The code is moved straight into the request and never stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the code is wrong or expired.
     pub async fn submit_email_code(&self, code: String) -> Result<(), TdError> {
         self.client.check_authentication_email_code(code).await
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
@@ -759,7 +795,7 @@ mod tests {
         }
     }
 
-    /// A client that models TDLib's asynchronous teardown: it reports a non-closed
+    /// A client that models `TDLib`'s asynchronous teardown: it reports a non-closed
     /// state for the first few `authorization_state` polls after a `log_out`/`close`,
     /// then `Closed` — so a caller that does not wait would observe the pre-`Closed`
     /// state. Only the teardown surface is implemented; the rest is unreachable here.

@@ -3,6 +3,20 @@
 //! translates its source into an [`Action`], [`App::dispatch`] applies it and
 //! marks the frame dirty, and the loop repaints from the new state. Nothing here
 //! touches the terminal or awaits — it stays a pure, unit-testable reducer.
+//!
+//! Cohesion review (#182d): this file stays one module, by design rather than
+//! neglect. `Action` is one flat enum because it is the single vocabulary every
+//! input source (terminal, mouse, `TDLib` updates) is translated into, and
+//! splitting it would just scatter that vocabulary. `App`'s ~80-odd accessor,
+//! projection, and `take_*` methods are the state the rest of the crate reads
+//! and drains — they are coupled to the one struct's fields, not an independent
+//! seam. [`App::dispatch`] itself is one large `match` over every `Action`
+//! variant; unlike `tuigram-core`'s `messages.rs` (#182c, request traits vs. a
+//! store) or `ui.rs` (#182b, one render function per pane), there is no
+//! existing per-arm boundary to move code across — the match arms share `self`
+//! and each other's helpers directly. Breaking `dispatch` up would mean
+//! redesigning it around a command-pattern dispatch table, which is a design
+//! change, not a mechanical move, so it is out of scope for a cohesion pass.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -406,6 +420,9 @@ pub enum Action {
 
 /// The whole app's state. Phase 5/6 widgets and real data hang off this; for now
 /// it carries only what the spine needs to prove the loop is alive.
+// Each bool is an independent, non-mutually-exclusive state dimension (quit vs.
+// dirty vs. collapsed, ...); they don't collapse into one enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Default)]
 pub struct App {
     /// Set once a quit action is seen; the loop checks it and breaks.
@@ -1305,6 +1322,9 @@ impl App {
     /// Key events are resolved through the central [`keymap`] against the current
     /// focus and help-overlay state, so this stays a thin adapter and the bindings
     /// live in one place.
+    // `Event` is `Copy` here (no `bracketed-paste` feature) and this is a
+    // dispatch entry point called from 40+ sites; by-value is the natural fit.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn on_terminal_event(&self, event: Event) -> Action {
         match event {
             Event::Key(key) => keymap::resolve(self.focus, self.overlay, &key),
@@ -1420,6 +1440,9 @@ impl App {
     /// [`project_conversation`](Self::project_conversation) (#114) directly, since
     /// the projection needs the `Client` and `App` stays pure. Every remaining
     /// signal (files/auth) is a repaint nudge until its own projection lands.
+    // `&self` is unused today but kept for API symmetry with the sibling
+    // `on_terminal_event`; by-value `AppEvent` matches that method's convention.
+    #[allow(clippy::unused_self, clippy::needless_pass_by_value)]
     pub fn on_app_event(&self, event: AppEvent) -> Action {
         match event {
             AppEvent::Connection(state) => Action::SetConnection(state),
@@ -1427,7 +1450,7 @@ impl App {
             | AppEvent::Chats
             | AppEvent::ChatReadOutbox
             | AppEvent::Messages
-            | AppEvent::File
+            | AppEvent::File(_)
             | AppEvent::Secret
             | AppEvent::Lagged => Action::Render,
         }
@@ -1689,7 +1712,11 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::SearchCancel => {
+            Action::SearchCancel
+            | Action::AttachCancel
+            | Action::ContactSearchCancel
+            | Action::SettingsCancel
+            | Action::LogoutCancel => {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
@@ -1869,10 +1896,6 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::AttachCancel => {
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
             Action::SecretOpen => {
                 // Offer the lifecycle action for the selected chat — start a secret
                 // chat with a private chat's user, or close an open one. The
@@ -1949,10 +1972,6 @@ impl App {
                     self.dirty = true;
                 }
             }
-            Action::ContactSearchCancel => {
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
             Action::ContactResultNext => {
                 self.contacts.select_next();
                 self.dirty = true;
@@ -2015,10 +2034,6 @@ impl App {
                     }
                     self.overlay = Overlay::None;
                 }
-                self.dirty = true;
-            }
-            Action::SettingsCancel => {
-                self.overlay = Overlay::None;
                 self.dirty = true;
             }
             Action::ReplyMessage => {
@@ -2171,10 +2186,6 @@ impl App {
                 self.overlay = Overlay::None;
                 self.dirty = true;
             }
-            Action::LogoutCancel => {
-                self.overlay = Overlay::None;
-                self.dirty = true;
-            }
             Action::NoticeDismiss => {
                 // Drop the showing toast (revealing any next); a no-op that does
                 // not repaint when none is up.
@@ -2227,6 +2238,7 @@ fn media_kind(content: &MessageContent) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -2593,7 +2605,7 @@ mod tests {
             AppEvent::Auth,
             AppEvent::Chats,
             AppEvent::Messages,
-            AppEvent::File,
+            AppEvent::File(0),
             AppEvent::Lagged,
         ] {
             assert_eq!(app.on_app_event(event), Action::Render);
@@ -3962,7 +3974,8 @@ mod tests {
         app.dispatch(Action::SecretOpen);
         assert_eq!(app.overlay(), Overlay::SecretChat);
         assert_eq!(
-            app.secret().map(|p| p.lifecycle()),
+            app.secret()
+                .map(super::super::secret::SecretChatPrompt::lifecycle),
             Some(SecretLifecycle::Start { user_id: 7 })
         );
     }
@@ -3980,7 +3993,8 @@ mod tests {
         app.dispatch(Action::SecretOpen);
         assert_eq!(app.overlay(), Overlay::SecretChat);
         assert_eq!(
-            app.secret().map(|p| p.lifecycle()),
+            app.secret()
+                .map(super::super::secret::SecretChatPrompt::lifecycle),
             Some(SecretLifecycle::Close { secret_chat_id: 9 })
         );
     }
@@ -4103,7 +4117,8 @@ mod tests {
         app.dispatch(Action::ContactResultConfirm);
         assert_eq!(app.overlay(), Overlay::SecretChat);
         assert_eq!(
-            app.secret().map(|p| p.lifecycle()),
+            app.secret()
+                .map(super::super::secret::SecretChatPrompt::lifecycle),
             Some(SecretLifecycle::Start { user_id: 7 })
         );
         assert!(app.secret().unwrap().prompt().contains("Ada Lovelace"));
@@ -4318,9 +4333,9 @@ mod tests {
         assert_eq!(app.conversation().selected_message().map(|m| m.id), Some(1));
     }
 
-    /// #210: TDLib documents `chat_id` as "may be 0 if the replied message is
+    /// #210: `TDLib` documents `chat_id` as "may be 0 if the replied message is
     /// in unknown chat" — a same-chat reply must still jump rather than
-    /// always no-op if TDLib reports `0` instead of the real chat id here.
+    /// always no-op if `TDLib` reports `0` instead of the real chat id here.
     #[test]
     fn jump_to_quoted_resolves_a_reply_whose_chat_id_is_reported_as_zero() {
         use crate::conversation::ConversationView;
@@ -4400,12 +4415,12 @@ mod tests {
 
     #[test]
     fn save_media_records_a_file_id_for_media_and_toasts_otherwise() {
-        use tuigram_core::model::{FileRef, MessageContent, Photo};
+        use tuigram_core::model::{FileRef, FormattedText, MessageContent, Photo};
         // A media message: the file id is recorded for the loop to save.
         let mut photo = crate::conversation::sample_message(
             1,
             MessageContent::Photo(Photo {
-                caption: Default::default(),
+                caption: FormattedText::default(),
                 file: FileRef::new(99),
                 width: 1,
                 height: 1,
@@ -4425,7 +4440,7 @@ mod tests {
 
     #[test]
     fn copy_message_records_text_for_a_text_message_and_toasts_otherwise() {
-        use tuigram_core::model::{FileRef, MessageContent, Photo};
+        use tuigram_core::model::{FileRef, FormattedText, MessageContent, Photo};
         // A text message: its text is recorded for the loop to copy.
         let mut app = app_with_message(text_message(1, "hello there", false));
         app.dispatch(Action::CopyMessage);
@@ -4435,7 +4450,7 @@ mod tests {
         let mut photo = crate::conversation::sample_message(
             2,
             MessageContent::Photo(Photo {
-                caption: Default::default(),
+                caption: FormattedText::default(),
                 file: FileRef::new(9),
                 width: 1,
                 height: 1,

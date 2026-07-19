@@ -1,0 +1,29 @@
+name: Weekly advisory sweep
+
+# Push/PR-triggered cargo-deny (ci.yml's `deny` job) only sees advisories that
+# existed at the last push; RustSec entries land continuously, and this repo
+# doesn't push every day. A quiet week would otherwise mean a new high/critical
+# advisory sits undetected until the next PR (#176). This is also meant to be
+# the detection mechanism for #177's frozen-OpenSSL rebuild policy.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # every Monday, 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Install Rust toolchain
+        run: rustup show
+      # See ci.yml's `deny`/`semver-checks` jobs for why this pins the
+      # versioned release tag rather than hashing the `@cargo-deny`
+      # convenience tag (taiki-e/install-action's README warns against it).
+      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+        with:
+          tool: cargo-deny
+      - name: cargo deny check advisories
+        run: cargo deny check advisories -A unmaintained -A notice

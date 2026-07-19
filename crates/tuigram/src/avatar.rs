@@ -14,7 +14,7 @@ use tuigram_core::model::User;
 
 use crate::conversation::accent_color;
 
-/// DejaVu Sans Bold (see `assets/fonts/LICENSE_DEJAVU` — Bitstream Vera terms,
+/// `DejaVu` Sans Bold (see `assets/fonts/LICENSE_DEJAVU` — Bitstream Vera terms,
 /// free to bundle and redistribute): broad Unicode coverage so a sender's
 /// first initial renders correctly across scripts, not just Latin.
 static FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/DejaVuSans-Bold.ttf");

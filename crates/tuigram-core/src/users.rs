@@ -3,14 +3,14 @@
 //!
 //! A [`Sender::User`](crate::model::Sender::User) and a
 //! [`ChatKind::Private`](crate::model::ChatKind::Private) both carry only a user
-//! id; on their own they render as opaque integers. TDLib streams the actual user
+//! id; on their own they render as opaque integers. `TDLib` streams the actual user
 //! records as `updateUser` (the full record) and `updateUserStatus` (presence
 //! only), and expects the client to keep them. [`UserStore`] is that kept state:
 //! the single update router folds each user-route update into it via
 //! [`UserStore::reduce`], and [`UserStore::get`] / [`UserStore::display_name`]
 //! read a name back for whatever id a chat or message snapshot holds.
 //!
-//! Folding is **idempotent** — TDLib repeats `updateUser` on reconnect and resync
+//! Folding is **idempotent** — `TDLib` repeats `updateUser` on reconnect and resync
 //! — so re-applying any update converges rather than accreting state.
 //!
 //! [`UserRequests`] is this module's slice of the request surface — only the
@@ -45,7 +45,7 @@ pub trait UserRequests {
     ///
     /// A backfill for an id the update stream has not announced — most users
     /// arrive unsolicited as `updateUser`, but a sender paged in from history can
-    /// reference a user TDLib has not pushed yet. TDLib also emits the
+    /// reference a user `TDLib` has not pushed yet. `TDLib` also emits the
     /// corresponding `updateUser`, so the store folds the same record through the
     /// router; this returned copy is for the caller that needed it synchronously.
     async fn get_user(&self, user_id: i64) -> Result<User, TdError>;
@@ -116,7 +116,7 @@ impl UserStore {
         self.users.is_empty()
     }
 
-    /// Insert or replace a user from `updateUser`. TDLib sends the full record,
+    /// Insert or replace a user from `updateUser`. `TDLib` sends the full record,
     /// so a replace is correct — including its presence, which a later
     /// `updateUserStatus` then refines.
     fn upsert(&mut self, user: User) {
@@ -125,7 +125,7 @@ impl UserStore {
 
     /// Fold `updateUserStatus`: refresh just the presence of a known user.
     ///
-    /// An unknown user is ignored: TDLib announces a user with `updateUser`
+    /// An unknown user is ignored: `TDLib` announces a user with `updateUser`
     /// before sending its status, so a status for an unknown id is a stale or
     /// out-of-order update, safe to drop — and [`get_user`](UserRequests::get_user)
     /// backfills any user we still lack rather than synthesizing a nameless one
@@ -138,6 +138,7 @@ impl UserStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use crate::model::{ChatKind, Sender, UserKind};
@@ -147,7 +148,7 @@ mod tests {
         UpdateUser, UpdateUserStatus, User as TdUser, UserStatusOffline, UserStatusOnline,
     };
 
-    /// A TDLib `User` with every field zeroed but id, names, and status — what the
+    /// A `TDLib` `User` with every field zeroed but id, names, and status — what the
     /// fold and resolution paths exercise.
     fn td_user(id: i64, first: &str, last: &str, status: TdUserStatus) -> TdUser {
         TdUser {

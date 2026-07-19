@@ -70,6 +70,8 @@ impl ReactionPicker {
     }
 
     /// The emoji to offer, in display order.
+    // `&self` unused; kept for symmetry with the other getters on this type.
+    #[allow(clippy::unused_self)]
     #[must_use]
     pub fn palette(&self) -> &'static [&'static str] {
         PALETTE

@@ -1,13 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/tuigram-core", "crates/tuigram"]
+members = ["crates/tuigram-core", "crates/tuigram", "crates/tuigram-fixtures"]
 
 [workspace.package]
 # CalVer (month-based): YYYY.MINOR.MICRO, unpadded so Cargo accepts it as valid
 # SemVer (leading zeros are rejected). MINOR is the release month, MICRO the
 # patch within it; both crates inherit this via `version.workspace = true`, and
 # it flows to TDLib as `application_version` through `tuigram_core::version()`.
-version = "2026.7.2"
+version = "2026.7.3"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/queq-co/tuigram"
@@ -30,7 +30,16 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 # separate event queues + separate raw-mode tracking (lost events, terminal not
 # restored on exit). The `event-stream` feature turns terminal input into an
 # async Stream feeding the central tokio::select! loop. See research/ratatui.md.
-ratatui = { version = "0.30" }
+# Trimmed off ratatui's defaults (#180): `all-widgets` (pulls in the calendar
+# widget, unused), `macros` (the `ratatui_macros` crate, unused), and
+# `underline-color` (colored-underline terminal support — we only use the
+# plain `Modifier::UNDERLINED` ANSI attribute, in richtext.rs). `layout-cache`
+# is kept: it's ratatui-core's internal `Layout::split` memoization, a pure
+# perf win with no extra surface.
+ratatui = { version = "0.30", default-features = false, features = [
+    "crossterm",
+    "layout-cache",
+] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 # Local-time rendering for message timestamps (#194) — chrono is already pulled
 # in transitively via serde_with (a tdlib-rs dependency), so this adds no new
@@ -88,6 +97,13 @@ ab_glyph = { version = "0.2" }
 # (#214, #215) — already in the graph transitively via ratatui; promoted to
 # direct since `wrap.rs` calls it to measure display width, not byte/char count.
 unicode-width = { version = "0.2" }
+# Benchmark harness (#183), dev-only in both crates: baseline numbers for the
+# hot paths named in the issue, not wired into default CI (bench noise on
+# shared runners is worse than no gate — see each crate's benches/ for how to
+# run them locally). `html_reports` gives the `target/criterion/` report the
+# closing baseline numbers are read from; async features are all off since
+# nothing benched here awaits.
+criterion = { version = "0.8", default-features = false, features = ["html_reports", "cargo_bench_support"] }
 
 # Project-wide lints. Telegram/TDLib FFI will introduce `unsafe` later; we keep
 # it visible (warn, not deny) so every use is a deliberate, reviewed decision.
@@ -96,3 +112,40 @@ unsafe_code = "warn"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Function-length is a module-cohesion call, not a lint-hygiene one: today's
+# flagged functions (`dispatch`, `from_tdlib`, `run`, render/view builders) are
+# single cohesive match/switch bodies, not accidental sprawl. #182 is the
+# tracked place to revisit that call as part of its module cohesion review.
+too_many_lines = "allow"
+# Every cast site reviewed (#179) is domain-bounded in a way clippy can't see
+# statically: terminal dimensions and string lengths cast to `u16` (ratatui
+# geometry, always far under `u16::MAX`), palette indices bounded by a `%` by
+# a small constant, hash functions that intentionally reinterpret bits, values
+# already clamped to `>= 0` before the cast, and test-only loop counters/ids.
+# Real truncation risk (e.g. a `TDLib` id that could exceed the target width)
+# gets a comment and, where warranted, a `try_from`/checked conversion instead
+# of relying on this allow — it is a baseline, not a blanket exemption.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+
+# #179b: ban `.unwrap()` outside tests. Every non-test call site becomes
+# `.expect("reason")` describing the invariant that makes the unwrap safe, or
+# (where the invariant doesn't actually hold — TDLib response parsing,
+# config/session file I/O, user input) proper `Result` propagation instead.
+unwrap_used = "warn"
+
+# #184: tuned release profile for shipped binaries. `panic = "abort"` was
+# evaluated and deliberately left unset — `Bridge`'s and `Client`'s `Drop`
+# impls (bridge.rs, client.rs) join the TDLib receive thread and stop the
+# router task on unwind; under `abort` those never run, and a mid-session
+# panic can leave TDLib's SQLite database mid-write (see the shutdown note in
+# examples/repl.rs). The terminal-restore panic hook (#178) isn't a reason to
+# switch, either — it runs before the abort/unwind decision, so it already
+# fires under `abort` too.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

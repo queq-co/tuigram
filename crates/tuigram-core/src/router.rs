@@ -1,6 +1,6 @@
 //! The single update router — tuigram's one always-on subscriber of the bridge.
 //!
-//! TDLib pushes a firehose of unsolicited updates. Rather than let each
+//! `TDLib` pushes a firehose of unsolicited updates. Rather than let each
 //! subsystem subscribe and clone the whole stream, Phase 3 routes everything
 //! through **one** long-lived task ([`Router::run`]): it drains the bridge's
 //! lagged-aware stream once, classifies each update with a single match, and
@@ -92,7 +92,7 @@ enum Route {
 /// Tag an update with the domain that owns it.
 ///
 /// This is deliberately a *routing* match, not a model projection, so a
-/// catch-all `Ignored` arm is correct: the vast majority of TDLib's update
+/// catch-all `Ignored` arm is correct: the vast majority of `TDLib`'s update
 /// variants are connectivity/metadata the router does not fold, and a new
 /// variant defaulting to `Ignored` is safe (it is simply not routed). Contrast
 /// `model::*::from_tdlib`, which is total *on purpose* so a new content variant
@@ -293,7 +293,9 @@ mod tests {
     fn user_status() -> Update {
         Update::UserStatus(tdlib_rs::types::UpdateUserStatus {
             user_id: 7,
-            status: tdlib_rs::enums::UserStatus::Recently(Default::default()),
+            status: tdlib_rs::enums::UserStatus::Recently(
+                tdlib_rs::types::UserStatusRecently::default(),
+            ),
         })
     }
 
@@ -468,14 +470,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_drains_a_mixed_stream_and_dispatches_each_event() {
-        let events = tokio_stream::iter([
+        let events = tokio_stream::iter(vec![
             RouterEvent::Update(chat_read_inbox()),
             RouterEvent::Update(delete_messages()),
             RouterEvent::Lagged(7),
             RouterEvent::Update(chat_last_message()),
         ]);
 
-        let sink = Router::new(SpySink::default()).run(events).await;
+        let sink = Box::pin(Router::new(SpySink::default()).run(events)).await;
 
         assert_eq!(sink.chat, 2);
         assert_eq!(sink.message, 1);

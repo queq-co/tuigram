@@ -21,6 +21,21 @@ cargo clippy --workspace --all-targets
 git config core.hooksPath .githooks
 ```
 
+### Coverage
+
+CI's `coverage` job (see `.github/workflows/ci.yml`) runs
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) over the
+workspace on every push/PR and uploads the HTML report + an `lcov.info` as
+build artifacts — informational only, not a merge gate (a percentage floor
+would reward padding tests over fixing real gaps; see #181). To run the same
+report locally:
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+cargo llvm-cov --workspace --html   # report at target/llvm-cov/html/index.html
+```
+
 TDLib system dependencies and `tdjson` setup are documented in
 [docs/research/tdlib.md](docs/research/tdlib.md) (prebuilt by default; from-source
 for power users).

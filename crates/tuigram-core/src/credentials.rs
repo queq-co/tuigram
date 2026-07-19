@@ -1,4 +1,4 @@
-//! Resolves the Telegram `api_id` / `api_hash` a TDLib login requires.
+//! Resolves the Telegram `api_id` / `api_hash` a `TDLib` login requires.
 //!
 //! Telegram ties these to a developer's own app registration and rate-limits the
 //! published *sample* id (`API_ID_PUBLISHED_FLOOD`), so a FOSS client must never
@@ -29,21 +29,36 @@ pub const ENV_API_ID: &str = "TUIGRAM_API_ID";
 /// Environment variable holding the Telegram `api_hash`.
 pub const ENV_API_HASH: &str = "TUIGRAM_API_HASH";
 
-/// TDLib error message when the `api_id` in use is the rate-limited public
+/// `TDLib` error message when the `api_id` in use is the rate-limited public
 /// sample — the failure mode the per-user-credentials policy exists to avoid.
 pub const API_ID_PUBLISHED_FLOOD: &str = "API_ID_PUBLISHED_FLOOD";
 
 /// A user's Telegram application credentials, from <https://my.telegram.org>.
 ///
-/// Low-value relative to the TDLib session (which is live account access), but
+/// Low-value relative to the `TDLib` session (which is live account access), but
 /// still never committed to git. These map straight onto the `api_id`/`api_hash`
 /// fields of [`crate::ClientParameters`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `api_hash` is not [`zeroize`](https://docs.rs/zeroize)d on drop (#178):
+/// `TDLib` keeps its own copy on the C++ side for the client's lifetime, so
+/// scrubbing the Rust-side `String` would not remove the value from process
+/// memory — it would add a dependency for no real protection.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ApiCredentials {
     /// Telegram API id (a positive integer).
     pub api_id: i32,
     /// Telegram API hash (a hex string).
     pub api_hash: String,
+}
+
+impl std::fmt::Debug for ApiCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never render the hash, even in logs/panics that format it (#178).
+        f.debug_struct("ApiCredentials")
+            .field("api_id", &self.api_id)
+            .field("api_hash", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Interactive first-run capture of freshly-registered credentials.
@@ -53,6 +68,11 @@ pub struct ApiCredentials {
 /// trait so [`CredentialResolver::resolve`] is testable with a scripted stand-in.
 pub trait Onboarding {
     /// Prompt for and return the user's `api_id` / `api_hash`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the prompt is cancelled, fails to read input, or the
+    /// captured values don't parse into valid credentials.
     fn capture(&self) -> Result<ApiCredentials, CredentialError>;
 }
 
@@ -154,7 +174,7 @@ impl CredentialResolver {
         })?;
         match config.telegram {
             None => Ok(None),
-            Some(t) => Ok(Some(validate(t.api_id, t.api_hash, "config.toml")?)),
+            Some(t) => Ok(Some(validate(t.api_id, &t.api_hash, "config.toml")?)),
         }
     }
 
@@ -178,7 +198,7 @@ impl CredentialResolver {
     }
 }
 
-/// Whether a TDLib error is the published-sample-id flood condition.
+/// Whether a `TDLib` error is the published-sample-id flood condition.
 #[must_use]
 pub fn is_api_id_published_flood(error: &TdError) -> bool {
     error.message.contains(API_ID_PUBLISHED_FLOOD)
@@ -199,11 +219,7 @@ struct TelegramSection {
 }
 
 /// Validate already-typed config values into [`ApiCredentials`].
-fn validate(
-    api_id: i32,
-    api_hash: String,
-    source: &str,
-) -> Result<ApiCredentials, CredentialError> {
+fn validate(api_id: i32, api_hash: &str, source: &str) -> Result<ApiCredentials, CredentialError> {
     if api_id <= 0 {
         return Err(CredentialError::Malformed(format!(
             "{source} api_id must be a positive integer, got {api_id}"
@@ -218,7 +234,7 @@ fn validate(
     Ok(ApiCredentials { api_id, api_hash })
 }
 
-/// Validate string-form values (the env path; api_id arrives as text).
+/// Validate string-form values (the env path; `api_id` arrives as text).
 fn validate_str(
     api_id: &str,
     api_hash: &str,
@@ -229,7 +245,7 @@ fn validate_str(
             "{source} api_id must be a positive integer, got {api_id:?}"
         ))
     })?;
-    validate(api_id, api_hash.to_owned(), source)
+    validate(api_id, api_hash, source)
 }
 
 /// `$XDG_CONFIG_HOME/tuigram/config.toml`, falling back to `~/.config/...`.
@@ -283,7 +299,10 @@ fn set_dir_private(dir: &Path) -> io::Result<()> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
+// Must return `io::Result<()>` to match the `unix` sibling above: callers are
+// platform-agnostic and use `?` regardless of which cfg arm compiles.
 #[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
 fn set_dir_private(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
@@ -293,7 +312,7 @@ fn set_dir_private(_dir: &Path) -> io::Result<()> {
 pub enum CredentialError {
     /// Reading or writing the config file failed.
     Io(io::Error),
-    /// A configured value was present but invalid (bad api_id, empty hash,
+    /// A configured value was present but invalid (bad `api_id`, empty hash,
     /// partial env pair, unparseable TOML).
     Malformed(String),
     /// The interactive onboarding step failed (e.g. aborted, or EOF on input).
@@ -336,12 +355,13 @@ impl From<io::Error> for CredentialError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
 
     fn sample() -> ApiCredentials {
         ApiCredentials {
-            api_id: 1234567,
+            api_id: 1_234_567,
             api_hash: "0123456789abcdef0123456789abcdef".to_owned(),
         }
     }
@@ -457,6 +477,18 @@ mod tests {
             resolver.resolve(&NeverPrompts),
             Err(CredentialError::Malformed(_))
         ));
+    }
+
+    #[test]
+    fn debug_redacts_the_api_hash() {
+        let creds = sample();
+        let shown = format!("{creds:?}");
+        assert!(
+            !shown.contains(&creds.api_hash),
+            "Debug must not leak the api_hash"
+        );
+        assert!(shown.contains("redacted"));
+        assert!(shown.contains(&creds.api_id.to_string()));
     }
 
     #[test]

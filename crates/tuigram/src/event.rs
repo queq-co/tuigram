@@ -42,8 +42,12 @@ pub enum AppEvent {
     ChatReadOutbox,
     /// A message update folded by core: a chat's history may have changed.
     Messages,
-    /// `updateFile`: a download or upload made progress.
-    File,
+    /// `updateFile`: a download or upload made progress, carrying the touched
+    /// file's `TDLib` id (#276). `updateFile` fires for every in-flight
+    /// transfer on the *whole account*, not just the open chat — the id lets
+    /// the loop skip a reproject the open conversation can't possibly be
+    /// affected by, instead of repainting on every unrelated tick.
+    File(i32),
     /// `updateSecretChat`: a secret chat's lifecycle/key state advanced (#121) —
     /// pending → ready → closed — so the secret-state projection re-reads it.
     Secret,
@@ -121,14 +125,14 @@ fn classify_update(update: &Update) -> Option<AppEvent> {
         | Update::MessageSendFailed(_)
         | Update::MessageContent(_)
         | Update::MessageInteractionInfo(_)
-        | Update::DeleteMessages(_) => Some(AppEvent::Messages),
+        | Update::DeleteMessages(_)
         // A user record arrived or changed (#160): re-project the open chat so a
         // sender name that lands after first paint replaces the numeric fallback in
         // the header. Reuses the `Messages` signal — the conversation projection
         // re-resolves senders from the (now updated) user store. `updateUserStatus`
         // stays dropped below: presence churn must not wake the loop constantly.
-        Update::User(_) => Some(AppEvent::Messages),
-        Update::File(_) => Some(AppEvent::File),
+        | Update::User(_) => Some(AppEvent::Messages),
+        Update::File(u) => Some(AppEvent::File(u.file.id)),
         // The E2E chat lifecycle: a state advance (pending/ready/closed) folds into
         // the secret-chat store, which the secret-state projection reads back (#121).
         Update::SecretChat(_) => Some(AppEvent::Secret),
@@ -136,7 +140,7 @@ fn classify_update(update: &Update) -> Option<AppEvent> {
     }
 }
 
-/// Project TDLib's connection state onto the status-bar [`ConnectionState`].
+/// Project `TDLib`'s connection state onto the status-bar [`ConnectionState`].
 ///
 /// Reuses core's [`from_tdlib`](tuigram_core::ConnectionState::from_tdlib) for the
 /// raw-enum mapping (one source of truth for that), then collapses core's
@@ -162,7 +166,7 @@ mod tests {
         UpdateDeleteMessages, UpdateFile, UpdateUser, UpdateUserStatus, User as TdUser,
     };
 
-    /// A minimal TDLib `User` for classification tests: only the variant matters to
+    /// A minimal `TDLib` `User` for classification tests: only the variant matters to
     /// [`classify_update`], so every field is zeroed/empty.
     fn td_user(id: i64) -> TdUser {
         TdUser {
@@ -171,7 +175,9 @@ mod tests {
             last_name: String::new(),
             usernames: None,
             phone_number: String::new(),
-            status: tuigram_core::enums::UserStatus::Recently(Default::default()),
+            status: tuigram_core::enums::UserStatus::Recently(
+                tuigram_core::types::UserStatusRecently::default(),
+            ),
             profile_photo: None,
             accent_color_id: 0,
             background_custom_emoji_id: 0,
@@ -249,7 +255,7 @@ mod tests {
                     ..Default::default()
                 },
             })),
-            Some(AppEvent::File)
+            Some(AppEvent::File(7))
         );
         assert_eq!(
             signal(Update::AuthorizationState(UpdateAuthorizationState {
@@ -298,7 +304,9 @@ mod tests {
         assert_eq!(
             classify(RouterEvent::Update(Update::UserStatus(UpdateUserStatus {
                 user_id: 1,
-                status: tuigram_core::enums::UserStatus::Recently(Default::default()),
+                status: tuigram_core::enums::UserStatus::Recently(
+                    tuigram_core::types::UserStatusRecently::default(),
+                ),
             }))),
             None
         );

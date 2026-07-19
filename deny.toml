@@ -1,0 +1,43 @@
+# cargo-deny config (#176). Run locally with:
+#   cargo deny check
+# CI runs `cargo deny check -A unmaintained -A notice` (see .github/workflows/ci.yml):
+# this cargo-deny version has no per-category lint-level keys left in this file for
+# advisories (only `ignore` for specific IDs) — severity policy is enforced via CLI
+# lint flags instead. Effective policy: vulnerability/yanked/unsound stay at their
+# default (deny); unmaintained/notice are downgraded to non-fatal in CI, matching
+# "fail on high/critical, warn on unmaintained/informational".
+[advisories]
+ignore = []
+
+# This section is considered when running `cargo deny check licenses`.
+# https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",                # zlib-rs, foldhash
+    "Unicode-3.0",         # unicode-ident (AND'd with MIT/Apache-2.0 — both sides need allowing)
+    "NCSA",                # libfuzzer-sys, transitive via rav1e's fuzz harness (AND'd with MIT/Apache-2.0)
+    "BSL-1.0",             # clipboard-win, error-code (Boost Software License, permissive)
+    "CC0-1.0",             # public-domain-equivalent; no MIT/Apache-2.0 alternative on at least one crate
+    "MIT-0",               # public-domain-equivalent MIT variant, paired with CC0-1.0 above
+    "MPL-2.0",             # option-ext only; weak file-level copyleft, no obligation on our code since we don't modify it
+    "CDLA-Permissive-2.0", # webpki-roots; permissive despite the name (root CA cert data)
+    "bzip2-1.0.6",         # libbz2-rs-sys, transitive via tdlib-rs's bundled zip; permissive BSD-style license
+]
+
+# This section is considered when running `cargo deny check bans`.
+# https://embarkstudios.github.io/cargo-deny/checks/bans/cfg.html
+[bans]
+# Flag (not block) duplicate majors of the same crate — visibility for #180's cleanup.
+multiple-versions = "warn"
+
+# This section is considered when running `cargo deny check sources`.
+# https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,76 +1,15 @@
-//! Per-chat message history — paged backward from TDLib and kept current by
-//! live updates, folded into one ordered, deduplicated view.
-//!
-//! A chat's messages reach tuigram two ways: **history** is *pulled* a page at a
-//! time with `getChatHistory` (it returns the messages directly), while **live**
-//! messages are *pushed* as `updateNewMessage`. Both land in the same
-//! [`MessageStore`], keyed per chat by message id, so the two streams converge on
-//! a single chronological view with no duplicates — a message seen live and then
-//! re-fetched in a history page is the same entry, not two.
-//!
-//! Ordering is by message id, which TDLib assigns monotonically within a chat, so
-//! id-ascending is chronological (oldest first). A `BTreeMap` per chat gives that
-//! ordering and the dedupe for free: re-inserting an id replaces in place.
-//!
-//! This module owns the message slice of the request surface — the same
-//! per-domain segregation as [`ChatRequests`](crate::chats::ChatRequests) and
-//! [`AuthRequests`](crate::auth::AuthRequests), but segmented one level further:
-//! the seam is split into per-capability traits ([`HistoryRequests`],
-//! [`SendRequests`], [`EditRequests`], …) so a consumer binds only what it uses
-//! and a test double implements only what it exercises. [`MessageRequests`]
-//! bundles them all for a caller that wants the whole surface. [`load_history`]
-//! drives the backward paging; folding each page stays the caller's choice (so
-//! production can fold under its lock per page, never across an await).
-//!
-//! Sending (#19) lives here too: [`SendRequests::send_text`] posts a text
-//! message (optionally a reply) and TDLib creates it optimistically with a
-//! temporary id in [`SendState::Pending`]; the reducer then folds the lifecycle —
-//! `updateMessageSendSucceeded` swaps the temp id for the server's real one,
-//! `updateMessageSendFailed` flips the same entry to [`SendState::Failed`] — so a
-//! sent message appears at once and reconciles in place, never blocking on
-//! delivery.
-//!
-//! Editing and deleting (#20) round out the write side:
-//! [`EditRequests::edit_text`] replaces a message's text and
-//! [`DeleteRequests::delete`] removes messages (for self or, with `revoke`, for
-//! everyone). The reducer reconciles both: `updateMessageContent` swaps a known
-//! message's content in place, and a permanent `updateDeleteMessages` drops the
-//! messages — a cache-eviction delete is ignored so our copy survives.
-//!
-//! Read state (#21): [`ReadRequests::view_messages`] marks a chat's messages
-//! read. It is advisory — the call acknowledges the messages to the server and
-//! never blocks the read path; the resulting unread-count change arrives as
-//! `updateChatReadInbox`, which the [chat store](crate::chats::ChatStore) folds.
-//!
-//! Search (#37): [`SearchRequests::search_chat_messages`] looks within one chat
-//! and [`SearchRequests::search_messages`] across the whole account. Both return
-//! normalized hits with a paging cursor as a [`SearchPage`], and the caller
-//! collects them into a [`SearchResults`] — a transient, id-deduplicated view
-//! that never folds into [`MessageStore`], so a search leaves loaded history
-//! untouched. [`search_chat`] and [`search_global`] drive either search to
-//! exhaustion into that view, the search counterpart to [`load_history`].
-//!
-//! Reactions and pins (#51): [`ReactionRequests::add_message_reaction`] /
-//! [`ReactionRequests::remove_message_reaction`] react to a message, and
-//! [`PinRequests::pin_chat_message`] / [`PinRequests::unpin_chat_message`]
-//! pin it. Both are advisory, like the read path: a reaction's new counts arrive
-//! as `updateMessageInteractionInfo`, which this store folds onto the message
-//! (replacing its reaction buckets in place); a pin's `updateMessageIsPinned`
-//! is chat state, folded by the [chat store](crate::chats::ChatStore) onto
-//! [`Chat::pinned_message_ids`](crate::model::Chat::pinned_message_ids), not here.
-//!
-//! Scope: history paging, live `updateNewMessage`, sending text + reply with its
-//! lifecycle (#19), editing and deleting with their updates (#20), marking
-//! messages read (#21), forwarding (#36), in-chat and global search (#37),
-//! reactions and pins (#51), and the snapshot.
-
-use std::collections::BTreeMap;
-use std::collections::HashMap;
-use std::collections::HashSet;
+//! The message request seam — traits per capability (history, send, edit,
+//! format, delete, read, forward, search, reaction, pin), `Bridge`'s live
+//! implementation of each, and the paging drivers ([`load_history`],
+//! [`search_chat`], [`search_global`]) built on them. The client-side store
+//! ([`MessageStore`](super::store::MessageStore),
+//! [`SearchPage`](super::store::SearchPage),
+//! [`SearchResults`](super::store::SearchResults)) lives in [`super::store`];
+//! see [`super`] for how the two sides fit together.
 
 use tdlib_rs::enums::{
     FoundChatMessages, FoundMessages, InputMessageContent, InputMessageReplyTo, MessageSource,
-    Messages, ReactionType, TextParseMode, Update,
+    Messages, ReactionType, TextParseMode,
 };
 use tdlib_rs::types::{
     Error as TdError, InputMessageReplyToMessage, InputMessageText, ReactionTypeEmoji,
@@ -78,9 +17,9 @@ use tdlib_rs::types::{
 };
 
 use crate::bridge::Bridge;
-use crate::model::{
-    FormattedText, Message, MessageContent, OutgoingMedia, Reaction, SendState, Sender,
-};
+use crate::model::{FormattedText, Message, OutgoingMedia, Sender};
+
+use super::store::{SearchPage, SearchResults};
 
 // The message request seam — tuigram's message slice of the
 // `tdlib_rs::functions` surface, segregated from the auth and chat requests.
@@ -105,7 +44,7 @@ use crate::model::{
 pub trait HistoryRequests {
     /// Fetch up to `limit` messages of a chat's history, older than the anchor
     /// `from_message_id` ([`NEWEST`] for the most recent). Returns the page
-    /// projected to [`Message`]s (TDLib's null entries dropped); an **empty**
+    /// projected to [`Message`]s (`TDLib`'s null entries dropped); an **empty**
     /// page means the chat's beginning was reached.
     async fn get_chat_history(
         &self,
@@ -119,10 +58,10 @@ pub trait HistoryRequests {
 #[allow(async_fn_in_trait)]
 pub trait SendRequests {
     /// Send `text` to a chat, optionally replying to `reply_to` (a message id in
-    /// the same chat; `None` for a plain message). Returns the message TDLib
-    /// creates **optimistically** — a temporary id, [`SendState::Pending`] —
+    /// the same chat; `None` for a plain message). Returns the message `TDLib`
+    /// creates **optimistically** — a temporary id, [`SendState::Pending`](crate::model::SendState::Pending) —
     /// which the lifecycle updates later reconcile in the store. Returns as soon
-    /// as TDLib accepts the request; it never waits for delivery.
+    /// as `TDLib` accepts the request; it never waits for delivery.
     async fn send_text(
         &self,
         chat_id: i64,
@@ -133,14 +72,14 @@ pub trait SendRequests {
     /// Send a file-backed media message (photo, video, document, audio, voice, or
     /// animation) from a local path, optionally replying to `reply_to` (a message
     /// id in the same chat). The [`OutgoingMedia`] carries the local path and an
-    /// optional caption; TDLib uploads the file and measures its metadata.
+    /// optional caption; `TDLib` uploads the file and measures its metadata.
     ///
-    /// Returns the message TDLib creates **optimistically** — a temporary id,
-    /// [`SendState::Pending`] — exactly like [`send_text`](Self::send_text). The
+    /// Returns the message `TDLib` creates **optimistically** — a temporary id,
+    /// [`SendState::Pending`](crate::model::SendState::Pending) — exactly like [`send_text`](Self::send_text). The
     /// upload then streams as `updateFile` (folded by the
     /// [`FileStore`](crate::files::FileStore)) and the send settles via
     /// `updateMessageSendSucceeded`/`updateMessageSendFailed` (folded by the
-    /// [`MessageStore`]), so a caller observes progress and reconciliation through
+    /// [`MessageStore`](super::store::MessageStore)), so a caller observes progress and reconciliation through
     /// the router rather than awaiting this. It never waits for the upload.
     async fn send_media(
         &self,
@@ -154,7 +93,7 @@ pub trait SendRequests {
 #[allow(async_fn_in_trait)]
 pub trait EditRequests {
     /// Replace the text of a message tuigram's account sent. Returns the edited
-    /// [`Message`] TDLib produces once the edit lands server-side; the matching
+    /// [`Message`] `TDLib` produces once the edit lands server-side; the matching
     /// `updateMessageContent` reconciles the stored copy. Errors if the message
     /// is not editable (not own, too old, not a text message).
     async fn edit_text(
@@ -165,7 +104,7 @@ pub trait EditRequests {
     ) -> Result<Message, TdError>;
 
     /// Replace the caption of a media message tuigram's account sent (an empty
-    /// `caption` clears it). Returns the edited [`Message`] TDLib produces once the
+    /// `caption` clears it). Returns the edited [`Message`] `TDLib` produces once the
     /// edit lands; the matching `updateMessageContent` reconciles the stored copy,
     /// the same fold as [`edit_text`](Self::edit_text). Errors if the message is
     /// not editable (not own, too old, not a captioned message).
@@ -180,15 +119,15 @@ pub trait EditRequests {
 /// Parse composer text into formatting entities before it is sent (#212).
 #[allow(async_fn_in_trait)]
 pub trait FormatRequests {
-    /// Parse `text` as markdown and send it through TDLib's
+    /// Parse `text` as markdown and send it through `TDLib`'s
     /// `parseTextEntities` with `TextParseMode::Markdown { version: 2 }`
-    /// (Telegram's MarkdownV2: `*bold*`, `_italic_`, `__underline__`,
+    /// (Telegram's `MarkdownV2`: `*bold*`, `_italic_`, `__underline__`,
     /// `~strikethrough~`, `` `code` ``, ```` ```pre``` ````, `[text](url)`,
     /// `||spoiler||`). Implementations should first rewrite the common
     /// "doubled-marker" convention (`**bold**`, `~~strikethrough~~`, plain
     /// `*italic*`) into that syntax — see `to_markdown_v2` in this module —
-    /// since MarkdownV2 alone has no doubled-marker forms and a literal
-    /// `**bold**` fails to parse. MarkdownV2 still requires escaping reserved
+    /// since `MarkdownV2` alone has no doubled-marker forms and a literal
+    /// `**bold**` fails to parse. `MarkdownV2` still requires escaping reserved
     /// punctuation anywhere it appears, so ordinary prose containing
     /// unescaped punctuation can still error here — callers must treat that
     /// as expected and fall back to sending `text` plain
@@ -202,7 +141,7 @@ pub trait FormatRequests {
 pub trait DeleteRequests {
     /// Delete messages from a chat. With `revoke` true the messages are removed
     /// for **everyone** (revoke for all members); with it false they are removed
-    /// only for tuigram's account. TDLib rejects a revoke it does not permit. The
+    /// only for tuigram's account. `TDLib` rejects a revoke it does not permit. The
     /// matching `updateDeleteMessages` removes them from the store.
     async fn delete(
         &self,
@@ -215,7 +154,7 @@ pub trait DeleteRequests {
 /// Acknowledge messages as read.
 #[allow(async_fn_in_trait)]
 pub trait ReadRequests {
-    /// Mark `message_ids` in a chat as read (TDLib's `viewMessages`). **Advisory**
+    /// Mark `message_ids` in a chat as read (`TDLib`'s `viewMessages`). **Advisory**
     /// — it acknowledges the messages to the server and lets the unread count
     /// settle, but the read path never waits on the result: the new count returns
     /// asynchronously as `updateChatReadInbox`, folded by the chat store. An empty
@@ -233,9 +172,9 @@ pub trait ForwardRequests {
     /// the usual forward header naming the original sender. `remove_caption` drops
     /// any caption when copying (only meaningful with `send_copy`).
     ///
-    /// Returns the messages TDLib creates **optimistically** in the target chat —
-    /// temporary ids, [`SendState::Pending`] — exactly like
-    /// [`send_text`](SendRequests::send_text). TDLib also streams each as
+    /// Returns the messages `TDLib` creates **optimistically** in the target chat —
+    /// temporary ids, [`SendState::Pending`](crate::model::SendState::Pending) — exactly like
+    /// [`send_text`](SendRequests::send_text). `TDLib` also streams each as
     /// `updateNewMessage`, so the store gains them through the router on the same
     /// lifecycle path as a normal send; these returned copies are for the caller's
     /// reference, not a second insert.
@@ -259,10 +198,10 @@ pub trait SearchRequests {
     /// The returned [`SearchPage`] carries the normalized hits, an approximate
     /// total, and the cursor for the next page ([`SearchPage::next`] is `None` at
     /// the end). Results are a **transient view** — the caller folds them into a
-    /// [`SearchResults`], never the live [`MessageStore`], so a search leaves the
+    /// [`SearchResults`], never the live [`MessageStore`](super::store::MessageStore), so a search leaves the
     /// loaded history untouched.
     ///
-    /// Media-type filtering (TDLib's `SearchMessagesFilter`) is out of scope here
+    /// Media-type filtering (`TDLib`'s `SearchMessagesFilter`) is out of scope here
     /// — this searches all message types; filtering by content kind is a
     /// follow-up alongside the non-text content model.
     async fn search_chat_messages(
@@ -294,10 +233,10 @@ pub trait SearchRequests {
 #[allow(async_fn_in_trait)]
 pub trait ReactionRequests {
     /// Add tuigram's account's reaction to a message — a standard `emoji`
-    /// (e.g. `"👍"`), TDLib's `addMessageReaction`. **Advisory**, like
+    /// (e.g. `"👍"`), `TDLib`'s `addMessageReaction`. **Advisory**, like
     /// [`view_messages`](ReadRequests::view_messages): it acknowledges the reaction to the
     /// server and never blocks; the resulting reaction counts arrive as
-    /// `updateMessageInteractionInfo`, which the [`MessageStore`] folds onto the
+    /// `updateMessageInteractionInfo`, which the [`MessageStore`](super::store::MessageStore) folds onto the
     /// message. Only emoji reactions are sent here — custom-emoji and paid
     /// reactions ([`ReactionKind`](crate::model::ReactionKind)) are read-only in
     /// this model.
@@ -308,7 +247,7 @@ pub trait ReactionRequests {
         emoji: String,
     ) -> Result<(), TdError>;
 
-    /// Remove tuigram's account's emoji reaction from a message, TDLib's
+    /// Remove tuigram's account's emoji reaction from a message, `TDLib`'s
     /// `removeMessageReaction`. The counterpart to
     /// [`add_message_reaction`](Self::add_message_reaction); the matching
     /// `updateMessageInteractionInfo` folds the new counts.
@@ -323,7 +262,7 @@ pub trait ReactionRequests {
 /// Pin and unpin a chat's messages.
 #[allow(async_fn_in_trait)]
 pub trait PinRequests {
-    /// Pin a message in a chat, TDLib's `pinChatMessage`. `disable_notification`
+    /// Pin a message in a chat, `TDLib`'s `pinChatMessage`. `disable_notification`
     /// pins silently; `only_for_self` pins only for tuigram's account (a private
     /// pin). The resulting `updateMessageIsPinned` folds the chat's pinned-message
     /// set ([`Chat::pinned_message_ids`](crate::model::Chat::pinned_message_ids)).
@@ -335,7 +274,7 @@ pub trait PinRequests {
         only_for_self: bool,
     ) -> Result<(), TdError>;
 
-    /// Unpin a message in a chat, TDLib's `unpinChatMessage`. The counterpart to
+    /// Unpin a message in a chat, `TDLib`'s `unpinChatMessage`. The counterpart to
     /// [`pin_chat_message`](Self::pin_chat_message); the matching
     /// `updateMessageIsPinned` (with `is_pinned` false) folds the message out of
     /// the chat's pinned set.
@@ -379,10 +318,10 @@ impl<T> MessageRequests for T where
 
 impl Bridge {
     /// Shared send plumbing: post `content` to `chat_id` with an optional reply
-    /// target and return the optimistic message TDLib creates. The text and media
+    /// target and return the optimistic message `TDLib` creates. The text and media
     /// send paths differ only in the `content` they build, so the `send_message`
     /// call — reply mapping, the defaulted topic/options, the `from_tdlib`
-    /// projection — lives here once. TDLib also streams the message as
+    /// projection — lives here once. `TDLib` also streams the message as
     /// `updateNewMessage`, so the store gains the `Pending` entry via the router;
     /// the returned copy is for the caller's reference (its temp id), not a second
     /// insert.
@@ -523,7 +462,7 @@ fn run_length(chars: &[char], start: usize, marker: char) -> usize {
 /// Index of the next run of exactly `len` consecutive `marker` chars at or
 /// after `start`, skipping over shorter/longer runs (a code span's closing
 /// backtick fence must match the opening fence's length exactly, per
-/// CommonMark).
+/// `CommonMark`).
 fn find_exact_run(chars: &[char], start: usize, marker: char, len: usize) -> Option<usize> {
     let mut i = start;
     while i < chars.len() {
@@ -541,10 +480,10 @@ fn find_exact_run(chars: &[char], start: usize, marker: char, len: usize) -> Opt
 }
 
 /// Rewrite the common "doubled-marker" markdown convention (`**bold**`,
-/// `~~strikethrough~~`, plain `*italic*`) into the MarkdownV2 syntax TDLib's
+/// `~~strikethrough~~`, plain `*italic*`) into the `MarkdownV2` syntax `TDLib`'s
 /// `parseTextEntities` actually expects (`*bold*`, `~strikethrough~`,
 /// `_italic_`). Users commonly type the GitHub/Discord-style convention
-/// double-`*` for bold, single-`*` for italic — but MarkdownV2 has no
+/// double-`*` for bold, single-`*` for italic — but `MarkdownV2` has no
 /// doubled-marker forms and reserves single `*` for bold, so a literal
 /// `**bold**` fails to parse (two adjacent `*` close an empty entity) and
 /// the whole send falls back to plain text (see [`FormatRequests::
@@ -555,12 +494,12 @@ fn find_exact_run(chars: &[char], start: usize, marker: char, len: usize) -> Opt
 /// `~`/`~~` runs need remapping; everything else passes through unchanged.
 /// A run of 3+ consecutive markers (e.g. `***text***`) is treated the same
 /// as a run of 2 (bold/strikethrough) — nested bold+italic via a tripled
-/// marker isn't supported, the same as plain MarkdownV2 today.
+/// marker isn't supported, the same as plain `MarkdownV2` today.
 ///
 /// Code spans (`` `...` ``) and pre blocks (```` ```...``` ````) are copied
 /// through verbatim, however long their backtick run, so markers inside
 /// code are never rewritten or treated as entity delimiters. A
-/// backslash-escaped char (MarkdownV2's own escape, e.g. `\*` for a literal
+/// backslash-escaped char (`MarkdownV2`'s own escape, e.g. `\*` for a literal
 /// asterisk) is likewise copied through untouched, so an explicit escape
 /// still suppresses formatting after this rewrite.
 fn to_markdown_v2(text: &str) -> String {
@@ -615,10 +554,14 @@ fn to_markdown_v2(text: &str) -> String {
 
 /// Parse `text` as markdown ([`FormatRequests::parse_markdown`]) and send it,
 /// optionally as a reply to `reply_to`. A parse failure — expected for
-/// ordinary prose containing unescaped MarkdownV2 punctuation, not just
+/// ordinary prose containing unescaped `MarkdownV2` punctuation, not just
 /// malformed input — must never block the send, so it falls back to sending
 /// `text` plain, with no entities, exactly as an unparsed composer send did
 /// before #212.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` rejects the send.
 pub async fn send_formatted_text<C: FormatRequests + SendRequests>(
     client: &C,
     chat_id: i64,
@@ -638,6 +581,10 @@ pub async fn send_formatted_text<C: FormatRequests + SendRequests>(
 /// Parse `text` as markdown and edit a message's text with it — the edit
 /// counterpart to [`send_formatted_text`], with the same parse-failure
 /// fallback to plain text.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` rejects the edit.
 pub async fn edit_formatted_text<C: FormatRequests + EditRequests>(
     client: &C,
     chat_id: i64,
@@ -845,97 +792,27 @@ impl PinRequests for Bridge {
     }
 }
 
-/// A page of message-search hits plus the cursor for the next page.
-///
-/// Generic over the cursor `C` because TDLib pages the two searches differently:
-/// an in-chat search resumes from a message id (`C = i64`), a global search from
-/// an opaque string offset (`C = String`). [`next`](Self::next) is `None` at the
-/// end of results — the loop stop condition either way.
-///
-/// A search page is a **transient view**: its messages are normalized
-/// [`Message`]s but they are never folded into the [`MessageStore`]; collect them
-/// into a [`SearchResults`] instead, so a search never disturbs loaded history.
-// Not `Eq`: a hit's [`Message`] may carry `f64` location coordinates.
-#[derive(Debug, Clone, PartialEq)]
-pub struct SearchPage<C> {
-    /// The normalized hits on this page, in the order TDLib ranked them.
-    pub messages: Vec<Message>,
-    /// Approximate total number of matches; `-1` when TDLib does not know.
-    pub total_count: i32,
-    /// Cursor for the next page, or `None` when results are exhausted.
-    pub next: Option<C>,
-}
-
-/// A transient, deduplicated accumulation of search hits across pages.
-///
-/// Search results are a view onto messages that mostly already live (or could
-/// live) in the [`MessageStore`]; this keeps them **separate** so a search never
-/// mutates loaded history. Hits are deduplicated by `(chat_id, message_id)` — so
-/// overlapping pages, or a hit that also appears in the history already on
-/// screen, collapse onto one entry — while preserving TDLib's result ordering.
-#[derive(Debug, Default)]
-pub struct SearchResults {
-    messages: Vec<Message>,
-    seen: HashSet<(i64, i64)>,
-}
-
-impl SearchResults {
-    /// An empty result set.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Append a page of hits, dropping any whose `(chat_id, message_id)` was
-    /// already collected. Order is preserved (the first occurrence wins), so
-    /// re-appending an overlapping page — or [`extend`](Self::extend)ing with a
-    /// hit already on screen — is idempotent.
-    pub fn extend(&mut self, page: impl IntoIterator<Item = Message>) {
-        for message in page {
-            if self.seen.insert((message.chat_id, message.id)) {
-                self.messages.push(message);
-            }
-        }
-    }
-
-    /// The collected hits, in result order.
-    #[must_use]
-    pub fn messages(&self) -> &[Message] {
-        &self.messages
-    }
-
-    /// Whether a given message has already been collected — the dedupe a caller
-    /// uses to avoid showing a hit twice when it also sits in loaded history.
-    #[must_use]
-    pub fn contains(&self, chat_id: i64, message_id: i64) -> bool {
-        self.seen.contains(&(chat_id, message_id))
-    }
-
-    /// Number of distinct hits collected.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.messages.len()
-    }
-
-    /// Whether no hits have been collected.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.messages.is_empty()
-    }
-}
-
 /// Anchor passed to [`HistoryRequests::get_chat_history`] to start from a chat's
-/// most recent message. TDLib reads message id `0` as "the newest".
+/// most recent message. `TDLib` reads message id `0` as "the newest".
 pub const NEWEST: i64 = 0;
 
 /// Page a chat's history backward, from the newest message to the start, folding
 /// each page through `fold`.
 ///
 /// The next anchor is the oldest message id in the page just received, so each
-/// request asks for the messages before it; paging stops when TDLib returns an
+/// request asks for the messages before it; paging stops when `TDLib` returns an
 /// empty page. Folding is left to the caller — production folds into the shared
 /// store under its lock per page (never held across the awaits here), while a
-/// test folds into a local [`MessageStore`]. Any request error is propagated.
+/// test folds into a local [`MessageStore`](super::store::MessageStore). Any request error is propagated.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page request.
+///
+/// # Panics
+///
+/// Never in practice: the internal `.expect()` is guarded by the preceding
+/// empty-batch check, so it only runs on a non-empty page.
 pub async fn load_history<C, F>(
     client: &C,
     chat_id: i64,
@@ -966,11 +843,15 @@ where
 /// [`SearchResults`].
 ///
 /// Mirrors [`load_history`]'s paging, but for search and with one deliberate
-/// difference: the hits are **never** folded into a [`MessageStore`]. Each call
+/// difference: the hits are **never** folded into a [`MessageStore`](super::store::MessageStore). Each call
 /// resumes from the previous page's [`SearchPage::next`] cursor (the first from
 /// [`NEWEST`]) and stops when the cursor comes back `None`; the hits accumulate —
 /// deduplicated by `(chat_id, message_id)` — in the returned [`SearchResults`], so
 /// a search leaves loaded history untouched. Any request error is propagated.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page of the search.
 pub async fn search_chat<C>(
     client: &C,
     chat_id: i64,
@@ -1001,10 +882,14 @@ where
 /// a transient [`SearchResults`].
 ///
 /// The account-wide counterpart to [`search_chat`]: it resumes from the opaque
-/// string offset TDLib returns (the first page from the empty string) and stops
+/// string offset `TDLib` returns (the first page from the empty string) and stops
 /// when [`SearchPage::next`] comes back `None`. Hits across different chats stay
 /// distinct — the dedupe keys on `(chat_id, message_id)` — and, as with the
-/// in-chat search, never fold into the live [`MessageStore`]. Errors propagate.
+/// in-chat search, never fold into the live [`MessageStore`](super::store::MessageStore). Errors propagate.
+///
+/// # Errors
+///
+/// Returns an error if `TDLib` fails a page of the search.
 pub async fn search_global<C>(
     client: &C,
     query: String,
@@ -1022,181 +907,6 @@ where
         match next {
             Some(cursor) => offset = cursor,
             None => return Ok(results),
-        }
-    }
-}
-
-/// Every known message, grouped by chat and ordered chronologically within each.
-#[derive(Debug, Default)]
-pub struct MessageStore {
-    by_chat: HashMap<i64, BTreeMap<i64, Message>>,
-}
-
-impl MessageStore {
-    /// An empty store.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Fold one message-route update into the store.
-    ///
-    /// - `updateNewMessage` — a live (or optimistically sent) message; inserted.
-    /// - `updateMessageSendSucceeded` — the send was accepted; the temporary
-    ///   entry is dropped and the server's message (real id) inserted in its
-    ///   place, so the message keeps its spot but gains its final id.
-    /// - `updateMessageSendFailed` — the send was rejected; the same entry (it
-    ///   keeps its temporary id) flips to [`SendState::Failed`] with the cause.
-    /// - `updateMessageContent` — an edit; the known message's content is swapped
-    ///   in place (unknown message: ignored).
-    /// - `updateMessageInteractionInfo` — a reaction change (#51); the known
-    ///   message's reactions are replaced in place with the update's buckets, or
-    ///   cleared when it carries none (unknown message: ignored).
-    /// - `updateDeleteMessages` — a deletion; when permanent, the messages are
-    ///   removed. A cache-eviction delete (`is_permanent` false) is ignored.
-    ///
-    /// Every arm is idempotent: re-applying converges (a reconcile whose temp
-    /// entry is already gone just re-inserts the real message; a failure re-marks
-    /// in place; a re-edit re-sets the same content; a re-delete of an absent id
-    /// is a no-op).
-    pub fn reduce(&mut self, update: &Update) {
-        match update {
-            Update::NewMessage(u) => self.insert(Message::from_tdlib(&u.message)),
-            Update::MessageSendSucceeded(u) => {
-                let message = Message::from_tdlib(&u.message);
-                // The temp message lived in the same chat under the old id.
-                self.remove(message.chat_id, u.old_message_id);
-                self.insert(message);
-            }
-            Update::MessageSendFailed(u) => {
-                // The failed message keeps its temporary id; flip it in place and
-                // carry TDLib's error so callers can surface and retry it.
-                let mut message = Message::from_tdlib(&u.message);
-                message.send_state = SendState::Failed {
-                    code: u.error.code,
-                    message: u.error.message.clone(),
-                };
-                self.insert(message);
-            }
-            Update::MessageContent(u) => {
-                // An edit: swap the known message's content in place.
-                self.edit_content(
-                    u.chat_id,
-                    u.message_id,
-                    MessageContent::from_tdlib(&u.new_content),
-                );
-            }
-            Update::MessageInteractionInfo(u) => {
-                // A reaction change: replace the known message's reactions with
-                // this update's buckets (empty when the info or its reactions are
-                // absent — i.e. the last reaction was removed).
-                self.set_reactions(
-                    u.chat_id,
-                    u.message_id,
-                    crate::model::reactions_from(u.interaction_info.as_ref()),
-                );
-            }
-            // A real deletion removes the messages; a cache-eviction delete
-            // (`is_permanent` false — TDLib unloading its own cache) leaves our
-            // copy intact, so only the permanent case folds here.
-            Update::DeleteMessages(u) if u.is_permanent => {
-                for &message_id in &u.message_ids {
-                    self.remove(u.chat_id, message_id);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Merge a history page (or any batch of messages) into the store. Each
-    /// message is filed under its own chat and id, so re-merging an overlapping
-    /// page is idempotent — duplicates collapse onto the same entry.
-    ///
-    /// A re-fetched page **replaces** an already-known message rather than
-    /// skipping it: `getChatHistory` is server-authoritative, and is the one
-    /// documented recovery path (#207) for a message whose reactions or content
-    /// changed while its chat was closed and so never arrived as a live update —
-    /// opening the chat and re-paging its history is what catches those up mid
-    /// session, exactly as a restart does. A live fold ([`reduce`](Self::reduce))
-    /// racing a page fetch for the same id is a narrower, separate concern than
-    /// disabling that recovery path is worth trading away here.
-    pub fn merge(&mut self, messages: impl IntoIterator<Item = Message>) {
-        for message in messages {
-            self.insert(message);
-        }
-    }
-
-    /// A chat's messages, oldest first. Empty if the chat is unknown.
-    #[must_use]
-    pub fn history(&self, chat_id: i64) -> Vec<&Message> {
-        self.by_chat
-            .get(&chat_id)
-            .map(|m| m.values().collect())
-            .unwrap_or_default()
-    }
-
-    /// Look up a single message within a chat.
-    #[must_use]
-    pub fn get(&self, chat_id: i64, message_id: i64) -> Option<&Message> {
-        self.by_chat.get(&chat_id)?.get(&message_id)
-    }
-
-    /// Number of messages known for a chat.
-    #[must_use]
-    pub fn count(&self, chat_id: i64) -> usize {
-        self.by_chat.get(&chat_id).map_or(0, BTreeMap::len)
-    }
-
-    /// Whether no messages are known for any chat.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.by_chat.values().all(BTreeMap::is_empty)
-    }
-
-    /// File a message under its chat and id, replacing any existing entry with
-    /// the same id (the dedupe across the live and history streams).
-    fn insert(&mut self, message: Message) {
-        self.by_chat
-            .entry(message.chat_id)
-            .or_default()
-            .insert(message.id, message);
-    }
-
-    /// Drop a message from a chat by id. A no-op if the chat or id is unknown, so
-    /// reconciling an already-reconciled send — or replaying a delete — is
-    /// idempotent.
-    fn remove(&mut self, chat_id: i64, message_id: i64) {
-        if let Some(chat) = self.by_chat.get_mut(&chat_id) {
-            chat.remove(&message_id);
-        }
-    }
-
-    /// Replace a known message's content in place (the `updateMessageContent`
-    /// fold). A no-op if the message is unknown: TDLib only edits the content of
-    /// a message it already delivered, and a content-only update carries no
-    /// sender/date, so we never synthesize a partial entry from one.
-    fn edit_content(&mut self, chat_id: i64, message_id: i64, content: MessageContent) {
-        if let Some(message) = self
-            .by_chat
-            .get_mut(&chat_id)
-            .and_then(|chat| chat.get_mut(&message_id))
-        {
-            message.content = content;
-        }
-    }
-
-    /// Replace a known message's reactions in place (the
-    /// `updateMessageInteractionInfo` fold). A no-op if the message is unknown —
-    /// the update carries no sender/date/content, so we never synthesize a partial
-    /// entry from one, the same rule as [`edit_content`](Self::edit_content).
-    /// Idempotent: re-applying sets the same buckets; the empty list clears them.
-    fn set_reactions(&mut self, chat_id: i64, message_id: i64, reactions: Vec<Reaction>) {
-        if let Some(message) = self
-            .by_chat
-            .get_mut(&chat_id)
-            .and_then(|chat| chat.get_mut(&message_id))
-        {
-            message.reactions = reactions;
         }
     }
 }
@@ -1302,13 +1012,16 @@ mod markdown_v2_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
+    use super::super::store::MessageStore;
     use super::*;
     use crate::model::OutgoingMedia;
-    use crate::model::{MessageContent, Sender};
+    use crate::model::{MessageContent, Reaction, SendState, Sender};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use tdlib_rs::enums::MessageSendingState;
+    use tdlib_rs::enums::Update;
     use tdlib_rs::types::{
         FormattedText as TdFormattedText, MessagePhoto as TdMessagePhoto, MessageSenderUser,
         MessageSendingStatePending, MessageText, UpdateMessageContent, UpdateMessageSendFailed,
@@ -1334,7 +1047,7 @@ mod tests {
         }
     }
 
-    /// A TDLib `Message` with every field zeroed but id/chat and a text body, for
+    /// A `TDLib` `Message` with every field zeroed but id/chat and a text body, for
     /// driving the live `updateNewMessage` reducer. `sending_state` lets a test
     /// build an optimistic (Pending) message for the send lifecycle.
     fn td_message(chat_id: i64, id: i64) -> tdlib_rs::types::Message {
@@ -1402,7 +1115,7 @@ mod tests {
     }
 
     /// An optimistically-sent message: a live `updateNewMessage` carrying a temp
-    /// id and a Pending sending state, as TDLib emits right after `sendMessage`.
+    /// id and a Pending sending state, as `TDLib` emits right after `sendMessage`.
     fn pending_message(chat_id: i64, temp_id: i64) -> Update {
         Update::NewMessage(UpdateNewMessage {
             message: td_message_state(
@@ -1639,7 +1352,7 @@ mod tests {
     }
 
     /// A spy that captures the arguments of the most recent `send_text` and
-    /// echoes back the optimistic Pending message TDLib would return.
+    /// echoes back the optimistic Pending message `TDLib` would return.
     struct SendSpy {
         last: RefCell<Option<(i64, Option<i64>, FormattedText)>>,
     }
@@ -2025,7 +1738,7 @@ mod tests {
         assert_eq!(*spy.viewed.borrow(), Some((10, vec![1, 2, 3])));
     }
 
-    /// A forward as TDLib emits it: the same messages re-appear in the target chat
+    /// A forward as `TDLib` emits it: the same messages re-appear in the target chat
     /// under fresh temp ids and Pending state.
     fn forwarded_pending(target_chat: i64, temp_id: i64) -> Update {
         pending_message(target_chat, temp_id)
@@ -2042,7 +1755,7 @@ mod tests {
     }
 
     /// Captures the most recent `forward_messages` arguments and echoes back the
-    /// optimistic Pending messages TDLib would create in the target chat.
+    /// optimistic Pending messages `TDLib` would create in the target chat.
     #[derive(Default)]
     struct ForwardSpy {
         last: RefCell<Option<ForwardCall>>,
@@ -2326,7 +2039,7 @@ mod tests {
         );
     }
 
-    /// A TDLib `Message` carrying a photo with `caption`, reusing the zeroed
+    /// A `TDLib` `Message` carrying a photo with `caption`, reusing the zeroed
     /// scaffold the text helper builds and swapping only the content. `sending_state`
     /// drives the optimistic (Pending) vs settled distinction the send lifecycle
     /// needs.
@@ -2348,7 +2061,7 @@ mod tests {
     }
 
     /// A spy that captures the arguments of the most recent `send_media` /
-    /// `edit_caption` and echoes back the optimistic Pending photo TDLib returns.
+    /// `edit_caption` and echoes back the optimistic Pending photo `TDLib` returns.
     #[derive(Default)]
     struct MediaSpy {
         sent: RefCell<Option<(i64, Option<i64>, OutgoingMedia)>>,
@@ -2532,7 +2245,7 @@ mod tests {
     }
 
     /// An `updateMessageInteractionInfo` carrying `reactions` as
-    /// `(emoji, count, is_chosen)` triples — the reaction-count change TDLib
+    /// `(emoji, count, is_chosen)` triples — the reaction-count change `TDLib`
     /// streams after a reaction is added or removed.
     fn reaction_update(chat_id: i64, message_id: i64, reactions: &[(&str, i32, bool)]) -> Update {
         use tdlib_rs::types::{
@@ -2562,7 +2275,7 @@ mod tests {
         })
     }
 
-    /// An `updateMessageInteractionInfo` with no interaction info at all — TDLib's
+    /// An `updateMessageInteractionInfo` with no interaction info at all — `TDLib`'s
     /// signal that a message's last reaction (and other interactions) is gone.
     fn reaction_cleared(chat_id: i64, message_id: i64) -> Update {
         Update::MessageInteractionInfo(tdlib_rs::types::UpdateMessageInteractionInfo {
@@ -2726,7 +2439,7 @@ mod tests {
     }
 
     /// Secret chat text messaging (#54). A secret chat is reached by an ordinary
-    /// chat id, so text sent and received in one rides the same [`MessageStore`]
+    /// chat id, so text sent and received in one rides the same [`MessageStore`](super::store::MessageStore)
     /// and send lifecycle as any chat — there is no secret-chat-specific routing.
     /// These exercise that path on a secret chat's chat id; the only rule the
     /// lifecycle adds is that a send waits for the chat to be ready.
@@ -2814,7 +2527,7 @@ mod tests {
     /// the secret chat's ordinary chat id just as text does:
     /// [`send_media`](SendRequests::send_media) posts a file-backed message
     /// optimistically and the lifecycle reconciles it through the same
-    /// [`MessageStore`], the file-backed content surviving the temp→real swap. The
+    /// [`MessageStore`](super::store::MessageStore), the file-backed content surviving the temp→real swap. The
     /// readiness gate is shared with text — there is no media-specific rule — so
     /// these reuse [`SecretChat::is_ready`] rather than restating one.
     mod secret_chat_media {

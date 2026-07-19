@@ -1,6 +1,6 @@
 //! Chat actions — the transient "who is typing…" view, kept apart from history.
 //!
-//! TDLib streams `updateChatAction` whenever a sender starts or stops an activity
+//! `TDLib` streams `updateChatAction` whenever a sender starts or stops an activity
 //! in a chat (typing, recording a voice note, uploading a photo, …) and a
 //! matching `chatActionCancel` when they stop or it times out. These are
 //! **advisory, ephemeral signals**: they are never part of a chat's message
@@ -44,12 +44,12 @@ use crate::model::{ChatAction, Sender};
 #[allow(async_fn_in_trait)]
 pub trait ChatActionRequests {
     /// Broadcast a chat action to `chat_id`: `Some(action)` announces the
-    /// activity, `None` cancels it (TDLib's `chatActionCancel`).
+    /// activity, `None` cancels it (`TDLib`'s `chatActionCancel`).
     ///
     /// Advisory and best-effort — the server rebroadcasts it to the chat's other
     /// members and expires it on its own after a few seconds, so a client repeats
     /// it while still active. It never blocks sending or reading; a driver fires
-    /// it and moves on. There is no resulting fold for *our* action — TDLib does
+    /// it and moves on. There is no resulting fold for *our* action — `TDLib` does
     /// not echo our own `updateChatAction` back to us.
     async fn send_chat_action(
         &self,
@@ -150,7 +150,7 @@ impl ChatActionStore {
     }
 
     /// Record `sender` as performing `action` in `chat_id`, replacing any earlier
-    /// action for that sender (TDLib sends the latest activity, e.g. typing then
+    /// action for that sender (`TDLib` sends the latest activity, e.g. typing then
     /// uploading-a-photo, so a replace is correct).
     fn set(&mut self, chat_id: i64, sender: Sender, action: ChatAction) {
         self.by_chat
@@ -174,6 +174,7 @@ impl ChatActionStore {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // tests: panicking on a broken assumption is the point
 mod tests {
     use super::*;
     use std::cell::RefCell;

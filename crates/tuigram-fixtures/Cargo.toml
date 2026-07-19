@@ -1,0 +1,18 @@
+[package]
+name = "tuigram-fixtures"
+description = "Synthetic fixture generators shared by both crates' benches (#183)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+# Bench/dev support only: never published, so its API has no semver commitment
+# and isn't covered by the workspace's cargo-semver-checks gate (#176).
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+tuigram-core = { path = "../tuigram-core" }
