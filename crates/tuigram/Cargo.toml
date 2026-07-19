@@ -108,7 +108,7 @@ required-features = ["login-harness"]
 # `version.workspace = true` (that only equalizes the two crates' own package
 # versions) — bump this by hand alongside every workspace version bump, or
 # tuigram-client's crates.io publish will fail to resolve. See docs/releasing.md.
-tuigram-core = { version = "=2026.7.3", path = "../tuigram-core" }
+tuigram-core = { version = "=2026.7.4", path = "../tuigram-core" }
 # Async runtime for the central tokio::select! event loop (Phase 5). The TUI is
 # I/O-bound on terminal events + core updates, not CPU-bound, but the multi-thread
 # runtime lets blocking core work run off the render thread. `time` drives the
