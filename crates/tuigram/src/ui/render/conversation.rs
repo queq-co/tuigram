@@ -56,11 +56,11 @@ pub(crate) fn convo_body_width(area: Rect, gutter_cols: usize) -> usize {
 /// reaction line — windowed forward from the scroll offset so a long history never
 /// builds the whole buffer, with a scrollbar tracking the offset. With no chat open
 /// the view is empty, so the pane falls through to the empty-state placeholder (#188).
-pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> HistoryRows {
+pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> (HistoryRows, bool) {
     let view = app.conversation();
     if view.is_empty() {
         render_conversation_placeholder(frame, area, app);
-        return HistoryRows::default();
+        return (HistoryRows::default(), false);
     }
 
     // Window forward from the offset: format messages until the visible rows are
@@ -156,6 +156,13 @@ pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> H
     }
     lines.truncate(inner_rows);
 
+    // Recorded before the second-pass loops below consume `avatars`/`media` by
+    // value (#278): whether this frame drew at least one avatar or inline-media
+    // image at all — the loop's Kitty-scroll-ghosting mitigation only needs to
+    // force an extra clear on a scroll step when there was something on screen
+    // that could actually be left stale by one.
+    let has_visible_images = !avatars.is_empty() || !media.is_empty();
+
     // The conversation header doubles as the chat-action indicator (#87): the pane
     // title names the transient "typing…" activity when someone is acting.
     let title = match view.chat_action() {
@@ -247,17 +254,20 @@ pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> H
     // `area.y + 1 + row` above), clipped to what `truncate` above actually kept
     // so a message half-cut off at the pane's bottom edge never claims rows past
     // the border.
-    HistoryRows(
-        message_rows
-            .into_iter()
-            .map(|(start, end, id)| {
-                (
-                    area.y + 1 + start as u16,
-                    area.y + 1 + end.min(inner_rows) as u16,
-                    id,
-                )
-            })
-            .collect(),
+    (
+        HistoryRows(
+            message_rows
+                .into_iter()
+                .map(|(start, end, id)| {
+                    (
+                        area.y + 1 + start as u16,
+                        area.y + 1 + end.min(inner_rows) as u16,
+                        id,
+                    )
+                })
+                .collect(),
+        ),
+        has_visible_images,
     )
 }
 
@@ -1628,6 +1638,176 @@ mod tests {
             partial,
             full - 5,
             "5 row-steps shows exactly 5 fewer of message 1's rows"
+        );
+    }
+
+    /// Reported: scrolling up through a media message into one from a sender
+    /// with a long username left a fragment of that name "stuck", duplicating
+    /// into a column of garbage as scrolling up continued, recovering when
+    /// scrolling back down. This drives one `Terminal` across many draws
+    /// (unlike `render`/`render_output`, which each start a fresh one) so it
+    /// actually exercises ratatui's own cross-frame buffer diffing — the same
+    /// as the real run loop's persistent `Terminal`. If a stale-cell bug lived
+    /// in this codebase's own render/scroll path (rather than a real
+    /// terminal's graphics-protocol pixel ghosting, which `TestBackend` never
+    /// executes at all), this is where it would show up: the long name's text
+    /// appearing in more than one row at once.
+    #[test]
+    fn scrolling_past_media_never_leaves_a_long_username_in_two_rows_at_once() {
+        let long_user = Sender::User(99);
+        let long_name = "Alexandrapetrovnakuznetsovaverylongusername";
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let named = Message {
+            id: 2,
+            chat_id: 1,
+            sender: long_user.clone(),
+            date: 0,
+            edit_date: 0,
+            is_outgoing: false,
+            content: MessageContent::Text(FormattedText {
+                text: "hi".to_owned(),
+                entities: Vec::new(),
+            }),
+            send_state: SendState::Sent,
+            reactions: Vec::new(),
+            reply_to: None,
+        };
+        let mut messages = vec![photo, named];
+        messages.extend((3..15).map(|i| text_message(i, &format!("filler {i}"))));
+
+        let mut senders = HashMap::new();
+        senders.insert(
+            long_user,
+            SenderLabel {
+                label: long_name.to_owned(),
+                color: None,
+            },
+        );
+        let mut view = ConversationView::default();
+        view.project(1, messages, HashSet::new(), senders, 0, 0, true);
+
+        let mut app = App::with_conversation(view);
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        app.project_downloads(vec![present_file(7)]);
+        let picker = graphics_picker();
+        let build_protocol = |picker: &ratatui_image::picker::Picker| {
+            picker
+                .new_protocol(
+                    image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4)),
+                    ratatui::layout::Size::new(4, 4),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .expect("halfblocks protocol always encodes")
+        };
+        app.cache_media(1, build_protocol(&picker));
+        // Cache an avatar for every sender (including the long-username one),
+        // so scrolling actually shifts different avatar images through the
+        // same gutter rows across frames — the specific mechanism a stale-cell
+        // bug would show up in, per the #229 ghosting precedent (avatars sit
+        // in the gutter, on the header row, as a second-pass `Image` overlay).
+        for user_id in [1, 99].into_iter().chain(3..15) {
+            app.cache_avatar(user_id, build_protocol(&picker));
+        }
+
+        // A short, distinctive slice of the long name — enough to identify a
+        // fragment without depending on where a wrap/truncation would cut it.
+        let needle = &long_name[..15];
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 15)).unwrap();
+        terminal
+            .draw(|frame| drop(crate::ui::ui(frame, &app)))
+            .unwrap();
+
+        // Scroll up several times, redrawing on the *same* terminal each step —
+        // exactly where a leftover-cell bug (if this codebase has one) would
+        // show the fragment surviving into a row it no longer belongs to.
+        for step in 0..12 {
+            app.dispatch(Action::ScrollUp);
+            terminal
+                .draw(|frame| drop(crate::ui::ui(frame, &app)))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows_with_fragment: Vec<u16> = (0..buffer.area.height)
+                .filter(|&y| row_text(buffer, y).contains(needle))
+                .collect();
+            assert!(
+                rows_with_fragment.len() <= 1,
+                "step {step}: the long username fragment appeared in more than \
+                 one row at once: {rows_with_fragment:?}"
+            );
+        }
+    }
+
+    /// #278: `RenderOutput::history_has_visible_images` is the signal the
+    /// scroll-ghosting mitigation gates on — it must stay `false` when nothing
+    /// on screen could be left stale (plain text, or graphics off) and flip
+    /// `true` the moment either an avatar or inline media is actually drawn.
+    #[test]
+    fn history_has_visible_images_reflects_avatars_and_media() {
+        let plain = app_with_history(vec![text_message(1, "hi")]);
+        assert!(
+            !render_output(&plain, 80, 24).history_has_visible_images,
+            "plain text, no graphics support at all"
+        );
+
+        let photo = sample_message(
+            1,
+            MessageContent::Photo(Photo {
+                caption: FormattedText::default(),
+                file: FileRef::new(7),
+                width: 0,
+                height: 0,
+            }),
+        );
+        let mut with_media = app_with_history(vec![photo]);
+        with_media.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        with_media.project_downloads(vec![present_file(7)]);
+        assert!(
+            !render_output(&with_media, 80, 24).history_has_visible_images,
+            "the media box is reserved but no protocol is cached yet"
+        );
+        let picker = graphics_picker();
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4));
+        let protocol = picker
+            .new_protocol(
+                image,
+                ratatui::layout::Size::new(4, 4),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("halfblocks protocol always encodes");
+        with_media.cache_media(1, protocol);
+        assert!(
+            render_output(&with_media, 80, 24).history_has_visible_images,
+            "a decoded, visible media protocol is now on screen"
+        );
+
+        let mut with_avatar = app_with_history(vec![text_message(2, "hi")]);
+        with_avatar.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        assert!(
+            !render_output(&with_avatar, 80, 24).history_has_visible_images,
+            "the gutter is reserved but no avatar protocol is cached yet"
+        );
+        let picker = graphics_picker();
+        let protocol = picker
+            .new_protocol(
+                image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4)),
+                ratatui::layout::Size::new(4, 4),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("halfblocks protocol always encodes");
+        with_avatar.cache_avatar(2, protocol);
+        assert!(
+            render_output(&with_avatar, 80, 24).history_has_visible_images,
+            "a cached avatar alone also counts"
         );
     }
 
