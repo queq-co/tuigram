@@ -82,7 +82,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::EventStream;
 use ratatui::layout::Size;
@@ -118,6 +118,19 @@ use crate::terminal::{AvatarSupport, TerminalGuard, install_panic_hook};
 /// Render cadence cap (~30 FPS). Bounds repaint rate independently of network
 /// latency, so the UI stays smooth while core is mid-request.
 const FRAME: Duration = Duration::from_millis(33);
+
+/// How long the conversation's scroll position must stay unchanged before a
+/// pending Kitty-ghosting clear (#278) actually fires. Firing the clear on
+/// every scroll tick (the first attempt) forced a visible flicker at any real
+/// scroll speed, since the only tool available is a whole-screen clear+redraw
+/// — ratatui-image's Kitty backend documents placement removal as handled
+/// automatically by the terminal once its unicode placeholder is overwritten,
+/// with no surgical "invalidate just this one placement" API to fall back on
+/// instead. Debouncing trades real-time correctness for scroll fluidity: a
+/// continuous fast scroll burst pays no clear at all (smooth), and the
+/// artifact — if it happens — persists for the burst's duration, correcting
+/// itself once scrolling visibly settles.
+const GRAPHICS_CLEAR_SETTLE: Duration = Duration::from_millis(150);
 
 /// How often a showing toast is aged (#139). A `Notice`'s lifetime is counted in
 /// these ~1s heartbeats, so this is the clock that expires toasts. Independent of
@@ -376,6 +389,15 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
     // available before drawing.
     let mut last_scroll_position: (usize, usize) = (0, 0);
     let mut last_had_images = false;
+    // Debounce state for the scroll-triggered clear (#278, `GRAPHICS_CLEAR_SETTLE`):
+    // `scroll_clear_armed` is set the moment a scroll happens while images were
+    // visible, and `scroll_clear_at` is pushed forward on every further scroll
+    // before the settle duration elapses — so a continuous scroll burst never
+    // fires the clear, only the quiet period after it stops. Cleared whenever
+    // any clear actually fires, for any reason (chat/overlay/scroll), so a
+    // chat switch mid-burst doesn't leave a redundant clear to fire later.
+    let mut scroll_clear_armed = false;
+    let mut scroll_clear_at: Option<Instant> = None;
 
     while !app.should_quit() {
         if app.is_dirty() {
@@ -406,9 +428,12 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // visible avatar/media's row shifts on any `(offset, row_skip)`
             // change, and some terminals don't fully repaint an existing
             // placement's old position when it's merely moved rather than
-            // deleted and recreated. Gated on `last_had_images` (was there
-            // anything on screen last frame worth protecting) so a scroll
-            // through a chat with zero avatars/media never pays for this.
+            // deleted and recreated. `arm_scroll_clear` only arms this (rather
+            // than firing immediately) when there was something on screen last
+            // frame worth protecting, and it's debounced against
+            // `GRAPHICS_CLEAR_SETTLE` — see that constant's doc for why firing
+            // on every scroll tick isn't viable (a real-terminal flicker
+            // report against the first attempt at this).
             //
             // Forced via `resize()` to the current size, not `Terminal::clear()`
             // (#234 hotfix): `clear()` snapshots the cursor position first via a
@@ -426,15 +451,22 @@ async fn run(guard: &mut TerminalGuard, client: &Arc<Client>) -> io::Result<()> 
             // how often it now fires, since it never touches cursor position at
             // all.
             let scroll_position = (app.conversation().offset(), app.conversation().row_skip());
+            if arm_scroll_clear(scroll_position != last_scroll_position, last_had_images) {
+                scroll_clear_armed = true;
+                scroll_clear_at = Some(Instant::now());
+            }
+            let scroll_clear_due = scroll_clear_armed
+                && scroll_clear_at.is_some_and(|at| at.elapsed() >= GRAPHICS_CLEAR_SETTLE);
             if should_clear_for_graphics(
                 app.graphics_active(),
                 history.open != last_open_chat,
                 app.overlay() != last_overlay,
-                scroll_position != last_scroll_position,
-                last_had_images,
+                scroll_clear_due,
             ) {
                 let area = guard.terminal_mut().size()?.into();
                 guard.terminal_mut().resize(area)?;
+                scroll_clear_armed = false;
+                scroll_clear_at = None;
             }
             last_open_chat = history.open;
             last_overlay = app.overlay();
@@ -1192,14 +1224,13 @@ fn drive_secret(app: &mut App, client: &Arc<Client>, outbound_tx: &mpsc::Sender<
 /// `draw` (#229, extended #278): only when graphics are actually in play (a
 /// graphics-capable terminal *and* the user's setting on,
 /// [`App::graphics_active`]), and either the open chat or overlay just
-/// changed, or the conversation scrolled while it had at least one avatar or
-/// inline-media image on screen last frame (`had_visible_images`) — the
-/// scroll case is gated on that because a scroll through an image-free chat
-/// has nothing an extra clear could protect. Pure and independent of the
-/// tokio loop so the decision itself is unit-testable without a real
-/// terminal — see `run`'s call site for the full (and still not fully
-/// confirmed) rationale.
-// Five orthogonal, independently-meaningful conditions (see the `#[test]`
+/// changed, or a debounced scroll-triggered clear is due (`scroll_clear_due`
+/// — see [`arm_scroll_clear`] and `GRAPHICS_CLEAR_SETTLE` for how that's
+/// decided; this function only cares that it already is). Pure and
+/// independent of the tokio loop so the decision itself is unit-testable
+/// without a real terminal — see `run`'s call site for the full (and still
+/// not fully confirmed) rationale.
+// Four orthogonal, independently-meaningful conditions (see the `#[test]`
 // block below, which enumerates their combinations) — a struct would only
 // add ceremony around what's a pure decision table.
 #[allow(clippy::fn_params_excessive_bools)]
@@ -1207,10 +1238,19 @@ fn should_clear_for_graphics(
     graphics_active: bool,
     chat_changed: bool,
     overlay_changed: bool,
-    scroll_changed: bool,
-    had_visible_images: bool,
+    scroll_clear_due: bool,
 ) -> bool {
-    graphics_active && (chat_changed || overlay_changed || (scroll_changed && had_visible_images))
+    graphics_active && (chat_changed || overlay_changed || scroll_clear_due)
+}
+
+/// Whether a scroll that just happened should arm (or re-arm, extending its
+/// settle window) the debounced Kitty-ghosting clear (#278) — only when
+/// there's at least one avatar/inline-media image on screen worth an
+/// eventual clear protecting; scrolling through an image-free chat never
+/// arms it at all. Pure and independently testable from the `Instant`-based
+/// debounce timing itself, which lives in `run`'s loop.
+fn arm_scroll_clear(scroll_changed: bool, had_visible_images: bool) -> bool {
+    scroll_changed && had_visible_images
 }
 
 /// Apply a confirmed retention edit from the in-app editor (#146). The editor
@@ -2043,55 +2083,68 @@ mod tests {
     #[test]
     fn never_clears_when_graphics_are_not_active() {
         // No images were ever drawn, so there is nothing to ghost — regardless of
-        // whether the chat, overlay, or scroll position changed.
-        assert!(!should_clear_for_graphics(
-            false, false, false, false, false
-        ));
-        assert!(!should_clear_for_graphics(false, true, false, false, false));
-        assert!(!should_clear_for_graphics(false, false, true, false, false));
-        assert!(!should_clear_for_graphics(false, true, true, false, false));
-        assert!(!should_clear_for_graphics(false, false, false, true, true));
+        // whether the chat, overlay, or a debounced scroll clear came due.
+        assert!(!should_clear_for_graphics(false, false, false, false));
+        assert!(!should_clear_for_graphics(false, true, false, false));
+        assert!(!should_clear_for_graphics(false, false, true, false));
+        assert!(!should_clear_for_graphics(false, true, true, false));
+        assert!(!should_clear_for_graphics(false, false, false, true));
     }
 
     #[test]
     fn never_clears_when_graphics_are_active_but_nothing_changed() {
         // No structural transition happened, so nothing could have been left
         // behind since the last frame.
-        assert!(!should_clear_for_graphics(true, false, false, false, false));
+        assert!(!should_clear_for_graphics(true, false, false, false));
     }
 
     #[test]
     fn clears_when_graphics_are_active_and_the_chat_or_overlay_changed() {
         assert!(
-            should_clear_for_graphics(true, true, false, false, false),
+            should_clear_for_graphics(true, true, false, false),
             "chat changed"
         );
         assert!(
-            should_clear_for_graphics(true, false, true, false, false),
+            should_clear_for_graphics(true, false, true, false),
             "overlay changed"
         );
         assert!(
-            should_clear_for_graphics(true, true, true, false, false),
+            should_clear_for_graphics(true, true, true, false),
             "both changed at once"
         );
     }
 
-    /// #278: a scroll step alone (no chat/overlay transition) only clears when
-    /// there was at least one avatar/inline-media image on screen last frame —
-    /// a scroll through an image-free chat has nothing an extra clear could
-    /// protect, so it must stay a no-op.
+    /// #278: a debounced scroll-clear coming due (see `GRAPHICS_CLEAR_SETTLE`
+    /// and `arm_scroll_clear` for how that's decided) also forces a clear,
+    /// independent of any chat/overlay transition.
     #[test]
-    fn clears_on_a_scroll_step_only_when_images_were_visible() {
+    fn clears_when_a_debounced_scroll_clear_is_due() {
         assert!(
-            should_clear_for_graphics(true, false, false, true, true),
+            should_clear_for_graphics(true, false, false, true),
+            "scroll-clear due"
+        );
+        assert!(
+            !should_clear_for_graphics(true, false, false, false),
+            "no scroll-clear pending"
+        );
+    }
+
+    /// #278: arming (or re-arming) the debounced scroll-clear only makes sense
+    /// when there was actually an avatar/inline-media image on screen worth an
+    /// eventual clear protecting — scrolling through an image-free chat must
+    /// never arm it.
+    #[test]
+    fn arm_scroll_clear_requires_both_a_scroll_and_visible_images() {
+        assert!(
+            arm_scroll_clear(true, true),
             "scrolled with an image on screen"
         );
         assert!(
-            !should_clear_for_graphics(true, false, false, true, false),
+            !arm_scroll_clear(true, false),
             "scrolled but nothing was on screen to ghost"
         );
         assert!(
-            !should_clear_for_graphics(true, false, false, false, true),
+            !arm_scroll_clear(false, true),
             "images were visible but the scroll position didn't change"
         );
     }
