@@ -56,7 +56,7 @@ pub use model::{
     User, UserKind, Venue, Video, Voice,
 };
 pub use router::{Router, UpdateSink};
-pub use sanitize::{scrub_line, scrub_prose};
+pub use sanitize::{normalize_reaction_emoji, scrub_line, scrub_prose};
 pub use secret_chats::{SecretChatRequests, SecretChatStore};
 pub use session::{EncryptionKey, SessionError, SessionStorage};
 pub use settings::{CacheCap, InterfaceSettings, KeepMedia, StorageSettings};

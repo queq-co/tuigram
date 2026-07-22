@@ -494,7 +494,9 @@ impl ReactionKind {
     #[must_use]
     pub fn from_tdlib(kind: &TdReactionType) -> Self {
         match kind {
-            TdReactionType::Emoji(e) => Self::Emoji(crate::sanitize::scrub_line(&e.emoji)),
+            TdReactionType::Emoji(e) => Self::Emoji(crate::sanitize::normalize_reaction_emoji(
+                &crate::sanitize::scrub_line(&e.emoji),
+            )),
             TdReactionType::CustomEmoji(c) => Self::CustomEmoji(c.custom_emoji_id),
             TdReactionType::Paid => Self::Paid,
         }

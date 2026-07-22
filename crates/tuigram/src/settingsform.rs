@@ -48,6 +48,20 @@ impl SettingsField {
         }
     }
 
+    /// The previous field in the Tab cycle (wraps from the first back to the
+    /// last) — the mirror of [`next`](Self::next), for Shift-Tab and the
+    /// overlay mouse wheel scrolling backward.
+    #[must_use]
+    fn prev(self) -> Self {
+        match self {
+            Self::KeepPrivate => Self::Graphics,
+            Self::KeepGroups => Self::KeepPrivate,
+            Self::KeepChannels => Self::KeepGroups,
+            Self::MaxCache => Self::KeepChannels,
+            Self::Graphics => Self::MaxCache,
+        }
+    }
+
     /// The label shown before this field in the overlay.
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -155,6 +169,13 @@ impl SettingsDraft {
     /// editing again.
     pub fn toggle_field(&mut self) {
         self.field = self.field.next();
+        self.error = None;
+    }
+
+    /// Move focus to the previous field (Shift-Tab, and the overlay mouse
+    /// wheel scrolling up) — the mirror of [`toggle_field`](Self::toggle_field).
+    pub fn toggle_field_prev(&mut self) {
+        self.field = self.field.prev();
         self.error = None;
     }
 
@@ -309,6 +330,40 @@ mod tests {
             draft.field(),
             SettingsField::KeepPrivate,
             "wraps to the first"
+        );
+    }
+
+    #[test]
+    fn shift_tab_cycles_backward_and_wraps() {
+        let mut draft = SettingsDraft::default();
+        assert_eq!(draft.field(), SettingsField::KeepPrivate);
+        draft.toggle_field_prev();
+        assert_eq!(draft.field(), SettingsField::Graphics, "wraps to the last");
+        draft.toggle_field_prev();
+        assert_eq!(draft.field(), SettingsField::MaxCache);
+        draft.toggle_field_prev();
+        assert_eq!(draft.field(), SettingsField::KeepChannels);
+        draft.toggle_field_prev();
+        assert_eq!(draft.field(), SettingsField::KeepGroups);
+        draft.toggle_field_prev();
+        assert_eq!(draft.field(), SettingsField::KeepPrivate);
+    }
+
+    #[test]
+    fn forward_then_backward_through_every_field_returns_to_the_start() {
+        let mut draft = SettingsDraft::default();
+        let start = draft.field();
+        for _ in 0..5 {
+            draft.toggle_field();
+        }
+        assert_eq!(draft.field(), start, "next() is a full 5-cycle");
+        for _ in 0..5 {
+            draft.toggle_field_prev();
+        }
+        assert_eq!(
+            draft.field(),
+            start,
+            "prev() is a full 5-cycle, the other way"
         );
     }
 
