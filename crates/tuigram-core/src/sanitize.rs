@@ -86,6 +86,24 @@ pub fn scrub_line(input: &str) -> String {
     scrub(input, MAX_LINE_CHARS, Shape::Line)
 }
 
+/// Strip VARIATION SELECTOR-16 (U+FE0F) from a reaction emoji, so a
+/// dual-presentation character (chiefly ❤, U+2764) compares and transmits as
+/// Telegram's canonical single-codepoint form rather than the emoji-styled
+/// two-codepoint form a palette or an OS emoji picker produces. Every other
+/// standard reaction emoji is already single-codepoint and passes through
+/// unchanged.
+///
+/// ```
+/// use tuigram_core::normalize_reaction_emoji;
+///
+/// assert_eq!(normalize_reaction_emoji("❤️"), "❤");
+/// assert_eq!(normalize_reaction_emoji("🔥"), "🔥");
+/// ```
+#[must_use]
+pub fn normalize_reaction_emoji(input: &str) -> String {
+    input.chars().filter(|&c| c != '\u{fe0f}').collect()
+}
+
 /// Which policy [`scrub`] applies — the two differ only in how they treat line
 /// breaks and bidi overrides.
 #[derive(Clone, Copy, PartialEq, Eq)]

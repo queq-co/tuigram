@@ -362,6 +362,9 @@ pub enum Action {
     SettingsEnd,
     /// Move settings editing to the next field (Tab).
     SettingsToggleField,
+    /// Move settings editing to the previous field (Shift-Tab, and the
+    /// overlay mouse wheel scrolling up).
+    SettingsToggleFieldPrev,
     /// Validate and confirm the settings edit. A valid edit updates the in-memory
     /// policy and records it for the loop to persist and apply live (#146); an
     /// invalid value is rejected in place, keeping the overlay open.
@@ -1340,11 +1343,14 @@ impl App {
     /// Map a mouse event to an [`Action`] against the pane rectangles the last
     /// render recorded (#161/#162). While a modal overlay is open, a left-click
     /// is hit-tested against its row map instead (see
-    /// [`on_overlay_click`](Self::on_overlay_click)) and every other mouse event
-    /// is ignored — overlay wheel-scroll stays out of scope (#217). Otherwise a
-    /// left-click focuses the pane under the pointer — or, on an actual
-    /// chat/history/composer position, opens/selects/places the cursor directly
-    /// (see [`on_click`](Self::on_click)) — and the wheel moves the chat-list
+    /// [`on_overlay_click`](Self::on_overlay_click)) and the wheel scrolls or
+    /// navigates that overlay the same way its own j/k/Up/Down binding does
+    /// (see [`overlay_scroll_up`](Self::overlay_scroll_up)/
+    /// [`overlay_scroll_down`](Self::overlay_scroll_down)) — every other mouse
+    /// event is ignored. Otherwise a left-click focuses the pane under the
+    /// pointer — or, on an actual chat/history/composer position,
+    /// opens/selects/places the cursor directly (see
+    /// [`on_click`](Self::on_click)) — and the wheel moves the chat-list
     /// selection or scrolls the history, the pane the pointer is *over*
     /// regardless of which pane holds focus. Clicks/wheels over the status bar
     /// or empty space, and the wheel over the composer, are ignored. Pure, like
@@ -1355,6 +1361,8 @@ impl App {
                 MouseEventKind::Down(MouseButton::Left) => {
                     self.on_overlay_click(mouse.column, mouse.row)
                 }
+                MouseEventKind::ScrollUp => self.overlay_scroll_up(),
+                MouseEventKind::ScrollDown => self.overlay_scroll_down(),
                 _ => Action::Noop,
             };
         }
@@ -1371,6 +1379,38 @@ impl App {
                 Some(Focus::History) => Action::ScrollDown,
                 _ => Action::Noop,
             },
+            _ => Action::Noop,
+        }
+    }
+
+    /// The action a mouse-wheel-up over the currently open overlay maps to —
+    /// mirrors that overlay's own keyboard k/Up binding
+    /// (`keymap::resolve_help`/`resolve_search_results`/`resolve_forward`/
+    /// `resolve_contact_search_results`/`resolve_reaction`/`resolve_settings`),
+    /// so the wheel and keyboard scroll identically (#217). `Noop` for
+    /// overlays with no scrollable/navigable content (single-line inputs,
+    /// confirm dialogs).
+    fn overlay_scroll_up(&self) -> Action {
+        match self.overlay {
+            Overlay::Help => Action::HelpScrollUp,
+            Overlay::SearchResults => Action::ResultPrev,
+            Overlay::Forward => Action::ForwardPrev,
+            Overlay::ContactSearchResults => Action::ContactResultPrev,
+            Overlay::Reaction => Action::ReactionPrev,
+            Overlay::Settings => Action::SettingsToggleFieldPrev,
+            _ => Action::Noop,
+        }
+    }
+
+    /// The mouse-wheel-down mirror of [`overlay_scroll_up`](Self::overlay_scroll_up).
+    fn overlay_scroll_down(&self) -> Action {
+        match self.overlay {
+            Overlay::Help => Action::HelpScrollDown,
+            Overlay::SearchResults => Action::ResultNext,
+            Overlay::Forward => Action::ForwardNext,
+            Overlay::ContactSearchResults => Action::ContactResultNext,
+            Overlay::Reaction => Action::ReactionNext,
+            Overlay::Settings => Action::SettingsToggleField,
             _ => Action::Noop,
         }
     }
@@ -2017,6 +2057,10 @@ impl App {
                 self.settings.toggle_field();
                 self.dirty = true;
             }
+            Action::SettingsToggleFieldPrev => {
+                self.settings.toggle_field_prev();
+                self.dirty = true;
+            }
             Action::SettingsConfirm => {
                 // Validate every field through core's parsers. A valid edit updates
                 // the in-memory policy (so a reopen shows the new values) and lands
@@ -2388,16 +2432,64 @@ mod tests {
     }
 
     #[test]
-    fn mouse_events_are_ignored_while_a_modal_overlay_is_open() {
-        // An overlay captures input, so a click/wheel falls through to nothing
-        // rather than reaching the panes underneath (#161).
+    fn mouse_clicks_never_reach_the_panes_under_a_modal_overlay() {
+        // An overlay captures a click, so it falls through to nothing rather
+        // than reaching the panes underneath (#161) — hit-testing against the
+        // overlay's own row map is covered by `on_overlay_click`'s tests.
         let mut app = app_with_panes();
         app.dispatch(Action::ToggleHelp);
         assert_ne!(app.overlay(), Overlay::None, "help overlay should be open");
         assert_eq!(app.on_terminal_event(mouse(LEFT_CLICK, 1, 1)), Action::Noop);
+    }
+
+    #[test]
+    fn wheel_over_an_overlay_with_no_scrollable_content_is_ignored() {
+        // A single-line input overlay has nothing to scroll or navigate — the
+        // wheel over it stays a no-op (#217), unlike the scrollable/navigable
+        // overlays covered by `wheel_over_an_open_overlay_mirrors_its_keyboard_scroll`.
+        let mut app = app_with_panes();
+        app.dispatch(Action::SearchOpen);
+        assert_eq!(app.overlay(), Overlay::SearchInput);
         assert_eq!(
             app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 50, 1)),
             Action::Noop
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollUp, 50, 1)),
+            Action::Noop
+        );
+    }
+
+    #[test]
+    fn wheel_over_an_open_overlay_mirrors_its_keyboard_scroll() {
+        // The wheel over each scrollable/navigable overlay dispatches the exact
+        // same action its own k/Up and j/Down keyboard binding does (#217) —
+        // confirmed here against every overlay `overlay_scroll_up`/`down`
+        // handles, at any column/row (overlay wheel-scroll ignores position,
+        // unlike the pane-hit-tested wheel scroll above).
+        let mut app = app_with_panes();
+
+        app.dispatch(Action::ToggleHelp);
+        assert_eq!(app.overlay(), Overlay::Help);
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 1, 1)),
+            Action::HelpScrollDown
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollUp, 1, 1)),
+            Action::HelpScrollUp
+        );
+        app.dispatch(Action::ToggleHelp);
+
+        app.dispatch(Action::SettingsOpen);
+        assert_eq!(app.overlay(), Overlay::Settings);
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollDown, 1, 1)),
+            Action::SettingsToggleField
+        );
+        assert_eq!(
+            app.on_terminal_event(mouse(MouseEventKind::ScrollUp, 1, 1)),
+            Action::SettingsToggleFieldPrev
         );
     }
 
@@ -3570,7 +3662,8 @@ mod tests {
         assert_eq!(message.reactions.len(), 1);
         assert_eq!(
             message.reactions[0].kind,
-            ReactionKind::Emoji(chosen.to_owned())
+            ReactionKind::Emoji(tuigram_core::normalize_reaction_emoji(chosen)),
+            "the stored reaction is confirm's normalized wire form, not the display glyph"
         );
     }
 

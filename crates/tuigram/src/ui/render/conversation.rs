@@ -17,7 +17,7 @@ use tuigram_core::model::{
 
 use crate::app::App;
 use crate::conversation::ConversationView;
-use crate::keymap::Focus;
+use crate::keymap::{Focus, Overlay};
 use crate::ui::HistoryRows;
 
 use super::chat_list::{action_phrase, delivery_glyph};
@@ -173,44 +173,55 @@ pub(crate) fn render_conversation(frame: &mut Frame, area: Rect, app: &App) -> (
     let history = Paragraph::new(lines).block(block);
     frame.render_widget(history, area);
 
-    // Second pass (#201): overlay one 2-row `Image` widget per visible
-    // avatar-bearing message, at the inner column/row the header's leading
-    // gutter span reserved for it. Clip the height to what `truncate` above
-    // actually kept, so a message half-cut off at the pane's bottom edge
-    // never draws its bubble past the border.
-    for (row, protocol) in avatars {
-        let rect = Rect {
-            x: area.x + 1,
-            y: area.y + 1 + row as u16,
-            width: gutter_cols as u16,
-            height: 2.min((inner_rows - row) as u16),
-        };
-        // `allow_clipping` (#222): without it, `Image` silently renders
-        // nothing at all whenever the rect is shorter than the encoded
-        // protocol's own size — which the reduced `height` above already
-        // asks for whenever a bubble sits at the pane's edge.
-        frame.render_widget(Image::new(protocol).allow_clipping(true), rect);
-    }
+    // Second pass (#201/#208, skipped while an overlay is open — see below):
+    // overlay one 2-row avatar `Image` and one inline-media `Image` per
+    // visible message, at the column/row their first pass reserved. Clipped
+    // to what `truncate` above actually kept, so a message half-cut off at
+    // the pane's bottom edge never draws its bubble past the border.
+    //
+    // Kitty/Sixel/iTerm2 place these pixels out-of-band from ratatui's own
+    // cell-diffing model, so once an overlay's `Clear`+`Paragraph` redraw the
+    // text grid on top in the same frame, the terminal doesn't reliably erase
+    // pixels already painted underneath (confirmed live: the leak vanishes
+    // with graphics rendering off). `should_clear_for_graphics` (`lib.rs`)
+    // already forces a full-terminal clear on the overlay open/close
+    // *transition*, but every subsequent redraw while the same overlay stays
+    // open would otherwise re-place these images at their same screen
+    // coordinates regardless of what now covers them — so the placement
+    // itself is skipped for as long as any overlay is up, not just cleared
+    // once at the transition.
+    if app.overlay() == Overlay::None {
+        for (row, protocol) in avatars {
+            let rect = Rect {
+                x: area.x + 1,
+                y: area.y + 1 + row as u16,
+                width: gutter_cols as u16,
+                height: 2.min((inner_rows - row) as u16),
+            };
+            // `allow_clipping` (#222): without it, `Image` silently renders
+            // nothing at all whenever the rect is shorter than the encoded
+            // protocol's own size — which the reduced `height` above already
+            // asks for whenever a bubble sits at the pane's edge.
+            frame.render_widget(Image::new(protocol).allow_clipping(true), rect);
+        }
 
-    // Second pass (#208): overlay one inline-media `Image` per visible,
-    // already-decoded message, in the fixed-size box its own row reservation
-    // above made room for — same clip-to-truncated-view treatment as avatars.
-    // Bounded to a fraction of the pane's own width (never wider than the body
-    // column left after the gutter), not just `MEDIA_COLS`, so a narrow
-    // terminal never draws past its own border.
-    let media_cols = media_cols(area.width, gutter_cols);
-    for (row, protocol) in media {
-        let rect = Rect {
-            x: area.x + 1 + gutter_cols as u16,
-            y: area.y + 1 + row as u16,
-            width: media_cols as u16,
-            height: (crate::conversation::MEDIA_ROWS).min(inner_rows - row) as u16,
-        };
-        // `allow_clipping` (#222): required for the bottom-edge partial
-        // visibility this reduced `height` computes — only Kitty/Halfblocks
-        // protocols actually honor it (upstream limitation); Sixel/iTerm2
-        // still render all-or-nothing.
-        frame.render_widget(Image::new(protocol).allow_clipping(true), rect);
+        // Bounded to a fraction of the pane's own width (never wider than the
+        // body column left after the gutter), not just `MEDIA_COLS`, so a
+        // narrow terminal never draws past its own border.
+        let media_cols = media_cols(area.width, gutter_cols);
+        for (row, protocol) in media {
+            let rect = Rect {
+                x: area.x + 1 + gutter_cols as u16,
+                y: area.y + 1 + row as u16,
+                width: media_cols as u16,
+                height: (crate::conversation::MEDIA_ROWS).min(inner_rows - row) as u16,
+            };
+            // `allow_clipping` (#222): required for the bottom-edge partial
+            // visibility this reduced `height` computes — only Kitty/Halfblocks
+            // protocols actually honor it (upstream limitation); Sixel/iTerm2
+            // still render all-or-nothing.
+            frame.render_widget(Image::new(protocol).allow_clipping(true), rect);
+        }
     }
 
     // The scrollbar tracks the message offset, inset one row so it rides the
@@ -1808,6 +1819,48 @@ mod tests {
         assert!(
             render_output(&with_avatar, 80, 24).history_has_visible_images,
             "a cached avatar alone also counts"
+        );
+    }
+
+    #[test]
+    fn an_open_overlay_skips_placing_history_images() {
+        // Chat media renders via `ratatui_image`'s `Image` widget, whose Kitty
+        // encoder writes a distinctive Unicode placeholder codepoint
+        // (`\u{10EEEE}`) into its rect's leading cell (see `kitty.rs::render`
+        // upstream) — `TestBackend` genuinely captures this, unlike the real
+        // terminal's actual pixel plane, so it is a reliable proxy for "was
+        // the image placed at all" in this headless test. With no overlay
+        // open, a cached avatar's placeholder lands in the gutter; with an
+        // overlay open, the placement is skipped entirely (this fix) so that
+        // cell holds only the blank gutter padding the text pane wrote —
+        // preventing an out-of-band graphics placement from ever being
+        // (re-)issued while it would leak through an overlay's popup.
+        let mut app = app_with_history(vec![text_message(2, "hi")]);
+        app.set_avatar_support(AvatarSupport::Graphics(graphics_picker()));
+        let picker = graphics_picker();
+        let protocol = picker
+            .new_protocol(
+                image::DynamicImage::ImageRgb8(image::RgbImage::new(4, 4)),
+                ratatui::layout::Size::new(4, 4),
+                ratatui_image::Resize::Fit(None),
+            )
+            .expect("halfblocks protocol always encodes");
+        app.cache_avatar(2, protocol);
+
+        let area = render_output(&app, 80, 24).panes.history;
+        let gutter_cell = (area.x + 1, area.y + 1);
+
+        let no_overlay = render(&app, 80, 24);
+        assert!(
+            no_overlay[gutter_cell].symbol().contains('\u{10eeee}'),
+            "no overlay open: the avatar image is placed"
+        );
+
+        app.dispatch(Action::ToggleHelp);
+        let with_overlay = render(&app, 80, 24);
+        assert!(
+            !with_overlay[gutter_cell].symbol().contains('\u{10eeee}'),
+            "an overlay is open: the avatar image placement is skipped"
         );
     }
 

@@ -702,6 +702,7 @@ fn resolve_settings(key: &KeyEvent) -> Action {
         KeyCode::Esc => Action::SettingsCancel,
         KeyCode::Enter => Action::SettingsConfirm,
         KeyCode::Tab => Action::SettingsToggleField,
+        KeyCode::BackTab => Action::SettingsToggleFieldPrev,
         KeyCode::Backspace => Action::SettingsBackspace,
         KeyCode::Left => Action::SettingsLeft,
         KeyCode::Right => Action::SettingsRight,

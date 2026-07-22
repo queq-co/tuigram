@@ -132,16 +132,25 @@ impl ReactionPicker {
 
     /// The emoji a confirm would react with: the trimmed custom buffer in custom mode
     /// (`None` when it is empty — nothing to send), or the selected palette emoji in
-    /// palette mode. The reducer reads this to decide whether the confirm acts.
+    /// palette mode. Normalized via
+    /// [`normalize_reaction_emoji`](tuigram_core::normalize_reaction_emoji) — dropping
+    /// a VS16 (e.g. on ❤️) — so this, the sole producer of the value that reaches the
+    /// optimistic local reaction bucket and the outbound `add`/`remove_message_reaction`
+    /// call, hands both a form matching Telegram's canonical reaction string. The
+    /// reducer reads this to decide whether the confirm acts.
     #[must_use]
     pub fn confirmed_emoji(&self) -> Option<String> {
-        match &self.custom {
+        let raw = match &self.custom {
             Some(buffer) => {
                 let trimmed = buffer.trim();
-                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+                if trimmed.is_empty() {
+                    return None;
+                }
+                trimmed
             }
-            None => Some(self.selected_emoji().to_owned()),
-        }
+            None => self.selected_emoji(),
+        };
+        Some(tuigram_core::normalize_reaction_emoji(raw))
     }
 
     /// Move the selection to the next emoji, clamping at the last.
@@ -213,6 +222,26 @@ mod tests {
     }
 
     #[test]
+    fn palette_heart_confirms_as_telegrams_bare_codepoint() {
+        // The palette displays "❤️" (heart + VS16) so the picker renders the emoji
+        // glyph, but confirming it must send Telegram's canonical single-codepoint
+        // "❤" — the form the server expects and echoes back.
+        let mut picker = ReactionPicker::new();
+        let heart_index = picker
+            .palette()
+            .iter()
+            .position(|&e| e == "❤️")
+            .expect("palette has a heart entry");
+        picker.select(heart_index);
+        assert_eq!(
+            picker.selected_emoji(),
+            "❤️",
+            "display glyph keeps its VS16"
+        );
+        assert_eq!(picker.confirmed_emoji().as_deref(), Some("❤"));
+    }
+
+    #[test]
     fn custom_mode_accumulates_and_confirms_the_typed_emoji() {
         let mut picker = ReactionPicker::new();
         picker.enter_custom();
@@ -220,11 +249,11 @@ mod tests {
         assert_eq!(picker.custom_input(), Some(""));
         // An empty buffer has nothing to send.
         assert_eq!(picker.confirmed_emoji(), None);
-        // A multi-scalar emoji (heart + VS16) is taken verbatim.
+        // A multi-scalar emoji (heart + VS16) normalizes to Telegram's bare form.
         for c in "❤️".chars() {
             picker.push(c);
         }
-        assert_eq!(picker.confirmed_emoji().as_deref(), Some("❤️"));
+        assert_eq!(picker.confirmed_emoji().as_deref(), Some("❤"));
         picker.backspace(); // drop the VS16
         picker.backspace(); // drop the heart
         assert_eq!(picker.custom_input(), Some(""));
