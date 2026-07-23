@@ -204,7 +204,7 @@ jobs:
       # release, so a hash of it can reference a commit later absent from the
       # repo — an "impostor commit"). Pin the *action's* versioned release tag
       # instead and select the tool via `with:`.
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         if: steps.baseline.outputs.published == 'true'
         with:
           tool: cargo-semver-checks
@@ -235,7 +235,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libc++1 libc++abi1
       # See the semver-checks job above for why this pins the versioned
       # release tag rather than hashing the `@cargo-llvm-cov` convenience tag.
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         with:
           tool: cargo-llvm-cov
       - name: cargo llvm-cov
@@ -268,7 +268,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
       # See the semver-checks job above for why this pins the versioned
       # release tag rather than hashing the `@cargo-deny` convenience tag.
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         with:
           tool: cargo-deny
       - name: cargo deny check
