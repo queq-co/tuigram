@@ -71,7 +71,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: v
         shell: bash
         run: |
@@ -101,7 +101,7 @@ jobs:
           - { name: windows-x86_64, os: windows-latest }
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup show
@@ -227,7 +227,7 @@ jobs:
           - { name: macos-arm64,    os: macos-15,          archive: tar.gz }
           - { name: windows-x86_64, os: windows-latest,    archive: zip }
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: |
             LICENSE
