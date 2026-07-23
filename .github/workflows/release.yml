@@ -71,7 +71,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: v
         shell: bash
         run: |
@@ -101,7 +101,7 @@ jobs:
           - { name: windows-x86_64, os: windows-latest }
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         run: rustup show
@@ -133,7 +133,7 @@ jobs:
       # advisory without guessing from the release tag/date. `cargo auditable
       # build` is a drop-in wrapper — every arg after it passes to `cargo` as
       # normal, so this doesn't otherwise change what gets built.
-      - uses: taiki-e/install-action@ed67fa35ac944f3a9b33f12c4dd43b6f31a47e20 # v2.83.3
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         with:
           tool: cargo-auditable
 
@@ -227,7 +227,7 @@ jobs:
           - { name: macos-arm64,    os: macos-15,          archive: tar.gz }
           - { name: windows-x86_64, os: windows-latest,    archive: zip }
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           sparse-checkout: |
             LICENSE
