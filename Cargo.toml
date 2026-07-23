@@ -91,7 +91,7 @@ image = { version = "0.25" }
 # Draws the generated fallback avatar bubble (#201, Stage 4) for senders with
 # no profile-photo minithumbnail: `imageproc` for the accent-color-filled
 # `RgbImage` + text drawing, `ab_glyph` as its font-rasterizing backend.
-imageproc = { version = "0.25", default-features = false }
+imageproc = { version = "0.27", default-features = false, features = ["text"] }
 ab_glyph = { version = "0.2" }
 # Column-width measurement for word-wrapping message bodies and the composer
 # (#214, #215) — already in the graph transitively via ratatui; promoted to
