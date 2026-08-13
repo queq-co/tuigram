@@ -46,7 +46,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup show
 
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
 
       # The Linux prebuilt tdjson links LLVM's libc++ (not libstdc++), which is
       # not preinstalled on ubuntu runners. OpenSSL 3 + zlib already are. Install
@@ -166,7 +166,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       - name: cargo doc (intra-doc links)
         env:
           RUSTDOCFLAGS: -D warnings
@@ -197,7 +197,7 @@ jobs:
       - name: Install Rust toolchain
         if: steps.baseline.outputs.published == 'true'
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
         if: steps.baseline.outputs.published == 'true'
       # taiki-e/install-action's own README warns against hashing the
       # `@<tool-name>` convenience tag directly (it moves on every tool
@@ -226,7 +226,7 @@ jobs:
         run: rustup show
       - name: Install llvm-tools-preview
         run: rustup component add llvm-tools-preview
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       # Same reason as the build job's identically-named step: the Linux
       # prebuilt tdjson links libc++ (not libstdc++), which isn't preinstalled
       # on ubuntu runners. Without this, `tests/cli.rs`'s spawned binary can't
@@ -265,7 +265,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
       # See the semver-checks job above for why this pins the versioned
       # release tag rather than hashing the `@cargo-deny` convenience tag.
       - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
