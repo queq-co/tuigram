@@ -77,7 +77,7 @@ rustyline = { version = "18", default-features = false }
 # Decodes TDLib's base64-encoded `Minithumbnail.data` (profile-photo mini
 # avatars, #201) once at projection time, so nothing downstream re-touches
 # base64. Already in the dependency graph transitively; promoted to direct.
-base64 = { version = "0.22" }
+base64 = { version = "0.23" }
 # Renders the raster mini-avatar bubble (#201) as a Sixel/Kitty/iTerm2 image
 # widget. `image-defaults` picks the pure-Rust encoder path instead of the
 # default `chafa-dyn`/`chafa-static`, avoiding a system `libchafa` build
