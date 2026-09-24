@@ -22,7 +22,7 @@ jobs:
       # See ci.yml's `deny`/`semver-checks` jobs for why this pins the
       # versioned release tag rather than hashing the `@cargo-deny`
       # convenience tag (taiki-e/install-action's README warns against it).
-      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
         with:
           tool: cargo-deny
       - name: cargo deny check advisories
